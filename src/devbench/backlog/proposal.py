@@ -2583,3 +2583,163 @@ def _strip_pending_proposal_marker(source_file: Path, rejected_task_id: str) -> 
     updated = re.sub(r"\n{3,}", "\n\n", updated)
     if updated != content:
         atomic_write_text(source_file, updated)
+
+
+def _remove_dependency_from_source(source_file: Path, dep_id: str) -> bool:
+    """Drop ``dep_id``'s row from ``source_file``'s Dependencies table.
+
+    Restores the canonical ``| none | | |`` placeholder when the removal
+    empties the table: a Dependencies section with a header and no rows is
+    not a shape the parser or the contract recognises, so leaving one behind
+    would trade a wrong edge for a malformed file.
+
+    Returns:
+        ``True`` when a row was removed, ``False`` when no row named
+        ``dep_id`` (so the caller can report an honest no-op).
+    """
+    content = source_file.read_text(encoding="utf-8")
+    idx = content.find("## Dependencies")
+    if idx == -1:
+        raise ProposalError(f"remove-dep: {source_file} has no '## Dependencies' section")
+    next_section = content.find("\n## ", idx + 1)
+    section = content[idx : next_section if next_section != -1 else len(content)]
+    remainder = content[next_section:] if next_section != -1 else ""
+
+    row_re = re.compile(rf"^\|\s*{re.escape(dep_id)}\s*\|[^\n]*\|\s*$\n?", re.MULTILINE)
+    stripped = row_re.sub("", section)
+    if stripped == section:
+        return False
+
+    # A table left with only its header and separator has no rows; the
+    # contract's empty form is the explicit `none` row, not an absent one.
+    data_row_re = re.compile(r"^\|(?!\s*(?:ID|-+)\s*\|)[^\n]*\|\s*$", re.MULTILINE)
+    if not data_row_re.search(stripped):
+        stripped = stripped.rstrip("\n") + "\n| none | | |\n"
+    atomic_write_text(source_file, content[:idx] + stripped + remainder)
+    return True
+
+
+def _remove_dependency_from_index(backlog_index: Path, blocked_task_id: str, blocker_task_id: str) -> None:
+    """Drop ``blocker_task_id`` from ``blocked_task_id``'s BACKLOG.md Dependencies cell.
+
+    Exact inverse of :func:`_append_dependency_to_index`, and it must run
+    whenever the row write does: an index still naming an edge the work-unit
+    file has dropped is the divergence the parser warns about, and the
+    cascade would keep reading the removed dependency from it. Writes
+    ``None`` when the last token is removed, matching the cell text the
+    index uses for a task with no dependencies.
+
+    Silent no-op when the row is absent or already lacks the token, so a
+    repeat call cannot corrupt the cell.
+    """
+    content = backlog_index.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
+        match = _BACKLOG_ROW_RE.match(line)
+        if match is None or match.group(1) != blocked_task_id:
+            continue
+        cells = line.split("|")
+        if len(cells) < 6:
+            continue
+        tokens = [token.strip() for token in cells[5].split(",") if token.strip()]
+        remaining = [token for token in tokens if token != blocker_task_id]
+        if remaining == tokens:
+            return
+        cells[5] = f" {', '.join(remaining)} " if remaining else " None "
+        lines[i] = "|".join(cells)
+        atomic_write_text(backlog_index, "\n".join(lines) + "\n")
+        return
+
+
+def remove_dep(
+    *,
+    backlog_root: Path,
+    backlog_index: Path,
+    blocked_task_id: str,
+    blocker_task_id: str,
+    reason: str = "",
+) -> bool:
+    """Remove ``blocker_task_id`` as a dependency of ``blocked_task_id``. Idempotent.
+
+    The inverse of :func:`add_dep`, and the reason it has to exist: ``add_dep``
+    is additive-only, so an edge wired in the wrong direction could not be
+    corrected. Re-wiring the reverse fails the cycle guard while the erroneous
+    row is still present, and the documented remedy was an operator hand-edit
+    of the work-unit file -- unreachable from inside a run, because
+    ``guard-work-unit-write.sh`` blocks executor-tier writes to
+    ``backlog/**/*.md``. A backlog carrying one reversed edge therefore stalled
+    every unit behind it with no automation path.
+
+    Clears all three channels ``add_dep`` writes, because any one left behind
+    still encodes the edge: the Dependencies row, the BACKLOG.md Dependencies
+    cell, and the ``[BLOCKED_PENDING_PROPOSAL]`` marker (via
+    :func:`_strip_pending_proposal_marker`, the same helper ``reject-proposal``
+    uses, rather than a second implementation). An audit comment records the
+    removal, since the row that would otherwise evidence it is gone.
+
+    Deliberately does NOT touch status. Deciding that a unit has become
+    claimable is the cascade's job and depends on the whole graph; flipping it
+    here would re-queue a unit that is still blocked for some other reason.
+
+    Unlike ``add_dep``, the blocker is NOT required to exist in the index. A
+    marker pointing at an unknown ID is exactly the fault ``validate-backlog``
+    reports so an operator can clear it, so requiring the target to exist would
+    make this command unusable for the case that most needs it.
+
+    Args:
+        backlog_root: Backlog tree root.
+        backlog_index: Path to ``BACKLOG.md``.
+        blocked_task_id: The task whose dependency is being removed.
+        blocker_task_id: The dependency to remove.
+        reason: Optional audit text explaining why the edge was wrong.
+
+    Returns:
+        ``True`` when a row, an index token, or a marker was removed;
+        ``False`` when the edge was already absent in every channel.
+
+    Raises:
+        ProposalError: The two IDs are the same, the blocked task is not in
+            the index, or its file has no ``## Dependencies`` section.
+    """
+    if blocked_task_id == blocker_task_id:
+        raise ProposalError(f"remove-dep: blocked and blocker cannot be the same task ({blocked_task_id})")
+
+    blocked_file = _find_source_task_file(backlog_root, backlog_index, blocked_task_id)
+    if blocked_file is None:
+        raise ProposalError(
+            f"remove-dep: blocked task '{blocked_task_id}' not found in backlog index; nothing to unwire."
+        )
+
+    had_marker = _comments_have_marker(blocked_file, blocker_task_id)
+    workspace_root = backlog_index.parent
+    with flock_backlog(workspace_root):
+        removed_row = _remove_dependency_from_source(blocked_file, blocker_task_id)
+        _remove_dependency_from_index(backlog_index, blocked_task_id, blocker_task_id)
+        if had_marker:
+            _strip_pending_proposal_marker(blocked_file, blocker_task_id)
+
+    if not (removed_row or had_marker):
+        return False
+
+    detail = f"; reason: {reason}" if reason else ""
+    _append_unwired_comment(blocked_file, blocked_task_id, blocker_task_id, detail)
+    return True
+
+
+def _append_unwired_comment(blocked_file: Path, blocked_task_id: str, blocker_task_id: str, detail: str) -> None:
+    """Record an edge removal in the blocked unit's Comments section.
+
+    The removal deletes the row and marker that would otherwise be the only
+    evidence the edge ever existed, so without this the graph would change
+    with nothing in the file explaining why.
+    """
+    from devbench.backlog.manager import BacklogManager
+
+    BacklogManager()._append_agent_comment(
+        blocked_file,
+        "operator",
+        f"[WU_UNWIRED] {blocked_task_id} no longer depends on {blocker_task_id}: the Dependencies row, "
+        f"the BACKLOG.md index cell and any [BLOCKED_PENDING_PROPOSAL] marker for it were removed via "
+        f"'devbench remove-dep'{detail}. Status is unchanged; the cascade decides whether this unit is "
+        "now claimable.",
+    )

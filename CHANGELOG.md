@@ -3,6 +3,69 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] -- 2026-08-20
+
+### Added
+
+- **`devbench remove-dep`, the inverse `add-dep` never had, without which a
+  reversed dependency edge could not be corrected by any agent** (#349).
+  `add-dep` is additive-only. Re-wiring an edge in the correct direction fails
+  the cycle guard while the erroneous row is still present, and the documented
+  remedy -- `docs/adr/10-multi-target-proposal-wiring.md`, and the brownfield
+  example at `how-it-was-made.md` line 611 -- was an operator hand-edit of the
+  work-unit file. That remedy is unreachable from inside a run, because
+  `guard-work-unit-write.sh` blocks executor-tier writes to `backlog/**/*.md`
+  and executor sessions carry no orchestrator role, so the work was
+  structurally impossible for every agent tier. Observed on a 76-task backlog:
+  two independent units blocked on exactly this with 47 further units waiting
+  behind them, and the run exited `NO_ACTIONABLE` with one task in-queue and
+  nothing claimable. `remove-dep` clears all three channels `add-dep` writes,
+  because any one left behind still encodes the edge: the `## Dependencies`
+  row, restoring the canonical `| none | | |` row when the removal empties the
+  table; the `BACKLOG.md` Dependencies cell, writing `None` when the last token
+  goes; and the `[BLOCKED_PENDING_PROPOSAL]` marker, through
+  `_strip_pending_proposal_marker`, the same helper `reject-proposal` already
+  uses rather than a second implementation. A `[WU_UNWIRED]` audit comment
+  records the removal, since the row that would otherwise evidence the edge is
+  gone. Two asymmetries with `add-dep` are deliberate: status is left untouched,
+  because whether a unit became claimable depends on the whole graph and is
+  `reconcile-cascade`'s decision, and flipping it here would re-queue a unit
+  still blocked for another reason; and the blocker is not required to exist,
+  because a marker pointing at an unknown ID is precisely the fault
+  `validate-backlog` reports for an operator to clear, so demanding the target
+  exist would make the command unusable for the case that most needs it.
+
+### Fixed
+
+- **`reconcile-cascade` re-queued units blocked on a human, which the
+  orchestrator re-blocked seconds later** (#350). Marker state and dependency
+  state were the only inputs, and neither can see that a unit is waiting on an
+  operator, so a unit blocked with `[OPERATOR_INPUT_REQUIRED]` was re-queued on
+  every sweep, claimed, found to need the same missing input, and blocked
+  again. Measured in one run: the cascade flipped three units to `in-queue` at
+  07:39:59, the orchestrator set all three back to `blocked` at 07:40:09, and
+  the run exited `NO_ACTIONABLE` at 07:40:26 -- two audit rows per unit per
+  sweep, nothing advanced, and the real blocking reason buried deeper in the
+  Comments each time. The cascade now skips a unit carrying an unanswered
+  `[OPERATOR_INPUT_REQUIRED]` row and names that in its `skipped` envelope. The
+  guard is keyed to that explicit tag rather than to the
+  `OPERATOR_ACTION_REQUIRED` classification, and the first implementation got
+  this wrong: that classification also covers a unit blocked with no marker, no
+  unmet dependency and no recovery signal, which is exactly the crash-mid-write
+  case `reconcile-cascade` exists to repair (#150), so keying on it defeated the
+  command's own purpose. An existing test caught it, and a new test pins the
+  crash case as still repairable. A later `[UNBLOCKED]` row clears the tag;
+  `[CASCADE_RECONCILED]` deliberately does not, because the cascade is not the
+  operator and treating its own audit row as the answer is the loop itself.
+
+- **`remove-dep` lost its `--reason` to fixed-arity dispatch.** The dispatcher
+  slices trailing arguments for non-variadic commands, so `remove-dep A B
+  --reason "x"` dropped the value and then failed with `--reason requires a
+  value`. `add-dep` takes the identical grammar and was already in
+  `_VARIADIC_COMMANDS`; the new verb had to join it. Found by running the
+  command for real rather than only through its unit tests, which call
+  `cmd_remove_dep` directly and never cross the dispatcher.
+
 ## [0.5.0] -- 2026-08-19
 
 - **A review-rejection loop had no bound in code, so one task could be rejected

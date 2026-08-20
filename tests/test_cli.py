@@ -16676,6 +16676,133 @@ class TestCmdReconcileCascade:
         assert "## Status: in-queue" in t2
         assert "[CASCADE_RECONCILED]" in t2
 
+    def test_unanswered_operator_input_tag_is_not_requeued(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A unit handed to a human must not be flipped, however clean its graph is.
+
+        Observed live: the cascade flipped three such units at 07:39:59, the
+        orchestrator set all three back at 07:40:09, and the run exited
+        NO_ACTIONABLE having written two audit rows per unit and moved nothing.
+        """
+        comments = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [BLOCKED] "
+            "[OPERATOR_INPUT_REQUIRED] decision reserved for the operator\n"
+        )
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped"] == []
+        reasons = {item["unit_id"]: item["reason"] for item in envelope["skipped"]}
+        assert "operator action required" in reasons["E0-F1-S1-T2"]
+        assert "## Status: blocked" in (tmp_path / "backlog" / "E0-F1-S1-T2.md").read_text()
+
+    def test_operator_answered_tag_no_longer_holds_the_unit(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """An [UNBLOCKED] row after the request is the operator answering it."""
+        comments = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [BLOCKED] "
+            "[OPERATOR_INPUT_REQUIRED] decision reserved for the operator\n"
+            "[2026-01-02 00:00 UTC] [agent/operator] [UNBLOCKED] decision recorded\n"
+        )
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" in [item["unit_id"] for item in envelope["flipped"]]
+
+    def test_cascade_own_audit_row_does_not_answer_the_request(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The exact loop: the cascade must not count its own re-queue as the answer."""
+        comments = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [BLOCKED] "
+            "[OPERATOR_INPUT_REQUIRED] decision reserved for the operator\n"
+            "[2026-01-02 00:00 UTC] [agent/backlog_manager] [CASCADE_RECONCILED] "
+            "regular deps satisfied; re-queuing\n"
+        )
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", comments),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert envelope["flipped"] == []
+
+    def test_crash_blocked_unit_with_no_tag_is_still_repaired(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The guard must not defeat the case this command exists for (issue #150).
+
+        A unit blocked by a crash mid-write carries no marker, no unmet dep and
+        no operator request. It classifies OPERATOR_ACTION_REQUIRED, which is
+        why the guard is keyed to the explicit tag instead.
+        """
+        index = _cascade_build_backlog(
+            tmp_path,
+            rows=[
+                ("E0-F1-S1-T1", "Task", "done", "None", "E0-F1-S1-T1", ""),
+                ("E0-F1-S1-T2", "Task", "blocked", "E0-F1-S1-T1", "E0-F1-S1-T2", "## Comments\n"),
+            ],
+        )
+        with (
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", index),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_reconcile_cascade()
+
+        assert rc == 0
+        envelope = json.loads(capsys.readouterr().out.strip())
+        assert "E0-F1-S1-T2" in [item["unit_id"] for item in envelope["flipped"]]
+
     def test_open_marker_keeps_task_blocked(
         self,
         tmp_path: Path,

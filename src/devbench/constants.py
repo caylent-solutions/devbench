@@ -1005,6 +1005,13 @@ DEFAULT_ORCHESTRATE_MAX_THINKING_TOKENS: int = 16000
 # config load rather than passed through to fail deep inside a session.
 VALID_ORCHESTRATE_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
+# Tag an agent writes inside a ``[BLOCKED]`` audit row when it cannot proceed
+# without a human: a decision reserved for the operator, or a repair no agent
+# tier is permitted to perform. ``reconcile-cascade`` treats an unanswered one
+# as a hard stop, because re-queuing such a unit only produces another
+# identical block.
+OPERATOR_INPUT_REQUIRED_TAG: str = "[OPERATOR_INPUT_REQUIRED]"
+
 # Audit marker emitted by ``_should_resume_after_quota_recovery`` on each
 # permitted in-process quota resume: ``[ORCHESTRATOR_QUOTA_RESUME]
 # resume=<n> max=<cap>`` (spec FR-2.10).

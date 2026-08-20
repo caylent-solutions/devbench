@@ -177,6 +177,7 @@ from devbench.backlog.proposal import (
     promote_proposal,
     read_proposal,
     reject_proposal,
+    remove_dep,
     write_proposal,
 )
 from devbench.backlog.review_feedback_vocabulary import (
@@ -242,6 +243,7 @@ from devbench.constants import (
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     KNOWN_JUDGE_NAMES,
+    OPERATOR_INPUT_REQUIRED_TAG,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
     ORCHESTRATOR_ONLY_TDD_PHASES,
@@ -2641,6 +2643,36 @@ def _notify_blocked_classification_transitions(units: list) -> None:
     prune_notification_state_for_unblocked(workspace_root, blocked_task_ids)
 
 
+def _has_unresolved_operator_input_tag(wu_file: Path) -> bool:
+    """Return True when ``wu_file`` carries an operator-input request nothing has answered.
+
+    An agent that cannot proceed without a human writes
+    ``[BLOCKED] [OPERATOR_INPUT_REQUIRED] ...`` into the unit's Comments. Until
+    an operator answers it, re-queuing the unit only produces another identical
+    block, so the cascade treats the tag as a hard stop.
+
+    A later ``[UNBLOCKED]`` row clears it, because that is what an operator (or
+    a command acting on an operator's instruction) writes when the request has
+    been satisfied. ``[CASCADE_RECONCILED]`` deliberately does NOT clear it:
+    the cascade is not the operator, and letting its own audit row count as an
+    answer is precisely the loop this guard exists to break.
+
+    Scans the ``## Comments`` body only, so the tag quoted in a Description or
+    Approach cannot pin a unit closed.
+    """
+    try:
+        content = wu_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        # Unreadable file: the surrounding sweep already reports it, and
+        # guessing "unblocked" here would re-queue a unit nobody can read.
+        return False
+    comments = BacklogManager()._extract_sections(content).get("Comments", "")
+    latest_request = comments.rfind(OPERATOR_INPUT_REQUIRED_TAG)
+    if latest_request == -1:
+        return False
+    return "[UNBLOCKED]" not in comments[latest_request:]
+
+
 def cmd_reconcile_cascade() -> int:
     """Reconcile every blocked task against marker target + regular dep state.
 
@@ -2718,6 +2750,34 @@ def cmd_reconcile_cascade() -> int:
             unsatisfied = _first_unsatisfied_dep(unit, units_by_id)
             reason = f"regular dep not yet terminal: {unsatisfied}" if unsatisfied else "regular deps unsatisfied"
             skipped.append({"unit_id": unit.id, "reason": reason})
+            continue
+
+        # Operator-input evaluation. Marker and dependency state can both be
+        # clean while the unit is still blocked on a human -- a decision gate,
+        # or a repair no agent is permitted to make. Re-queuing one of those
+        # does not advance it: the orchestrator claims it, meets the same
+        # unmet requirement, and blocks it again. Observed live, every run:
+        # the cascade flipped three units to in-queue at 07:39:59 and the
+        # orchestrator set all three back to blocked at 07:40:09, ten seconds
+        # later, then exited NO_ACTIONABLE, having written two audit rows per
+        # unit and moved nothing.
+        #
+        # Keyed to the explicit tag an agent writes when it hands a unit to a
+        # human, NOT to the OPERATOR_ACTION_REQUIRED classification. That
+        # classification also covers a unit blocked with no marker, no dep and
+        # no recovery signal -- which is exactly the crash-mid-write case this
+        # command exists to repair (issue #150), so keying on it would defeat
+        # the cascade's own purpose.
+        if _has_unresolved_operator_input_tag(wu_file):
+            skipped.append(
+                {
+                    "unit_id": unit.id,
+                    "reason": (
+                        f"operator action required: an unresolved {OPERATOR_INPUT_REQUIRED_TAG} audit row is "
+                        "present; re-queuing would not advance it"
+                    ),
+                }
+            )
             continue
 
         manager.force_status(wu_file, BACKLOG_INDEX, unit.id, STATUS_IN_QUEUE)
@@ -12949,8 +13009,12 @@ def _canonicalize_add_dep_row(
         atomic_write_text(blocked_file, content.replace(placeholder, real_row, 1))
 
 
-def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
-    """Parse the add-dep flag grammar.
+def _parse_add_dep_argv(argv: tuple[str, ...], verb: str = "add-dep") -> tuple[str | None, str, str]:
+    """Parse the two-task-id-plus-``--reason`` grammar shared by add-dep and remove-dep.
+
+    ``verb`` only names the command in the error text; the grammar is
+    identical for both, so they share one parser rather than keeping two
+    copies that could drift.
 
     Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
     after printing a usage error to stderr so the caller can ``return 1``.
@@ -12979,7 +13043,7 @@ def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
 
     if len(positional) != 2:
         print(
-            "ERROR: add-dep requires exactly two task ids: <blocked-task-id> <blocker-task-id>",
+            f"ERROR: {verb} requires exactly two task ids: <blocked-task-id> <blocker-task-id>",
             file=sys.stderr,
         )
         return None, "", ""
@@ -12987,11 +13051,87 @@ def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
     for label, tid in (("blocked", blocked_id), ("blocker", blocker_id)):
         if not task_id_re.match(tid):
             print(
-                f"ERROR: add-dep: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
+                f"ERROR: {verb}: {label} task id '{tid}' does not match E<N>-F<N>-S<N>-T<N> format",
                 file=sys.stderr,
             )
             return None, "", ""
     return blocked_id, blocker_id, reason
+
+
+def cmd_remove_dep(*argv: str) -> int:
+    """Remove a cross-task dependency edge from an existing work unit.
+
+    Usage::
+
+        remove-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+
+    The inverse of ``add-dep``, and the reason it exists: ``add-dep`` is
+    additive-only, so an edge wired in the wrong direction could not be
+    corrected. Re-wiring the reverse fails the cycle guard while the erroneous
+    row is still present, and the documented remedy was an operator hand-edit
+    of the work-unit file -- which ``guard-work-unit-write.sh`` blocks for
+    executor-tier sessions, so a backlog carrying one reversed edge stalled
+    every unit behind it with no automation path.
+
+    Clears all three channels ``add-dep`` writes -- the Dependencies row, the
+    BACKLOG.md Dependencies cell, and the ``[BLOCKED_PENDING_PROPOSAL]``
+    marker -- and records the removal as an audit comment, since the row that
+    would otherwise evidence the edge is gone.
+
+    Leaves status untouched: whether the unit has become claimable depends on
+    the rest of the graph and is ``reconcile-cascade``'s decision.
+
+    Emits the same JSON key set as ``add-dep`` with ``unwired`` in place of
+    ``wired``, so a caller can parse either uniformly. ``unwired: false`` with
+    rc=0 means the edge was already absent (an honest no-op, not a failure);
+    rc=1 with ``unwired: false`` means the removal could not be performed and
+    ``reason`` says why.
+    """
+    blocked_task_id, blocker_task_id, reason = _parse_add_dep_argv(argv, verb="remove-dep")
+    if blocked_task_id is None:
+        return 1
+
+    rc = _reject_em_dash("reason", reason) if reason else None
+    if rc is not None:
+        return rc
+
+    try:
+        removed = remove_dep(
+            backlog_root=BACKLOG_ROOT,
+            backlog_index=BACKLOG_INDEX,
+            blocked_task_id=blocked_task_id,
+            blocker_task_id=blocker_task_id,
+            reason=reason,
+        )
+    except (ProposalError, OSError, UnicodeDecodeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print(
+            json.dumps({"blocked": blocked_task_id, "blocker": blocker_task_id, "unwired": False, "reason": str(exc)})
+        )
+        return 1
+
+    logger.info(
+        "remove-dep: %s no longer depends on %s (unwired=%s)",
+        blocked_task_id,
+        blocker_task_id,
+        removed,
+    )
+    if not removed:
+        print(
+            f"WARNING: remove-dep: {blocked_task_id} had no dependency on {blocker_task_id}; nothing to remove.",
+            file=sys.stderr,
+        )
+    print(
+        json.dumps(
+            {
+                "blocked": blocked_task_id,
+                "blocker": blocker_task_id,
+                "unwired": removed,
+                "reason": reason,
+            }
+        )
+    )
+    return 0
 
 
 def cmd_reject_proposal(*argv: str) -> int:
@@ -13479,6 +13619,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_add_dep,
         2,
         "Wire a cross-task BLOCKED_PENDING_PROPOSAL marker: add-dep <blocked-id> <blocker-id> [--reason <msg>]",
+    ),
+    "remove-dep": (
+        cmd_remove_dep,
+        2,
+        "Remove a cross-task dependency edge: remove-dep <blocked-id> <blocker-id> [--reason <msg>]",
     ),
     "materialise-proposal": (
         cmd_materialise_proposal,

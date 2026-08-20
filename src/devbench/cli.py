@@ -13662,6 +13662,7 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "watchdog",
         "notify-test",
         "add-dep",
+        "remove-dep",
         "decline",
         # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
         "green-green-check",

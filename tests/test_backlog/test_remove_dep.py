@@ -468,3 +468,22 @@ class TestOperatorInputTagHelper:
         from devbench import cli
 
         assert cli._has_unresolved_operator_input_tag(tmp_path / "missing.md") is False
+
+
+@pytest.mark.unit
+class TestRemoveDepIsVariadic:
+    def test_remove_dep_owns_its_own_flag_parsing(self) -> None:
+        """Fixed-arity dispatch truncates trailing flags, so `--reason` would be eaten.
+
+        `add-dep` takes the same grammar and is registered variadic for exactly
+        this reason; a `remove-dep` left out of the set silently loses its
+        audit reason and then fails with "--reason requires a value".
+        """
+        from devbench.cli import _VARIADIC_COMMANDS
+
+        assert "remove-dep" in _VARIADIC_COMMANDS
+
+    def test_both_dep_verbs_share_the_same_dispatch_treatment(self) -> None:
+        from devbench.cli import _VARIADIC_COMMANDS
+
+        assert {"add-dep", "remove-dep"} <= _VARIADIC_COMMANDS

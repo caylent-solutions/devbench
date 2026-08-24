@@ -56,6 +56,7 @@ Pick the doc closest to your role.
 | **An operator** running devbench against a backlog | [CLI Reference](#cli-reference), [FAQ](docs/faq.md), [Interactive Mode](#interactive-mode), [Troubleshooting](#troubleshooting), live dashboards in [docs/watch-activity.md](docs/watch-activity.md) and [docs/hook-activity.md](docs/hook-activity.md) |
 | **A developer** extending or modifying devbench | [docs/architecture.md](docs/architecture.md) for the end-to-end model, [docs/plugin-architecture.md](docs/plugin-architecture.md) for agents/hooks/skill, the ADRs under [docs/adr/](docs/adr/) for rationale, [open GitHub issues](https://github.com/caylent-solutions/devbench/issues) for in-queue work and technical debt, [docs/spec-operator-attention-alerts.md](docs/spec-operator-attention-alerts.md) for the attention-alerts future-work design sketch |
 | **Authoring a new backlog** for devbench to execute | [docs/creating-specs-and-backlogs.md](docs/creating-specs-and-backlogs.md), [docs/backlog-contract.md](docs/backlog-contract.md), [docs/example-work-unit-template.md](docs/example-work-unit-template.md), [docs/authoring-manifests.md](docs/authoring-manifests.md) |
+| **Reporting a bug or contributing** | [CONTRIBUTING.md](CONTRIBUTING.md) to get started, [docs/issue-tracker.md](docs/issue-tracker.md) for how issues are labelled and triaged, [SECURITY.md](SECURITY.md) for vulnerabilities (never file those as issues) |
 | **A decision-maker** assessing fit | [docs/architecture.md §2 Capabilities](docs/architecture.md#2-capabilities), then skim the ADR list under [docs/adr/](docs/adr/) |
 
 ## Table of contents
@@ -70,6 +71,7 @@ Pick the doc closest to your role.
 - [Interactive mode](#interactive-mode)
 - [Remote EC2 dev environments](#remote-ec2-dev-environments)
 - [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 
 ## How it works
 
@@ -422,7 +424,7 @@ match to their own setup and copy it as a starting point.
 > Both tools point at the same workspace. See
 > [`docs/zero-to-ready.md`](docs/zero-to-ready.md) Step 10 for the full
 > two-track operator workflow, and
-> [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/operator-interventions.md)
+> [`examples/backlogs/brownfield/multi-repo_single-pr_no-merge/`](examples/backlogs/brownfield/multi-repo_single-pr_no-merge/)
 > for a worked example.
 
 ```bash
@@ -489,3 +491,18 @@ Fixed by [ADR-09](docs/adr/09-idempotent-materialise-proposal.md). If you see re
 devbench is licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
 The software is provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied (Apache-2.0 Section 7, Disclaimer of Warranty), and the contributors' liability is limited as described in Apache-2.0 Section 8 (Limitation of Liability). You assume all risk associated with your use or redistribution of the software.
+
+## Contributing
+
+Bug reports, feature requests, and pull requests are welcome.
+
+- **Report a bug or request a feature:** use the forms at
+  [Issues > New issue](https://github.com/caylent-solutions/devbench/issues/new/choose). They ask
+  which area of devbench is involved and apply the labels for you.
+- **How issues are labelled and triaged:** [docs/issue-tracker.md](docs/issue-tracker.md).
+- **Contributing a change:** [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the quality bar, and
+  what a reviewable pull request looks like.
+- **Found a security vulnerability?** Do not open an issue. Follow [SECURITY.md](SECURITY.md) to
+  report it privately.
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).

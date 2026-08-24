@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in devbench does not behave as documented
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for reporting. The most useful bug reports name what you expected and
+        show what happened instead.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what devbench did instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Output or logs
+      description: >-
+        Relevant output, log lines, or work-unit ids. Redact anything you would not
+        want in a public repository, such as tokens, hostnames, or internal paths.
+      render: text
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of devbench. Pick the closest; a maintainer will adjust if needed.
+      options:
+        - "orchestrator - orchestrate loop, sessions, daemon lifecycle, drain, quota"
+        - "cli - command surface, flags, help, exit codes"
+        - "backlog - work units, validate-backlog, manifests, proposals, dependencies"
+        - "review - judges, review pipeline, verdicts, retry budgets"
+        - "git-ops - branching, staging, commits, PRs, CI integration"
+        - "reporting - status, report, notifications, liveness, metrics"
+        - "plugin - plugin, skills, agent definitions, hooks"
+        - "config - devbench.yaml, schema, env resolution"
+        - "docs - documentation and examples"
+        - "packaging - build, release, dependencies, CI workflows"
+        - "not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: devbench version
+      description: "Output of: devbench --version"
+      placeholder: "0.2.0"

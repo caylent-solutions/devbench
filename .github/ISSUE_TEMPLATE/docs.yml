@@ -1,0 +1,41 @@
+name: Documentation
+description: Something in the docs is wrong, missing, or unclear
+labels: ["documentation", "needs-triage"]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: Page, file, or command help output.
+      placeholder: docs/cli-reference.md, "claim" section
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing
+      description: >-
+        If the docs contradict the behaviour, say which one you believe is correct.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of devbench. Pick the closest; a maintainer will adjust if needed.
+      options:
+        - "orchestrator - orchestrate loop, sessions, daemon lifecycle, drain, quota"
+        - "cli - command surface, flags, help, exit codes"
+        - "backlog - work units, validate-backlog, manifests, proposals, dependencies"
+        - "review - judges, review pipeline, verdicts, retry budgets"
+        - "git-ops - branching, staging, commits, PRs, CI integration"
+        - "reporting - status, report, notifications, liveness, metrics"
+        - "plugin - plugin, skills, agent definitions, hooks"
+        - "config - devbench.yaml, schema, env resolution"
+        - "docs - documentation and examples"
+        - "packaging - build, release, dependencies, CI workflows"
+        - "not sure"
+    validations:
+      required: true

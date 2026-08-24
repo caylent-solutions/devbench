@@ -1,0 +1,60 @@
+name: Apply issue labels
+
+# Turns the issue-form Area answer into an area:: label, so reporters answer a
+# question about their problem rather than learning our label taxonomy.
+#
+# The forms apply the type label (bug / enhancement / documentation) and
+# needs-triage statically. This adds area:: and clears needs-triage once the
+# area is known. "not sure" keeps needs-triage, which is the honest outcome:
+# the reporter should not have to guess at our internal structure.
+#
+# Deliberately does not set priority. On a public repo that is a maintainer
+# judgement, not something a reporter can know.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || "";
+            const existing = new Set(context.payload.issue.labels.map(l => l.name));
+
+            // Issue forms render an answer as "### <label>\n\n<answer>".
+            const areaMatch = body.match(/###\s+Area\s*\n+([^\n]*)/i);
+            const answer = areaMatch ? areaMatch[1].trim() : "";
+
+            // Each option starts with the bare area token, e.g. "cli - command surface".
+            const token = answer.match(
+              /^(orchestrator|cli|backlog|review|git-ops|reporting|plugin|config|docs|packaging)\b/i
+            );
+
+            if (!token) {
+              core.notice(`no area resolved from ${answer || "(no answer)"}; leaving needs-triage`);
+              return;
+            }
+
+            const label = `area::${token[1].toLowerCase()}`;
+            if (!existing.has(label)) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, labels: [label],
+              });
+            }
+
+            if (existing.has("needs-triage")) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, name: "needs-triage",
+              });
+            }
+
+            core.notice(`applied ${label}; cleared needs-triage`);

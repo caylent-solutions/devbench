@@ -1297,6 +1297,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   merges to `main`, matching the posture already recorded for this
   identical PR pair.
 
+- **`spec-to-backlog`'s generator-side ancestry-gate template now teaches
+  the same four-outcome `check-ancestry` exit contract as `devbench
+  check-ancestry` itself and `docs/cross-backlog-dependencies.md`,
+  closing a disabled-gate fail-open in the generated `AC-DEP-001`**
+  (`plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md`
+  "Authoring the ancestry-gate task" block; issue #12). Because gates
+  default to disabled (D-17), a disabled ancestry gate's exit 0 was
+  indistinguishable, under the old two-outcome template, from a merged
+  dependency's exit 0 -- every ancestry-gate task generated into a
+  backlog that had not opted into `gates.ancestry.enabled` would
+  self-certify "dependency merged" with zero ancestry ever verified. The
+  template's generated `## Acceptance Criteria` now requires the printed
+  status line to carry `status: "pass"` together with `mode: "strict"` or
+  `mode: "squash-pr"`, and states explicitly that a printed `status:
+  "disabled"` line does not satisfy `AC-DEP-001`. The `### Approach`
+  block documents all four outcomes (merged, disabled-gate, BLOCKED/
+  evaluation error, usage error), the retired `"ancestor"`/`"not_ancestor"`
+  tokens are gone, the `dependency_ref`/`target_ref` examples read
+  `<remote>/<dependency-branch>` and `<remote>/<default-branch>` instead
+  of a hard-coded `origin/`, and the cross-reference to
+  `docs/cross-backlog-dependencies.md` now points at that document's
+  "Squash-aware verification (317-D02)" section rather than a superseded
+  "known limitation" paragraph.
+
 ## [0.4.0] -- 2026-08-12
 
 ### Changed (model defaults)

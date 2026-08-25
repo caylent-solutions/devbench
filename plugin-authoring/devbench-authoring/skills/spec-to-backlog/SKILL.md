@@ -212,8 +212,8 @@ authored in Step 5a:
 
 **Declared work-group dependency (dependency-ancestry-gate)**: also extract any declared prerequisite on another work group's branch merging first. This is expressed either explicitly by the operator in their invocation message (e.g. "this work group depends on `<name>`, branch `origin/<dependency-branch>`, which must merge into `<target-branch>` before this work starts") or via a `## Dependencies` / `## Prerequisites` section in the spec naming another work group and its branch. When found, record:
 
-- `dependency_ref` -- the fully qualified, fetchable branch ref of the prerequisite (e.g. `origin/<dependency-branch>`; NOT a bare branch name -- `devbench check-ancestry` does not invent a remote-tracking prefix for you)
-- `target_ref` (optional) -- the branch the prerequisite must have merged into; when the spec/operator does not name one explicitly, it defaults at generation time to this work group's own target repo's default branch (`origin/<default-branch>`)
+- `dependency_ref` -- the fully qualified, fetchable branch ref of the prerequisite (e.g. `<remote>/<dependency-branch>`; NOT a bare branch name -- `devbench check-ancestry` does not invent a remote-tracking prefix for you)
+- `target_ref` (optional) -- the branch the prerequisite must have merged into; when the spec/operator does not name one explicitly, it defaults at generation time to this work group's own target repo's default branch (`<remote>/<default-branch>`)
 
 When no such declaration is found anywhere (operator message or spec), this work group has no cross-work-group prerequisite -- skip Step 4a's gate-task rule and the gate-task authoring in Step 5 entirely; every other part of the skill behaves exactly as before. This is additive and opt-in: backlogs authored from specs without a declared dependency are unaffected.
 
@@ -385,21 +385,31 @@ Write the task `.md` file to `backlog/<epic-id>-<epic-slug>/<feature-id>-<featur
   devbench check-ancestry E0-F<N>-S1-T1 <dependency_ref> [<target_ref>]
   ```
 
-  - Exit 0 ("ancestor"): the dependency has merged. Mark AC-DEP-001 met.
-  - Exit 1 ("not_ancestor" or an evaluation error): the dependency has NOT
-    merged (or ancestry could not be determined). Do not mark AC-DEP-001
-    met, and do not fabricate a pass -- leave the task unresolved so the
-    next orchestrator pass / operator re-run re-executes the same check.
-    Every other task in this backlog is transitively blocked behind this
-    one via the `## Dependencies` wiring from Step 4a.
+  - Exit 0 with `mode: "strict"` or `mode: "squash-pr"` in the status
+    line: the dependency has merged. Mark AC-DEP-001 met.
+  - Exit 0 with `{"gate": "ancestry", "status": "disabled"}` on stdout:
+    the ancestry gate is NOT enabled for this repo. This is not an answer
+    to "has the dependency merged" -- it means the question was never
+    asked. Do NOT mark AC-DEP-001 met on this output; enable
+    `gates.ancestry.enabled` for the repo and re-run, or treat the gate
+    task as blocked pending that configuration.
+  - Exit 1 (a BLOCKED result, or an evaluation error): the dependency has
+    NOT merged (or ancestry could not be determined). Do not mark
+    AC-DEP-001 met, and do not fabricate a pass -- leave the task
+    unresolved so the next orchestrator pass / operator re-run
+    re-executes the same check. Every other task in this backlog is
+    transitively blocked behind this one via the `## Dependencies` wiring
+    from Step 4a.
+  - Exit 2 (a usage error, e.g. an empty dependency ref): fix the
+    invocation and re-run; this is not a verdict on the dependency.
   ````
 
-- **`## Acceptance Criteria`**: a single `AC-DEP-001` stating that `devbench check-ancestry E0-F<N>-S1-T1 <dependency_ref> [<target_ref>]` exits 0.
+- **`## Acceptance Criteria`**: a single `AC-DEP-001` stating that `devbench check-ancestry E0-F<N>-S1-T1 <dependency_ref> [<target_ref>]` prints a status line carrying `status: "pass"` together with `mode: "strict"` or `mode: "squash-pr"`. A printed `status: "disabled"` line does NOT satisfy this AC -- it means the gate was never enabled, not that the dependency merged.
 - **`## Changes Manifest`**: `(none)` -- this task makes no production-code changes, only runs the check (same convention as a validation-gate task, `docs/adr/06-validation-gate-bug-escalation.md`).
 - **`## Dependencies`**: `| none | | |` (the gate task itself has no upstream dependency within this backlog).
 - **`### Depends On This`**: every DAG-root task from Step 4a's rule, resolved to real IDs per the normal "Dependency wiring" rule below.
 
-See `docs/cross-backlog-dependencies.md` for the full worked pattern and the documented known limitation (squash-merge / rebase / fix-pack topologies where strict ancestry can under-report a logically-satisfied dependency).
+See `docs/cross-backlog-dependencies.md` for the full worked pattern, including its "Squash-aware verification (317-D02)" section describing the two-probe contract (a strict probe, then a `mode: "squash-pr"` probe) that lets a squash-merged, rebased, or fix-pack-landed dependency still satisfy the gate.
 
 **Forbidden patterns** (the skill MUST NOT generate any of these):
 - Multiple `#### Error Handling Contract` subsections (general + this-task variants). Use ONE subsection; task-specific content follows the generic content under the same heading.

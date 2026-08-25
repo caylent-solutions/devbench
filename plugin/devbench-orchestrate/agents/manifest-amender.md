@@ -87,33 +87,49 @@ uv run devbench apply-amendment $ARGUMENTS
 
 **Step B.reject** -- verdict is `reject` (request should be refused). Run the ENTIRE recipe below as a single execution:
 ```bash
+set -euo pipefail
+
 # 1. Resolve the target repo.
 REPO_PATH=$(uv run devbench read-unit $ARGUMENTS | python3 -c "import sys, json; print(json.load(sys.stdin)['repo_path'])")
 REQUEST_FILE="$DEVBENCH_WORKSPACE_ROOT/.devbench/amendments/$ARGUMENTS.json"
 
 # 2. Revert every file listed in the pending request so staged production
-#    edits do not leak into subsequent tasks.
-for f in $(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); [print(e['path']) for e in d['files_to_add']]" "$REQUEST_FILE"); do
-  git -C "$REPO_PATH" restore --staged "$f" 2>/dev/null || true
-  git -C "$REPO_PATH" checkout -- "$f" 2>/dev/null || true
-  git -C "$REPO_PATH" clean -f -- "$f" 2>/dev/null || true
+#    edits do not leak into subsequent tasks. An agent must NEVER set DEVBENCH_ALLOW_DESTRUCTIVE_GIT
+#    to work around a guard refusal below -- that override is reserved for
+#    operators. If a path genuinely cannot be reverted by either branch,
+#    escalate via log-comment instead.
+FILES_TO_REVERT=$(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); [print(e['path']) for e in d['files_to_add']]" "$REQUEST_FILE") \
+  || { echo "FATAL: could not read files_to_add from $REQUEST_FILE; recipe cannot proceed" >&2; exit 1; }
+for f in $FILES_TO_REVERT; do
+  if git -C "$REPO_PATH" ls-files --error-unmatch "$f" >/dev/null; then
+    # Tracked path: a staged-and-worktree restore is guard-destructive-git.sh's
+    # own named path-scoped revert remediation, restoring both the index
+    # and the worktree in one call.
+    git -C "$REPO_PATH" restore --staged --worktree "$f" \
+      || { echo "FATAL: could not revert tracked path '$f' via git restore --staged --worktree; recipe cannot proceed" >&2; exit 1; }
+  elif [[ -e "$REPO_PATH/$f" ]]; then
+    # Untracked path the rejected request newly created: an enumerated
+    # per-path removal is guard-destructive-git.sh's own remediation for
+    # the forbidden forced-clean form -- never bulk-clean.
+    rm "$REPO_PATH/$f" \
+      || { echo "FATAL: could not remove untracked path '$f' via rm; recipe cannot proceed" >&2; exit 1; }
+  else
+    echo "FATAL: path '$f' from the pending request is neither tracked nor present on disk; cannot revert" >&2
+    exit 1
+  fi
 done
 
 # 3. Invoke the backlog-side rejection. This is the command that archives
 #    the pending request into .devbench/rejected-requests/ so blocker-resolver
-#    can read it. Capture the exit code for the verification step below.
-uv run devbench reject-amendment $ARGUMENTS "<specific rejection reason>"
-REJECT_RC=$?
+#    can read it.
+uv run devbench reject-amendment $ARGUMENTS "<specific rejection reason>" \
+  || { echo "FATAL: reject-amendment failed; cannot complete verdict" >&2; exit 1; }
 
 # 4. VERIFY the archive exists on disk. Your turn does NOT end here; this
 #    assertion must print OK before you move to Phase 2. If the archive is
 #    missing, the downstream blocker-resolver / task-factory flow cannot
 #    fire and this run has effectively corrupted the state machine.
-if [[ $REJECT_RC -ne 0 ]]; then
-  echo "FATAL: reject-amendment exited $REJECT_RC; cannot complete verdict" >&2
-  exit 1
-fi
-if ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+if compgen -G "$DEVBENCH_WORKSPACE_ROOT/.devbench/rejected-requests/$ARGUMENTS-*.json" >/dev/null; then
   echo "ARCHIVE_OK -- rejected-requests/$ARGUMENTS-*.json present; blocker-resolver can read it"
 else
   echo "ARCHIVE_MISSING -- reject-amendment returned 0 but the archive did not land on disk; re-run step 3"
@@ -127,8 +143,8 @@ fi
 #    invocation will not see the rejection rationale. The legacy
 #    ``.devbench/amender-rejections/<task-id>-<n>.json`` location is also
 #    accepted for forward compatibility with archived runs.
-if ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-"*.json >/dev/null 2>&1 \
-  || ls "$DEVBENCH_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-"*.json >/dev/null 2>&1; then
+if compgen -G "$DEVBENCH_WORKSPACE_ROOT/.devbench/review-failures/$ARGUMENTS-manifest_amender-*.json" >/dev/null \
+  || compgen -G "$DEVBENCH_WORKSPACE_ROOT/.devbench/amender-rejections/$ARGUMENTS-*.json" >/dev/null; then
   echo "FEEDBACK_OK -- review-failures/$ARGUMENTS-manifest_amender-*.json present"
 else
   echo "FEEDBACK_MISSING -- reject-amendment returned 0 but the feedback JSON did not land; re-run step 3"
@@ -136,7 +152,7 @@ else
 fi
 ```
 
-The `|| true` on the three git commands is intentional: a file can be tracked-and-modified, tracked-and-restored-to-head, or untracked-and-new, and the trio collectively handles all cases without failing the pipeline. Every OTHER step is strict -- any non-zero exit aborts the verdict.
+Tracked-vs-untracked is decided explicitly with `git ls-files --error-unmatch` before either revert branch runs: a tracked path is restored (staged and worktree) back to HEAD via `git restore --staged --worktree` -- `guard-destructive-git.sh`'s own named path-scoped revert remediation -- and an untracked path the request newly created is removed with an enumerated `rm`, the exact per-path replacement the guard names in its own remediation string for the forced-clean form it blocks. The recipe opens with `set -euo pipefail` and every command list uses `||` only to capture-and-report a failure explicitly (never `|| true`), so a blocked or otherwise failing revert aborts the recipe with a non-zero exit and a message naming the path, instead of silently reporting success. The path enumeration itself is captured into `FILES_TO_REVERT` with its own explicit `|| { ...; exit 1; }` failure branch before the `for` loop runs, because `set -e` does not apply to a command substitution used directly as a `for`-list word -- capturing it into a variable first (with an explicit check on the assignment) closes that gap, so a missing or schema-drifted `files_to_add` key aborts the recipe instead of silently iterating zero times and falling through to the archive step. This is regression-tested by `tests/test_integration/test_manifest_amender_reject_recipe.py`.
 
 **Verdict-emission contract (issue #156).** The amender-rejection JSON written by `reject-amendment` already follows the schema-v1 review-failures shape (judge=`manifest_amender`), so no separate `log-rejection-feedback` invocation is required. The category code surfaced in the rejection reason flows into `categories[0].code` via the legacy heuristic; valid codes are `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. See `docs/review-feedback-vocabulary.md` for the full registry.
 

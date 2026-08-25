@@ -95,6 +95,14 @@ COMMENT_ENTRY_TEMPLATE: str = "[{timestamp}] [{agent_id}] [{action}] {message}\n
 # Orchestrator templates
 # ---------------------------------------------------------------------------
 BRANCH_NAME_TEMPLATE: str = "backlog/{unit_id}"
+
+# The tracker id a work unit's spec-defined branch name leads with, e.g. the
+# `SFB-229` in `sfb-229-vendoring-pipeline`. Read by
+# `config_loader.extract_ticket_id` to fill a `{ticket}` placeholder in
+# `git_ops.commit_subject_template`. Anchored at the start and terminated by a
+# hyphen so a slug that itself contains a hyphenated number cannot be mistaken
+# for the ticket.
+TICKET_IN_BRANCH_RE = re.compile(r"^([A-Za-z]{2,10}-[0-9]+)-")
 PR_BODY_TEMPLATE: str = "Automated PR for work unit {unit_id}\n\n{description}"
 
 # ---------------------------------------------------------------------------

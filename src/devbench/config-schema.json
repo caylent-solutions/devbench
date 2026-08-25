@@ -41,6 +41,10 @@
             "branch_prefix": {
               "type": "string",
               "description": "Per-repo task-branch prefix override. When set, task branches are named backlog/<prefix>/<unit-id-lower> instead of backlog/<unit-id-lower>. Overrides the top-level git_ops.branch_prefix for this repo. Must not be empty, have leading/trailing '/', or contain '..'."
+            },
+            "commit_subject_template": {
+              "type": "string",
+              "description": "Per-repo commit-subject template override. Placeholders: {unit_id}, {title}, {ticket} (the tracker id led by the work unit's **Branch:** field, e.g. SFB-229 from sfb-229-vendoring-pipeline). Overrides the top-level git_ops.commit_subject_template for this repo. Set this when the repo's own commit-msg hook enforces a subject shape the multi-dash work-unit ID cannot satisfy."
             }
           }
         }
@@ -176,6 +180,10 @@
         "single_branch": {
           "type": "string",
           "description": "When set, all work units use this branch name instead of per-unit backlog/<id> branches. Enables accumulating multiple commits on one branch for a single PR."
+        },
+        "commit_subject_template": {
+          "type": "string",
+          "description": "Template for the commit subject git-ops writes, overridden per-repo by repos.<org/repo>.commit_subject_template. Placeholders: {unit_id}, {title}, {ticket} (the tracker id led by the work unit's **Branch:** field, e.g. SFB-229 from sfb-229-vendoring-pipeline). Default: unset, which keeps the subject '<unit-id>: <title>'. A template naming {ticket} fails loudly when a work unit's branch carries no tracker id."
         },
         "branch_prefix": {
           "type": "string",
@@ -623,6 +631,14 @@
             "minLength": 1
           },
           "description": "File extensions this workspace treats as production source, consumed with production_source_paths by the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent keeps the built-in Python-only behaviour. Declare it when behaviour lives in non-Python artefacts, for example an infrastructure repo whose service specs are YAML and whose modules are HCL, so those changes are RED-gated instead of being forced to task type 'chore'."
+        },
+        "audit_trail_paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Path prefixes every task type may declare in its Changes Manifest regardless of its task-type invariant (rule 21). Absent means no such prefix exists and the invariant is unchanged. Declare it when the target repository requires each ticket to carry an audit-trail record, for example ['.ai-sdlc/']: that record is neither production source, nor a test, nor documentation, so no existing classifier accepts it, yet a docs task and a chore task must both be able to own one. See docs/backlog-contract.md 'Task-Type Taxonomy'."
         }
       }
     },

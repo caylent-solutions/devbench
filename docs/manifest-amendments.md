@@ -115,23 +115,36 @@ The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-ve
 
 ### Rejection feedback persistence (issue #154)
 
-Every rejection also writes a structured feedback JSON to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json` so the executor-feedback collector can ingest the rejection on the next retry. Schema:
+Every rejection also writes a structured feedback JSON via `persist_rejection_feedback()` (`src/devbench/backlog/amendment.py`) so the executor-feedback collector can ingest the rejection on the next retry. Issue #154's original implementation wrote to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json`; issue #156 unified this with every other review-judge rejection, so the current write path is `<workspace>/.devbench/review-failures/<task-id>-manifest_amender-<n>.json` -- the `manifest_amender` segment is the judge name in the shared review-failures schema. The legacy `amender-rejections` directory is preserved **read-only**: `read_review_failure_files()` still reads it (forward compatibility for archived runs), but nothing writes to it anymore. Schema:
 
 ```json
 {
+  "schema_version": 1,
   "task_id": "EX-F1-S1-T1",
+  "judge": "manifest_amender",
   "attempt": 1,
+  "rejected_at": "2026-05-02T12:34:56Z",
+  "categories": [
+    {
+      "code": "SCOPE",
+      "severity": "fail",
+      "summary": "amendment is out of scope for this task",
+      "remediation": "Address the manifest-amender finding and re-stage; or surface a dependent task via [NEEDS_DEP] when the fix belongs upstream.",
+      "files": ["path/to/file.py"]
+    }
+  ],
+  "raw_verdict_text": "amendment is out of scope for this task",
+  "capped": false,
   "reason_category": "SCOPE",
   "reason_text": "amendment is out of scope for this task",
   "request": { /* original AmendmentRequest dict */ },
-  "capped": false,
   "recorded_at": "2026-05-02T12:34:56Z"
 }
 ```
 
-`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Classification resolves by the EARLIEST canonical token named in the upper-cased rejection reason, not by a fixed scan order over the taxonomy: a reason mentioning several tokens (for example a rejection that opens with `PRE_FILTER` but later reports that `APPROACH_AUTH, SCOPE and JUSTIFICATION_COHERENCE all PASSED`) classifies as whichever token appears first in the text. A reason naming no canonical token falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
+`categories[].code` (and the legacy `reason_category` field, preserved for issue #154 consumers) is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Classification resolves by the EARLIEST canonical token named in the upper-cased rejection reason, not by a fixed scan order over the taxonomy: a reason mentioning several tokens (for example a rejection that opens with `PRE_FILTER` but later reports that `APPROACH_AUTH, SCOPE and JUSTIFICATION_COHERENCE all PASSED`) classifies as whichever token appears first in the text. A reason naming no canonical token falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
 
-The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
+The `review-failures` directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
 
 ## What the amendment workflow does NOT do
 

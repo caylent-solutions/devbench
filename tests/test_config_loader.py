@@ -26,10 +26,13 @@ from devbench.config_loader import (
     SkillsConfig,
     TaskFactoryConfig,
     TimeoutConfig,
+    extract_ticket_id,
     format_branch_name,
+    format_commit_subject,
     format_single_branch_name,
     get_configured_default_branch,
     get_effective_branch_prefix,
+    get_effective_commit_subject_template,
     get_effective_merge_strategy,
     get_repo_local_path,
     load_runtime_config,
@@ -344,6 +347,97 @@ class TestFormatBranchName:
 
     def test_empty_string_prefix_treated_as_unset(self) -> None:
         assert format_branch_name("E1-F1-S1-T1", "") == "backlog/e1-f1-s1-t1"
+
+
+@pytest.mark.unit
+class TestGetEffectiveCommitSubjectTemplate:
+    """Per-repo commit_subject_template overrides the top-level one; None when neither set.
+
+    Same three-tier precedence as TestGetEffectiveBranchPrefix. Exists because
+    a target repo's commit-msg hook can enforce a subject shape the multi-dash
+    work-unit ID cannot satisfy, and that is a per-repo fact.
+    """
+
+    def test_per_repo_override_wins(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(commit_subject_template="{ticket}: {title}")},
+            git_ops=GitOpsConfig(commit_subject_template="{unit_id}: {title}"),
+        )
+        assert get_effective_commit_subject_template("org/repo", config) == "{ticket}: {title}"
+
+    def test_top_level_fallback_when_no_per_repo(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(commit_subject_template=None)},
+            git_ops=GitOpsConfig(commit_subject_template="{unit_id}: {title}"),
+        )
+        assert get_effective_commit_subject_template("org/repo", config) == "{unit_id}: {title}"
+
+    def test_top_level_applies_to_unknown_repo(self) -> None:
+        config = RuntimeConfig(repos={}, git_ops=GitOpsConfig(commit_subject_template="{ticket}: {title}"))
+        assert get_effective_commit_subject_template("org/unknown", config) == "{ticket}: {title}"
+
+    def test_none_when_neither_set(self) -> None:
+        config = RuntimeConfig(repos={"org/repo": RepoConfig()}, git_ops=GitOpsConfig())
+        assert get_effective_commit_subject_template("org/repo", config) is None
+
+
+@pytest.mark.unit
+class TestExtractTicketId:
+    """extract_ticket_id: the tracker id a work unit's branch name leads with."""
+
+    def test_reads_the_ticket_a_branch_leads_with(self) -> None:
+        assert extract_ticket_id("sfb-229-vendoring-pipeline") == "SFB-229"
+
+    def test_upper_cases_a_lowercase_branch_convention(self) -> None:
+        assert extract_ticket_id("abc-7-do-a-thing") == "ABC-7"
+
+    def test_strips_the_backticks_a_work_unit_field_wraps_it_in(self) -> None:
+        assert extract_ticket_id("`sfb-229-vendoring-pipeline`") == "SFB-229"
+
+    def test_none_for_a_branch_carrying_no_ticket(self) -> None:
+        assert extract_ticket_id("backlog/e1-f1-s1-t1") is None
+
+    def test_none_for_a_ticket_with_no_slug_after_it(self) -> None:
+        # The trailing hyphen is required: without it a bare "sfb-229" could
+        # equally be the first two segments of some other naming scheme.
+        assert extract_ticket_id("sfb-229") is None
+
+    def test_none_for_empty_and_none(self) -> None:
+        assert extract_ticket_id("") is None
+        assert extract_ticket_id(None) is None
+
+
+@pytest.mark.unit
+class TestFormatCommitSubject:
+    """format_commit_subject: unchanged default, ticket substitution, and loud refusals."""
+
+    def test_no_template_matches_original_subject(self) -> None:
+        assert format_commit_subject("E1-F1-S1-T1", "Do the thing", "sfb-229-slug", None) == "E1-F1-S1-T1: Do the thing"
+
+    def test_ticket_template_names_the_ticket_not_the_unit_id(self) -> None:
+        subject = format_commit_subject(
+            "E1-F2-S1-T1", "Write the vendoring ADR", "sfb-229-vendoring-pipeline", "{ticket}: {title}"
+        )
+        assert subject == "SFB-229: Write the vendoring ADR"
+
+    def test_template_may_still_name_the_unit_id(self) -> None:
+        subject = format_commit_subject("E1-F1-S1-T1", "Do the thing", "sfb-229-slug", "{ticket}: {title} ({unit_id})")
+        assert subject == "SFB-229: Do the thing (E1-F1-S1-T1)"
+
+    def test_refuses_a_ticket_template_when_the_branch_carries_none(self) -> None:
+        with pytest.raises(ValueError, match="carries no tracker id"):
+            format_commit_subject("E1-F1-S1-T1", "Do the thing", "backlog/e1-f1-s1-t1", "{ticket}: {title}")
+
+    def test_refuses_a_ticket_template_when_the_branch_is_missing(self) -> None:
+        with pytest.raises(ValueError, match="carries no tracker id"):
+            format_commit_subject("E1-F1-S1-T1", "Do the thing", None, "{ticket}: {title}")
+
+    def test_refuses_an_unknown_placeholder(self) -> None:
+        with pytest.raises(ValueError, match="unknown placeholder"):
+            format_commit_subject("E1-F1-S1-T1", "Do the thing", "sfb-229-slug", "{epic}: {title}")
+
+    def test_a_ticketless_template_needs_no_ticket(self) -> None:
+        assert format_commit_subject("E1-F1-S1-T1", "Do the thing", None, "chore: {title}") == "chore: Do the thing"
 
 
 class TestFormatSingleBranchName:

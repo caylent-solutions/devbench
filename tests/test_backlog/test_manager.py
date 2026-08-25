@@ -4381,6 +4381,76 @@ class TestIsChorePath:
         assert BacklogManager._is_chore_path(path) is expected
 
 
+class TestIsAuditTrailPath:
+    """The fourth row classifier: configuration-driven, off unless declared.
+
+    A target repo may refuse any ticketed commit whose audit-trail record is
+    not already staged. That record matches none of the three shape
+    classifiers, so without this predicate every docs and chore task that
+    must open one fails the task-type invariant it cannot avoid.
+    """
+
+    def test_unset_key_accepts_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: None))
+        assert BacklogManager._is_audit_trail_path(".ai-sdlc/SFB-229/events.jsonl") is False
+
+    def test_empty_list_accepts_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: ()))
+        assert BacklogManager._is_audit_trail_path(".ai-sdlc/SFB-229/events.jsonl") is False
+
+    def test_declared_prefix_accepts_the_trail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: (".ai-sdlc/",)))
+        assert BacklogManager._is_audit_trail_path(".ai-sdlc/SFB-229/events.jsonl") is True
+        assert BacklogManager._is_audit_trail_path(".ai-sdlc/SFB-229/record.md") is True
+
+    def test_declared_prefix_accepts_nothing_outside_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prefix-matched, not extension-matched: the exemption covers one tree."""
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: (".ai-sdlc/",)))
+        assert BacklogManager._is_audit_trail_path("scripts/events.jsonl") is False
+        assert BacklogManager._is_audit_trail_path("src/foo.py") is False
+
+    def test_leading_dot_slash_does_not_defeat_the_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: ("./.ai-sdlc/",)))
+        assert BacklogManager._is_audit_trail_path("./.ai-sdlc/SFB-229/events.jsonl") is True
+        assert BacklogManager._is_audit_trail_path(".ai-sdlc/SFB-229/events.jsonl") is True
+
+
+class TestTaskTypeInvariantAcceptsAuditTrail:
+    """The invariant itself, not just the predicate: docs and chore both pass."""
+
+    def test_docs_task_may_own_a_declared_trail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: (".ai-sdlc/",)))
+        errors: list[str] = []
+        BacklogManager()._check_task_type_manifest_invariant(
+            "E1-F2-S1-T1", "docs", ["docs/vendoring.md", ".ai-sdlc/SFB-229/events.jsonl"], errors
+        )
+        assert errors == []
+
+    def test_chore_task_may_own_a_declared_trail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: (".ai-sdlc/",)))
+        errors: list[str] = []
+        BacklogManager()._check_task_type_manifest_invariant(
+            "E1-F2-S1-T2", "chore", ["pyproject.toml", ".ai-sdlc/SFB-229/events.jsonl"], errors
+        )
+        assert errors == []
+
+    def test_undeclared_workspace_still_rejects_the_trail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The widening is opt-in: a workspace that never set the key is unchanged."""
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: None))
+        errors: list[str] = []
+        BacklogManager()._check_task_type_manifest_invariant(
+            "E1-F2-S1-T1", "docs", ["docs/vendoring.md", ".ai-sdlc/SFB-229/events.jsonl"], errors
+        )
+        assert len(errors) == 1
+        assert ".ai-sdlc/SFB-229/events.jsonl" in errors[0]
+
+    def test_declaring_a_trail_never_admits_production_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(BacklogManager, "_configured_audit_trail_paths", staticmethod(lambda: (".ai-sdlc/",)))
+        errors: list[str] = []
+        BacklogManager()._check_task_type_manifest_invariant("E1-F2-S1-T1", "docs", ["src/foo.py"], errors)
+        assert len(errors) == 1
+
+
 class TestExtractTaskType:
     """Direct tests for the ``## Task Type:`` line extractor (FR-4.1 / AC-45)."""
 

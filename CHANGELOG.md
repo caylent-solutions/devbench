@@ -5,6 +5,41 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-reachability` is wired into the done path and persists a
+  `[GATE_PASS reachability]` record; `mark-done` now enforces it, and an
+  operator-attributed `[GATE_WAIVER reachability]` marker is the escape
+  valve** (spec `integration-reality-gates-hardening.md` sections 4.2 and
+  4.4 final bullet, 4.9, Section 2 G4/G7; AC-6, AC-7, AC-15, AC-16; issue
+  #10). A clean enabled run with at least one Manifest file appends exactly
+  one `[GATE_PASS reachability] <iso-utc> <scope-hash>` line to the unit's
+  audit section through the new `devbench.gate_records.compose_gate_pass_record`
+  builder, `<scope-hash>` matching the status line's `scope_hash`
+  (`devbench.gate_records.compute_scope_hash` over the sorted Manifest file
+  list plus each file's git blob hash), so any later edit to an in-scope
+  file invalidates the record; a failing run or a disabled gate writes no
+  record. `mark-done` on a unit whose repo has `gates.reachability.enabled`
+  true now refuses (exit 1, no status write) unless a fresh
+  `[GATE_PASS reachability]` record exists, naming the exact remediation
+  `uv run devbench check-reachability <unit-id>`; a record whose recomputed
+  scope hash no longer matches is refused with `ERROR: gate 'reachability'
+  record is stale (scope changed since it ran)`. `devbench.gate_records`
+  gains `gate_waiver_records`/`gate_waiver_targets`, the sole scan-and-parse
+  loop for the `[GATE_WAIVER <gate>]` marker family: `check-reachability`
+  reads it before scanning, so a candidate with an OPERATOR-attributed
+  waiver on file is reported `[WAIVED] <target> -- <reason>`, excluded from
+  the blocking `findings` count, and the run exits 0 when every finding is
+  waived this way; an executor-attributed waiver alone is scanned normally
+  and never suppresses a finding or contributes to a `[GATE_PASS
+  reachability]` write, since reachability is machine-blocking (spec
+  Section 3.6/D-6) and an executor cannot self-certify. A malformed
+  `[GATE_WAIVER reachability]` marker (missing target, missing or empty
+  reason) is never silently treated as "no waiver": both `check-reachability`
+  and `mark-done`'s generic gate-record invariant fail loud, naming the unit
+  and the offending line. `docs/cli-reference.md`'s `check-reachability`
+  entry documents the record shape, the `mark-done` requirement, the
+  stale-record message and the `log-waiver` invocation that clears an
+  artifact.
+
 - **`check-reachability` gains transitive reachability and the
   `gates.reachability.entry_points` config tunable** (spec
   `integration-reality-gates-hardening.md` section 4.4 bullet 2; issue #10

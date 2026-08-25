@@ -250,6 +250,8 @@ from devbench.constants import (
     GATE_PROVENANCE_BUILTIN,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
+    GATE_WAIVER_ATTRIBUTION_EXECUTOR,
+    GATE_WAIVER_ATTRIBUTION_OPERATOR,
     KNOWN_JUDGE_NAMES,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
     ORCHESTRATOR_BLOCK_QUARANTINE_AUDIT_PREFIX,
@@ -4813,6 +4815,20 @@ _REACHABILITY_STATUS_DISABLED: str = "disabled"
 _REACHABILITY_STATUS_PASS: str = "pass"
 _REACHABILITY_STATUS_FAIL: str = "fail"
 
+# Reachability is machine-blocking (`constants.GATE_TIERS`, spec Section
+# 3.6/D-6): the operator is the only waiver authority. `_reachability_prepare_run`
+# filters `gate_records.gate_waiver_targets`'s full records down to this
+# attribution ONLY before a target can be reported `[WAIVED]`, excluded from
+# the blocking `findings` count, or contribute to a clean run that persists a
+# `[GATE_PASS reachability]` record -- an executor-attributed waiver alone
+# must never launder into a record `mark-done`'s generic gate-record
+# invariant (`BacklogManager._check_gate_pass_done_invariant`) would then
+# accept. Derived from `constants.GATE_WAIVER_ATTRIBUTION_OPERATOR`, the
+# single-sourced attribution vocabulary `devbench.backlog.manager` (both
+# `compose_gate_waiver_record` and this same done-gate invariant) also
+# consumes, rather than a second hand-copied literal.
+_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION: str = GATE_WAIVER_ATTRIBUTION_OPERATOR
+
 # `git grep` exit codes at or above this value are a genuine plumbing
 # failure (spec 4.4 bullet 3, Section 7); rc=1 is "no match" data, never an
 # error, and is never swallowed by a `continue`.
@@ -5378,20 +5394,43 @@ def _load_reachability_gate_config_or_report(canonical_repo: str) -> "ResolvedGa
     return gate_config
 
 
+def _reachability_waived_block(target: str, reason: str) -> str:
+    """Render the ``[WAIVED]`` report block for a candidate an operator has waived (spec 4.9, Section 2 G7)."""
+    return f"[WAIVED] {target} -- {reason}"
+
+
 def _reachability_scan_candidates(
-    repo_path: Path, candidates: list[str], entry_points: tuple[str, ...], canonical_repo: str
-) -> tuple[list[str], int, int] | None:
+    repo_path: Path,
+    candidates: list[str],
+    entry_points: tuple[str, ...],
+    canonical_repo: str,
+    waived: Mapping[str, str],
+) -> tuple[list[str], int, int, int] | None:
     """Scan *candidates* for reachability, rendering one report block per file.
 
     Extracted out of :func:`cmd_check_reachability` to keep that function's
     return/branch count within ruff's thresholds.
 
+    A candidate named in *waived* (``{target: reason}``, already filtered by
+    the caller -- :func:`_reachability_prepare_run` -- down to
+    ``_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION``-attributed records from
+    :func:`devbench.gate_records.gate_waiver_targets`; this function trusts
+    that filtering and performs none of its own) is rendered as a
+    ``[WAIVED] <target> -- <reason>`` block and never counted towards
+    ``unreachable_count``/``load_error_count`` -- an operator waiver clears
+    the finding regardless of what the underlying reachability search would
+    otherwise have concluded (spec 4.9, Section 2 G7), so no reachability
+    work is performed for a waived candidate at all. A target with only an
+    executor-attributed waiver on file is NOT in *waived* (reachability is
+    machine-blocking, spec Section 3.6/D-6) and is scanned normally below,
+    exactly as if no waiver existed.
+
     Returns:
-        ``(report_lines, unreachable_count, load_error_count)`` on success.
-        ``None`` after printing the loud ``git grep`` failure message (spec
-        Section 7) when :func:`_search_reachability_importers` raises
-        ``RuntimeError`` for any candidate -- the caller exits 1 in that
-        case with no further output.
+        ``(report_lines, unreachable_count, load_error_count, waived_count)``
+        on success. ``None`` after printing the loud ``git grep`` failure
+        message (spec Section 7) when :func:`_search_reachability_importers`
+        raises ``RuntimeError`` for any candidate -- the caller exits 1 in
+        that case with no further output.
 
     A referrer that cannot be read during the entry-point walk
     (:class:`_ReachabilityReferrerReadError`, raised by
@@ -5404,7 +5443,13 @@ def _reachability_scan_candidates(
     report_lines: list[str] = []
     unreachable_count = 0
     load_error_count = 0
+    waived_count = 0
     for rel_path in candidates:
+        if rel_path in waived:
+            waived_count += 1
+            report_lines.append(_reachability_waived_block(rel_path, waived[rel_path]))
+            continue
+
         abs_path = repo_path / rel_path
         try:
             content = abs_path.read_text(encoding="utf-8")
@@ -5436,7 +5481,84 @@ def _reachability_scan_candidates(
             unreachable_count += 1
             report_lines.append(_reachability_orphan_chain_block(rel_path, symbols, importers, canonical_repo))
 
-    return report_lines, unreachable_count, load_error_count
+    return report_lines, unreachable_count, load_error_count, waived_count
+
+
+def _reachability_prepare_run(
+    unit_id: str,
+    repo_path: Path,
+    unit: WorkUnit,
+    gate_config: "ResolvedGateConfig",
+) -> tuple[Path, tuple[str, ...], dict[str, str], ScopeResult] | int:
+    """Resolve everything :func:`cmd_check_reachability` needs before it can scan a
+    single candidate: the entry-point containment check, the waived-target
+    mapping (spec 4.9, Section 2 G7) and the resolved Manifest scope.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    return/branch count within ruff's thresholds -- every early-exit branch
+    below that used to live inline in the caller is now internal to this
+    helper and no longer inflates the caller's own return-statement count.
+
+    Returns:
+        ``(wu_file, entry_points, waived, scope)`` on success, with *waived*
+        already filtered to ``_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION``-
+        attributed records only (spec Section 3.6/D-6: reachability is
+        machine-blocking, so an executor cannot self-certify a waiver). An
+        already fully-handled exit code (``1``; the failure has already
+        printed its own ``ERROR:`` message, and -- per the fail-fast
+        contract -- no status line) when the entry-point containment check,
+        the waiver read or the scope resolution fails.
+    """
+    from devbench.config import DEFER_PR
+    from devbench.gate_records import gate_waiver_targets
+
+    entry_points = cast("tuple[str, ...]", gate_config.values["entry_points"])
+    missing_entry_point = _reachability_missing_entry_point(
+        repo_path, entry_points, gate_config.provenance["entry_points"]
+    )
+    if missing_entry_point is not None:
+        print(
+            f"ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
+            f"{missing_entry_point}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Waiver adoption (spec 4.9, Section 2 G7): resolved before scope so a
+    # malformed `[GATE_WAIVER reachability]` marker fails loud before any
+    # further work is done, and before any status line is printed (spec
+    # Section 7 fail-fast rule). `gate_waiver_targets` is the sole reader for
+    # this marker family (`devbench.gate_records`); a malformed marker is
+    # never silently treated as "no waiver". Reachability is machine-blocking
+    # (spec Section 3.6/D-6), so an executor-attributed record is read (never
+    # silently dropped as "malformed") but excluded here from *waived* --
+    # only an operator-attributed record can clear a candidate. Filtering
+    # here, once, means every downstream consumer of *waived*
+    # (`_reachability_scan_candidates`, the clean-run `[GATE_PASS]` write
+    # below) sees only records that are actually allowed to clear a finding.
+    wu_file = _resolve_work_unit_file(unit)
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR: Cannot read work unit file for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        waiver_records = gate_waiver_targets(wu_content, _REACHABILITY_GATE_NAME)
+    except ValueError as exc:
+        print(f"ERROR: malformed [GATE_WAIVER {_REACHABILITY_GATE_NAME}] marker in {unit_id}: {exc}", file=sys.stderr)
+        return 1
+    waived = {
+        target: record.reason
+        for target, record in waiver_records.items()
+        if record.attribution == _REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION
+    }
+
+    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    if scope is None:
+        return 1
+
+    return wu_file, entry_points, waived, scope
 
 
 def cmd_check_reachability(unit_id: str) -> int:
@@ -5507,7 +5629,7 @@ def cmd_check_reachability(unit_id: str) -> int:
         that case), when ``git grep`` fails loudly (rc>=2, no status line
         printed), or when an enabled run has at least one finding.
     """
-    from devbench.config import DEFER_PR
+    from devbench.gate_records import compose_gate_pass_record
 
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
@@ -5518,22 +5640,10 @@ def cmd_check_reachability(unit_id: str) -> int:
     if isinstance(gate_config, int):
         return gate_config
 
-    entry_points = cast("tuple[str, ...]", gate_config.values["entry_points"])
-    missing_entry_point = _reachability_missing_entry_point(
-        repo_path, entry_points, gate_config.provenance["entry_points"]
-    )
-    if missing_entry_point is not None:
-        print(
-            f"ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
-            f"{missing_entry_point}",
-            file=sys.stderr,
-        )
-        return 1
-
-    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
-    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
-    if scope is None:
-        return 1
+    prepared = _reachability_prepare_run(unit_id, repo_path, unit, gate_config)
+    if isinstance(prepared, int):
+        return prepared
+    wu_file, entry_points, waived, scope = prepared
 
     # `scope.files` legitimately carries a Manifest path with no on-disk file
     # -- e.g. a file a prior stage of this same unit deleted, which the
@@ -5555,18 +5665,42 @@ def cmd_check_reachability(unit_id: str) -> int:
         unreachable_count = 0
         load_error_count = 0
     else:
-        scanned = _reachability_scan_candidates(repo_path, candidates, entry_points, canonical_repo)
+        scanned = _reachability_scan_candidates(repo_path, candidates, entry_points, canonical_repo, waived)
         if scanned is None:
             return 1
-        candidate_lines, unreachable_count, load_error_count = scanned
+        candidate_lines, unreachable_count, load_error_count, waived_count = scanned
         report_lines = [f"Candidate artifacts examined: {len(candidates)}", *candidate_lines]
         report_lines.append(
             f"Summary: {len(candidates)} candidate(s) examined, {unreachable_count} potentially "
-            f"unreachable, {load_error_count} load error(s)."
+            f"unreachable, {load_error_count} load error(s), {waived_count} waived."
         )
 
     total_findings = unreachable_count + load_error_count
     status = _REACHABILITY_STATUS_FAIL if total_findings else _REACHABILITY_STATUS_PASS
+
+    if total_findings == 0 and scope.files:
+        # Persisted machine record (spec 4.2, 4.4 final bullet): a clean
+        # enabled run writes `[GATE_PASS reachability]` so `mark-done`'s
+        # generic gate hook (`BacklogManager._check_gate_pass_done_invariant`)
+        # can later require it. `compose_gate_pass_record` is the sole
+        # authorized builder of the marker text (AC-E2-F2-S1-T1-6); no other
+        # path in this command formats that text by hand. An empty Changes
+        # Manifest (`scope.files` empty, `scope.scope_hash == ""`) has no
+        # scope to persist a hash for, so no record is written for it --
+        # mirroring `compute_scope_hash`'s own refusal to hash an empty
+        # change set.
+        if not wu_file.is_file():
+            print(
+                f"ERROR: Cannot write [GATE_PASS {_REACHABILITY_GATE_NAME}] record for {unit_id}: "
+                f"work unit file not found at {wu_file}",
+                file=sys.stderr,
+            )
+            return 1
+        from devbench.backlog.manager import BacklogManager
+
+        marker = compose_gate_pass_record(_REACHABILITY_GATE_NAME, scope.scope_hash)
+        BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
     print(
         json.dumps(
             {
@@ -6514,7 +6648,7 @@ def cmd_log_waiver(*argv: str) -> int:
         return 1
 
     wu_file = _resolve_work_unit_file(unit)
-    attribution = "operator" if operator else "executor"
+    attribution = GATE_WAIVER_ATTRIBUTION_OPERATOR if operator else GATE_WAIVER_ATTRIBUTION_EXECUTOR
     marker = compose_gate_waiver_record(gate, target, attribution, reason)
     BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
 

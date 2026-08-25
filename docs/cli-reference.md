@@ -670,7 +670,7 @@ ERROR: done-gate: gate 'reachability' is enabled for repo
 E9-F1-S1-T1. Run: uv run devbench check-reachability E9-F1-S1-T1
 ```
 
-A `[GATE_PASS <gate>]` record's `scope_hash` is recomputed from the unit's current `## Changes Manifest` file list (SHA-256 over the sorted file list plus each file's live `git hash-object` blob hash, `gate_records.compute_scope_hash`); any edit to an in-scope file's content after the gate ran invalidates the record, refused with `ERROR: gate '<name>' record is stale (scope changed since it ran)`. A disabled gate imposes nothing at all. Like the task-type invariant above, this check is implemented once in `BacklogManager.mark_done` and inherits into every caller, including `check-merge` below.
+A `[GATE_PASS <gate>]` record's `scope_hash` is recomputed from the unit's current `## Changes Manifest` file list (SHA-256 over the sorted file list plus each file's live `git hash-object` blob hash, `gate_records.compute_scope_hash`); any edit to an in-scope file's content after the gate ran invalidates the record, refused with `ERROR: gate '<name>' record is stale (scope changed since it ran)`. A malformed `[GATE_WAIVER <gate>]` marker (missing target, missing or empty reason) is never silently treated as "no waiver": `mark-done` refuses with `ERROR: malformed [GATE_WAIVER <gate>] marker: <parse detail> (unit <unit-id>)`, naming both the offending marker line and the unit -- this is `mark-done`'s own wording (`BacklogManager._check_gate_pass_done_invariant`, which folds the unit id into `_latest_gate_waiver_attribution`'s `RuntimeError`); `check-reachability` reports the analogous failure as `ERROR: malformed [GATE_WAIVER <gate>] marker in <unit-id>: <detail>`. A disabled gate imposes nothing at all. Like the task-type invariant above, this check is implemented once in `BacklogManager.mark_done` and inherits into every caller, including `check-merge` below.
 
 ### `decline`
 
@@ -1385,7 +1385,35 @@ Prints the spec 5.2 gate status line as the FIRST stdout line. When the gate is 
 | Exit code | Meaning |
 |---|---|
 | 0 | Gate disabled for the unit's repo, or an enabled run found zero findings. |
-| 1 | Work unit not found, no local path configured for its repo, the config file failed to load (including a `gates.reachability.entry_points` element that is absolute or contains a `..` segment), a configured `entry_points` path that does not exist in the repo checkout (`ERROR: gates.reachability.entry_points names a path that is not present in the repo: <path>`, checked before any candidate is examined), `work_unit_scope.resolve_changed_files` raised (no status line printed), `git grep` exited rc>=2 (no status line printed), or an enabled run has at least one `[POTENTIALLY UNREACHABLE]` / `[POTENTIALLY UNREACHABLE via orphan-chain]` / `[LOAD_ERROR]` finding. |
+| 1 | Work unit not found, no local path configured for its repo, the config file failed to load (including a `gates.reachability.entry_points` element that is absolute or contains a `..` segment), a configured `entry_points` path that does not exist in the repo checkout (`ERROR: gates.reachability.entry_points names a path that is not present in the repo: <path>`, checked before any candidate is examined), a malformed `[GATE_WAIVER reachability]` marker on the unit (`ERROR: malformed [GATE_WAIVER reachability] marker in <unit-id>: <detail>`, checked before scope is resolved, no status line printed), `work_unit_scope.resolve_changed_files` raised (no status line printed), `git grep` exited rc>=2 (no status line printed), the work-unit file could not be read to check for waivers or could not be written to persist a passing record (no status line printed), or an enabled run has at least one `[POTENTIALLY UNREACHABLE]` / `[POTENTIALLY UNREACHABLE via orphan-chain]` / `[LOAD_ERROR]` finding. |
+
+**Persisted machine record (spec 4.2, 4.4 final bullet).** A clean enabled run (`findings: 0`, at least one file in the unit's Changes Manifest) appends exactly one `[GATE_PASS reachability] <iso-utc> <scope-hash>` line to the unit's audit section -- the `<scope-hash>` is identical to the status line's `scope_hash`, computed by `devbench.gate_records.compute_scope_hash` over the sorted Changes Manifest file list plus each file's current git blob hash, so any later edit to an in-scope file invalidates the record. `devbench.gate_records.compose_gate_pass_record` is the sole authorized BUILDER of that marker text -- `check-reachability` never hand-formats it, and no other command composes one. A failing run, or a disabled gate, writes no record.
+
+**`mark-done` requirement.** When `gates.reachability.enabled` is `true` for the unit's repo, `mark-done` refuses (exit 1, writes no status) unless the unit carries a fresh `[GATE_PASS reachability]` record or an operator-attributed `[GATE_WAIVER reachability]` marker:
+
+```
+$ uv run devbench mark-done E9-F1-S1-T1
+ERROR: done-gate: gate 'reachability' is enabled for repo 'caylent-solutions/devbench' but has no
+[GATE_PASS reachability] record for E9-F1-S1-T1. Run: uv run devbench check-reachability E9-F1-S1-T1
+```
+
+Editing any Manifest file after the record was written re-derives a different scope hash, so the stale record no longer satisfies the gate:
+
+```
+ERROR: gate 'reachability' record is stale (scope changed since it ran). Run: uv run devbench check-reachability E9-F1-S1-T1 to produce a fresh record.
+```
+
+An operator-attributed `[GATE_WAIVER reachability]` marker (see [`log-waiver`](#log-waiver)) satisfies the requirement in place of a record, and does so even when an existing record has gone stale (spec Section 3.6: the operator is the only waiver authority for a machine-blocking gate); an executor-attributed waiver alone is never sufficient.
+
+**Waiver adoption (spec 4.9, Section 2 G7).** Before scanning, `check-reachability` reads every `[GATE_WAIVER reachability]` marker on the unit via `devbench.gate_records.gate_waiver_targets`, the module's per-target reader built on `gate_records.gate_waiver_records` -- the sole scan-and-parse loop for the `[GATE_WAIVER <gate>]` marker family (also consumed by `mark-done`'s generic gate-record invariant for its own whole-gate bypass). Because reachability is machine-blocking (spec Section 3.6/D-6), only an OPERATOR-attributed record clears a candidate: it is rendered `[WAIVED] <target> -- <reason>` instead of `[OK]` / `[POTENTIALLY UNREACHABLE]` / `[LOAD_ERROR]`, is excluded from the blocking `findings` count, and the run exits 0 when every finding is waived this way. A target with only an executor-attributed `[GATE_WAIVER reachability]` marker on file is scanned normally, exactly as if no waiver existed -- an executor cannot self-certify a waiver for a machine-blocking gate. Clear a candidate this way with:
+
+```
+$ uv run devbench log-waiver code_review E9-F1-S1-T1 \
+    --gate reachability --target src/ui/LegacyPanel.tsx \
+    --reason "mounted via route-split registry resolved at runtime" --operator
+```
+
+A malformed `[GATE_WAIVER reachability]` marker (missing target, missing/empty reason) is never silently treated as "no waiver": the run fails loud with `ERROR: malformed [GATE_WAIVER reachability] marker in <unit-id>: <detail>` naming the offending line, and prints no status line.
 
 ### `run-tests`
 

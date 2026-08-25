@@ -290,6 +290,205 @@ class TestComputeScopeHash:
 
 
 @pytest.mark.unit
+class TestGateWaiverRecords:
+    """`gate_waiver_records`: the sole scan-and-parse loop for the
+    `[GATE_WAIVER <gate>]` marker family (spec 4.9, 5.3), consumed by both
+    `gate_waiver_targets` below and `devbench.backlog.manager
+    ._latest_gate_waiver_attribution`."""
+
+    def test_returns_empty_list_when_no_marker_is_present(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        assert gate_waiver_records("## Comments\n\nnothing here\n", "reachability") == []
+
+    def test_returns_full_record_in_file_order_including_attribution(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py executor first reason\n"
+            "[2026-01-02 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-02T00:00:00+00:00 src/bar.py operator second reason\n"
+        )
+
+        result = gate_waiver_records(content, "reachability")
+
+        assert [r.target for r in result] == ["src/foo.py", "src/bar.py"]
+        assert [r.attribution for r in result] == ["executor", "operator"]
+        assert [r.reason for r in result] == ["first reason", "second reason"]
+
+    def test_ignores_markers_for_other_gates(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER ancestry] "
+            "2026-01-01T00:00:00+00:00 src/other.py operator unrelated gate\n"
+        )
+
+        assert gate_waiver_records(content, "reachability") == []
+
+    def test_does_not_raise_on_a_malformed_marker_for_a_different_gate(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        content = "## Comments\n\n[GATE_WAIVER ancestry] not-well-formed-at-all\n"
+
+        assert gate_waiver_records(content, "reachability") == []
+
+    def test_raises_on_a_marker_missing_the_target(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 operator missing the target token\n"
+        )
+
+        with pytest.raises(ValueError, match="Malformed"):
+            gate_waiver_records(content, "reachability")
+
+    def test_rejects_an_unknown_gate(self) -> None:
+        from devbench.gate_records import gate_waiver_records
+
+        with pytest.raises(ValueError, match="bogus_gate"):
+            gate_waiver_records("anything", "bogus_gate")
+
+
+@pytest.mark.unit
+class TestGateWaiverTargets:
+    """`gate_waiver_targets`: the per-target `[GATE_WAIVER <gate>]` read side
+    consumed by `check-reachability` (spec 4.9, Section 2 G7). Returns the
+    FULL parsed record per target (not just the reason) so a caller for a
+    machine-blocking gate can enforce spec Section 3.6/D-6's operator-only
+    waiver rule by inspecting `record.attribution` before treating a target
+    as cleared."""
+
+    def test_returns_empty_mapping_when_no_marker_is_present(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        assert gate_waiver_targets("## Comments\n\nnothing here\n", "reachability") == {}
+
+    def test_returns_full_record_for_a_well_formed_marker(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/ui/LegacyPanel.tsx operator "
+            "mounted via route-split registry resolved at runtime\n"
+        )
+
+        result = gate_waiver_targets(content, "reachability")
+
+        assert set(result) == {"src/ui/LegacyPanel.tsx"}
+        record = result["src/ui/LegacyPanel.tsx"]
+        assert record.attribution == "operator"
+        assert record.reason == "mounted via route-split registry resolved at runtime"
+        assert record.target == "src/ui/LegacyPanel.tsx"
+
+    def test_an_executor_only_record_is_still_returned_with_its_attribution_intact(self) -> None:
+        """Spec Section 3.6/D-6: this function performs no attribution
+        filtering of its own -- a caller for a machine-blocking gate must see
+        the executor attribution (to reject it), not have it silently
+        dropped as if no waiver existed."""
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/Orphan.tsx executor self-certified this orphan\n"
+        )
+
+        result = gate_waiver_targets(content, "reachability")
+
+        assert set(result) == {"src/Orphan.tsx"}
+        assert result["src/Orphan.tsx"].attribution == "executor"
+
+    def test_ignores_markers_for_other_gates(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER ancestry] "
+            "2026-01-01T00:00:00+00:00 src/other.py operator unrelated gate\n"
+        )
+
+        assert gate_waiver_targets(content, "reachability") == {}
+
+    def test_later_marker_for_the_same_target_supersedes_an_earlier_one(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py executor first reason\n"
+            "[2026-01-02 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-02T00:00:00+00:00 src/foo.py operator superseding reason\n"
+        )
+
+        result = gate_waiver_targets(content, "reachability")
+
+        assert set(result) == {"src/foo.py"}
+        assert result["src/foo.py"].attribution == "operator"
+        assert result["src/foo.py"].reason == "superseding reason"
+
+    def test_distinct_targets_both_retained(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/a.py operator reason a\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/b.py operator reason b\n"
+        )
+
+        result = gate_waiver_targets(content, "reachability")
+
+        assert set(result) == {"src/a.py", "src/b.py"}
+        assert result["src/a.py"].reason == "reason a"
+        assert result["src/b.py"].reason == "reason b"
+
+    def test_raises_on_a_marker_missing_the_target(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 operator missing the target token\n"
+        )
+
+        with pytest.raises(ValueError, match="Malformed"):
+            gate_waiver_targets(content, "reachability")
+
+    def test_raises_on_a_marker_with_an_empty_reason(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py operator\n"
+        )
+
+        with pytest.raises(ValueError, match="Malformed"):
+            gate_waiver_targets(content, "reachability")
+
+    def test_does_not_raise_on_a_malformed_marker_for_a_different_gate(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = "## Comments\n\n[GATE_WAIVER ancestry] not-well-formed-at-all\n"
+
+        assert gate_waiver_targets(content, "reachability") == {}
+
+    def test_rejects_an_unknown_gate(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        with pytest.raises(ValueError, match="bogus_gate"):
+            gate_waiver_targets("anything", "bogus_gate")
+
+
+@pytest.mark.unit
 class TestGateTiers:
     """Gate tier taxonomy (spec 4.2, D-6; AC-E2-F2-S1-T1-4/5)."""
 

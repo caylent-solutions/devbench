@@ -26,6 +26,31 @@ gate command may embed it as the message body of a normal audit comment
 `devbench.cli._BLOCKED_AUDIT_LINE_RE`), so :func:`latest_gate_pass_record`
 locates the tag wherever it appears on a line rather than requiring the
 marker to be the entire line.
+
+:func:`gate_waiver_records` and :func:`gate_waiver_targets` (spec 4.9, Section
+2 G7) are this module's read side for the sibling `[GATE_WAIVER <gate>]
+<iso-utc> <target> <operator|executor> <reason>` marker family, and its SOLE
+reader: :func:`gate_waiver_records` is the one shared scan-and-parse loop
+every consumer of that marker family builds on --
+:func:`devbench.backlog.manager._latest_gate_waiver_attribution` (the
+generic `mark_done` gate-record invariant's whole-gate waiver bypass) calls
+it directly rather than re-scanning the content with its own copy of the tag
+regex, so "what a well-formed `[GATE_WAIVER]` marker looks like, and which
+one is most recent" has exactly one implementation. A gate command (e.g.
+`check-reachability`) calls :func:`gate_waiver_targets` to learn, per
+candidate, the most recent full waiver record an operator or executor has
+filed for it -- but because reachability (like every gate in
+`constants.GATE_TIERS`'s machine-blocking tier, spec Section 3.6/D-6) does
+not trust an executor to self-certify its own finding, the caller MUST check
+`record.attribution` itself before treating a target as cleared: only an
+operator-attributed record may suppress a finding, render `[WAIVED] <target>
+-- <reason>`, or contribute to a clean run that persists a `[GATE_PASS]`
+record. `devbench.backlog.manager.compose_gate_waiver_record` /
+`parse_gate_waiver_record` remain the sole grammar authority for the marker
+family (mirroring this module's own role for `[GATE_PASS]`); both readers
+below consume that parser rather than duplicating its grammar, and -- like
+every other reader in this module -- perform no work-unit-file I/O of their
+own.
 """
 
 from __future__ import annotations
@@ -35,8 +60,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from devbench.constants import GATE_TIERS
+
+if TYPE_CHECKING:
+    from devbench.backlog.manager import GateWaiverRecord
 
 # Fixed width of a SHA-256 hex digest -- the scope-hash shape both
 # `compose_gate_pass_record` (input validation) and the marker grammar
@@ -231,3 +260,111 @@ def latest_gate_pass_record(content: str, gate: str) -> GatePassRecord | None:
             continue
         latest = parse_gate_pass_record(line[tag_match.start() :])
     return latest
+
+
+# Locates a `[GATE_WAIVER <gate>]` tag wherever it appears within a line,
+# mirroring `_TAG_RE`'s role for the sibling `[GATE_PASS]` family --
+# `gate_waiver_records` isolates the remainder of the line from this match's
+# start and hands it to `devbench.backlog.manager.parse_gate_waiver_record`,
+# the sole grammar authority for the full `[GATE_WAIVER <gate>] <iso-utc>
+# <target> <operator|executor> <reason>` shape (spec 5.3), so this module
+# never re-derives that grammar itself.
+_WAIVER_TAG_RE = re.compile(r"\[GATE_WAIVER (?P<gate>" + _GATE_GROUP_RE + r")\]")
+
+
+def gate_waiver_records(content: str, gate: str) -> list[GateWaiverRecord]:
+    """Return every well-formed `[GATE_WAIVER <gate>]` record in *content*, in file order.
+
+    This is the SOLE scan-and-parse loop for the `[GATE_WAIVER <gate>]`
+    marker family (spec 4.9, 5.3): both :func:`gate_waiver_targets` below and
+    `devbench.backlog.manager._latest_gate_waiver_attribution` (the generic
+    `mark_done` gate-record invariant's whole-gate waiver bypass) build on
+    this function rather than each re-scanning *content* with their own copy
+    of the tag regex, so "what a well-formed `[GATE_WAIVER]` marker looks
+    like" has exactly one implementation.
+
+    Scans *content* line by line for a `[GATE_WAIVER <gate>]` tag -- wherever
+    it appears on the line, the same embedded-anywhere convention
+    :func:`latest_gate_pass_record` uses for `[GATE_PASS]` -- and parses the
+    remainder of that line with
+    `devbench.backlog.manager.parse_gate_waiver_record`, the sole grammar
+    authority for the `[GATE_WAIVER]` marker family: this module duplicates
+    no marker grammar of its own, it only consumes that parser. Every
+    well-formed record is returned, including every attribution
+    (`"operator"` or `"executor"`) and every target -- callers that must
+    honour spec 3.6's operator-only rule for a machine-blocking gate (e.g.
+    :func:`gate_waiver_targets`'s consumers) are responsible for filtering on
+    `record.attribution` themselves; this function performs no such
+    filtering, since a judge-evidence gate's caller may legitimately want
+    every attribution.
+
+    Args:
+        content: The text to scan (typically a work unit's full text).
+        gate: The declared gate name to look up.
+
+    Returns:
+        A list of `GateWaiverRecord` in the order their markers appear in
+        *content* (the audit trail is append-only, so this is also
+        chronological order). Empty when no marker for *gate* is present.
+
+    Raises:
+        ValueError: If `gate` is not declared, or if a line tagged
+            `[GATE_WAIVER <gate>]` is present but the remainder of that line
+            does not parse as a well-formed record (spec Section 7 fail-loud
+            rule) -- a malformed waiver for the requested gate is never
+            silently skipped or treated as "not a waiver".
+    """
+    _require_declared_gate(gate)
+    from devbench.backlog.manager import parse_gate_waiver_record
+
+    records: list[GateWaiverRecord] = []
+    for line in content.splitlines():
+        tag_match = _WAIVER_TAG_RE.search(line)
+        if tag_match is None or tag_match.group("gate") != gate:
+            continue
+        records.append(parse_gate_waiver_record(line[tag_match.start() :]))
+    return records
+
+
+def gate_waiver_targets(content: str, gate: str) -> dict[str, GateWaiverRecord]:
+    """Return ``{target: GateWaiverRecord}`` for every well-formed `[GATE_WAIVER <gate>]` marker in *content*.
+
+    Spec 4.9 / Section 2 G7: a machine-blocking gate command (e.g.
+    `check-reachability`) calls this to learn which of its own candidate
+    findings have a waiver on file, so a waived artifact can be reported as
+    `[WAIVED] <target> -- <reason>` and excluded from the gate's blocking
+    findings count. The FULL record is returned -- not just the reason --
+    because spec Section 3.6/D-6 makes the operator the only waiver
+    authority for a machine-blocking gate: the caller MUST inspect
+    `record.attribution` and honour only `"operator"`-attributed records
+    before treating a target as cleared. An executor-attributed record is
+    still returned here (this function performs no attribution filtering of
+    its own -- that would silently hide the distinction from a caller that
+    legitimately needs to see and reject it), but a caller for a
+    machine-blocking gate must never suppress a finding, print `[WAIVED]`,
+    or persist a `[GATE_PASS]` record on the strength of one alone.
+
+    Built on :func:`gate_waiver_records`, this module's sole scan-and-parse
+    loop for the marker family, rather than re-deriving the grammar. The
+    audit trail is append-only, so when the same *target* is waived more
+    than once, the LAST marker for that target wins.
+
+    Args:
+        content: The text to scan (typically a work unit's full text).
+        gate: The declared gate name to look up.
+
+    Returns:
+        A `{target: GateWaiverRecord}` mapping. Empty when no marker for
+        *gate* is present in *content*.
+
+    Raises:
+        ValueError: If `gate` is not declared, or if a line tagged
+            `[GATE_WAIVER <gate>]` is present but the remainder of that line
+            does not parse as a well-formed record (spec Section 7 fail-loud
+            rule) -- a malformed waiver for the requested gate is never
+            silently skipped or treated as "not a waiver".
+    """
+    targets: dict[str, GateWaiverRecord] = {}
+    for record in gate_waiver_records(content, gate):
+        targets[record.target] = record
+    return targets

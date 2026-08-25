@@ -1413,3 +1413,20 @@ GATE_TIERS: Mapping[str, str] = {
     gate: (GATE_TIER_MACHINE_BLOCKING if gate in _GATE_TIER_D6_MACHINE_BLOCKING_NAMES else GATE_TIER_JUDGE_EVIDENCE)
     for gate in GATE_NAMES
 }
+
+# ---------------------------------------------------------------------------
+# GATE_WAIVER marker attribution vocabulary (spec 3.6, 4.9; D-6). A
+# ``[GATE_WAIVER <gate>]`` marker's attribution field is exactly one of
+# these two values: "operator" is the only waiver authority for a
+# machine-blocking gate (``GATE_TIER_MACHINE_BLOCKING`` above) -- an
+# "executor"-attributed marker alone never satisfies one, since executors
+# do not self-certify a machine-blocking gate's outcome. Single-sourced
+# here so ``devbench.backlog.manager`` (``compose_gate_waiver_record`` /
+# ``parse_gate_waiver_record``'s grammar and the ``mark_done`` gate-record
+# invariant) and ``devbench.cli`` (``log-waiver``'s ``--operator`` flag and
+# each machine-blocking gate command's waiver-adoption filter, e.g.
+# ``check-reachability``) share one vocabulary instead of each re-declaring
+# the literal ``"operator"``/``"executor"`` strings.
+# ---------------------------------------------------------------------------
+GATE_WAIVER_ATTRIBUTION_OPERATOR: str = "operator"
+GATE_WAIVER_ATTRIBUTION_EXECUTOR: str = "executor"

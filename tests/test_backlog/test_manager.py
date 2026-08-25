@@ -1206,6 +1206,31 @@ class TestMarkDoneGateRecords:
         content = wu.read_text(encoding="utf-8")
         assert "## Status: done" not in content
 
+    def test_malformed_waiver_marker_blocks_and_names_the_unit_and_offending_line(self, tmp_path: Path) -> None:
+        """A malformed ``[GATE_WAIVER reachability]`` marker (missing
+        target) is never silently treated as "no waiver" (spec Section 7
+        fail-loud rule): ``mark_done`` refuses, and -- unlike
+        ``_latest_gate_waiver_attribution``'s own content-only message --
+        the refusal names both the offending unit and the offending marker
+        line, matching ``check-reachability``'s "malformed ... marker in
+        <unit-id>" wording."""
+        unit_id = "E0-F1-S1-T1"
+        malformed_line = "[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 operator some-reason"
+        waiver = f"[2026-01-01 00:00 UTC] [agent/executor] {malformed_line}\n"
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert unit_id in message
+        assert malformed_line in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in content
+
     # -- (e) every gate disabled: behaves exactly as before (AC-5) --
 
     def test_all_gates_disabled_behaves_as_before(self, tmp_path: Path) -> None:
@@ -1235,6 +1260,97 @@ class TestMarkDoneGateRecords:
             mgr.mark_done(wu, idx, unit_id)
 
         assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestLatestGateWaiverAttributionDelegation:
+    """``_latest_gate_waiver_attribution`` delegates to
+    ``devbench.gate_records.gate_waiver_records`` (spec 4.9/5.3; the
+    ``code_review`` SOLID_VIOLATION remediation on
+    .devbench/review-failures/E3-F2-S1-T1-code_review-1.json) instead of
+    re-scanning content with its own copy of the ``[GATE_WAIVER]`` tag
+    regex. Two readers of the same marker grammar drifted: the loose,
+    attribution-only ``_GATE_WAIVER_TAG_RE`` line-scan this class supersedes
+    silently accepted a marker with an empty reason or a missing target as a
+    well-formed, "operator"-attributed waiver, because it never routed
+    through ``parse_gate_waiver_record``, the sole grammar authority. This
+    class pins the delegation itself (via monkeypatch) and the two malformed
+    shapes the old loose regex left silently open.
+    """
+
+    def test_delegates_to_gate_records_gate_waiver_records(self) -> None:
+        """The production call site is a direct delegation, not a
+        parallel re-implementation: monkeypatching
+        ``gate_records.gate_waiver_records`` intercepts every call."""
+        from devbench.backlog import manager as manager_module
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_gate_waiver_records(content: str, gate: str) -> list[manager_module.GateWaiverRecord]:
+            calls.append((content, gate))
+            return [
+                manager_module.GateWaiverRecord(
+                    gate=gate,
+                    timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+                    target="src/x.py",
+                    attribution="operator",
+                    reason="reviewed manually",
+                )
+            ]
+
+        marker_text = "some unrelated content"
+        with patch("devbench.gate_records.gate_waiver_records", side_effect=fake_gate_waiver_records):
+            attribution = manager_module._latest_gate_waiver_attribution(marker_text, "reachability")
+
+        assert attribution == "operator"
+        assert calls == [(marker_text, "reachability")]
+
+    def test_no_marker_for_gate_returns_none(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "operator", "reviewed manually")
+        content = f"## Comments\n\n[2026-01-01T00:00:00Z] [agent/operator] {marker}\n"
+
+        assert _latest_gate_waiver_attribution(content, "reachability") is None
+
+    def test_last_record_wins_across_targets_and_attributions(self) -> None:
+        """Append-only audit trail semantics: the LAST marker for *gate*
+        wins, regardless of which target it names or the attribution of
+        earlier markers for the same gate."""
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        first = compose_gate_waiver_record("reachability", "src/a.py", "executor", "self-certified")
+        second = compose_gate_waiver_record("reachability", "src/b.py", "operator", "reviewed manually")
+        content = (
+            "## Comments\n\n"
+            f"[2026-01-01T00:00:00Z] [agent/executor] {first}\n"
+            f"[2026-01-02T00:00:00Z] [agent/operator] {second}\n"
+        )
+
+        assert _latest_gate_waiver_attribution(content, "reachability") == "operator"
+
+    def test_other_gate_markers_are_ignored(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/a.py", "operator", "reviewed manually")
+        content = f"## Comments\n\n[2026-01-01T00:00:00Z] [agent/operator] {marker}\n"
+
+        assert _latest_gate_waiver_attribution(content, "reachability") is None
+
+    def test_marker_with_empty_reason_raises_runtime_error(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution
+
+        content = "## Comments\n\n[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 src/a.py operator \n"
+
+        with pytest.raises(RuntimeError, match=r"malformed \[GATE_WAIVER reachability\] marker"):
+            _latest_gate_waiver_attribution(content, "reachability")
+
+    def test_marker_with_missing_target_raises_runtime_error(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution
+
+        content = "## Comments\n\n[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 operator some-reason\n"
+
+        with pytest.raises(RuntimeError, match=r"malformed \[GATE_WAIVER reachability\] marker"):
+            _latest_gate_waiver_attribution(content, "reachability")
 
 
 class TestRecomputeGateScopeHashErrorPaths:

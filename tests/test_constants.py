@@ -1145,3 +1145,42 @@ class TestGateConstants:
         expected = set(GATE_NAMES) - machine_blocking
         actual = {gate for gate, tier in GATE_TIERS.items() if tier == GATE_TIER_JUDGE_EVIDENCE}
         assert actual == expected
+
+
+class TestGateWaiverAttributionConstants:
+    """``[GATE_WAIVER <gate>]`` marker attribution vocabulary (spec 3.6,
+    4.9; D-6; code_review SOLID_VIOLATION,
+    ``.devbench/review-failures/E3-F2-S1-T1-code_review-2.json``): single-
+    sourced here so ``devbench.backlog.manager`` (the marker grammar and the
+    ``mark_done`` gate-record invariant) and ``devbench.cli`` (``log-waiver``
+    and each machine-blocking gate command's waiver-adoption filter) consume
+    the same two literals instead of each hand-declaring "operator"/
+    "executor" independently.
+    """
+
+    def test_operator_and_executor_are_the_distinct_attribution_values(self) -> None:
+        from devbench.constants import GATE_WAIVER_ATTRIBUTION_EXECUTOR, GATE_WAIVER_ATTRIBUTION_OPERATOR
+
+        assert GATE_WAIVER_ATTRIBUTION_OPERATOR == "operator"
+        assert GATE_WAIVER_ATTRIBUTION_EXECUTOR == "executor"
+        assert GATE_WAIVER_ATTRIBUTION_OPERATOR != GATE_WAIVER_ATTRIBUTION_EXECUTOR
+
+    def test_backlog_manager_consumes_the_shared_constants_not_a_local_copy(self) -> None:
+        """``devbench.backlog.manager`` must import the vocabulary from
+        ``constants`` rather than re-declaring its own module-level
+        ``"operator"``/``"executor"`` literals (the exact duplication the
+        SOLID_VIOLATION finding this class pins was raised against)."""
+        import devbench.backlog.manager as manager_module
+        from devbench.constants import GATE_WAIVER_ATTRIBUTION_EXECUTOR, GATE_WAIVER_ATTRIBUTION_OPERATOR
+
+        assert manager_module.GATE_WAIVER_ATTRIBUTION_OPERATOR is GATE_WAIVER_ATTRIBUTION_OPERATOR
+        assert manager_module.GATE_WAIVER_ATTRIBUTION_EXECUTOR is GATE_WAIVER_ATTRIBUTION_EXECUTOR
+
+    def test_cli_reachability_waiver_filter_derives_from_the_shared_operator_constant(self) -> None:
+        """``devbench.cli``'s reachability waiver-adoption filter must
+        derive from ``constants.GATE_WAIVER_ATTRIBUTION_OPERATOR`` rather
+        than a second hand-copied ``"operator"`` literal."""
+        import devbench.cli as cli_module
+        from devbench.constants import GATE_WAIVER_ATTRIBUTION_OPERATOR
+
+        assert cli_module._REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION is GATE_WAIVER_ATTRIBUTION_OPERATOR

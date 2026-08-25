@@ -63,6 +63,8 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
+    GATE_WAIVER_ATTRIBUTION_EXECUTOR,
+    GATE_WAIVER_ATTRIBUTION_OPERATOR,
     GATED_TASK_TYPES,
     RED_OBSERVED_ENTRY_LINE_RE,
     RED_OBSERVED_MESSAGE_FIELDS_RE,
@@ -357,15 +359,14 @@ def green_green_observed_satisfied(content: str) -> bool:
 # an executor-attributed one before it can decide whether an ENABLED
 # machine-blocking gate's requirement is met.
 #
-# The ``log-waiver`` WRITER verb lands in E2-F4-S1-T1, and the properly
-# consolidated waiver READER moves into ``gate_records.py`` when E3-F2-S1-T1
-# (the first per-gate consumer) needs to share it across gates -- this task's
-# Changes Manifest does not touch ``gate_records.py``, so the read-side
-# grammar below is intentionally local to this module until that promotion.
+# The ``log-waiver`` WRITER verb landed in E2-F4-S1-T1. The consolidated
+# waiver READER (``gate_waiver_records``, the sole scan-and-parse loop for
+# the ``[GATE_WAIVER <gate>]`` marker family) now lives in
+# ``gate_records.py`` (E3-F2-S1-T1, the first per-gate consumer that needed
+# to share it across gates); ``_latest_gate_waiver_attribution`` below
+# delegates to it rather than re-scanning *content* with a second copy of
+# the tag grammar.
 # ---------------------------------------------------------------------------
-
-_GATE_WAIVER_ATTRIBUTION_OPERATOR: str = "operator"
-_GATE_WAIVER_ATTRIBUTION_EXECUTOR: str = "executor"
 
 # Bounded timeout (seconds) for the read-only ``git hash-object`` call used
 # to recompute a machine-blocking gate's scope hash for freshness comparison
@@ -373,23 +374,30 @@ _GATE_WAIVER_ATTRIBUTION_EXECUTOR: str = "executor"
 # generous-but-bounded git-subprocess discipline.
 _GATE_SCOPE_HASH_GIT_TIMEOUT: int = 30
 
-# Locates a ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
-# <reason>`` marker (spec 5.3) wherever it appears on a line -- mirroring
-# ``gate_records._TAG_RE``'s "additive to the audit-comment contract" search,
-# since the marker may follow a ``[<timestamp>] [agent/<name>]`` prefix
-# rather than being the entire line.
-_GATE_WAIVER_TAG_RE: re.Pattern[str] = re.compile(
-    r"\[GATE_WAIVER (?P<gate>[A-Za-z0-9_]+)\]\s+\S+\s+\S+\s+"
-    rf"(?P<attribution>{_GATE_WAIVER_ATTRIBUTION_OPERATOR}|{_GATE_WAIVER_ATTRIBUTION_EXECUTOR})\b"
-)
-
 
 def _latest_gate_waiver_attribution(content: str, gate: str) -> str | None:
     """Return the attribution of the most recent ``[GATE_WAIVER <gate>]`` marker for *gate*.
 
+    Delegates to ``devbench.gate_records.gate_waiver_records``, the sole
+    scan-and-parse loop for the ``[GATE_WAIVER <gate>]`` marker family
+    (spec 4.9, 5.3), rather than re-scanning *content* with a second, looser
+    copy of the tag regex: two independent readers of the same grammar had
+    drifted (``code_review`` SOLID_VIOLATION,
+    ``.devbench/review-failures/E3-F2-S1-T1-code_review-1.json``) -- this
+    module's own former ``_GATE_WAIVER_TAG_RE`` line-scan pulled out only
+    the attribution field via a loose pattern that never routed through
+    ``parse_gate_waiver_record``, the strict spec-5.3 grammar authority, so
+    it silently treated a marker with an empty reason or a missing target
+    as a well-formed, attributable waiver. Routing through
+    ``gate_waiver_records`` means a malformed marker for *gate* is now a
+    loud ``RuntimeError`` here too, matching the fail-fast rule every other
+    reader of this marker family already enforces.
+
     Mirrors ``gate_records.latest_gate_pass_record``'s append-only-log
-    semantics: scans every line and keeps the LAST match, so the most
-    recently written waiver for *gate* wins.
+    semantics: ``gate_waiver_records`` returns every well-formed record for
+    *gate* in file order, and the LAST one (across every target) wins, so
+    the most recently written waiver for *gate* wins regardless of which
+    target it names.
 
     Args:
         content: The full text of a work-unit markdown file.
@@ -397,15 +405,25 @@ def _latest_gate_waiver_attribution(content: str, gate: str) -> str | None:
 
     Returns:
         ``"operator"`` or ``"executor"`` (the marker's attribution field),
-        or ``None`` when no ``[GATE_WAIVER <gate>]`` marker is present.
+        or ``None`` when no well-formed ``[GATE_WAIVER <gate>]`` marker is
+        present.
+
+    Raises:
+        RuntimeError: A line tagged ``[GATE_WAIVER <gate>]`` is present but
+            the remainder of that line does not parse as a well-formed
+            record (spec Section 7 fail-loud rule) -- a malformed waiver
+            for *gate* is never silently skipped or treated as "not a
+            waiver".
     """
-    latest: str | None = None
-    for line in content.splitlines():
-        match = _GATE_WAIVER_TAG_RE.search(line)
-        if match is None or match.group("gate") != gate:
-            continue
-        latest = match.group("attribution")
-    return latest
+    from devbench.gate_records import gate_waiver_records
+
+    try:
+        records = gate_waiver_records(content, gate)
+    except ValueError as exc:
+        raise RuntimeError(f"malformed [GATE_WAIVER {gate}] marker: {exc}") from exc
+    if not records:
+        return None
+    return records[-1].attribution
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +502,10 @@ def compose_gate_waiver_record(
     """
     if gate not in GATE_TIERS:
         raise ValueError(f"Unknown gate {gate!r}; declared gates are: {', '.join(sorted(GATE_TIERS))}.")
-    if attribution not in (_GATE_WAIVER_ATTRIBUTION_OPERATOR, _GATE_WAIVER_ATTRIBUTION_EXECUTOR):
+    if attribution not in (GATE_WAIVER_ATTRIBUTION_OPERATOR, GATE_WAIVER_ATTRIBUTION_EXECUTOR):
         raise ValueError(
-            f"attribution must be {_GATE_WAIVER_ATTRIBUTION_OPERATOR!r} or "
-            f"{_GATE_WAIVER_ATTRIBUTION_EXECUTOR!r}; got {attribution!r}."
+            f"attribution must be {GATE_WAIVER_ATTRIBUTION_OPERATOR!r} or "
+            f"{GATE_WAIVER_ATTRIBUTION_EXECUTOR!r}; got {attribution!r}."
         )
     if not target or any(ch.isspace() for ch in target):
         raise ValueError(f"target must be a single non-empty token with no whitespace; got {target!r}.")
@@ -506,14 +524,15 @@ def compose_gate_waiver_record(
 
 # Strict full-grammar match, anchored from the tag through end-of-line:
 # ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>``.
-# Distinct from ``_GATE_WAIVER_TAG_RE`` above (a loose, embedded-anywhere
-# search used only to pull out the attribution field for the done-gate
-# check) -- this pattern is the strict grammar authority both
-# ``parse_gate_waiver_record`` and, transitively, the validate-backlog
-# grammar rule and the report waiver-count consumer rely on.
+# Distinct from ``gate_records._WAIVER_TAG_RE`` (a loose, embedded-anywhere
+# search used only to locate the ``[GATE_WAIVER <gate>]`` tag on a line
+# before slicing off the remainder to parse here) -- this pattern is the
+# strict grammar authority both ``parse_gate_waiver_record`` and,
+# transitively, the validate-backlog grammar rule and the report
+# waiver-count consumer rely on.
 _GATE_WAIVER_RECORD_RE = re.compile(
     r"^\[GATE_WAIVER (?P<gate>[A-Za-z0-9_]+)\] (?P<timestamp>\S+) (?P<target>\S+) "
-    rf"(?P<attribution>{_GATE_WAIVER_ATTRIBUTION_OPERATOR}|{_GATE_WAIVER_ATTRIBUTION_EXECUTOR}) (?P<reason>.+)$"
+    rf"(?P<attribution>{GATE_WAIVER_ATTRIBUTION_OPERATOR}|{GATE_WAIVER_ATTRIBUTION_EXECUTOR}) (?P<reason>.+)$"
 )
 
 
@@ -592,7 +611,7 @@ def count_gate_waiver_markers(content: str) -> tuple[int, int]:
             record = parse_gate_waiver_record(line[tag_idx:])
         except ValueError:
             continue
-        if record.attribution == _GATE_WAIVER_ATTRIBUTION_OPERATOR:
+        if record.attribution == GATE_WAIVER_ATTRIBUTION_OPERATOR:
             operator_count += 1
         else:
             executor_count += 1
@@ -906,8 +925,18 @@ class BacklogManager:
             if not resolved.values["enabled"]:
                 continue
 
-            attribution = _latest_gate_waiver_attribution(content, gate)
-            if attribution == _GATE_WAIVER_ATTRIBUTION_OPERATOR:
+            try:
+                attribution = _latest_gate_waiver_attribution(content, gate)
+            except RuntimeError as exc:
+                # Re-raise with the unit id folded in: `_latest_gate_waiver_attribution`
+                # is a content-only helper (its own direct-call unit tests
+                # pass no unit id) and its message already names the
+                # offending line via `parse_gate_waiver_record`'s ValueError,
+                # but a `mark-done` refusal must name the unit too, matching
+                # `check-reachability`'s "malformed ... marker in <unit-id>"
+                # wording (spec Section 7 fail-loud rule).
+                raise RuntimeError(f"{exc} (unit {unit_id})") from exc
+            if attribution == GATE_WAIVER_ATTRIBUTION_OPERATOR:
                 continue
 
             remediation = f"uv run devbench {_gate_check_command(gate)} {unit_id}"
@@ -921,7 +950,7 @@ class BacklogManager:
                     f"Run: {remediation} to produce a fresh record."
                 )
 
-            if attribution == _GATE_WAIVER_ATTRIBUTION_EXECUTOR:
+            if attribution == GATE_WAIVER_ATTRIBUTION_EXECUTOR:
                 raise RuntimeError(
                     f"gate {gate!r} is enabled for repo {repo!r} but its only [GATE_WAIVER {gate}] "
                     f"record for {unit_id} is executor-attributed; a machine-blocking gate requires an "

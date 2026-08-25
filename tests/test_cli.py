@@ -3387,6 +3387,65 @@ class TestCmdMarkDoneGateRefusal:
         assert result == 0
         assert "[DONE]" in wu_file.read_text(encoding="utf-8")
 
+    def test_operator_waiver_satisfies_with_no_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-FUNC-005 (spec 4.2, 4.9, AC-16): an operator [GATE_WAIVER reachability]
+        marker satisfies the done gate even with no [GATE_PASS] record at all."""
+        unit_id = "E233-F1-S1-T3"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        wu_file.write_text(
+            wu_file.read_text(encoding="utf-8").replace(
+                "## Comments\n\n",
+                "## Comments\n\n"
+                "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+                "2026-01-01T00:00:00+00:00 src/foo.py operator pre-existing dead artifact, tracked separately\n",
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_executor_waiver_alone_is_insufficient(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-FUNC-005 (spec 3.6): reachability is machine-blocking, so an
+        executor-attributed waiver alone must never satisfy the done gate."""
+        unit_id = "E233-F1-S1-T4"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        before_waiver = wu_file.read_text(encoding="utf-8")
+        wu_file.write_text(
+            before_waiver.replace(
+                "## Comments\n\n",
+                "## Comments\n\n"
+                "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+                "2026-01-01T00:00:00+00:00 src/foo.py executor pre-existing dead artifact, tracked separately\n",
+            ),
+            encoding="utf-8",
+        )
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "executor-attributed" in err
+        assert "operator-attributed waiver" in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a refused mark-done must write nothing"
+
 
 @pytest.mark.unit
 class TestCmdDeclineCitation:
@@ -3932,6 +3991,51 @@ def _seed_scope_backlog(
         encoding="utf-8",
     )
     return backlog_root, backlog_index
+
+
+def _seed_reachability_done_path_backlog(
+    tmp_path: Path, unit_id: str, repo_name: str, manifest_file: str
+) -> tuple[Path, Path, Path]:
+    """Write a scratch ``BACKLOG.md`` + work-unit ``.md`` carrying everything the
+    reachability done-path end-to-end cycle needs at once: a ``## Target
+    Repository`` section and ``## Changes Manifest`` (`work_unit_scope`
+    resolution and `_check_gate_pass_done_invariant`'s repo extraction), an
+    exempt ``## Task Type`` (so `mark_done`'s RED_OBSERVED invariant never
+    blocks these tests -- that invariant is exercised elsewhere), and an
+    all-five-judges-pass ``## Comments`` block (`mark_done`'s judge-round
+    invariant).
+
+    Returns ``(backlog_root, backlog_index, wu_file)``.
+    """
+    from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+    backlog_root = tmp_path / "backlog"
+    backlog_root.mkdir(exist_ok=True)
+    wu_file = backlog_root / f"{unit_id}.md"
+    all_pass = "".join(
+        f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+    )
+    wu_file.write_text(
+        f"# {unit_id}: End to end reachability cycle test\n\n"
+        "## Status: in-review\n\n"
+        "## Task Type: test-only\n\n"
+        f"## Target Repository\n\n- **Repo:** `{repo_name}`\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n|------|--------|\n"
+        f"| `{manifest_file}` | modify |\n\n"
+        f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+        encoding="utf-8",
+    )
+    backlog_index = tmp_path / "BACKLOG.md"
+    backlog_index.write_text(
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        f"| {unit_id} | End to end reachability cycle test | Task | in-review | None | "
+        f"{repo_name} | `backlog/{unit_id}.md` |\n",
+        encoding="utf-8",
+    )
+    return backlog_root, backlog_index, wu_file
 
 
 def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
@@ -7568,6 +7672,13 @@ class _ReachabilityCmdFixtures:
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            # `unit.file_path` is `backlog/<unit_id>.md`, relative -- pointed
+            # at the real `_seed_scope_backlog` fixture file (`_resolve_work_unit_file`
+            # tries `BACKLOG_ROOT / unit.file_path` first) so the waiver read
+            # and the `[GATE_PASS reachability]` record write both resolve to
+            # the same on-disk work-unit file `work_unit_scope` resolves scope
+            # against, rather than a nonexistent path in the real checkout.
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
@@ -7771,7 +7882,7 @@ class TestCmdCheckReachability(_ReachabilityCmdFixtures):
 
         assert result == 1
         assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
-        assert "Summary: 1 candidate(s) examined, 1 potentially unreachable, 0 load error(s)." in out
+        assert "Summary: 1 candidate(s) examined, 1 potentially unreachable, 0 load error(s), 0 waived." in out
 
     def test_referenced_only_by_own_test_still_flagged_unreachable(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
@@ -8346,6 +8457,317 @@ class TestCmdCheckReachabilityOrphanChain(_ReachabilityCmdFixtures):
         assert captured.out == ""
         assert "ERROR:" in captured.err
         assert "gates.reachability.entry_points" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckReachabilityWritesGatePass(_ReachabilityCmdFixtures):
+    """check-reachability persists the spec-4.2 machine record: a passing
+    enabled run writes exactly one `[GATE_PASS reachability]` line whose
+    scope hash matches the status line (AC-FUNC-001); a failing run writes
+    none (AC-FUNC-002)."""
+
+    def test_passing_run_writes_exactly_one_gate_pass_record_matching_scope_hash(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 0
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS reachability]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "reachability")
+        assert record is not None
+        assert record.scope_hash == status_line["scope_hash"]
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_failing_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 1
+        assert "[GATE_PASS reachability]" not in content
+
+    def test_wu_file_unreadable_prints_error_and_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task-specific error path: the waiver read cannot open the work-unit
+        file (here, a directory sits where the file is expected) -- the
+        command fails loud with no status line, never a silent 'no waivers'."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/foo.py",))
+        wu_file = backlog_root / f"{unit_id}.md"
+        wu_file.unlink()
+        wu_file.mkdir()
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert f"ERROR: Cannot read work unit file for {unit_id}" in captured.err
+
+    def test_wu_file_missing_at_write_time_prints_error_and_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task-specific error path: the record cannot be written because the
+        work-unit file no longer exists by the time the passing run reaches
+        the write step -- fails loud, never a silent skip."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        # A subclass whose `.is_file()` always lies, wrapping the exact same
+        # on-disk path: `read_text()` still succeeds (real bytes on disk),
+        # only the LATER `.is_file()` check the write step guards on sees
+        # "missing". Patched only into `devbench.cli._resolve_work_unit_file`
+        # (the sole caller `_reachability_prepare_run` uses to build `wu_file`),
+        # so `work_unit_scope`'s own independent `BacklogParser` lookup -- a
+        # distinct `Path` object over the same string -- is unaffected.
+        class _NeverIsFilePath(Path):
+            def is_file(self, *args: object, **kwargs: object) -> bool:
+                return False
+
+        with patch("devbench.cli._resolve_work_unit_file", return_value=_NeverIsFilePath(wu_file)):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS reachability] record for {unit_id}" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckReachabilityWaivedTarget(_ReachabilityCmdFixtures):
+    """Waiver adoption (spec 4.9, Section 2 G7): a waived candidate is
+    reported `[WAIVED] <target> -- <reason>`, excluded from the blocking
+    `findings` count (AC-FUNC-006), and a malformed `[GATE_WAIVER
+    reachability]` marker is a loud error, never a silent pass (AC-FUNC-007)."""
+
+    def _seed_with_waiver(self, tmp_path: Path, unit_id: str, waiver_line: str) -> tuple[Path, Path]:
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+        content = wu_file.read_text(encoding="utf-8")
+        content = content.replace("## Comments\n", f"## Comments\n\n{waiver_line}\n")
+        wu_file.write_text(content, encoding="utf-8")
+        return backlog_root, backlog_index
+
+    def test_waived_candidate_reported_and_excluded_from_findings_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/Orphan.tsx operator mounted via route-split registry\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, waiver)
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+        status_line = json.loads(out.splitlines()[0])
+
+        assert result == 0
+        assert status_line["findings"] == 0
+        assert "[WAIVED] src/Orphan.tsx -- mounted via route-split registry" in out
+        assert "[POTENTIALLY UNREACHABLE]" not in out
+
+    def test_malformed_waiver_marker_exits_1_naming_offending_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        malformed_waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 operator missing the target token\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, malformed_waiver)
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR: malformed [GATE_WAIVER reachability] marker in" in captured.err
+        assert unit_id in captured.err
+
+    def test_executor_only_waiver_neither_clears_the_finding_nor_writes_a_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec Section 3.6/D-6: reachability is machine-blocking, so an
+        executor cannot self-certify a waiver. An executor-attributed
+        `[GATE_WAIVER reachability]` marker for the only finding must NOT be
+        rendered `[WAIVED]`, must NOT zero the blocking `findings` count, and
+        the run must NOT persist a `[GATE_PASS reachability]` record --
+        otherwise the executor waiver `mark-done`'s generic gate-record
+        invariant refuses would be laundered into a record it accepts
+        unconditionally."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        executor_waiver = (
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/Orphan.tsx executor self-certified this orphan\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, executor_waiver)
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+        status_line = json.loads(out.splitlines()[0])
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 1
+        assert status_line["findings"] == 1
+        assert "[WAIVED]" not in out
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+        assert "[GATE_PASS reachability]" not in content
+
+
+@pytest.mark.unit
+class TestReachabilityDonePathEndToEnd(_ReachabilityCmdFixtures):
+    """AC-CYCLE-001 (spec 4.2/4.4): the reachability done-path cycle observed
+    end to end against a real git fixture repo -- `mark-done` is blocked with
+    no record, `check-reachability` writes the `[GATE_PASS reachability]`
+    record, `mark-done` then consumes it and proceeds, and separately an
+    in-scope edit stales an existing record while an operator
+    `[GATE_WAIVER reachability]` still unblocks despite the staleness
+    (AC-FUNC-003/004/005, spec Section 2 G4)."""
+
+    def _seed(self, tmp_path: Path, unit_id: str) -> tuple[Path, Path, Path, Path]:
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "wire Wired.tsx"], cwd=repo, check=True, capture_output=True)
+        backlog_root, backlog_index, wu_file = _seed_reachability_done_path_backlog(
+            tmp_path, unit_id, self._REPO, "src/Wired.tsx"
+        )
+        return repo, backlog_root, backlog_index, wu_file
+
+    def _patches(
+        self, unit_id: str, repo: Path, backlog_root: Path, backlog_index: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Any, ...]:
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        cfg_path = self._write_gate_config(repo.parent, self._ENABLED_GATES_BLOCK)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_REACHABILITY_ENABLED", raising=False)
+        mark_done_rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(reachability=GateReachabilityConfig(enabled=True)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", mark_done_rt_cfg),
+        )
+
+    def test_blocked_then_record_written_then_done(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id)
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            before = wu_file.read_text(encoding="utf-8")
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1, "mark-done must refuse before any [GATE_PASS reachability] record exists"
+            assert wu_file.read_text(encoding="utf-8") == before
+
+            checked = cli.cmd_check_reachability(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS reachability]" in wu_file.read_text(encoding="utf-8")
+
+            done = cli.cmd_mark_done(unit_id)
+            assert done == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_stale_record_blocks_and_operator_waiver_unblocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id)
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            checked = cli.cmd_check_reachability(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS reachability]" in wu_file.read_text(encoding="utf-8")
+
+            # Edit the in-scope file AFTER the record was captured (AC-7):
+            # the persisted scope hash no longer matches the recomputed one.
+            (repo / "src/Wired.tsx").write_text("export function Wired() { return 'changed'; }\n", encoding="utf-8")
+
+            capsys.readouterr()  # discard the check-reachability output above
+            stale = cli.cmd_mark_done(unit_id)
+            assert stale == 1
+            # AC-FUNC-004's exact wording, so this test can only pass for the
+            # right reason -- not for an unrelated refusal (a judge-round or
+            # RED_OBSERVED invariant, or a scope-resolution failure).
+            assert "ERROR: gate 'reachability' record is stale (scope changed since it ran)" in capsys.readouterr().err
+            content_before_waiver = wu_file.read_text(encoding="utf-8")
+            assert "## Status: done" not in content_before_waiver
+
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "reachability",
+                "--target",
+                "src/Wired.tsx",
+                "--reason",
+                "reviewed manually, safe despite the stale record",
+                "--operator",
+            )
+            assert waiver_result == 0
+
+            unblocked = cli.cmd_mark_done(unit_id)
+            assert unblocked == 0, "an operator waiver must satisfy the gate even with a stale record"
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
 
 
 class TestCmdGetDiffModeAware:

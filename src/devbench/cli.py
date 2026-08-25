@@ -248,6 +248,9 @@ from devbench.constants import (
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
     GATE_PROVENANCE_BUILTIN,
+    GATE_STATUS_DISABLED,
+    GATE_STATUS_FAIL,
+    GATE_STATUS_PASS,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
     GATE_WAIVER_ATTRIBUTION_EXECUTOR,
@@ -4585,6 +4588,285 @@ def _resolve_ancestry_repo_context(unit_id: str) -> tuple[str, Path] | None:
     return canonical_repo, repo_path
 
 
+def _gate_disabled_line(gate_name: str) -> str:
+    """Render the spec 4.1 ``{"gate":"<gate_name>","status":"disabled"}`` line.
+
+    Single formatter shared by every gate command so the disabled-line
+    shape can never drift between gates; the status value comes from
+    ``constants.GATE_STATUS_DISABLED``, not a gate-local literal.
+    """
+    return json.dumps({"gate": gate_name, "status": GATE_STATUS_DISABLED})
+
+
+def _gate_status_line(gate_name: str, status: str, findings: int, **extra_fields: object) -> str:
+    """Render the spec 5.2 gate status-line JSON for an enabled run of *gate_name*.
+
+    Single formatter shared by every gate command so the base field
+    set/order (``gate``, ``tier``, ``status``, ``findings``) can never
+    drift between gates. ``**extra_fields`` carries each gate's own
+    additional fields (ancestry's ``mode``/``dependency_ref``/
+    ``target_ref``; reachability's ``scope_hash``), appended in the order
+    passed.
+    """
+    payload: dict[str, object] = {
+        "gate": gate_name,
+        "tier": GATE_TIERS[gate_name],
+        "status": status,
+        "findings": findings,
+    }
+    payload.update(extra_fields)
+    return json.dumps(payload)
+
+
+def _load_gate_config_or_report(gate_name: str, canonical_repo: str) -> "ResolvedGateConfig | int":
+    """Load config and resolve *gate_name*'s config for *canonical_repo* (spec 4.1, D-15).
+
+    Single gate-agnostic loader shared by every gate command: an ``int``
+    result means "already handled -- return this exit code as-is" (the
+    loader's own fail-fast ``ERROR:`` message, or the spec 5.2
+    ``{"gate":"<gate_name>","status":"disabled"}`` line, is already
+    printed); a ``ResolvedGateConfig`` result means the gate is enabled and
+    the caller should proceed.
+    """
+    from devbench.config import resolve_gate_env_override
+    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    try:
+        runtime_config = load_runtime_config(cfg_path, os.environ)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    gate_config = resolve_gate_config(
+        gate_name,
+        canonical_repo,
+        runtime_config,
+        resolve_gate_env_override(gate_name),
+    )
+    if not gate_config.values["enabled"]:
+        print(_gate_disabled_line(gate_name))
+        return 0
+    return gate_config
+
+
+# Gate identity + mode vocabulary for check-ancestry (spec
+# integration-reality-gates-hardening.md sections 4.1, 4.5, 5.2; AC-ANC-*).
+# Local, gate-scoped constant -- the status vocabulary itself
+# (``GATE_STATUS_DISABLED``/``PASS``/``FAIL``) lives once in
+# `constants.py` beside `GATE_NAMES`/`GATE_TIERS` and is shared by every
+# gate command through :func:`_gate_status_line`/:func:`_gate_disabled_line`
+# rather than re-declared per gate; only the ancestry-specific mode values
+# are declared here, once, rather than as inline literals scattered
+# through :func:`cmd_check_ancestry`.
+_ANCESTRY_GATE_NAME: str = "ancestry"
+_ANCESTRY_MODE_STRICT: str = "strict"
+_ANCESTRY_MODE_SQUASH_PR: str = "squash-pr"
+_ANCESTRY_MODE_NONE: str = "none"
+
+
+@dataclass(frozen=True)
+class _SquashProbeResult:
+    """Outcome of :func:`_probe_squash_merged_pr` (spec 4.5, 317-D02).
+
+    ``found=False`` is a legitimate, non-error result (the search
+    genuinely turned up no merged PR); a probe that could not even run
+    (``gh``/``git`` failure, unparseable output) returns ``None`` from
+    :func:`_probe_squash_merged_pr` instead of this type, so a hard
+    failure can never be mistaken for "no PR found" (spec 3.5 fallback
+    ban).
+    """
+
+    found: bool
+    pr_number: int | None
+
+
+def _resolve_ancestry_remote(canonical_repo: str, repo_path: Path) -> tuple[str, str] | None:
+    """Resolve *canonical_repo*'s configured tracking remote and its default branch.
+
+    Reads ``git config --get branch.<default-branch>.remote`` in
+    *repo_path* rather than assuming the literal ``"origin"`` (spec 4.5,
+    AC-ANC-004): a repo whose tracking remote uses a different name is
+    never silently checked against a ref that does not exist. The default
+    branch is returned alongside the remote so :func:`cmd_check_ancestry`
+    and the squash-PR probe (spec 4.5's ``--base <default-branch>``) share
+    one resolution instead of each re-deriving it.
+
+    Returns ``None`` (after printing its own ``ERROR:`` to stderr) when the
+    default branch cannot be resolved, or when the branch has no single
+    configured remote (unset or ambiguous).
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        print(
+            f"ERROR: Cannot determine default branch for '{canonical_repo}' to resolve its tracking "
+            "remote. Set 'default_branch' for this repo in devbench.yaml, or run "
+            "'git remote set-head <remote-name> --auto' for the repo's configured tracking remote.",
+            file=sys.stderr,
+        )
+        return None
+
+    rc, stdout, _stderr = run_command(
+        ["git", "config", "--get", f"branch.{default_branch}.remote"],
+        cwd=repo_path,
+    )
+    remote = stdout.strip()
+    if rc != 0 or not remote:
+        print(
+            f"ERROR: Cannot resolve tracking remote for '{canonical_repo}' branch '{default_branch}'. "
+            f"Set it with 'git config branch.{default_branch}.remote <remote-name>'.",
+            file=sys.stderr,
+        )
+        return None
+    return remote, default_branch
+
+
+def _probe_squash_merged_pr(dependency_ref: str, default_branch: str, repo_path: Path) -> _SquashProbeResult | None:
+    """Probe whether *dependency_ref* landed via a squash-merged/rebased PR (spec 4.5, 317-D02).
+
+    Complements the strict ``git merge-base --is-ancestor`` probe, which
+    cannot see a squash-merged, rebased, or fix-pack-landed dependency's
+    original commits: a merge-base "not ancestor" answer reports a false
+    ``BLOCKED`` for a dependency that is fully delivered on the shared
+    trunk under a different set of commit hashes.
+
+    Resolves *dependency_ref* to a commit SHA (``git rev-parse``), then
+    searches for a merged PR carrying that SHA via ``gh pr list --search
+    "<sha>" --state merged --base <default-branch> --json
+    number,mergedAt,title``.
+
+    Returns:
+        A :class:`_SquashProbeResult` with ``found=True`` when a merged PR
+        is found, or ``found=False`` when the search legitimately returns
+        no results (not an error -- an empty result is a real "not yet
+        merged this way either" answer). Returns ``None`` (after printing
+        its own ``ERROR:`` to stderr) when the ``git rev-parse`` or ``gh
+        pr list`` call itself fails, or its output cannot be parsed as the
+        expected JSON array -- callers must treat this as a hard failure
+        (spec 3.5), never silently reporting "not found".
+    """
+    rc, stdout, stderr = run_command(["git", "rev-parse", dependency_ref], cwd=repo_path)
+    if rc != 0 or not stdout.strip():
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': could not resolve to a commit "
+            f"SHA: {stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    sha = stdout.strip()
+
+    rc, stdout, stderr = run_command(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            sha,
+            "--state",
+            "merged",
+            "--base",
+            default_branch,
+            "--json",
+            "number,mergedAt,title",
+        ],
+        cwd=repo_path,
+    )
+    if rc != 0:
+        print(f"ERROR: squash-merge probe failed for '{dependency_ref}': {stderr.strip()}", file=sys.stderr)
+        return None
+
+    return _parse_squash_probe_response(stdout, dependency_ref)
+
+
+def _parse_squash_probe_response(stdout: str, dependency_ref: str) -> _SquashProbeResult | None:
+    """Parse `gh pr list --json number,mergedAt,title`'s stdout into a :class:`_SquashProbeResult`.
+
+    Split out of :func:`_probe_squash_merged_pr` purely to keep that
+    function's return-count within the project's complexity lint budget.
+    Every shape that is not a genuine, well-formed "zero or more merged
+    PRs" answer is a hard failure (spec 3.5) -- never coerced into
+    ``found=False``.
+    """
+    try:
+        prs = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': could not parse 'gh pr list' "
+            f"output as JSON: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    if not isinstance(prs, list):
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': unexpected 'gh pr list' output "
+            f"shape (expected a JSON array): {stdout.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    if not prs:
+        return _SquashProbeResult(found=False, pr_number=None)
+
+    first = prs[0]
+    if not isinstance(first, dict) or not isinstance(first.get("number"), int):
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': 'gh pr list' result missing a "
+            f"numeric 'number' field: {stdout.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    return _SquashProbeResult(found=True, pr_number=first["number"])
+
+
+def _ancestry_status_line(status: str, findings: int, mode: str, dependency_ref: str, resolved_target_ref: str) -> str:
+    """Render the spec 5.2 gate status line for an enabled ``check-ancestry`` run.
+
+    Thin ancestry-specific wrapper around the shared
+    :func:`_gate_status_line` formatter (also used by
+    :func:`cmd_check_reachability`) so the base field set/order (``gate``,
+    ``tier``, ``status``, ``findings``) can never drift between gates,
+    while the three terminal-decision branches in
+    :func:`cmd_check_ancestry` (strict pass, squash-pr pass, BLOCKED) keep
+    a single call shape for ancestry's own ``mode``/``dependency_ref``/
+    ``target_ref`` fields.
+    """
+    return _gate_status_line(
+        _ANCESTRY_GATE_NAME,
+        status,
+        findings,
+        mode=mode,
+        dependency_ref=dependency_ref,
+        target_ref=resolved_target_ref,
+    )
+
+
+def _print_ancestry_probe_outcomes(
+    dependency_ref: str,
+    resolved_target_ref: str,
+    strict_ancestor: bool,
+    squash_result: _SquashProbeResult | None,
+) -> None:
+    """Print both ancestry probes' human-readable outcomes (spec 4.5, AC-ANC-002).
+
+    Shared by every terminal decision :func:`cmd_check_ancestry` reaches
+    through a genuine probe result (strict pass, squash-pr pass, or
+    BLOCKED) so an operator always sees which probe answered what --
+    never a single probe's result standing in silently for the whole
+    decision (spec 3.5 fallback ban). *squash_result* is ``None`` when the
+    squash-PR probe never ran because the strict probe already passed.
+    """
+    strict_outcome = "ancestor" if strict_ancestor else "not an ancestor"
+    print(f"Strict probe (git merge-base --is-ancestor {dependency_ref} {resolved_target_ref}): {strict_outcome}")
+
+    if squash_result is None:
+        squash_outcome = "not run (strict probe already passed)"
+    elif squash_result.found:
+        squash_outcome = f"merged via PR #{squash_result.pr_number}"
+    else:
+        squash_outcome = "no merged PR found"
+    print(f"Squash-PR probe (gh pr list --search <sha> --state merged): {squash_outcome}")
+
+
 def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") -> int:
     """Verify a declared work-group dependency has actually merged, via real git ancestry.
 
@@ -4596,77 +4878,66 @@ def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") 
     instead of inventing a weaker proxy (e.g. checking for a local
     snapshot/report file, which can go stale or never existed).
 
-    Runs ``git merge-base --is-ancestor <dependency_ref> <target_ref>`` in
-    the work unit's target repo:
+    Command: ``check-ancestry <unit-id> <dependency-ref> [<target-ref>]``
+    (spec 4.5; machine-blocking per ``constants.GATE_TIERS``). Gate
+    enablement is read exclusively through
+    ``resolve_gate_config("ancestry", repo)`` (spec 4.1's single read
+    path): when the gate is disabled (or unconfigured) for the unit's
+    repo, prints exactly ``{"gate":"ancestry","status":"disabled"}`` and
+    returns 0 before any git call (AC-ANC-006). On an enabled run, the
+    spec 5.2 status line -- ``{"gate","tier","status","findings","mode",
+    "dependency_ref","target_ref"}`` -- is the FIRST stdout line
+    (AC-ANC-007), followed by both probes' human-readable outcomes.
 
-    - *dependency_ref* should be a fully qualified, fetchable ref (e.g.
-      ``origin/<dependency-branch>`` or a commit SHA). This function does
-      not invent a remote-tracking prefix for a bare branch name.
-    - *target_ref* defaults to ``origin/<default-branch>`` (resolved the
-      same way as :func:`cmd_get_diff`) when omitted -- i.e. "has the
-      dependency merged into the branch this work group's tasks are based
-      against."
+    **Two-probe contract (spec 4.5, 317-D02, AC-17).** A strict
+    ``git merge-base --is-ancestor <dependency_ref> <target_ref>`` probe
+    runs first. When it reports the dependency IS an ancestor (rc=0), the
+    gate passes with ``mode: "strict"``. When it reports rc=1 ("not an
+    ancestor" -- the strict, commit-graph-only answer a squash-merged,
+    rebased, or fix-pack-landed dependency can never satisfy), a second
+    probe searches for the dependency's merged PR via ``gh pr list
+    --search "<sha>" --state merged --base <default-branch>``
+    (:func:`_probe_squash_merged_pr`); finding one passes the gate with
+    ``mode: "squash-pr"``. Finding neither blocks the gate (``status:
+    "fail"``). Both probes' outcomes are always printed together on every
+    terminal decision (spec 3.5 fallback ban -- never a silent hand-off
+    from one probe to the other). ``git merge-base --is-ancestor``
+    returning rc>=2 (or the ``run_command`` sentinel 127 for a missing/
+    timed-out git) means git itself could not answer the question --
+    treated as a hard failure, never reported as "not merged", and the
+    squash-PR probe is never invoked in that case.
 
-    Best-effort ``git fetch origin`` runs first so a stale local view of
-    ``origin`` does not produce a false "not merged" result; a fetch
-    failure (offline, renamed remote) is logged to stderr but does not
-    abort the check -- the merge-base call still runs against whatever is
-    locally known.
+    *dependency_ref* should be a fully qualified, fetchable ref (e.g.
+    ``<remote>/<dependency-branch>`` or a commit SHA). This function does
+    not invent a remote-tracking prefix for a bare branch name.
+    *target_ref* defaults to ``<remote>/<default-branch>`` when omitted,
+    where ``<remote>`` is resolved from the repo's own git configuration
+    (:func:`_resolve_ancestry_remote`, spec 4.5, AC-ANC-004) rather than
+    assumed to be the literal ``"origin"``.
 
-    Exit contract (unlike most devbench commands, which return 0 and encode
-    failure only in JSON): returns 0 only when *dependency_ref* IS an
-    ancestor of *target_ref* (the gate should pass). Returns 1 for
-    "not yet an ancestor" (the gate should block) as well as for any error
-    that prevents a decision (unknown work unit, empty dependency ref,
-    unresolvable repo/default-branch, invalid git refs). A JSON status line
-    is always printed to stdout so callers get a machine-readable record
-    either way.
+    ``git fetch <remote>`` runs before either probe so a stale local view
+    cannot produce a false answer; a fetch failure is FATAL (spec 3.5)
+    -- ``ERROR: git fetch '<remote>' failed: <stderr>`` on stderr, exit 1,
+    and neither probe runs against stale refs.
 
-    Known limitation: ``git merge-base --is-ancestor`` is a strict commit
-    -graph ancestry check. It can report "not an ancestor" for a
-    logically-satisfied dependency when the producer branch was squash
-    -merged, rebased, or landed via a fix-pack branch that does not carry
-    the original branch's commit hashes. Callers hitting this should
-    target the actual merge commit / tag on the shared trunk (e.g.
-    ``origin/main`` after the squash-merge lands) rather than the
-    original feature branch ref, or fall back to the manual-blocker idiom
-    (``docs/manual-blockers.md``) with an operator-verified AC when no
-    ancestry-preserving ref exists.
+    Exit contract (spec Section 7; unlike most devbench commands, which
+    return 0 and encode failure only in JSON): 0 for a pass (either
+    probe), 1 for a BLOCKED result or any error that prevents a decision
+    (unknown work unit, unresolvable repo/default-branch/remote, fetch
+    failure, a probe that could not run, an invalid git ref), 2 for the
+    usage error of an empty *dependency_ref*.
 
     Usage: check-ancestry <unit_id> <dependency-ref> [<target-ref>]
     """
-    if not dependency_ref.strip():
-        print("ERROR: check-ancestry requires a non-empty dependency ref", file=sys.stderr)
-        return 1
+    prepared = _prepare_ancestry_probe_context(unit_id, dependency_ref, target_ref)
+    if isinstance(prepared, int):
+        return prepared
+    remote, default_branch, repo_path, resolved_target_ref = prepared
 
-    resolved = _resolve_ancestry_repo_context(unit_id)
-    if resolved is None:
-        return 1
-    canonical_repo, repo_path = resolved
-
-    resolved_target_ref = target_ref.strip()
-    if not resolved_target_ref:
-        default_branch = _resolve_default_branch(canonical_repo, repo_path)
-        if default_branch is None:
-            print(
-                f"ERROR: Cannot determine default branch for '{canonical_repo}' to use as the "
-                "ancestry target. Run 'git remote set-head origin --auto' to configure it, or "
-                "pass an explicit target-ref.",
-                file=sys.stderr,
-            )
-            return 1
-        resolved_target_ref = f"origin/{default_branch}"
-
-    # Best-effort refresh so a stale local `origin` doesn't produce a false
-    # "not merged" result. Non-fatal: offline runs / renamed remotes still
-    # fall through to the merge-base check below against whatever refs are
-    # already known locally.
-    fetch_rc, _fetch_stdout, fetch_stderr = run_command(["git", "fetch", "origin"], cwd=repo_path)
+    fetch_rc, _fetch_stdout, fetch_stderr = run_command(["git", "fetch", remote], cwd=repo_path)
     if fetch_rc != 0:
-        print(
-            f"WARNING: 'git fetch origin' failed, checking against local refs as-is: {fetch_stderr.strip()}",
-            file=sys.stderr,
-        )
+        print(f"ERROR: git fetch '{remote}' failed: {fetch_stderr.strip()}", file=sys.stderr)
+        return 1
 
     rc, _stdout, stderr = run_command(
         ["git", "merge-base", "--is-ancestor", dependency_ref, resolved_target_ref],
@@ -4674,44 +4945,94 @@ def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") 
     )
 
     if rc == 0:
-        print(
-            json.dumps(
-                {
-                    "unit_id": unit_id,
-                    "status": "ancestor",
-                    "dependency_ref": dependency_ref,
-                    "target_ref": resolved_target_ref,
-                }
-            )
-        )
+        print(_ancestry_status_line(GATE_STATUS_PASS, 0, _ANCESTRY_MODE_STRICT, dependency_ref, resolved_target_ref))
+        _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, True, None)
         return 0
 
     if rc == 1:
-        print(
-            json.dumps(
-                {
-                    "unit_id": unit_id,
-                    "status": "not_ancestor",
-                    "dependency_ref": dependency_ref,
-                    "target_ref": resolved_target_ref,
-                }
-            )
-        )
-        print(
-            f"BLOCKED: '{dependency_ref}' is not yet an ancestor of '{resolved_target_ref}'. "
-            "The declared dependency has not merged. Do not proceed with any other task in "
-            "this backlog until this check passes.",
-            file=sys.stderr,
-        )
-        return 1
+        return _resolve_ancestry_not_ancestor(dependency_ref, resolved_target_ref, default_branch, repo_path)
 
     # rc > 1 (or the run_command sentinel 127 for a missing/timed-out git)
     # means git itself could not answer the question -- unknown ref, not a
     # commit-ish, or the executable is missing. Treat as a hard failure
-    # rather than silently reporting "not merged".
+    # rather than silently reporting "not merged"; the squash-PR probe is
+    # never invoked here since the strict probe did not produce a real
+    # "not an ancestor" answer to complement.
     print(
-        f"ERROR: 'git merge-base --is-ancestor {dependency_ref} {resolved_target_ref}' could not "
-        f"be evaluated (rc={rc}): {stderr.strip()}",
+        f"ERROR: ancestry probe could not be evaluated (rc={rc}): 'git merge-base --is-ancestor "
+        f"{dependency_ref} {resolved_target_ref}': {stderr.strip()}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _prepare_ancestry_probe_context(
+    unit_id: str, dependency_ref: str, target_ref: str
+) -> tuple[str, str, Path, str] | int:
+    """Resolve everything :func:`cmd_check_ancestry` needs before running either probe.
+
+    Split out purely to keep that function's return-count within the
+    project's complexity lint budget (mirrors the existing
+    ``_resolve_*_or_report``-style helpers this module already uses for
+    the same reason). Bundles every early-exit condition -- empty
+    *dependency_ref* (usage error, exit 2), an unresolvable work
+    unit/repo, a disabled gate, and an unresolvable remote/default-branch
+    -- into one caller-side ``isinstance(..., int)`` check.
+
+    Returns:
+        ``(remote, default_branch, repo_path, resolved_target_ref)`` when
+        every resolution step succeeds and the gate is enabled; otherwise
+        the ``int`` exit code the caller should return as-is (the
+        offending step has already printed its own diagnostic).
+    """
+    if not dependency_ref.strip():
+        print("ERROR: check-ancestry requires a non-empty dependency ref", file=sys.stderr)
+        return 2
+
+    resolved = _resolve_ancestry_repo_context(unit_id)
+    if resolved is None:
+        return 1
+    canonical_repo, repo_path = resolved
+
+    gate_config = _load_gate_config_or_report(_ANCESTRY_GATE_NAME, canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    resolved_remote = _resolve_ancestry_remote(canonical_repo, repo_path)
+    if resolved_remote is None:
+        return 1
+    remote, default_branch = resolved_remote
+
+    resolved_target_ref = target_ref.strip() or f"{remote}/{default_branch}"
+    return remote, default_branch, repo_path, resolved_target_ref
+
+
+def _resolve_ancestry_not_ancestor(
+    dependency_ref: str, resolved_target_ref: str, default_branch: str, repo_path: Path
+) -> int:
+    """Handle the strict probe's rc=1 ("not an ancestor") terminal branch.
+
+    Split out of :func:`cmd_check_ancestry` purely to keep that function's
+    return-count within the project's complexity lint budget. Runs the
+    squash-PR probe (spec 4.5, 317-D02) and reports whichever of "pass via
+    squash-pr" or "BLOCKED" it settles on, always printing both probes'
+    outcomes together (AC-ANC-002).
+    """
+    squash_result = _probe_squash_merged_pr(dependency_ref, default_branch, repo_path)
+    if squash_result is None:
+        return 1
+
+    if squash_result.found:
+        print(_ancestry_status_line(GATE_STATUS_PASS, 0, _ANCESTRY_MODE_SQUASH_PR, dependency_ref, resolved_target_ref))
+        _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
+        return 0
+
+    print(_ancestry_status_line(GATE_STATUS_FAIL, 1, _ANCESTRY_MODE_NONE, dependency_ref, resolved_target_ref))
+    _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
+    print(
+        f"BLOCKED: '{dependency_ref}' is not yet an ancestor of '{resolved_target_ref}', and no merged "
+        "PR carrying its commit was found either. The declared dependency has not merged. Do not "
+        "proceed with any other task in this backlog until this check passes.",
         file=sys.stderr,
     )
     return 1
@@ -4811,9 +5132,6 @@ def cmd_run_tests(unit_id: str) -> int:
 # stem convention rather than an empty walk (D-17, AC-FUNC-006).
 
 _REACHABILITY_GATE_NAME: str = "reachability"
-_REACHABILITY_STATUS_DISABLED: str = "disabled"
-_REACHABILITY_STATUS_PASS: str = "pass"
-_REACHABILITY_STATUS_FAIL: str = "fail"
 
 # Reachability is machine-blocking (`constants.GATE_TIERS`, spec Section
 # 3.6/D-6): the operator is the only waiver authority. `_reachability_prepare_run`
@@ -5359,41 +5677,6 @@ def cmd_gates() -> int:
     return 0
 
 
-def _load_reachability_gate_config_or_report(canonical_repo: str) -> "ResolvedGateConfig | int":
-    """Load config and resolve the reachability gate's config for *canonical_repo*.
-
-    Extracted out of :func:`cmd_check_reachability` to keep that function's
-    return/branch count within ruff's thresholds. Folds two of that
-    function's early-exit branches (config load failure, disabled gate)
-    into one caller-side check via the union return type: an ``int``
-    result means "already handled -- return this exit code as-is" (the
-    loader's own fail-fast ``ERROR:`` message, or the spec 5.2
-    ``{"gate":"reachability","status":"disabled"}`` line, is already
-    printed); a ``ResolvedGateConfig`` result means the gate is enabled and
-    the caller should proceed.
-    """
-    from devbench.config import resolve_gate_env_override
-    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
-
-    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
-    try:
-        runtime_config = load_runtime_config(cfg_path, os.environ)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    gate_config = resolve_gate_config(
-        _REACHABILITY_GATE_NAME,
-        canonical_repo,
-        runtime_config,
-        resolve_gate_env_override(_REACHABILITY_GATE_NAME),
-    )
-    if not gate_config.values["enabled"]:
-        print(json.dumps({"gate": _REACHABILITY_GATE_NAME, "status": _REACHABILITY_STATUS_DISABLED}))
-        return 0
-    return gate_config
-
-
 def _reachability_waived_block(target: str, reason: str) -> str:
     """Render the ``[WAIVED]`` report block for a candidate an operator has waived (spec 4.9, Section 2 G7)."""
     return f"[WAIVED] {target} -- {reason}"
@@ -5636,7 +5919,7 @@ def cmd_check_reachability(unit_id: str) -> int:
         return 1
     unit, canonical_repo, repo_path = resolved
 
-    gate_config = _load_reachability_gate_config_or_report(canonical_repo)
+    gate_config = _load_gate_config_or_report(_REACHABILITY_GATE_NAME, canonical_repo)
     if isinstance(gate_config, int):
         return gate_config
 
@@ -5676,7 +5959,7 @@ def cmd_check_reachability(unit_id: str) -> int:
         )
 
     total_findings = unreachable_count + load_error_count
-    status = _REACHABILITY_STATUS_FAIL if total_findings else _REACHABILITY_STATUS_PASS
+    status = GATE_STATUS_FAIL if total_findings else GATE_STATUS_PASS
 
     if total_findings == 0 and scope.files:
         # Persisted machine record (spec 4.2, 4.4 final bullet): a clean
@@ -5701,17 +5984,7 @@ def cmd_check_reachability(unit_id: str) -> int:
         marker = compose_gate_pass_record(_REACHABILITY_GATE_NAME, scope.scope_hash)
         BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
 
-    print(
-        json.dumps(
-            {
-                "gate": _REACHABILITY_GATE_NAME,
-                "tier": GATE_TIERS[_REACHABILITY_GATE_NAME],
-                "status": status,
-                "findings": total_findings,
-                "scope_hash": scope.scope_hash,
-            }
-        )
-    )
+    print(_gate_status_line(_REACHABILITY_GATE_NAME, status, total_findings, scope_hash=scope.scope_hash))
     print(f"Reachability check for {unit_id} (repo: {canonical_repo})")
     for line in report_lines:
         print(line)
@@ -15233,10 +15506,14 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         cmd_check_ancestry,
         2,
         (
-            "Canonical git-ancestry check for a declared work-group dependency. "
-            "Runs 'git merge-base --is-ancestor <dependency-ref> <target-ref>' in the work "
-            "unit's repo (target-ref defaults to origin/<default-branch>). Exit 0 only when "
-            "the dependency is merged: check-ancestry <id> <dependency-ref> [<target-ref>]"
+            "Canonical git-ancestry check for a declared work-group dependency (machine-blocking "
+            "gate, see 'Gates' in docs/cli-reference.md). Passes via the strict probe "
+            "('git merge-base --is-ancestor <dependency-ref> <target-ref>', target-ref defaults "
+            "to <remote>/<default-branch> from repo config) or, when the strict probe reports "
+            "not-ancestor, via a squash-merged-PR probe ('gh pr list --search <sha> --state "
+            "merged --base <default-branch>'). Exit 0 on pass or when the gate is disabled for "
+            "the repo, exit 1 on a BLOCKED result or a probe error, exit 2 for a usage error "
+            "(empty dependency-ref): check-ancestry <id> <dependency-ref> [<target-ref>]"
         ),
     ),
     "cleanup-tracked-orphans": (

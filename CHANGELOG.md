@@ -5,6 +5,33 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-ancestry` gains a squash-aware second probe, a fatal `git fetch`,
+  and a configured tracking remote** (spec `integration-reality-gates-hardening.md`
+  section 4.5, 317-D02; AC-17, AC-15; issue #12). A strict
+  `git merge-base --is-ancestor` probe still runs first, but a "not an
+  ancestor" answer (rc=1) no longer prints `BLOCKED` outright: a second
+  probe searches for the dependency's merged PR via `gh pr list --search
+  "<sha>" --state merged --base <default-branch>`, and a pass through it is
+  recorded in the status line as `mode: "squash-pr"` -- a squash-merged,
+  rebased, or fix-pack-landed dependency the strict probe can never see is
+  no longer misreported as blocked. Both probes' outcomes are always
+  printed together on every terminal decision. `git fetch` is now FATAL
+  (`ERROR: git fetch '<remote>' failed: <stderr>`, exit 1) instead of the
+  previous best-effort warning-and-continue, so a stale local view can
+  never produce a false answer; the remote name is resolved from the
+  repo's own `git config --get branch.<default-branch>.remote` rather than
+  assumed to be the literal `origin`. The command is also brought onto the
+  shared gate surface: gate enablement is read exclusively through
+  `resolve_gate_config("ancestry", repo)`, printing
+  `{"gate": "ancestry", "status": "disabled"}` and exiting 0 before any git
+  call when disabled, or the spec 5.2 status line as the FIRST stdout line
+  on an enabled run. An empty `dependency-ref` is now a usage error (exit
+  2, was exit 1); `git merge-base --is-ancestor` returning rc>=2 is an
+  evaluation failure, never reported as "not merged". `docs/cli-reference.md`
+  and `docs/cross-backlog-dependencies.md` document the two-probe contract;
+  no document routes a squash-merged dependency to the manual-blocker idiom
+  as its only remediation any more.
+
 - **`check-reachability` is wired into the done path and persists a
   `[GATE_PASS reachability]` record; `mark-done` now enforces it, and an
   operator-attributed `[GATE_WAIVER reachability]` marker is the escape

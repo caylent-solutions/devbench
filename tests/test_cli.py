@@ -4627,154 +4627,180 @@ class TestCmdGetDiff:
 
 
 @pytest.mark.unit
-class TestCmdCheckAncestry:
-    """Tests for cmd_check_ancestry, the canonical git-ancestry dependency gate."""
+class _AncestryCmdFixtures:
+    """Shared fixture helpers for ``cmd_check_ancestry`` test classes (E4-F1-S1-T1).
 
-    def _make_unit(self) -> WorkUnit:
+    Mirrors ``_ReachabilityCmdFixtures``'s config-fixture approach (a real
+    ``devbench.yaml`` resolved through ``DEVBENCH_CONFIG_PATH``, exercising
+    the actual ``resolve_gate_config`` read path) but without the heavier
+    real-git-checkout requirement: every ``cmd_check_ancestry`` test drives
+    git/`gh` exclusively through the ``run_command`` seam, so a real git
+    repo on disk is unnecessary here.
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
         return WorkUnit(
-            id="E1-F1-S1-T1",
+            id=unit_id,
             title="Dependency ancestry gate",
             status=WorkUnitStatus.IN_PROGRESS,
             unit_type=WorkUnitType.TASK,
-            file_path=Path("backlog/E1-F1-S1-T1.md"),
-            repo="caylent-solutions/devbench",
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
             dependencies=[],
         )
 
-    def test_returns_zero_and_ancestor_status_when_dependency_merged(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    @classmethod
+    def _write_gate_config(cls, tmp_path: Path, gates_block: str) -> Path:
+        """Write a scratch ``devbench.yaml`` resolving ``resolve_gate_config``'s project layer."""
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {cls._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def _enable_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+        """Point ``DEVBENCH_CONFIG_PATH`` at a scratch config resolving ``gates.ancestry.enabled``.
+
+        Also clears the workspace-wide env override so an ambient
+        ``DEVBENCH_GATE_ANCESTRY_ENABLED`` left set by the host shell can
+        never leak into a test that relies on the project-layer value set
+        here (env is the highest-precedence layer, spec 4.1/D-15).
         """
-        Given: origin/dep-branch IS an ancestor of origin/main
-        When: cmd_check_ancestry is called with an explicit target-ref
-        Then: rc is 0 and the JSON status line reports "ancestor"
-        """
-        unit = self._make_unit()
+        gates_block = f"gates:\n  ancestry:\n    enabled: {'true' if enabled else 'false'}\n"
+        cfg_path = self._write_gate_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+    @contextlib.contextmanager
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        fake_run_command: Callable[..., tuple[int, str, str]],
+    ) -> Iterator[None]:
+        """Apply the standard patches shared by every test method."""
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("devbench.cli.BacklogParser", return_value=mock_parser))
+            stack.enter_context(patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}))
+            stack.enter_context(patch("devbench.cli.get_configured_default_branch", return_value="main"))
+            stack.enter_context(patch("devbench.cli.run_command", side_effect=fake_run_command))
+            yield
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestry(_AncestryCmdFixtures):
+    """Tests for cmd_check_ancestry, the canonical git-ancestry dependency gate (spec 4.5)."""
+
+    def test_returns_zero_and_pass_status_when_dependency_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: origin/dep-branch IS an ancestor of origin/main (strict probe rc=0)
+        When: cmd_check_ancestry is called with an explicit target-ref
+        Then: rc is 0, the status line reports mode "strict", and it is the FIRST stdout line
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
         repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
             if cmd[:2] == ["git", "fetch"]:
                 return (0, "", "")
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
                 return (0, "", "")
-            return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
 
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
+        with self._patch_common(unit, repo_path, fake_run_command):
             result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out.strip())
+        out_lines = capsys.readouterr().out.strip().splitlines()
+        payload = json.loads(out_lines[0])
         assert payload == {
-            "unit_id": "E1-F1-S1-T1",
-            "status": "ancestor",
+            "gate": "ancestry",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+            "mode": "strict",
             "dependency_ref": "origin/dep-branch",
             "target_ref": "origin/main",
         }
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
 
-    def test_returns_one_and_not_ancestor_status_when_dependency_not_merged(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    def test_ancestry_probe_rc_two_or_more_is_an_evaluation_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """
-        Given: origin/dep-branch is NOT an ancestor of origin/main (merge-base rc=1)
-        When: cmd_check_ancestry is called
-        Then: rc is 1, JSON reports "not_ancestor", and a BLOCKED message goes to stderr
-        """
-        unit = self._make_unit()
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
-        repo_path = tmp_path / "devbench"
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd[:2] == ["git", "fetch"]:
-                return (0, "", "")
-            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
-                return (1, "", "")
-            return (0, "", "")
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
-            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
-
-        assert result == 1
-        captured = capsys.readouterr()
-        payload = json.loads(captured.out.strip())
-        assert payload["status"] == "not_ancestor"
-        assert "BLOCKED" in captured.err
-        assert "not yet an ancestor" in captured.err
-
-    def test_returns_one_on_invalid_ref(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """
         Given: merge-base cannot resolve a ref (rc=128, the git convention for a bad revision)
         When: cmd_check_ancestry is called
-        Then: rc is 1 and an ERROR (not BLOCKED) is printed -- this is an evaluation failure,
-              not a confirmed "not merged" answer, and must not be conflated with it.
+        Then: rc is 1, an ERROR (not BLOCKED) is printed naming the rc, no status line is printed,
+              and the squash-PR probe is never invoked -- this is an evaluation failure, not a
+              confirmed "not merged" answer.
         """
+        self._enable_gate(tmp_path, monkeypatch)
         unit = self._make_unit()
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
+        gh_calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
             if cmd[:2] == ["git", "fetch"]:
                 return (0, "", "")
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 return (128, "", "fatal: Not a valid commit name origin/bogus-ref")
-            return (0, "", "")
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(cmd)
+            raise AssertionError(f"unexpected command: {cmd}")
 
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
+        with self._patch_common(unit, repo_path, fake_run_command):
             result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/bogus-ref", "origin/main")
 
         assert result == 1
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
-        assert "ERROR" in captured.err
+        assert "ERROR: ancestry probe could not be evaluated (rc=128)" in captured.err
         assert "BLOCKED" not in captured.err
+        assert gh_calls == []
 
-    def test_defaults_target_ref_to_origin_default_branch_when_omitted(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    def test_uses_remote_default_branch_ref_when_target_ref_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """
-        Given: no target-ref argument is supplied
+        Given: no target-ref argument is supplied, and the configured remote is "origin"
         When: cmd_check_ancestry is called with only unit_id + dependency_ref
-        Then: it resolves and uses origin/<default-branch> as the target
+        Then: it resolves and uses "<remote>/<default-branch>" as the target
         """
+        self._enable_gate(tmp_path, monkeypatch)
         unit = self._make_unit()
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
         merge_base_calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 merge_base_calls.append(cmd)
                 return (0, "", "")
-            return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
 
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.cli.get_configured_default_branch", return_value="main"),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
+        with self._patch_common(unit, repo_path, fake_run_command):
             result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
 
         assert result == 0
         assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
 
-    def test_returns_one_when_unit_not_found(self) -> None:
+    def test_returns_one_when_unit_not_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """
         Given: the unit_id does not exist in the backlog index
         When: cmd_check_ancestry is called
@@ -4788,11 +4814,11 @@ class TestCmdCheckAncestry:
 
         assert result == 1
 
-    def test_returns_one_on_empty_dependency_ref(self) -> None:
+    def test_returns_two_on_empty_dependency_ref(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """
         Given: an empty/whitespace dependency-ref argument
         When: cmd_check_ancestry is called
-        Then: it fails fast with rc 1 (guards against a silently-vacuous ancestry check)
+        Then: it fails fast with rc 2 (a usage error per spec Section 7), before any repo resolution
         """
         unit = self._make_unit()
         mock_parser = MagicMock()
@@ -4801,37 +4827,489 @@ class TestCmdCheckAncestry:
         with patch("devbench.cli.BacklogParser", return_value=mock_parser):
             result = cli.cmd_check_ancestry("E1-F1-S1-T1", "   ", "origin/main")
 
-        assert result == 1
+        assert result == 2
 
-    def test_fetch_failure_is_non_fatal_and_check_still_runs(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """
-        Given: 'git fetch origin' fails (e.g. offline)
-        When: cmd_check_ancestry is called
-        Then: a WARNING is printed but the merge-base check still runs and can pass
-        """
-        unit = self._make_unit()
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
-        repo_path = tmp_path / "devbench"
+
+@pytest.mark.unit
+class TestCmdCheckAncestrySquashProbe(_AncestryCmdFixtures):
+    """Tests for the squash-aware PR probe (spec 4.5, 317-D02): a second, independent
+    answer to "has this dependency merged" for a squash-merged/rebased/fix-pack-landed
+    branch that a strict ``git merge-base --is-ancestor`` cannot see."""
+
+    def _fake_run_command(
+        self,
+        *,
+        merge_base_rc: int = 1,
+        gh_rc: int = 0,
+        gh_stdout: str = "[]",
+        gh_stderr: str = "",
+        rev_parse_rc: int = 0,
+        rev_parse_stdout: str = "abc123deadbeef\n",
+        rev_parse_stderr: str = "",
+        remote: str = "origin",
+    ) -> tuple[Callable[..., tuple[int, str, str]], list[list[str]]]:
+        gh_calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, f"{remote}\n", "")
             if cmd[:2] == ["git", "fetch"]:
-                return (1, "", "fatal: unable to access origin")
-            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 return (0, "", "")
-            return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (merge_base_rc, "", "")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return (rev_parse_rc, rev_parse_stdout, rev_parse_stderr)
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(cmd)
+                return (gh_rc, gh_stdout, gh_stderr)
+            raise AssertionError(f"unexpected command: {cmd}")
 
-        with (
-            patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
+        return fake_run_command, gh_calls
+
+    def test_squash_merged_dependency_passes_via_pr_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 (not a graph ancestor) but the dependency's
+               commit was found on a merged PR via `gh pr list`
+        When: cmd_check_ancestry is called
+        Then: rc is 0, the status line carries mode "squash-pr", and BOTH probe outcomes
+              (strict AND squash-PR) are printed to stdout (spec 4.5, AC-ANC-001, AC-ANC-002)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, gh_calls = self._fake_run_command(
+            merge_base_rc=1,
+            gh_rc=0,
+            gh_stdout='[{"number": 317, "mergedAt": "2026-01-01T00:00:00Z", "title": "Squashed dependency"}]',
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
             result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
 
         assert result == 0
-        assert "WARNING" in capsys.readouterr().err
+        captured = capsys.readouterr()
+        out_lines = captured.out.strip().splitlines()
+        payload = json.loads(out_lines[0])
+        assert payload["mode"] == "squash-pr"
+        assert payload["status"] == "pass"
+        assert payload["findings"] == 0
+        assert "Strict probe" in captured.out
+        assert "Squash-PR probe" in captured.out
+        assert gh_calls == [
+            [
+                "gh",
+                "pr",
+                "list",
+                "--search",
+                "abc123deadbeef",
+                "--state",
+                "merged",
+                "--base",
+                "main",
+                "--json",
+                "number,mergedAt,title",
+            ]
+        ]
+
+    def test_blocked_when_neither_probe_confirms_merge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 AND the squash-PR probe finds no merged PR
+        When: cmd_check_ancestry is called
+        Then: rc is 1, the status line reports status "fail", BOTH probe outcomes are
+              printed, and a BLOCKED message is printed to stderr (spec 4.5, AC-ANC-002)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(merge_base_rc=1, gh_rc=0, gh_stdout="[]")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        out_lines = captured.out.strip().splitlines()
+        payload = json.loads(out_lines[0])
+        assert payload["status"] == "fail"
+        assert payload["mode"] == "none"
+        assert payload["findings"] == 1
+        assert "Strict probe" in captured.out
+        assert "Squash-PR probe" in captured.out
+        assert "BLOCKED" in captured.err
+
+    def test_rev_parse_failure_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `git rev-parse <dependency-ref>` itself fails
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the dependency ref, and no status line is printed
+              (spec 3.5: never silently report "not found" for a probe that could not run)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, rev_parse_rc=128, rev_parse_stdout="", rev_parse_stderr="fatal: bad revision"
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+
+    def test_gh_pr_list_failure_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list` itself fails (rc!=0)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the dependency ref and gh's stderr, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=1, gh_stdout="", gh_stderr="gh: authentication required"
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "authentication required" in captured.err
+
+    def test_gh_pr_list_malformed_json_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list` returns output that is not valid JSON
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the JSON parse failure, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(merge_base_rc=1, gh_rc=0, gh_stdout="not json")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "JSON" in captured.err
+
+    def test_gh_pr_list_unexpected_shape_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list --json ...` returns a JSON
+               object instead of the expected array (a malformed/unexpected shape)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the unexpected shape, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=0, gh_stdout='{"error": "not a list"}'
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+
+    def test_gh_pr_list_entry_missing_number_field_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list --json ...` returns a
+               well-formed JSON array whose first entry has no numeric "number" field
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the missing field, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=0, gh_stdout='[{"title": "no number field here"}]'
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "'number' field" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryFetchIsFatal(_AncestryCmdFixtures):
+    """A `git fetch` failure must FATALLY abort the check (spec 3.5, AC-ANC-003) --
+    the shipped ("best-effort fetch") behaviour silently answered from stale refs."""
+
+    def test_fetch_failure_exits_one_and_merge_base_never_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: 'git fetch <remote>' fails (e.g. offline, renamed remote)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the remote and the failure, no status line is printed,
+              and `git merge-base --is-ancestor` is never invoked against stale local refs
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd == ["git", "fetch", "origin"]:
+                return (1, "", "fatal: unable to access 'origin': Could not resolve host")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: git fetch 'origin' failed" in captured.err
+        assert "Could not resolve host" in captured.err
+        assert merge_base_calls == []
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryRemoteResolution(_AncestryCmdFixtures):
+    """The tracking remote name is resolved from the repo's own git configuration
+    (spec 4.5, AC-ANC-004), never assumed to be the literal "origin"."""
+
+    def test_fetches_and_defaults_target_ref_against_the_configured_remote(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Given: `git config --get branch.main.remote` reports a non-"origin" remote name
+        When: cmd_check_ancestry is called with no explicit target-ref
+        Then: `git fetch` and the merge-base default target-ref both use that remote name
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fetch_calls: list[list[str]] = []
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "config", "--get", "branch.main.remote"]:
+                return (0, "upstream\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                fetch_calls.append(cmd)
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "upstream/dep-branch")
+
+        assert result == 0
+        assert fetch_calls == [["git", "fetch", "upstream"]]
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "upstream/dep-branch", "upstream/main"]]
+
+    def test_unresolvable_remote_exits_one_naming_the_config_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch has no configured tracking remote (`git config --get` fails)
+        When: cmd_check_ancestry is called
+        Then: rc is 1 and stderr names the exact `git config branch.<default-branch>.remote`
+              setting the operator needs to fix -- no fetch or merge-base call is attempted
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "config", "--get", "branch.main.remote"]:
+                return (1, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "branch.main.remote" in captured.err
+
+    def test_unresolvable_default_branch_exits_one_before_remote_lookup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch itself cannot be determined (no configured
+               default branch, and the `origin/HEAD` fallback also fails)
+        When: cmd_check_ancestry is called
+        Then: rc is 1 and no git config / fetch / merge-base call is ever attempted
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (128, "", "fatal: ambiguous argument 'origin/HEAD'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+    def test_unresolvable_default_branch_remediation_is_reachable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch itself cannot be determined
+        When: cmd_check_ancestry is called
+        Then: the printed remediation does not tell the operator to "pass an
+              explicit target-ref" -- _prepare_ancestry_probe_context calls
+              _resolve_ancestry_remote unconditionally (the remote is also
+              needed for `git fetch` and the squash probe's `--base`), so an
+              explicit target-ref would hit the identical error again
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (128, "", "fatal: ambiguous argument 'origin/HEAD'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.err.strip() == (
+            f"ERROR: Cannot determine default branch for '{self._REPO}' to resolve its tracking "
+            "remote. Set 'default_branch' for this repo in devbench.yaml, or run "
+            "'git remote set-head <remote-name> --auto' for the repo's configured tracking remote."
+        )
+        assert "target-ref" not in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryDisabled(_AncestryCmdFixtures):
+    """When the ancestry gate is disabled (or unconfigured) for the unit's repo,
+    the command must print exactly the spec 4.1 disabled line and exit 0 before
+    any git call (spec 4.1, AC-ANC-006)."""
+
+    @pytest.mark.parametrize("enabled", [False], ids=["explicitly_disabled"])
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, enabled: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=enabled)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "ancestry", "status": "disabled"}'
+
+    def test_gate_absent_from_config_defaults_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: `devbench.yaml` has no `gates:` key at all (D-17 built-in default: disabled)
+        When: cmd_check_ancestry is called
+        Then: the disabled line prints and rc is 0, without any per-gate config present
+        """
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {self._REPO}:\n    default_branch: main\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "ancestry", "status": "disabled"}'
+
+    def test_config_load_failure_exits_one_before_any_git_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: `DEVBENCH_CONFIG_PATH` points at a config file that does not exist
+        When: cmd_check_ancestry is called
+        Then: rc is 1, the loader's own ERROR is printed, and no git call is attempted
+        """
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "does-not-exist" / "devbench.yaml"))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
 
 
 @pytest.mark.unit

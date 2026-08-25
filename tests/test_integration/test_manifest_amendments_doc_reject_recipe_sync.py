@@ -28,6 +28,15 @@ subcommand itself, and no longer claims the verify step is a single
    ``**Step B.reject**`` section actually exists there with a fenced bash
    block containing at least one ``git`` invocation, so the pointer cannot
    rot into a dangling reference.
+
+Background (E3-F2-S1-T9): the ``MANIFEST_AMENDER_PATH`` constant,
+``STEP_B_REJECT_FENCE_PATTERN`` regex, ``manifest_amender_text`` fixture and
+the two ``**Step B.reject**`` pointer-integrity assertions used to be
+hand-copied here and in the sibling
+``test_orchestrate_skill_reject_recipe_sync.py`` (E3-F2-S1-T7) module. Both
+are now defined exactly once in ``tests/test_integration/conftest.py`` and
+consumed from there; this module keeps only the
+docs/manifest-amendments.md-specific extraction pattern and assertions.
 """
 
 from __future__ import annotations
@@ -36,23 +45,13 @@ import re
 from pathlib import Path
 
 import pytest
+from test_integration.conftest import (
+    assert_manifest_amender_file_exists,
+    assert_step_b_reject_section_exists,
+    assert_step_b_reject_section_has_git_invocation,
+)
 
 DOC_PATH = Path(__file__).resolve().parent.parent.parent / "docs" / "manifest-amendments.md"
-
-MANIFEST_AMENDER_PATH = (
-    Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "manifest-amender.md"
-)
-
-# Extraction of the fenced bash block that immediately follows the
-# "**Step B.reject**" header. Deliberately does not pin any specific git
-# subcommand (restore/checkout/clean today, something else once a future
-# rewrite lands) -- only that the section's recipe still contains a `git`
-# invocation, so the pointer docs/manifest-amendments.md relies on cannot
-# silently degrade to an empty or command-free body.
-STEP_B_REJECT_FENCE_PATTERN = re.compile(
-    r"\*\*Step B\.reject\*\*.*?```bash\n(?P<code>.*?)```",
-    re.DOTALL,
-)
 
 # Narrow extraction of item 7 of the "## Flow" numbered list: it starts at
 # the literal "7. On `reject`:" marker and runs to the start of item 8
@@ -79,11 +78,6 @@ def doc_text() -> str:
 
 
 @pytest.fixture(scope="module")
-def manifest_amender_text() -> str:
-    return MANIFEST_AMENDER_PATH.read_text(encoding="utf-8")
-
-
-@pytest.fixture(scope="module")
 def item_7(doc_text: str) -> str:
     match = ITEM_7_PATTERN.search(doc_text)
     assert match is not None, (
@@ -104,7 +98,7 @@ class TestManifestAmendmentsDocRejectRecipeSync:
         assert DOC_PATH.is_file(), f"docs/manifest-amendments.md missing at {DOC_PATH}"
 
     def test_manifest_amender_file_exists(self) -> None:
-        assert MANIFEST_AMENDER_PATH.is_file(), f"manifest-amender.md missing at {MANIFEST_AMENDER_PATH}"
+        assert_manifest_amender_file_exists()
 
     def test_item_7_is_extracted(self, item_7: str) -> None:
         assert item_7.strip(), "Extracted item 7 is unexpectedly empty."
@@ -154,29 +148,7 @@ class TestManifestAmendmentsDocRejectRecipeSync:
         )
 
     def test_manifest_amender_step_b_reject_section_exists(self, manifest_amender_text: str) -> None:
-        assert "**Step B.reject**" in manifest_amender_text, (
-            "manifest-amender.md no longer contains a '**Step B.reject**' "
-            "section. docs/manifest-amendments.md item 7 points at this "
-            "file as the single source of truth for the git-cleanup "
-            "recipe; if the section is renamed or removed, that pointer "
-            "becomes stale and must be updated in the same change."
-        )
+        assert_step_b_reject_section_exists(manifest_amender_text)
 
     def test_manifest_amender_step_b_reject_section_has_git_invocation(self, manifest_amender_text: str) -> None:
-        match = STEP_B_REJECT_FENCE_PATTERN.search(manifest_amender_text)
-        assert match is not None, (
-            "Could not locate a fenced ```bash block following the "
-            "'**Step B.reject**' header in manifest-amender.md via the "
-            f"extraction pattern {STEP_B_REJECT_FENCE_PATTERN.pattern!r}. "
-            "Either the section's structure changed or the pattern needs "
-            "updating to track it."
-        )
-        code_block = match.group("code")
-        assert re.search(r"\bgit\b", code_block), (
-            "The '**Step B.reject**' fenced code block in manifest-amender.md "
-            "contains no 'git' invocation. docs/manifest-amendments.md item "
-            "7 points at this section as the single source of truth for "
-            "the git-cleanup recipe; a section that survives with an empty "
-            "or command-free body would leave that pointer misleading even "
-            "though the '**Step B.reject**' heading itself still exists."
-        )
+        assert_step_b_reject_section_has_git_invocation(manifest_amender_text)

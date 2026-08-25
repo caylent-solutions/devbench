@@ -129,7 +129,7 @@ Every rejection also writes a structured feedback JSON to `<workspace>/.devbench
 }
 ```
 
-`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Rejection reasons that include any of the canonical category tokens are auto-classified by substring match; everything else falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
+`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Classification resolves by the EARLIEST canonical token named in the upper-cased rejection reason, not by a fixed scan order over the taxonomy: a reason mentioning several tokens (for example a rejection that opens with `PRE_FILTER` but later reports that `APPROACH_AUTH, SCOPE and JUSTIFICATION_COHERENCE all PASSED`) classifies as whichever token appears first in the text. A reason naming no canonical token falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
 
 The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
 

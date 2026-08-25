@@ -11,25 +11,37 @@ against real pytest subprocess invocations.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import devbench.tdd_gate
+from devbench.backlog.manager import BacklogManager
 from devbench.tdd_gate import (
+    NODE_FRAMEWORK,
+    PYTEST_FRAMEWORK,
     REMEDY_1,
     REMEDY_2,
     REMEDY_3,
     RedObservation,
     TddGateRejectionError,
+    TestFramework,
     TestObservation,
     _build_rejection_message,
     _exit_code_reason,
+    _no_diagnostic,
+    _node_missing_file_diagnostic,
+    _parse_tap_node_outcome,
     classify_production_paths,
+    default_node_test_runner,
     default_pytest_runner,
     find_named_test_node_id,
     find_paths_outside_manifest,
     observe_red,
+    resolve_test_framework,
     stash_push_scoped,
 )
 
@@ -775,3 +787,482 @@ class TestObserveRedPopRunsEvenWhenTestStepRaises:
         assert prod_file.read_text(encoding="utf-8") == "x = 2\n"
         stash_list = subprocess.run(["git", "stash", "list"], cwd=repo, check=True, capture_output=True, text=True)
         assert stash_list.stdout.strip() == ""
+
+
+# ===========================================================================
+# node:test support (config-selectable `validate.test_runner: node`).
+#
+# The pytest classes above are untouched and must stay green: every function
+# these exercise takes its `framework` as a keyword defaulting to
+# PYTEST_FRAMEWORK, so a caller that passes nothing behaves exactly as it did
+# before node support existed. That "no regression" property is the point of
+# the default, and the 50 pre-existing cases above are its assertion.
+#
+# `default_node_test_runner` is covered twice on purpose. The monkeypatched
+# class pins the wiring -- the argv node is invoked with, and that the TAP
+# output is routed through the parser -- deterministically and without
+# needing a node binary, so the coverage floor never depends on one being
+# installed. The `TestDefaultNodeTestRunnerAgainstRealNode` class re-checks
+# the same behaviours against a real `node --test` so the measured semantics
+# recorded in this module's comments cannot silently drift from reality; it
+# skips where node is absent, and proves nothing the first class does not
+# already cover.
+# ===========================================================================
+
+requires_node = pytest.mark.skipif(shutil.which("node") is None, reason="requires a node binary on PATH")
+
+
+def _node_work_unit(name: str, path: str = "tests/greeter.test.js") -> str:
+    """A work unit whose single [RED] entry names a node-shaped test node id."""
+    return _work_unit_content([f'- [RED] 2026-08-25T10:00:00Z -- observed {path}::"{name}" failing.'])
+
+
+# ---------------------------------------------------------------------------
+# _parse_tap_node_outcome -- the load-bearing check for node, since node
+# collapses "file missing", "syntax error", and "assertion failed" into one
+# exit code and only the outcome line tells them apart.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestParseTapNodeOutcome:
+    # Verbatim `node --test --test-reporter=tap` output (Node 22), trimmed of
+    # its YAML diagnostic blocks. Kept as one realistic sample rather than
+    # per-test fragments so the indentation, the subtest numbering restart,
+    # and node's `\#` name escaping are all exercised against the shape node
+    # actually emits.
+    TAP = (
+        "TAP version 13\n"
+        "# Subtest: greets by name\n"
+        "ok 1 - greets by name\n"
+        "# Subtest: shouts loudly\n"
+        "not ok 2 - shouts loudly\n"
+        "# Subtest: skipped one\n"
+        "ok 3 - skipped one # SKIP\n"
+        "# Subtest: unfinished one\n"
+        "not ok 4 - unfinished one # TODO\n"
+        "# Subtest: rejects \\# in header\n"
+        "ok 5 - rejects \\# in header\n"
+        "# Subtest: suite\n"
+        "    # Subtest: nested case\n"
+        "    ok 1 - nested case\n"
+        "    1..1\n"
+        "ok 6 - suite\n"
+        "1..6\n"
+    )
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("greets by name", "PASSED"),
+            ("shouts loudly", "FAILED"),
+            # An indented subtest: a `describe`/`it` suite names its cases at
+            # the inner level, so anchoring to column zero would see only the
+            # suite and never the test an agent actually names.
+            ("nested case", "PASSED"),
+            ("suite", "PASSED"),
+            # Node escapes a `#` inside a name; the agent writes the name as
+            # the source declares it, so the parsed line must be un-escaped
+            # before comparison or this never matches.
+            ("rejects # in header", "PASSED"),
+            ("never declared", None),
+        ],
+    )
+    def test_outcomes_are_read_from_the_tap_line(self, name: str, expected: str | None) -> None:
+        assert _parse_tap_node_outcome(self.TAP, f'tests/g.test.js::"{name}"') == expected
+
+    @pytest.mark.parametrize("name", ["skipped one", "unfinished one"])
+    def test_skip_and_todo_directives_are_neither_passed_nor_failed(self, name: str) -> None:
+        # ERROR is accepted by neither gate, which is the fail-closed answer
+        # for both: a `# SKIP` reported as PASSED would satisfy green-green's
+        # "passed before and after" without the test ever running, and a
+        # `# TODO` reported as FAILED would satisfy the RED gate without the
+        # defect ever being reproduced.
+        assert _parse_tap_node_outcome(self.TAP, f'tests/g.test.js::"{name}"') == "ERROR"
+
+    def test_empty_output_yields_no_outcome(self) -> None:
+        assert _parse_tap_node_outcome("", 'tests/g.test.js::"greets by name"') is None
+
+    def test_backslash_in_a_name_is_unescaped_before_comparison(self) -> None:
+        tap = "ok 1 - back\\\\slash here\n"
+        assert _parse_tap_node_outcome(tap, 'tests/g.test.js::"back\\slash here"') == "PASSED"
+
+    def test_an_unrecognised_escape_is_left_alone_rather_than_mangled(self) -> None:
+        # Only `\\` and `\#` are node's own name escapes. A `\n` pair is left
+        # as the two characters it is, so it can only match a node id that
+        # spells the same two characters -- never a different name that a
+        # blanket "drop every backslash" rule would collide it with.
+        tap = "ok 1 - literal \\n pair\n"
+        assert _parse_tap_node_outcome(tap, 'tests/g.test.js::"literal \\n pair"') == "PASSED"
+        assert _parse_tap_node_outcome(tap, 'tests/g.test.js::"literal n pair"') is None
+
+
+# ---------------------------------------------------------------------------
+# _node_missing_file_diagnostic / _no_diagnostic
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestRunnerDiagnostics:
+    def test_missing_file_line_is_recovered_from_node_output(self) -> None:
+        output = "some noise\nCould not find 'tests/gone.test.js'\nmore noise\n"
+        assert _node_missing_file_diagnostic(output) == "Could not find 'tests/gone.test.js'"
+
+    def test_absent_marker_yields_no_diagnostic(self) -> None:
+        assert _node_missing_file_diagnostic("not ok 1 - boom\n") is None
+
+    def test_pytest_has_no_diagnostic_to_recover(self) -> None:
+        # Pytest's exit codes 2 and 4 already name their own cause, so there
+        # is nothing a diagnostic line would add; the hook exists so
+        # TestFramework can require one unconditionally.
+        assert _no_diagnostic("Could not find 'anything'") is None
+
+
+# ---------------------------------------------------------------------------
+# default_node_test_runner -- wiring, pinned without needing a node binary
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestDefaultNodeTestRunnerWiring:
+    @staticmethod
+    def _capture(monkeypatch: pytest.MonkeyPatch, result: tuple[int, str, str]) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def _fake_run_command(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+            calls.append(argv)
+            return result
+
+        monkeypatch.setattr("devbench.tdd_gate.run_command", _fake_run_command)
+        return calls
+
+    def test_runs_node_at_file_scope_with_the_tap_reporter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        calls = self._capture(monkeypatch, (0, "ok 1 - greets by name\n", ""))
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        # File scope, never `--test-name-pattern`: a pattern that matches
+        # nothing exits 0 with no outcome line, indistinguishable from a file
+        # that ran and passed -- the false GREEN this discipline prevents.
+        assert calls == [["node", "--test", "--test-reporter=tap", "tests/greeter.test.js"]]
+        assert observation.exit_code == 0
+        assert observation.node_outcome == "PASSED"
+
+    def test_stdout_and_stderr_are_both_searched_for_the_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._capture(monkeypatch, (1, "", "not ok 1 - greets by name\n"))
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 1
+        assert observation.node_outcome == "FAILED"
+        assert "not ok 1" in observation.raw_output
+
+    def test_missing_file_yields_exit_1_and_no_outcome(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        # Node has no exit-4 equivalent: a missing file exits 1 exactly as an
+        # assertion failure does, so only the absent outcome line proves the
+        # named test never ran.
+        self._capture(monkeypatch, (1, "", "Could not find 'tests/greeter.test.js'\n"))
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 1
+        assert observation.node_outcome is None
+        assert _node_missing_file_diagnostic(observation.raw_output) == "Could not find 'tests/greeter.test.js'"
+
+
+# ---------------------------------------------------------------------------
+# default_node_test_runner -- the measured semantics, against a real node
+# ---------------------------------------------------------------------------
+@requires_node
+@pytest.mark.unit
+class TestDefaultNodeTestRunnerAgainstRealNode:
+    @staticmethod
+    def _write_suite(tmp_path: Path, body: str) -> None:
+        write_scratch_file(
+            tmp_path,
+            "tests/greeter.test.js",
+            "const { test } = require('node:test');\nconst assert = require('node:assert');\n" + body,
+        )
+
+    def test_genuine_failure_reports_exit_1_and_failed_outcome(self, tmp_path: Path) -> None:
+        self._write_suite(tmp_path, "test('greets by name', () => { assert.strictEqual(1, 2); });\n")
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 1
+        assert observation.node_outcome == "FAILED"
+
+    def test_passing_test_reports_exit_0_and_passed_outcome(self, tmp_path: Path) -> None:
+        self._write_suite(tmp_path, "test('greets by name', () => { assert.ok(true); });\n")
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 0
+        assert observation.node_outcome == "PASSED"
+
+    def test_syntax_error_reports_exit_1_and_no_outcome(self, tmp_path: Path) -> None:
+        # The case that most needs outcome-line matching: node reports the
+        # same exit 1 it reports for an honest assertion failure, so an
+        # exit-code-only check would accept this as a RED.
+        write_scratch_file(tmp_path, "tests/greeter.test.js", "this is not ( valid javascript\n")
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 1
+        assert observation.node_outcome is None
+
+    def test_missing_file_reports_exit_1_and_the_could_not_find_line(self, tmp_path: Path) -> None:
+        observation = default_node_test_runner('tests/greeter.test.js::"greets by name"', tmp_path)
+        assert observation.exit_code == 1
+        assert observation.node_outcome is None
+        assert _node_missing_file_diagnostic(observation.raw_output) is not None
+
+
+# ---------------------------------------------------------------------------
+# resolve_test_framework -- config value to framework
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestResolveTestFramework:
+    def test_unset_resolves_to_pytest_so_existing_configs_are_unchanged(self) -> None:
+        assert resolve_test_framework(None) is PYTEST_FRAMEWORK
+
+    @pytest.mark.parametrize(("name", "expected"), [("pytest", PYTEST_FRAMEWORK), ("node", NODE_FRAMEWORK)])
+    def test_declared_names_resolve_to_their_framework(self, name: str, expected: TestFramework) -> None:
+        assert resolve_test_framework(name) is expected
+
+    def test_unknown_name_fails_closed_and_names_the_valid_values(self) -> None:
+        # Never a silent fallback to pytest: that would reject every node
+        # test as uncollected, which reads as a broken gate rather than as
+        # the misconfiguration it is.
+        with pytest.raises(TddGateRejectionError) as exc:
+            resolve_test_framework("jest")
+        assert "jest" in str(exc.value)
+        assert "node" in str(exc.value)
+        assert "pytest" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# find_named_test_node_id under the node framework
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestFindNamedNodeTestNodeId:
+    def test_quoted_name_with_spaces_is_found_in_free_text(self) -> None:
+        content = _node_work_unit("greets by name")
+        assert find_named_test_node_id(content, NODE_FRAMEWORK) == 'tests/greeter.test.js::"greets by name"'
+
+    def test_most_recent_red_entry_wins(self) -> None:
+        content = _work_unit_content(
+            [
+                '- [RED] 2026-08-25T10:00:00Z -- observed a/x.test.js::"first" failing.',
+                '- [RED] 2026-08-25T11:00:00Z -- observed a/y.test.js::"second" failing.',
+            ]
+        )
+        assert find_named_test_node_id(content, NODE_FRAMEWORK) == 'a/y.test.js::"second"'
+
+    def test_a_pytest_shaped_id_is_not_accepted_for_a_node_repo(self) -> None:
+        # The two patterns are mutually exclusive by construction (`::"` can
+        # never occur in a pytest node id, `.py::` never in a quoted one), so
+        # an id written in the wrong shape is not half-matched into something
+        # plausible -- it is simply not found, and the rejection names the
+        # shape that was expected.
+        content = _work_unit_content(["- [RED] 2026-08-25T10:00:00Z -- observed tests/test_x.py::test_x failing."])
+        assert find_named_test_node_id(content, NODE_FRAMEWORK) is None
+
+    def test_a_node_shaped_id_is_not_accepted_for_a_pytest_repo(self) -> None:
+        assert find_named_test_node_id(_node_work_unit("greets by name")) is None
+
+    def test_an_unquoted_node_name_is_not_found(self) -> None:
+        # Without the quotes there is no way to know where an arbitrary test
+        # name ends, so the shape is required rather than guessed at.
+        content = _work_unit_content(["- [RED] 2026-08-25T10:00:00Z -- observed a/x.test.js::greets by name failing."])
+        assert find_named_test_node_id(content, NODE_FRAMEWORK) is None
+
+
+# ---------------------------------------------------------------------------
+# Rejection messages under the node framework -- the agent that has to
+# produce a conforming [RED] entry reads these, so they must name node's
+# vocabulary, never pytest's.
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestNodeRejectionMessages:
+    def test_exit_code_reason_uses_the_node_table(self) -> None:
+        assert "node --test" in _exit_code_reason(0, NODE_FRAMEWORK)
+        assert "node --test" in _exit_code_reason(1, NODE_FRAMEWORK)
+
+    def test_unknown_node_exit_code_names_node_not_pytest(self) -> None:
+        reason = _exit_code_reason(127, NODE_FRAMEWORK)
+        assert "127" in reason
+        assert "node" in reason
+        assert "pytest" not in reason
+
+    def test_expected_line_names_node_and_its_failure_exit_code(self) -> None:
+        message = _build_rejection_message("T-1", 'a/x.test.js::"boom"', 0, "no RED", NODE_FRAMEWORK)
+        assert "Expected: node exit code 1" in message
+        assert "pytest" not in message
+
+    def test_missing_node_id_rejection_states_the_shape_the_agent_must_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(BacklogManager, "_production_source_extensions", classmethod(lambda cls: (".js",)))
+        repo = _init_repo(tmp_path)
+        _write(repo, "src/greeter.js", "module.exports = () => 'hi';\n")
+        _commit_all(repo, "seed")
+        with pytest.raises(TddGateRejectionError) as exc:
+            observe_red(
+                "T-2",
+                repo,
+                ["src/greeter.js"],
+                _work_unit_content(["- [RED] 2026-08-25T10:00:00Z -- it failed, trust me."]),
+                framework=NODE_FRAMEWORK,
+            )
+        message = str(exc.value)
+        assert '<path>::"<test name>"' in message
+        assert "double quotes" in message
+        assert "'node'" in message
+
+
+# ---------------------------------------------------------------------------
+# observe_red under the node framework
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestObserveRedWithNodeFramework:
+    @staticmethod
+    def _js_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A repo whose production source is JavaScript, per Rule 14's config.
+
+        `validate.production_source_extensions` is what an operator sets to
+        make Rule 14 see `.js` as production source; without it a pure-Node
+        manifest classifies to nothing and the gate rejects for "no
+        production-source rows" long before it reaches the test runner. That
+        key predates this change and is orthogonal to `test_runner` -- both
+        are needed for a Node repo, which is why the schema description for
+        `test_runner` points at it.
+        """
+        monkeypatch.setattr(BacklogManager, "_production_source_extensions", classmethod(lambda cls: (".js",)))
+        repo = _init_repo(tmp_path)
+        _write(repo, "src/greeter.js", "module.exports = () => 'hi';\n")
+        _write(repo, "tests/greeter.test.js", "// placeholder\n")
+        _commit_all(repo, "seed")
+        _write(repo, "src/greeter.js", "module.exports = () => 'hello';\n")
+        return repo
+
+    def test_a_genuine_node_red_is_observed_and_digested(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        repo = self._js_repo(tmp_path, monkeypatch)
+        observed: list[str] = []
+
+        def _runner(node_id: str, repo_path: Path) -> TestObservation:
+            observed.append(node_id)
+            return TestObservation(exit_code=1, node_outcome="FAILED", raw_output="not ok 1 - greets by name")
+
+        result = observe_red(
+            "T-3",
+            repo,
+            ["src/greeter.js", "tests/greeter.test.js"],
+            _node_work_unit("greets by name"),
+            framework=NODE_FRAMEWORK,
+            test_runner=_runner,
+        )
+        assert observed == ['tests/greeter.test.js::"greets by name"']
+        assert result.test_node_id == 'tests/greeter.test.js::"greets by name"'
+        assert result.exit_code == 1
+        assert result.failure_digest == hashlib.sha256(b"not ok 1 - greets by name").hexdigest()
+
+    def test_the_frameworks_own_runner_is_used_when_none_is_injected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The `test_runner` keyword is a test seam, not the selection
+        # mechanism: omitting it must reach `framework.runner`, or the whole
+        # config path would be inert in production while the tests passed.
+        repo = self._js_repo(tmp_path, monkeypatch)
+        # Only the `node` invocation is stubbed: `run_command` is also how
+        # this module shells out to git, and a blanket stub would break the
+        # very stash round-trip the gate is built around.
+        real_run_command = devbench.tdd_gate.run_command
+
+        def _only_stub_node(argv: list[str], **kwargs: Any) -> tuple[int, str, str]:
+            if argv[0] == "node":
+                return 1, "not ok 1 - greets by name\n", ""
+            return real_run_command(argv, **kwargs)  # type: ignore[no-any-return]
+
+        monkeypatch.setattr("devbench.tdd_gate.run_command", _only_stub_node)
+        result = observe_red(
+            "T-4",
+            repo,
+            ["src/greeter.js", "tests/greeter.test.js"],
+            _node_work_unit("greets by name"),
+            framework=NODE_FRAMEWORK,
+        )
+        assert result.exit_code == 1
+
+    def test_a_missing_test_file_is_rejected_with_nodes_diagnostic_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The exit code alone (1) is the same one a genuine RED produces, so
+        # without the recovered `Could not find` line an operator reads only
+        # "outcome was not collected" and goes hunting for a collection error
+        # that does not exist.
+        repo = self._js_repo(tmp_path, monkeypatch)
+
+        def _runner(node_id: str, repo_path: Path) -> TestObservation:
+            return TestObservation(
+                exit_code=1, node_outcome=None, raw_output="Could not find 'tests/greeter.test.js'\n"
+            )
+
+        with pytest.raises(TddGateRejectionError) as exc:
+            observe_red(
+                "T-5",
+                repo,
+                ["src/greeter.js", "tests/greeter.test.js"],
+                _node_work_unit("greets by name"),
+                framework=NODE_FRAMEWORK,
+                test_runner=_runner,
+            )
+        message = str(exc.value)
+        assert "not collected" in message
+        assert "Runner diagnostic: Could not find 'tests/greeter.test.js'" in message
+
+    @pytest.mark.parametrize(
+        ("exit_code", "node_outcome"),
+        [
+            (0, "PASSED"),
+            # A `# SKIP`/`# TODO` directive parses to ERROR, which the gate
+            # must reject exactly as it rejects a pytest setup error.
+            (1, "ERROR"),
+        ],
+    )
+    def test_a_non_failure_outcome_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, node_outcome: str
+    ) -> None:
+        repo = self._js_repo(tmp_path, monkeypatch)
+
+        def _runner(node_id: str, repo_path: Path) -> TestObservation:
+            return TestObservation(exit_code=exit_code, node_outcome=node_outcome, raw_output="whatever")
+
+        with pytest.raises(TddGateRejectionError) as exc:
+            observe_red(
+                "T-6",
+                repo,
+                ["src/greeter.js", "tests/greeter.test.js"],
+                _node_work_unit("greets by name"),
+                framework=NODE_FRAMEWORK,
+                test_runner=_runner,
+            )
+        assert node_outcome in str(exc.value)
+
+    @requires_node
+    def test_end_to_end_against_a_real_node_test_suite(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The whole path with nothing stubbed: a real git repo, a real
+        # path-scoped stash of the JavaScript fix, and a real `node --test`
+        # run proving the committed test genuinely fails without it.
+        monkeypatch.setattr(BacklogManager, "_production_source_extensions", classmethod(lambda cls: (".js",)))
+        repo = _init_repo(tmp_path)
+        _write(repo, "src/greeter.js", "module.exports = (name) => 'hi';\n")
+        _write(
+            repo,
+            "tests/greeter.test.js",
+            "const { test } = require('node:test');\n"
+            "const assert = require('node:assert');\n"
+            "const greet = require('../src/greeter.js');\n"
+            "test('greets by name', () => { assert.strictEqual(greet('Ada'), 'hi Ada'); });\n",
+        )
+        _commit_all(repo, "seed: pinning test committed against still-broken source")
+        # The fix, staged-but-uncommitted exactly as the executor leaves it.
+        _write(repo, "src/greeter.js", "module.exports = (name) => `hi ${name}`;\n")
+
+        result = observe_red(
+            "T-7",
+            repo,
+            ["src/greeter.js", "tests/greeter.test.js"],
+            _node_work_unit("greets by name"),
+            framework=NODE_FRAMEWORK,
+        )
+        assert result.test_node_id == 'tests/greeter.test.js::"greets by name"'
+        assert result.exit_code == 1
+        # The stash was popped: the fix is back in the tree.
+        assert "`hi ${name}`" in (repo / "src/greeter.js").read_text(encoding="utf-8")

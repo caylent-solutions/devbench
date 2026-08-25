@@ -301,9 +301,16 @@ _GREEN_GREEN_OBSERVED_MESSAGE_TEMPLATE: str = "test_node_ids={test_node_ids}"
 
 # Re-validates the matched entry's message body independently of whatever
 # validation ran at write time (mirroring RED_OBSERVED_MESSAGE_FIELDS_RE):
-# requires the single ``test_node_ids=`` field, a comma-joined run of
-# non-whitespace node ids, with no partial-record fallback.
-_GREEN_GREEN_OBSERVED_MESSAGE_FIELDS_RE = re.compile(r"^test_node_ids=(?P<test_node_ids>\S+)$")
+# requires the single ``test_node_ids=`` field, comma-joined, with no
+# partial-record fallback.
+#
+# The value is ``.+`` rather than ``\S+`` for the same reason
+# RED_OBSERVED_MESSAGE_FIELDS_RE widened: a ``node:test`` node id contains
+# spaces. Greedy is safe here because this is the only field and it is
+# anchored at both ends, and the capture is never split back into
+# individual ids -- ``green_green_observed_satisfied`` only asks whether a
+# well-formed record is present.
+_GREEN_GREEN_OBSERVED_MESSAGE_FIELDS_RE = re.compile(r"^test_node_ids=(?P<test_node_ids>.+)$")
 
 
 def green_green_observed_satisfied(content: str) -> bool:

@@ -1292,7 +1292,7 @@ Append a TDD phase entry to the work-unit's `## TDD Cycle Log` section. `devbenc
 ERROR: TDD phase 'RED_OBSERVED' is orchestrator-only and cannot be written via log-tdd; agent-writable phases are: GREEN, RED, REFACTOR.
 ```
 
-The `RED_OBSERVED` entry itself is written exclusively by the orchestrator's internal `write_red_observed_entry` function after it independently runs the test suite and observes a nonzero exit code; there is no `log-tdd-red-observed` CLI subcommand an agent could invoke. The record is a fixed three-field message, not free text -- every field in `devbench.constants.RED_OBSERVED_RECORD_FIELDS` is required: `exit_code` (the test-runner's observed exit code), `test_node_id` (the failing pytest node ID), and `failure_digest` (a hash-shaped digest of the failure output). A record missing any field is rejected before it is written, naming the missing field:
+The `RED_OBSERVED` entry itself is written exclusively by the orchestrator's internal `write_red_observed_entry` function after it independently runs the test suite and observes a nonzero exit code; there is no `log-tdd-red-observed` CLI subcommand an agent could invoke. The record is a fixed three-field message, not free text -- every field in `devbench.constants.RED_OBSERVED_RECORD_FIELDS` is required: `exit_code` (the test-runner's observed exit code), `test_node_id` (the failing node ID, in the configured framework's shape), and `failure_digest` (a hash-shaped digest of the failure output). `test_node_id` may contain interior spaces (a `node:test` id carries a quoted, arbitrary test name) but must be a single line with no surrounding whitespace, or it could not round-trip through the one-line record. A record missing any field is rejected before it is written, naming the missing field:
 
 ```
 RED_OBSERVED record is missing required field '<field>'.
@@ -1312,11 +1312,19 @@ The `GREEN_GREEN_OBSERVED` entry is written exclusively by `uv run devbench gree
 uv run devbench green-green-check <id> <test_node_id> [<test_node_id> ...]
 ```
 
-Each `<test_node_id>` must be a fully-qualified pytest node id -- there is no single fixed shape, since the shape depends on how the test is defined. Accepted forms:
+Each `<test_node_id>` must be a fully-qualified node id in the shape the target repo's configured test framework uses (`validate.test_runner`, per-repo overridable -- see [devbench-yaml-reference.md](devbench-yaml-reference.md#validatetest_runner)). Under the default `pytest` there is no single fixed shape, since the shape depends on how the test is defined. Accepted forms:
 
 - `<path>.py::<test_name>` (a module-level test function, e.g. `tests/test_foo.py::test_bar`).
 - `<path>.py::<Class>::<test_name>` (a test method nested in a class -- the common case in this repo, since most files under `tests/` define their tests inside a `class Test*`, e.g. `tests/test_foo.py::TestFoo::test_bar`).
 - `<path>.py::<Class>::<test_name>[<param>]` (a parametrized test method, with its `pytest.mark.parametrize` id suffix, e.g. `tests/test_foo.py::TestFoo::test_bar[case-1]`).
+
+Under `test_runner: node`, the shape is instead `<path>::"<test name>"` with the test name in double quotes -- for example `tests/greeter.test.js::"greets by name"`. The quotes are required because a `node:test` name is an arbitrary string that routinely contains spaces, and they mean the argument must also be shell-quoted:
+
+```
+uv run devbench green-green-check E1-F1-S1-T1 'tests/greeter.test.js::"greets by name"'
+```
+
+`devbench.tdd_gate.default_node_test_runner` runs `node --test --test-reporter=tap <file>` and matches the quoted name against the emitted `ok`/`not ok` TAP line. A test reported with a `# SKIP` or `# TODO` directive never counts as a pass: node reports `ok ... # SKIP` for a test that never executed, and treating that as passing would let a skipped test satisfy "passed before and after".
 
 A bare test *file* path is not accepted, and neither is a two-segment id for a class-nested test (it is missing the class segment): `devbench.tdd_gate.default_pytest_runner` scopes the run to the file but then matches the exact node id against the `-rA` outcome line via `_parse_node_outcome`, so anything short of the exact node id pytest itself would print on that `PASSED` line yields `node_outcome=None` and the check fails closed with "could not collect test". The authoritative source for a given test's node id is what pytest reports for it -- run `pytest <path>.py --collect-only -q` (or `-rA`) and copy the emitted id verbatim rather than hand-deriving it from the file's source.
 

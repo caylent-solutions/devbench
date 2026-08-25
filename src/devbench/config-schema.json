@@ -45,6 +45,11 @@
             "commit_subject_template": {
               "type": "string",
               "description": "Per-repo commit-subject template override. Placeholders: {unit_id}, {title}, {ticket} (the tracker id led by the work unit's **Branch:** field, e.g. SFB-229 from sfb-229-vendoring-pipeline). Overrides the top-level git_ops.commit_subject_template for this repo. Set this when the repo's own commit-msg hook enforces a subject shape the multi-dash work-unit ID cannot satisfy."
+            },
+            "test_runner": {
+              "type": "string",
+              "enum": ["pytest", "node"],
+              "description": "Per-repo test-framework override for the TDD RED gate (tdd-gate) and the refactor green-green check (green-green-check). Overrides the top-level validate.test_runner for this repo. Set this for one Node repo in a workspace whose other repos are Python."
             }
           }
         }
@@ -639,6 +644,11 @@
             "minLength": 1
           },
           "description": "Path prefixes every task type may declare in its Changes Manifest regardless of its task-type invariant (rule 21). Absent means no such prefix exists and the invariant is unchanged. Declare it when the target repository requires each ticket to carry an audit-trail record, for example ['.ai-sdlc/']: that record is neither production source, nor a test, nor documentation, so no existing classifier accepts it, yet a docs task and a chore task must both be able to own one. See docs/backlog-contract.md 'Task-Type Taxonomy'."
+        },
+        "test_runner": {
+          "type": "string",
+          "enum": ["pytest", "node"],
+          "description": "Which test framework the TDD RED gate (tdd-gate) and the refactor green-green check (green-green-check) invoke, overridden per-repo by repos.<org/repo>.test_runner. Absent (or 'pytest') keeps the original pytest-only behaviour exactly. 'node' selects 'node --test', for a target repo whose tests are node:test -- without it every behavior-fix and feature task in such a repo is rejected for naming no '<path>.py::<test>' node id, which it never could. With 'node', a [RED] entry must name its test as '<path>::\"<test name>\"', quoted, because a node:test name may contain spaces. Operator-selected rather than auto-detected: a repo carrying both a package.json and a pyproject.toml would make detection a coin flip."
         }
       }
     },

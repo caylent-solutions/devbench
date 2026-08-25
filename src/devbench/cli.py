@@ -221,6 +221,7 @@ from devbench.config_loader import (
     get_configured_default_branch,
     get_effective_branch_prefix,
     get_effective_commit_subject_template,
+    get_effective_test_runner,
 )
 from devbench.constants import (
     AGENT_WRITABLE_TDD_PHASES,
@@ -261,7 +262,7 @@ from devbench.constants import (
     RED_OBSERVED_MESSAGE_TEMPLATE,
     RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE,
     RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
-    RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE,
+    RED_OBSERVED_RECORD_UNPARSEABLE_TEST_NODE_ID_TEMPLATE,
     RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
@@ -289,6 +290,8 @@ from devbench.git_quarantine import UNATTRIBUTED_OWNER, QuarantineRecord, Restor
 
 if TYPE_CHECKING:
     from claude_agent_sdk.types import EffortLevel
+
+    from devbench.tdd_gate import TestFramework
 from devbench.github.git_ops import GitOpsService
 from devbench.log_setup import setup_logging
 from devbench.plugin_shadow import (
@@ -5051,10 +5054,11 @@ def build_red_observed_message(exit_code: int | None, test_node_id: str, failure
 
     Enforces the field-level constraints ``red_gate_satisfied`` re-validates
     on read, so a record that passes this builder always parses on read too:
-    a present, non-whitespace ``test_node_id`` (the read-side
-    ``RED_OBSERVED_MESSAGE_FIELDS_RE`` captures it as a single non-whitespace
-    token, so a space, tab or newline would build a record the gate can never
-    match), a nonzero ``exit_code``, and a hash-shaped ``failure_digest``
+    a present, single-line ``test_node_id`` with no surrounding whitespace
+    (the record is one log line, so a newline would split it into two lines
+    neither of which parses, and surrounding whitespace is eaten by the
+    field separator and so would not round-trip), a nonzero ``exit_code``,
+    and a hash-shaped ``failure_digest``
     (MEDIUM/LOW findings inherited on E4-F3-S1-T1). Raising ``ValueError``
     naming the offending field lets the orchestrator fail fast on a malformed
     record instead of writing one that silently never satisfies the gate.
@@ -5062,8 +5066,12 @@ def build_red_observed_message(exit_code: int | None, test_node_id: str, failure
     Args:
         exit_code: The observed test-run exit code. Must be present and nonzero
             -- a RED phase is, by definition, an observed failure.
-        test_node_id: The pytest node ID of the failing test. Must be
-            non-empty and contain no whitespace character.
+        test_node_id: The node ID of the failing test, in the configured
+            framework's shape. Must be non-empty, single-line, and free of
+            leading and trailing whitespace. Interior spaces ARE allowed: a
+            ``node:test`` node id carries its test name in quotes and that
+            name is an arbitrary string (``tests/g.test.js::"greets by
+            name"``).
         failure_digest: A lowercase hex digest of the failure output. Must
             match ``FAILURE_DIGEST_RE`` (8-64 lowercase hex characters) --
             never raw free text, which could otherwise leak paths or secrets
@@ -5074,16 +5082,16 @@ def build_red_observed_message(exit_code: int | None, test_node_id: str, failure
         message body (without the ``[RED_OBSERVED]`` tag or timestamp).
 
     Raises:
-        ValueError: If any field is missing/empty, ``test_node_id`` contains
-            whitespace, ``exit_code`` is zero, or ``failure_digest`` is not
-            hash-shaped.
+        ValueError: If any field is missing/empty, ``test_node_id`` spans
+            more than one line or is surrounded by whitespace, ``exit_code``
+            is zero, or ``failure_digest`` is not hash-shaped.
     """
     if exit_code is None:
         raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_EXIT_CODE))
     if not test_node_id:
         raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_TEST_NODE_ID))
-    if any(character.isspace() for character in test_node_id):
-        raise ValueError(RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE.format(test_node_id=test_node_id))
+    if "\n" in test_node_id or "\r" in test_node_id or test_node_id != test_node_id.strip():
+        raise ValueError(RED_OBSERVED_RECORD_UNPARSEABLE_TEST_NODE_ID_TEMPLATE.format(test_node_id=test_node_id))
     if not failure_digest:
         raise ValueError(RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE.format(field=RED_OBSERVED_FIELD_FAILURE_DIGEST))
     if exit_code == 0:
@@ -5162,9 +5170,13 @@ def cmd_tdd_gate(unit_id: str) -> int:
     production-source rows, no named test, a stash failure, or a false/no
     RED) -- see ``devbench.tdd_gate.observe_red`` for the full rejection
     taxonomy.
+
+    Which test framework runs is the target repo's configured
+    ``validate.test_runner`` (per-repo overridable), resolved here and
+    passed down; unset means pytest, exactly as before the key existed.
     """
     from devbench.backlog.manifest import ManifestParseError, parse_manifest
-    from devbench.tdd_gate import TddGateRejectionError, observe_red
+    from devbench.tdd_gate import TddGateRejectionError, observe_red, resolve_test_framework
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -5193,7 +5205,12 @@ def cmd_tdd_gate(unit_id: str) -> int:
         return 1
 
     try:
-        observation = observe_red(unit_id, repo_path, manifest_paths, content)
+        # Resolved inside the same try as the observation because
+        # `resolve_test_framework` fails closed the same way the gate does,
+        # with a `TddGateRejectionError` an operator reads on stderr -- an
+        # unrecognised `test_runner` is a rejected run, not a crash.
+        framework = resolve_test_framework(get_effective_test_runner(canonical_repo, RUNTIME_CONFIG))
+        observation = observe_red(unit_id, repo_path, manifest_paths, content, framework=framework)
     except TddGateRejectionError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -5247,20 +5264,32 @@ def _gg_clear_pycache(repo_path: Path) -> None:
         shutil.rmtree(cache_dir, ignore_errors=False)
 
 
-def _gg_run_named_tests(unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+def _gg_run_named_tests(
+    unit_id: str,
+    side: str,
+    test_node_ids: Sequence[str],
+    repo_path: Path,
+    framework: "TestFramework",
+) -> str | None:
     """Run every node id in *test_node_ids* on one *side* of a green-green check.
 
-    Reuses :func:`devbench.tdd_gate.default_pytest_runner` -- the identical
-    runner the RED gate itself uses -- so the pytest-invocation behavior
-    (file-scoped, ``-rA``) is defined exactly once (DRY), never duplicated.
-    Clears the bytecode cache first (see ``_gg_clear_pycache``).
+    Reuses ``framework.runner`` -- the identical runner the RED gate itself
+    uses for the same configured framework -- so the invocation behavior
+    (file-scoped, plus ``-rA`` for pytest or ``--test-reporter=tap`` for
+    node) is defined exactly once in ``devbench.tdd_gate`` (DRY), never
+    duplicated here. Clears the bytecode cache first (see
+    ``_gg_clear_pycache``).
 
     Args:
         unit_id: The work unit id, named in every rejection message.
         side: ``"before"`` or ``"after"``, named in every rejection message
             so an operator can tell which state failed.
-        test_node_ids: The pytest node ids to run.
+        test_node_ids: The node ids to run, in *framework*'s own shape.
         repo_path: The target repository's working tree.
+        framework: The target repo's configured test framework, supplying
+            both the runner and the pass exit code asserted against. Passed
+            in rather than resolved here so the before-state and
+            after-state runs cannot possibly disagree about it.
 
     Returns:
         ``None`` when every named test PASSED with exit code
@@ -5269,11 +5298,9 @@ def _gg_run_named_tests(unit_id: str, side: str, test_node_ids: Sequence[str], r
         (``node_outcome is None``) is reported as a collection failure --
         never silently as a pass -- mirroring FR-4.2's exit-2 semantics.
     """
-    from devbench.tdd_gate import PYTEST_EXIT_OK, default_pytest_runner
-
     _gg_clear_pycache(repo_path)
     for test_node_id in test_node_ids:
-        observation = default_pytest_runner(test_node_id, repo_path)
+        observation = framework.runner(test_node_id, repo_path)
         if observation.node_outcome is None:
             return (
                 f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run could "
@@ -5281,7 +5308,7 @@ def _gg_run_named_tests(unit_id: str, side: str, test_node_ids: Sequence[str], r
                 "collection failure is reported as a failure, never as a pass, per FR-4.6's "
                 "fail-closed semantics."
             )
-        if observation.exit_code != PYTEST_EXIT_OK or observation.node_outcome != "PASSED":
+        if observation.exit_code != framework.ok_exit_code or observation.node_outcome != "PASSED":
             return (
                 f"ERROR: green-green check rejected task '{unit_id}': the {side}-state run of "
                 f"'{test_node_id}' did not pass (exit code {observation.exit_code}, outcome "
@@ -5323,6 +5350,13 @@ def cmd_green_green_check(*argv: str) -> int:
     writes nothing -- the record is proof-of-success only, never
     proof-of-attempt.
 
+    The named tests are run by the target repo's configured
+    ``validate.test_runner`` (per-repo overridable), the same framework
+    ``tdd-gate`` uses for that repo, so a refactor task is never held to a
+    different test runner than the tasks around it. Under ``node`` the node
+    ids are quoted (``<path>::"<test name>"``) and so must be shell-quoted
+    when passed as arguments.
+
     Exits 0 only when every named test PASSED on both sides. Exits 1 on
     every rejection path: a dirty tree outside the Manifest, no
     production-source rows to reconstruct a "before" state from, no
@@ -5330,22 +5364,30 @@ def cmd_green_green_check(*argv: str) -> int:
     the "before" state from), a stash push/pop failure, or any test
     failing/not-collecting on either side.
     """
-    args = list(argv)
-    if len(args) < 2:
-        print("ERROR: green-green-check requires <id> <test_node_id> [<test_node_id> ...]", file=sys.stderr)
+    parsed = _gg_parse_args(list(argv))
+    if isinstance(parsed, str):
+        print(parsed, file=sys.stderr)
         return 1
-    unit_id, test_node_ids = args[0], args[1:]
+    unit_id, test_node_ids = parsed
+
+    from devbench.tdd_gate import TddGateRejectionError, resolve_test_framework
 
     resolved = _gg_resolve_target(unit_id)
     if isinstance(resolved, int):
         return resolved
-    repo_path, manifest_paths, wu_file = resolved
+    repo_path, manifest_paths, wu_file, repo_name = resolved
 
     prod_paths = _gg_preflight(unit_id, repo_path, manifest_paths)
     if isinstance(prod_paths, int):
         return prod_paths
 
-    result = _gg_run_before_after(unit_id, repo_path, prod_paths, test_node_ids)
+    try:
+        framework = resolve_test_framework(get_effective_test_runner(repo_name, RUNTIME_CONFIG))
+    except TddGateRejectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    result = _gg_run_before_after(unit_id, repo_path, prod_paths, test_node_ids, framework)
     if result != 0:
         return result
 
@@ -5360,17 +5402,48 @@ def cmd_green_green_check(*argv: str) -> int:
     return 0
 
 
-def _gg_resolve_target(unit_id: str) -> tuple[Path, list[str], Path] | int:
-    """Resolve the target repo path, Changes Manifest paths, and work-unit file
-    for green-green-check.
+def _gg_parse_args(args: Sequence[str]) -> tuple[str, list[str]] | str:
+    """Validate green-green-check's argv shape, returning ``(unit_id, node_ids)`` or an error.
 
-    Returns ``(repo_path, manifest_paths, wu_file)`` on success, or an
-    integer non-zero exit code (error already printed) on any resolution
-    failure. Consolidates the work-unit/repo/manifest lookups that would
-    otherwise be four separate early-return branches directly in
+    Two rejections, returned as one message rather than as two early exits
+    from ``cmd_green_green_check`` so that command keeps a single
+    bad-arguments branch:
+
+    1. Fewer than two arguments -- there is no test to run.
+    2. A node id spanning more than one line. The GREEN_GREEN_OBSERVED
+       record written on success is a single log line, so a newline would
+       write two lines neither of which re-validates. These ids come
+       straight from argv, and under the node framework they are
+       shell-quoted strings a caller could embed a newline in. Interior
+       spaces are fine and are that framework's normal case -- a node:test
+       id carries a quoted, arbitrary test name -- so only line breaks are
+       refused.
+    """
+    if len(args) < 2:
+        return "ERROR: green-green-check requires <id> <test_node_id> [<test_node_id> ...]"
+    unit_id, test_node_ids = args[0], list(args[1:])
+    unparseable = [node_id for node_id in test_node_ids if "\n" in node_id or "\r" in node_id]
+    if unparseable:
+        return (
+            f"ERROR: green-green check rejected task '{unit_id}': a test node id must be a single "
+            f"line, so the GREEN_GREEN_OBSERVED record it writes stays parseable; got {unparseable!r}."
+        )
+    return unit_id, test_node_ids
+
+
+def _gg_resolve_target(unit_id: str) -> tuple[Path, list[str], Path, str] | int:
+    """Resolve the target repo path, Changes Manifest paths, work-unit file,
+    and canonical repo name for green-green-check.
+
+    Returns ``(repo_path, manifest_paths, wu_file, canonical_repo)`` on
+    success, or an integer non-zero exit code (error already printed) on any
+    resolution failure. Consolidates the work-unit/repo/manifest lookups
+    that would otherwise be four separate early-return branches directly in
     ``cmd_green_green_check``. ``wu_file`` is returned (not just consumed
     here) so the caller can append the GREEN_GREEN_OBSERVED record to the
-    same file on success without re-resolving it.
+    same file on success without re-resolving it, and ``canonical_repo`` so
+    the caller can resolve that repo's configured test framework without
+    re-running ``resolve_repo``/``validate_repo``.
     """
     from devbench.backlog.manifest import ManifestParseError, parse_manifest
 
@@ -5400,7 +5473,7 @@ def _gg_resolve_target(unit_id: str) -> tuple[Path, list[str], Path] | int:
         print(f"ERROR: Changes Manifest could not be parsed for '{unit_id}': {exc}", file=sys.stderr)
         return 1
 
-    return repo_path, manifest_paths, wu_file
+    return repo_path, manifest_paths, wu_file, canonical_repo
 
 
 def _gg_preflight(unit_id: str, repo_path: Path, manifest_paths: Sequence[str]) -> list[str] | int:
@@ -5436,7 +5509,13 @@ def _gg_preflight(unit_id: str, repo_path: Path, manifest_paths: Sequence[str]) 
     return prod_paths
 
 
-def _gg_run_before_after(unit_id: str, repo_path: Path, prod_paths: Sequence[str], test_node_ids: Sequence[str]) -> int:
+def _gg_run_before_after(
+    unit_id: str,
+    repo_path: Path,
+    prod_paths: Sequence[str],
+    test_node_ids: Sequence[str],
+    framework: "TestFramework",
+) -> int:
     """Run the after/stash/before/pop sequence for green-green-check.
 
     Prints its own rejection messages and returns 0 when every named test
@@ -5456,7 +5535,7 @@ def _gg_run_before_after(unit_id: str, repo_path: Path, prod_paths: Sequence[str
     """
     from devbench.tdd_gate import stash_pop, stash_push_scoped
 
-    after_rejection = _gg_run_named_tests(unit_id, "after", test_node_ids, repo_path)
+    after_rejection = _gg_run_named_tests(unit_id, "after", test_node_ids, repo_path, framework)
     if after_rejection is not None:
         print(after_rejection, file=sys.stderr)
         return 1
@@ -5484,7 +5563,7 @@ def _gg_run_before_after(unit_id: str, repo_path: Path, prod_paths: Sequence[str
     before_rejection: str | None = None
     pop_error: str | None = None
     try:
-        before_rejection = _gg_run_named_tests(unit_id, "before", test_node_ids, repo_path)
+        before_rejection = _gg_run_named_tests(unit_id, "before", test_node_ids, repo_path, framework)
     except BaseException as caught:
         # Broad and intentional, mirroring observe_red: the pop in the
         # finally block below MUST still run when the before-state test

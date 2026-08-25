@@ -458,12 +458,28 @@ class ValidateConfig:
             task must both be able to own one. Widening by prefix rather
             than by extension keeps the exemption confined to the declared
             tree instead of admitting a file shape anywhere in the repo.
+        test_runner: Which test framework the TDD RED gate and the refactor
+            green-green check invoke, overridden per-repo by
+            ``RepoConfig.test_runner``. ``'pytest'`` (or ``None``, the
+            default) keeps the original behaviour exactly. ``'node'``
+            selects ``node --test``, for a target repo whose tests are
+            ``node:test`` rather than pytest -- without it, every
+            ``behavior-fix`` and ``feature`` task in such a repo is rejected
+            for naming no ``<path>.py::<test>`` node id, which it never
+            could. Operator-selected rather than auto-detected: a repo
+            carrying both a ``package.json`` and a ``pyproject.toml`` would
+            make detection a coin flip, and guessing wrong rejects honest
+            work with a message about the wrong tool. Sits beside
+            ``production_source_paths`` because it answers the same
+            question those keys do -- what shape is this target repo's
+            code.
     """
 
     check_orphan_path_tokens: bool = True
     production_source_paths: tuple[str, ...] | None = None
     production_source_extensions: tuple[str, ...] | None = None
     audit_trail_paths: tuple[str, ...] | None = None
+    test_runner: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1223,6 +1239,11 @@ class RepoConfig:
             is used, and when that is also unset the subject stays
             ``<unit-id>: <title>``.  Set this for a repo whose commit-msg hook
             enforces a subject shape the work-unit ID cannot satisfy.
+        test_runner: Per-repo test-framework override. When ``None``, the
+            top-level ``ValidateConfig.test_runner`` is used, and when that
+            is also unset the gate runs pytest. Set this for one Node repo
+            in a workspace whose other repos are Python -- the common case,
+            since a workspace's repos rarely all share one language.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
             ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
@@ -1239,6 +1260,7 @@ class RepoConfig:
     merge_strategy: str | None = None
     branch_prefix: str | None = None
     commit_subject_template: str | None = None
+    test_runner: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
 
@@ -1582,6 +1604,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
 
     repo_branch_prefix = _parse_branch_prefix(path, f"repos.{repo_name}.branch_prefix", repo_data.get("branch_prefix"))
     repo_commit_subject_template: str | None = repo_data.get("commit_subject_template") or None
+    repo_test_runner: str | None = repo_data.get("test_runner") or None
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
@@ -1590,6 +1613,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             merge_strategy=repo_merge_strategy,
             branch_prefix=repo_branch_prefix,
             commit_subject_template=repo_commit_subject_template,
+            test_runner=repo_test_runner,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1608,6 +1632,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         merge_strategy=repo_merge_strategy,
         branch_prefix=repo_branch_prefix,
         commit_subject_template=repo_commit_subject_template,
+        test_runner=repo_test_runner,
     )
 
 
@@ -2057,6 +2082,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         production_source_paths=_parse_production_source_paths(path, validate_raw),
         production_source_extensions=_parse_production_source_extensions(path, validate_raw),
         audit_trail_paths=_parse_audit_trail_paths(path, validate_raw),
+        test_runner=validate_raw.get("test_runner") or None,
     )
 
     # Populate StopHookConfig from YAML stop_hook block.
@@ -2261,6 +2287,33 @@ def get_effective_branch_prefix(repo: str, runtime_config: RuntimeConfig) -> str
         return repo_config.branch_prefix
     if runtime_config.git_ops.branch_prefix:
         return runtime_config.git_ops.branch_prefix
+    return None
+
+
+def get_effective_test_runner(repo: str, runtime_config: RuntimeConfig) -> str | None:
+    """Return the effective test-framework name for *repo*.
+
+    Resolution: per-repo ``repos.<org/repo>.test_runner`` override, else the
+    top-level ``validate.test_runner``, else ``None`` (pytest, the original
+    behaviour).  Pure function -- no env reads, no I/O.  Mapping the name to
+    a runner is ``devbench.tdd_gate.resolve_test_framework``'s job, not this
+    one: the config layer resolves *which value applies*, the gate resolves
+    *what that value means*, and keeping the split means this function
+    imports nothing from the gate.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The configured framework name (``'pytest'`` / ``'node'``), or
+        ``None`` when neither per-repo nor top-level sets one.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.test_runner:
+        return repo_config.test_runner
+    if runtime_config.validate.test_runner:
+        return runtime_config.validate.test_runner
     return None
 
 

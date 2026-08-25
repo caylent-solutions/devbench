@@ -47,7 +47,13 @@ repos:
     checkout_directory: devbench  # optional -- relative to DEVBENCH_WORKSPACE_ROOT
     merge_strategy: squash        # optional -- overrides top-level merge_strategy
     branch_prefix: wg_004         # optional -- overrides top-level git_ops.branch_prefix
+    test_runner: node             # optional -- overrides top-level validate.test_runner
 ```
+
+`test_runner` is the per-repo tier of the setting documented under
+[`validate:`](#validate----validate-backlog-rule-toggles) below. It is the tier
+that matters in practice: a workspace's repos rarely all share one language, so
+"this one Node repo among Python ones" is the usual shape.
 
 ---
 
@@ -368,7 +374,40 @@ task_factory:
 ```yaml
 validate:
   check_orphan_path_tokens: true   # Rule 20; default on, set false to opt out
+  test_runner: node                # optional -- 'pytest' (default) or 'node'
 ```
+
+### `validate.test_runner`
+
+Which test framework the TDD RED gate (`devbench tdd-gate`) and the refactor
+green-green check (`devbench green-green-check`) invoke. Overridden per repo by
+[`repos.<org/repo>.test_runner`](#repos-required). Absent -- or `pytest` --
+keeps the original pytest-only behaviour exactly.
+
+Set it to `node` for a target repo whose tests are `node:test`. Without it,
+every `behavior-fix` and `feature` task in such a repo is rejected by the gate
+for naming no `<path>.py::<test>` node id, which a Node repo can never produce.
+
+This is an operator choice, not something devbench sniffs from the repo: a repo
+carrying both a `package.json` and a `pyproject.toml` would make detection a
+coin flip, and a gate that guesses wrong rejects honest work with a message
+about the wrong tool.
+
+Under `node`, two things change for the agents working in that repo:
+
+- A `[RED]` entry must name its test as `<path>::"<test name>"`, **quoted** --
+  for example `tests/greeter.test.js::"greets by name"`. A `node:test` name is
+  an arbitrary string and routinely contains spaces, so free text offers no
+  other way to know where the name ends. The gate's rejection message states
+  this shape.
+- `green-green-check` takes the same quoted ids as arguments, so they must be
+  shell-quoted: `devbench green-green-check E1-F1-S1-T1 'tests/greeter.test.js::"greets by name"'`.
+
+A Node repo almost always needs `validate.production_source_extensions` set too
+(for example `['.js']`). That key is independent of this one and predates it,
+but without it Rule 14 sees no production source in a `.js`-only Changes
+Manifest and the gate rejects for "no production-source rows" before any test
+runs.
 
 ---
 

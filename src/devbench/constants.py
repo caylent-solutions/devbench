@@ -324,10 +324,11 @@ RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE: str = "RED_OBSERVED record is missin
 RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE: str = (
     "RED_OBSERVED requires a nonzero exit_code (a RED phase is, by definition, an observed failure); got exit_code=0."
 )
-RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE: str = (
-    "RED_OBSERVED test_node_id must not contain whitespace (the read-side parser "
-    "RED_OBSERVED_MESSAGE_FIELDS_RE requires a single non-whitespace token, so a "
-    "space, tab or newline would build a record the gate can never match); got {test_node_id!r}."
+RED_OBSERVED_RECORD_UNPARSEABLE_TEST_NODE_ID_TEMPLATE: str = (
+    "RED_OBSERVED test_node_id must be a single line with no leading or trailing whitespace "
+    "(the record is one log line, so a newline would split it into two lines neither of which "
+    "parses, and surrounding whitespace is eaten by the field separator and so would not "
+    "round-trip); got {test_node_id!r}."
 )
 RED_OBSERVED_RECORD_MALFORMED_DIGEST_TEMPLATE: str = (
     "RED_OBSERVED failure_digest must be a lowercase hex string of {min}-{max} characters; got {digest!r}."
@@ -356,9 +357,27 @@ RED_OBSERVED_ENTRY_LINE_RE = re.compile(
 # matches (no partial-record fallback). ``failure_digest`` is captured
 # permissively here (``\S+``); ``FAILURE_DIGEST_RE`` is the single source of
 # truth for the hash-shape validation applied on top of this parse.
+#
+# ``test_node_id`` is captured non-greedily as ``.+?`` rather than as a
+# single ``\S+`` token because a ``node:test`` node id legitimately contains
+# spaces: its name half is an arbitrary string, quoted precisely so the
+# gate can find it (see ``devbench.tdd_gate.NODE_FRAMEWORK``). The old
+# ``\S+`` was not a security property, only an artefact of pytest node ids
+# never containing a space, and it made every node-framework record
+# unwritable.
+#
+# The widening stays unambiguous because the trailing field is anchored:
+# ``failure_digest=(?P<failure_digest>\S+)$`` cannot itself contain a space,
+# so backtracking always resolves ``test_node_id`` at the LAST
+# `` failure_digest=`` on the line. A node id that contains that literal
+# text is therefore still parsed whole rather than truncated at its first
+# occurrence. Neither anchor this record's forgery defenses rest on is
+# touched: the entry line is still matched only at its structural start
+# (``RED_OBSERVED_ENTRY_LINE_RE``) and only inside the TDD Cycle Log
+# section, and ``exit_code`` and ``failure_digest`` remain strictly typed.
 RED_OBSERVED_MESSAGE_FIELDS_RE = re.compile(
     r"^exit_code=(?P<exit_code>-?\d+)\s+"
-    r"test_node_id=(?P<test_node_id>\S+)\s+"
+    r"test_node_id=(?P<test_node_id>.+?)\s+"
     r"failure_digest=(?P<failure_digest>\S+)$"
 )
 

@@ -26,6 +26,7 @@ from devbench.config_loader import (
     SkillsConfig,
     TaskFactoryConfig,
     TimeoutConfig,
+    ValidateConfig,
     extract_ticket_id,
     format_branch_name,
     format_commit_subject,
@@ -34,6 +35,7 @@ from devbench.config_loader import (
     get_effective_branch_prefix,
     get_effective_commit_subject_template,
     get_effective_merge_strategy,
+    get_effective_test_runner,
     get_repo_local_path,
     load_runtime_config,
     resolve_config_path,
@@ -379,6 +381,41 @@ class TestGetEffectiveCommitSubjectTemplate:
     def test_none_when_neither_set(self) -> None:
         config = RuntimeConfig(repos={"org/repo": RepoConfig()}, git_ops=GitOpsConfig())
         assert get_effective_commit_subject_template("org/repo", config) is None
+
+
+@pytest.mark.unit
+class TestGetEffectiveTestRunner:
+    """Per-repo test_runner overrides validate.test_runner; None when neither set.
+
+    Same three-tier precedence as TestGetEffectiveCommitSubjectTemplate. The
+    per-repo tier is the one that matters in practice: a workspace's repos
+    rarely all share one language, so "this one Node repo among Python ones"
+    is the common shape rather than the exception.
+    """
+
+    def test_per_repo_override_wins(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(test_runner="node")},
+            validate=ValidateConfig(test_runner="pytest"),
+        )
+        assert get_effective_test_runner("org/repo", config) == "node"
+
+    def test_top_level_fallback_when_no_per_repo(self) -> None:
+        config = RuntimeConfig(
+            repos={"org/repo": RepoConfig(test_runner=None)},
+            validate=ValidateConfig(test_runner="node"),
+        )
+        assert get_effective_test_runner("org/repo", config) == "node"
+
+    def test_top_level_applies_to_unknown_repo(self) -> None:
+        config = RuntimeConfig(repos={}, validate=ValidateConfig(test_runner="node"))
+        assert get_effective_test_runner("org/unknown", config) == "node"
+
+    def test_none_when_neither_set(self) -> None:
+        # None is what `tdd_gate.resolve_test_framework` maps to pytest, so
+        # every config written before this key existed keeps its behaviour.
+        config = RuntimeConfig(repos={"org/repo": RepoConfig()}, validate=ValidateConfig())
+        assert get_effective_test_runner("org/repo", config) is None
 
 
 @pytest.mark.unit
@@ -1876,6 +1913,49 @@ class TestManifestAmendmentConfig:
         cfg = tmp_path / "devbench.yaml"
         cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
         assert load_runtime_config(cfg, {}).validate.audit_trail_paths is None
+
+    def test_test_runner_from_yaml(self, tmp_path: Path) -> None:
+        """validate.test_runner lands on ValidateConfig for the whole workspace."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  test_runner: node\n")
+        assert load_runtime_config(cfg, {}).validate.test_runner == "node"
+
+    def test_per_repo_test_runner_from_yaml(self, tmp_path: Path) -> None:
+        """repos.<org/repo>.test_runner lands on that repo's RepoConfig."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n    test_runner: node\n")
+        assert load_runtime_config(cfg, {}).repos["org/repo"].test_runner == "node"
+
+    def test_per_repo_test_runner_survives_a_repo_with_no_checkout_directory(self, tmp_path: Path) -> None:
+        """_parse_repo_config returns early without checkout_directory; the key must still be carried."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    test_runner: node\n")
+        assert load_runtime_config(cfg, {}).repos["org/repo"].test_runner == "node"
+
+    def test_test_runner_absent_defaults_to_none(self, tmp_path: Path) -> None:
+        """Absent is what tdd_gate maps to pytest, so a pre-existing config is unchanged."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
+        result = load_runtime_config(cfg, {})
+        assert result.validate.test_runner is None
+        assert result.repos["org/repo"].test_runner is None
+
+    def test_unknown_test_runner_is_rejected_by_the_schema(self, tmp_path: Path) -> None:
+        """The enum is the first line of defence; tdd_gate.resolve_test_framework is the second.
+
+        Rejecting at load time names the offending key and file, which a
+        rejection raised later from inside a gate run cannot.
+        """
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  test_runner: jest\n")
+        with pytest.raises(ValueError, match="test_runner"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_per_repo_test_runner_is_rejected_by_the_schema(self, tmp_path: Path) -> None:
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n    test_runner: mocha\n")
+        with pytest.raises(ValueError, match="test_runner"):
+            load_runtime_config(cfg, {})
 
     def test_audit_trail_paths_strips_surrounding_whitespace(self, tmp_path: Path) -> None:
         """A prefix is compared against a path, so stray YAML whitespace must not defeat the match."""

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import types
 from collections.abc import Callable, Generator, Iterator, Sequence
@@ -34,6 +35,7 @@ from devbench.constants import (
     TDD_PHASE_RED_OBSERVED,
 )
 from devbench.github.git_ops import CIResult
+from devbench.tdd_gate import TestFramework
 
 
 @pytest.fixture
@@ -5463,20 +5465,50 @@ class TestBuildRedObservedMessage:
     @pytest.mark.parametrize(
         "test_node_id",
         [
-            "tests/test_foo.py::test_bar[param with space]",
-            "tests/test_foo.py::test_bar\ttabbed",
             "tests/test_foo.py::test_bar\nsecond_line",
+            "tests/test_foo.py::test_bar\rsecond_line",
+            " tests/test_foo.py::test_bar",
+            "tests/test_foo.py::test_bar ",
+            "tests/test_foo.py::test_bar\t",
         ],
     )
-    def test_build_red_observed_message_rejects_whitespace_test_node_id(self, test_node_id: str) -> None:
-        """A whitespace-bearing test_node_id builds a message ``RED_OBSERVED_MESSAGE_FIELDS_RE``
+    def test_build_red_observed_message_rejects_an_unparseable_test_node_id(self, test_node_id: str) -> None:
+        """A test_node_id that cannot round-trip through the record is rejected at write time.
 
-        (the read-side parser ``red_gate_satisfied`` consults) can never match, since that
-        parser captures ``test_node_id`` as a non-whitespace run (``\\S+``). The builder must
-        reject this at write time instead of silently emitting a record the gate rejects.
+        The record is a single log line, so a newline or carriage return
+        splits it into two lines neither of which
+        ``RED_OBSERVED_MESSAGE_FIELDS_RE`` (the read-side parser
+        ``red_gate_satisfied`` consults) matches. Surrounding whitespace is
+        eaten by the field separator, so it would parse back as a different
+        id than the one written. Either way the builder must refuse rather
+        than silently emit a record the gate can never match.
         """
         with pytest.raises(ValueError, match="test_node_id"):
             cli.build_red_observed_message(1, test_node_id, self._DIGEST)
+
+    @pytest.mark.parametrize(
+        "test_node_id",
+        [
+            "tests/test_foo.py::test_bar[param with space]",
+            'tests/greeter.test.js::"greets by name"',
+        ],
+    )
+    def test_build_red_observed_message_accepts_interior_spaces(self, test_node_id: str) -> None:
+        """Interior spaces round-trip, so the builder must not refuse them.
+
+        A ``node:test`` node id carries its test name in quotes and that name
+        is an arbitrary string, so a space inside one is the normal case, not
+        an anomaly; the pytest parametrize-id form has the same shape. The
+        read-side parser captures the field non-greedily against an anchored
+        trailing ``failure_digest``, so both parse back byte-for-byte.
+        """
+        from devbench.constants import RED_OBSERVED_MESSAGE_FIELDS_RE
+
+        message = cli.build_red_observed_message(1, test_node_id, self._DIGEST)
+        parsed = RED_OBSERVED_MESSAGE_FIELDS_RE.match(message)
+        assert parsed is not None
+        assert parsed.group("test_node_id") == test_node_id
+        assert parsed.group("failure_digest") == self._DIGEST
 
 
 @pytest.mark.unit
@@ -25413,6 +25445,236 @@ class TestGgClearPycache:
         assert venv_cache_dir.exists()
 
 
+# ---------------------------------------------------------------------------
+# node:test wiring for both gate commands. The framework-specific behaviour
+# itself is covered exhaustively at the module level in
+# tests/test_tdd_gate.py; what these cover is the wiring only -- that each
+# command resolves the TARGET REPO's configured `test_runner` (rather than
+# defaulting to pytest forever) and fails closed on an unrecognised value.
+# ---------------------------------------------------------------------------
+_requires_node = pytest.mark.skipif(shutil.which("node") is None, reason="requires a node binary on PATH")
+
+
+def _node_runtime_config(test_runner: str) -> object:
+    """A RuntimeConfig whose workspace-wide `validate.test_runner` is *test_runner*."""
+    from devbench.config_loader import RuntimeConfig, ValidateConfig
+
+    return RuntimeConfig(repos={}, validate=ValidateConfig(test_runner=test_runner))
+
+
+def _node_gate_repo(tmp_path: Path, *, dir_name: str, greeting: str) -> Path:
+    """A real git repo whose production source is JavaScript and whose test is node:test.
+
+    The test is committed asserting the FIXED behaviour while `src/greeter.js`
+    is committed still broken -- the test-first shape the RED gate observes --
+    and *greeting* is then written uncommitted as the fix the gate stashes away.
+    """
+    repo = _init_scratch_repo_for_cli(
+        tmp_path,
+        dir_name=dir_name,
+        author_email="node-gate-cli-test@example.com",
+        author_name="Node Gate Cli Test",
+    )
+    _tdd_gate_write(repo, "src/greeter.js", "module.exports = (name) => 'hi';\n")
+    _tdd_gate_write(
+        repo,
+        "tests/greeter.test.js",
+        "const { test } = require('node:test');\n"
+        "const assert = require('node:assert');\n"
+        "const greet = require('../src/greeter.js');\n"
+        "test('greets by name', () => { assert.strictEqual(greet('Ada'), 'hi Ada'); });\n",
+    )
+    _tdd_gate_commit_all(repo, "seed: node:test pinning test against still-broken source")
+    _tdd_gate_write(repo, "src/greeter.js", greeting)
+    return repo
+
+
+@pytest.mark.unit
+class TestGateCommandsHonourConfiguredTestRunner:
+    """Both gate commands run the target repo's configured framework, not always pytest."""
+
+    NODE_ID = 'tests/greeter.test.js::"greets by name"'
+
+    @staticmethod
+    def _js_is_production_source(monkeypatch: pytest.MonkeyPatch) -> None:
+        # `validate.production_source_extensions` is what makes Rule 14 see
+        # `.js` as production source. It predates this change and is
+        # orthogonal to `test_runner`, but a Node repo needs both: without it
+        # the manifest classifies to nothing and the gate rejects for "no
+        # production-source rows" before any test ever runs.
+        from devbench.backlog.manager import BacklogManager
+
+        monkeypatch.setattr(BacklogManager, "_production_source_extensions", classmethod(lambda cls: (".js",)))
+
+    @_requires_node
+    def test_tdd_gate_observes_a_real_node_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The defect this change closes, end to end: before it, this unit was
+        # rejected for naming "no named test node id (a '<path>.py::<test>'
+        # token)", which a Node repo can never produce.
+        self._js_is_production_source(monkeypatch)
+        repo = _node_gate_repo(
+            tmp_path, dir_name="node-target-repo", greeting="module.exports = (name) => `hi ${name}`;\n"
+        )
+
+        unit_id = "E0-F3-S1-T1"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(
+                unit_id,
+                "| `src/greeter.js` | modify |\n| `tests/greeter.test.js` | add |\n",
+                f"- [RED] 2026-08-25T00:00:00+00:00 -- Ran {self.NODE_ID}. Exit: 1.\n",
+            ),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", _node_runtime_config("node")),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 0, capsys.readouterr().err
+        assert self.NODE_ID in capsys.readouterr().out
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[RED_OBSERVED]" in content
+        # The gate restored the tree: the uncommitted fix is back.
+        assert "`hi ${name}`" in (repo / "src/greeter.js").read_text(encoding="utf-8")
+
+    @_requires_node
+    def test_green_green_check_runs_a_real_node_suite_on_both_sides(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._js_is_production_source(monkeypatch)
+        # Behaviour-preserving: the committed source already greets by name,
+        # and the uncommitted change only restructures how it does so.
+        repo = _init_scratch_repo_for_cli(
+            tmp_path,
+            dir_name="node-gg-repo",
+            author_email="node-gate-cli-test@example.com",
+            author_name="Node Gate Cli Test",
+        )
+        _tdd_gate_write(repo, "src/greeter.js", "module.exports = (name) => `hi ${name}`;\n")
+        _tdd_gate_write(
+            repo,
+            "tests/greeter.test.js",
+            "const { test } = require('node:test');\n"
+            "const assert = require('node:assert');\n"
+            "const greet = require('../src/greeter.js');\n"
+            "test('greets by name', () => { assert.strictEqual(greet('Ada'), 'hi Ada'); });\n",
+        )
+        _tdd_gate_commit_all(repo, "baseline greeter")
+        _tdd_gate_write(repo, "src/greeter.js", "module.exports = function (name) {\n  return `hi ${name}`;\n};\n")
+
+        unit_id = "E0-F3-S1-T2"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _gg_work_unit_content(unit_id, "| `src/greeter.js` | modify |\n| `tests/greeter.test.js` | modify |\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", _node_runtime_config("node")),
+        ):
+            result = cli.cmd_green_green_check(unit_id, self.NODE_ID)
+
+        assert result == 0, capsys.readouterr().err
+        assert "GREEN_GREEN_OBSERVED" in wu_file.read_text(encoding="utf-8")
+
+    def test_tdd_gate_fails_closed_on_an_unrecognised_test_runner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Never a silent fallback to pytest: that would reject every node
+        # test as uncollected, a symptom that reads as a broken gate rather
+        # than as the misconfiguration it is.
+        repo = _tdd_gate_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/greeter.py", "def greet() -> str:\n    return 'hi'\n")
+        _tdd_gate_commit_all(repo, "seed")
+
+        unit_id = "E0-F3-S1-T3"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(
+            _tdd_gate_work_unit_content(unit_id, "| `src/greeter.py` | modify |\n", "- [RED] 2026-08-25 -- ran it.\n"),
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _tdd_gate_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", _node_runtime_config("jest")),
+        ):
+            result = cli.cmd_tdd_gate(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "unknown test_runner 'jest'" in err
+        assert "[RED_OBSERVED]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_green_green_check_rejects_a_node_id_spanning_more_than_one_line(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Rejected before any repo resolution: the GREEN_GREEN_OBSERVED
+        # record is one log line, so a newline in an argv-supplied id would
+        # write two lines neither of which re-validates. Interior spaces are
+        # fine and are the node framework's normal case -- only line breaks
+        # are refused.
+        result = cli.cmd_green_green_check("E0-F3-S1-T5", 'tests/g.test.js::"two\nlines"')
+
+        assert result == 1
+        assert "single line" in capsys.readouterr().err
+
+    def test_green_green_check_fails_closed_on_an_unrecognised_test_runner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        repo = _gg_init_repo(tmp_path)
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    return a + b\n")
+        _tdd_gate_commit_all(repo, "baseline")
+        _tdd_gate_write(repo, "src/calc.py", "def add(a, b):\n    total = a + b\n    return total\n")
+
+        unit_id = "E0-F3-S1-T4"
+        wu_file = tmp_path / f"{unit_id}.md"
+        wu_file.write_text(_gg_work_unit_content(unit_id, "| `src/calc.py` | modify |\n"), encoding="utf-8")
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text("# Backlog\n\n## Full Work Unit Index\n\n", encoding="utf-8")
+        unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", _node_runtime_config("mocha")),
+        ):
+            result = cli.cmd_green_green_check(unit_id, "tests/test_calc.py::test_add")
+
+        assert result == 1
+        assert "unknown test_runner 'mocha'" in capsys.readouterr().err
+        assert "GREEN_GREEN_OBSERVED" not in wu_file.read_text(encoding="utf-8")
+
+
 @pytest.mark.unit
 class TestCmdGreenGreenCheck:
     """cmd_green_green_check -- refactor's own invariant: named tests pass before and after."""
@@ -25960,13 +26222,15 @@ class TestCmdGreenGreenCheck:
 
         original_run_named_tests = cli._gg_run_named_tests
 
-        def conflicting_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+        def conflicting_runner(
+            gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path, framework: TestFramework
+        ) -> str | None:
             if side == "before":
                 # Simulate a concurrent edit landing on the exact file the
                 # stash is about to restore, so the real `git stash pop`
                 # that follows genuinely conflicts.
                 (repo_path / "src" / "calc.py").write_text("def add(a, b):\n    return 'conflict'\n", encoding="utf-8")
-            return original_run_named_tests(gg_unit_id, side, test_node_ids, repo_path)
+            return original_run_named_tests(gg_unit_id, side, test_node_ids, repo_path, framework)
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
@@ -26009,7 +26273,9 @@ class TestCmdGreenGreenCheck:
         unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
         node_id = "tests/test_calc.py::test_add"
 
-        def flaky_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+        def flaky_runner(
+            gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path, framework: object
+        ) -> str | None:
             if side == "before":
                 raise RuntimeError("simulated crash during before-state run")
             return None
@@ -26055,7 +26321,9 @@ class TestCmdGreenGreenCheck:
         unit, mock_parser = _gg_setup_unit(unit_id, wu_file)
         node_id = "tests/test_calc.py::test_add"
 
-        def flaky_runner(gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path) -> str | None:
+        def flaky_runner(
+            gg_unit_id: str, side: str, test_node_ids: Sequence[str], repo_path: Path, framework: object
+        ) -> str | None:
             if side == "before":
                 raise RuntimeError("simulated crash during before-state run")
             return None

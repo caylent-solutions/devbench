@@ -1861,6 +1861,77 @@ class TestManifestAmendmentConfig:
         with pytest.raises(ValueError, match="must not contain an empty entry"):
             load_runtime_config(cfg, {})
 
+    def test_audit_trail_paths_from_yaml(self, tmp_path: Path) -> None:
+        """validate.audit_trail_paths is parsed into a tuple on ValidateConfig."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  audit_trail_paths:\n    - .ai-sdlc/\n    - .audit/\n"
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.validate.audit_trail_paths == (".ai-sdlc/", ".audit/")
+
+    def test_audit_trail_paths_absent_defaults_to_none(self, tmp_path: Path) -> None:
+        """Absent means no path is exempt from the task-type invariant, expressed as None."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\n")
+        assert load_runtime_config(cfg, {}).validate.audit_trail_paths is None
+
+    def test_audit_trail_paths_strips_surrounding_whitespace(self, tmp_path: Path) -> None:
+        """A prefix is compared against a path, so stray YAML whitespace must not defeat the match."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  audit_trail_paths:\n    - '  .ai-sdlc/  '\n"
+        )
+        assert load_runtime_config(cfg, {}).validate.audit_trail_paths == (".ai-sdlc/",)
+
+    def test_audit_trail_paths_rejects_non_list(self, tmp_path: Path) -> None:
+        """A scalar is a config error, not silently coerced. Caught by schema validation."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text("repos:\n  org/repo:\n    checkout_directory: repo\nvalidate:\n  audit_trail_paths: .ai-sdlc/\n")
+        with pytest.raises(ValueError, match="audit_trail_paths"):
+            load_runtime_config(cfg, {})
+
+    def test_audit_trail_paths_rejects_non_string_entry(self, tmp_path: Path) -> None:
+        """A non-string entry cannot be prefix-matched against a path. Caught by schema validation."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  audit_trail_paths:\n    - .ai-sdlc/\n    - 7\n"
+        )
+        with pytest.raises(ValueError, match="audit_trail_paths"):
+            load_runtime_config(cfg, {})
+
+    def test_audit_trail_paths_rejects_empty_entry(self, tmp_path: Path) -> None:
+        """An empty prefix would exempt every path in the repo; reject it loudly."""
+        cfg = tmp_path / "devbench.yaml"
+        cfg.write_text(
+            "repos:\n  org/repo:\n    checkout_directory: repo\n"
+            "validate:\n  audit_trail_paths:\n    - .ai-sdlc/\n    - '  '\n"
+        )
+        with pytest.raises(ValueError, match="must not contain an empty entry"):
+            load_runtime_config(cfg, {})
+
+    def test_parse_audit_trail_paths_rejects_non_list_directly(self) -> None:
+        """The parser's own type guard, independent of the schema.
+
+        Schema validation fires first on the ``load_runtime_config`` path, so
+        this guard is belt-and-suspenders for an in-memory raw dict fed
+        directly. Pinned here the same way ``_parse_model_rates`` is.
+        """
+        from devbench.config_loader import _parse_audit_trail_paths
+
+        with pytest.raises(ValueError, match="must be a list of path-prefix strings"):
+            _parse_audit_trail_paths(Path("test.yaml"), {"audit_trail_paths": ".ai-sdlc/"})
+
+    def test_parse_audit_trail_paths_rejects_non_string_entry_directly(self) -> None:
+        """Same guard, reached via a list whose entries are not all strings."""
+        from devbench.config_loader import _parse_audit_trail_paths
+
+        with pytest.raises(ValueError, match="must be a list of path-prefix strings"):
+            _parse_audit_trail_paths(Path("test.yaml"), {"audit_trail_paths": [".ai-sdlc/", 7]})
+
     def test_max_requests_per_execution_from_yaml(self, tmp_path: Path) -> None:
         cfg = self._write(
             tmp_path / "cfg.yaml",

@@ -1321,6 +1321,35 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "Squash-aware verification (317-D02)" section rather than a superseded
   "known limitation" paragraph.
 
+- **New `wire-gate <gate-task-id> --blocks-roots` verb mechanises
+  ancestry-gate fan-in, and `spec-to-backlog`-generated gate tasks are now
+  typed `chore` with a real Manifest row so they can actually reach
+  `done`** (spec `integration-reality-gates-hardening.md` section 4.5,
+  317-D01/317-D23; issue #12). Generating a gate task previously left it
+  untyped, which `validate-backlog` rule 21 defaults to the RED-gated
+  `behavior-fix` -- a check-only task authors no code and can never
+  produce the required RED evidence, so the generated task deadlocked
+  permanently at the done transition. The `spec-to-backlog` template now
+  authors `## Task Type: chore` with a `## Changes Manifest` row naming
+  the gate task's own report file (`docs/gate-reports/<id>-ancestry.md`)
+  instead of `(none)`, so the manifest is genuinely non-empty and
+  classifiable. Fanning the gate into every root of the intra-backlog
+  dependency DAG previously required hand-authoring an O(N) `##
+  Dependencies` row per root, each edit a place a hand-typed row could
+  silently drift from the canonical shape `validate-backlog` reads
+  (317-D23). `devbench wire-gate <gate-task-id> --blocks-roots` computes
+  the DAG roots itself and writes every edge through the same managed
+  dependency path `add-dep` already owns, so every row lands in the exact
+  canonical form; it validates every root BEFORE any write and fails
+  loudly (exit 1, zero edges written) on an unknown gate-task id, a
+  missing root file, or a root already wired to a different gate task. The
+  root computation also excludes the gate task's own Epic/Feature/Story
+  ancestors (present in every real generated tree) and any root already in
+  a terminal `done` / `declined` status, so a re-run is idempotent without
+  ever force-reverting a completed root's status back to `blocked`.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_wire_gate.py`.
+
 ## [0.4.0] -- 2026-08-12
 
 ### Changed (model defaults)

@@ -387,7 +387,7 @@ Print the work-unit content (the `.md` file body) plus the resolved repo path as
 
 ## Gates
 
-Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver`, `log-newly-reachable` and the `git-ops-finalize --provenance` flag -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
+Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver`, `log-newly-reachable`, the `git-ops-finalize --provenance` flag, and `wire-gate` -- the per-gate check commands (`check-reachability`, `check-shared-file-impact`, `check-fixture-consistency`, and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents) until a follow-up unit relocates them here.
 
 ### `gates`
 
@@ -532,6 +532,37 @@ Example, with a provenance map at `docs/release-notes/provenance-map.json`:
 
 ```
 $ uv run devbench git-ops-finalize caylent-solutions/devbench --provenance docs/release-notes/provenance-map.json
+```
+
+### `wire-gate`
+
+```
+uv run devbench wire-gate <gate-task-id> --blocks-roots
+```
+
+Fan an ancestry-gate task into every DAG root: wire-gate <gate-task-id> --blocks-roots
+
+Spec `integration-reality-gates-hardening.md` section 4.5 (317-D23) / 4.9. Mechanises the fan-in step that `spec-to-backlog`'s "Authoring the ancestry-gate task" template previously prescribed as O(N) hand-authored `## Dependencies` row edits -- one per root of the intra-backlog dependency DAG, each a place a hand-typed row could silently drift from the canonical shape `validate-backlog` reads. `wire-gate` computes the DAG roots itself and writes each edge through the SAME managed dependency path `add-dep` already owns (see [`add-dep`](#add-dep)), so every row lands in the exact canonical form, never hand-typed markdown.
+
+A **root** is any non-Epic unit (Task, Story, or Feature) that is neither `<gate-task-id>` itself NOR one of `<gate-task-id>`'s own Epic/Feature/Story ancestors (a unit `U` is an ancestor of `<gate-task-id>` when `<gate-task-id>` starts with `U-`; an ancestor cannot meaningfully depend on one of its own descendant Tasks -- every real `spec-to-backlog`-generated tree indexes these ancestors, so they are always present as candidates), NOR already in a terminal status (`done` / `declined` -- see Idempotency below), and that has no OTHER real upstream dependency once its own edge to `<gate-task-id>` (if already wired, e.g. on a re-run) is disregarded. A unit whose `## Dependencies` table names a genuine, unrelated dependency is excluded from the fan-in silently -- it is not a DAG root by definition, not an error.
+
+`--blocks-roots` is REQUIRED (the only fan-in mode this verb supports today). Every root is validated BEFORE any write: an unknown gate-task id, `<gate-task-id>` already terminal, a root's file missing from disk, or a root already wired to a DIFFERENT ancestry-gate task are all reported and the call exits 1 with ZERO dependency edges written for that invocation -- no partial wiring. This no-partial-write guarantee covers only these pre-write validation failures; it does NOT extend to a write-time failure (see the exit-1 row below), where roots wired earlier in the same call remain wired.
+
+Idempotent: re-running with the same `<gate-task-id>` after a prior successful run writes no duplicate rows and exits 0 -- an already-wired root's only remaining "real" dependency is `<gate-task-id>` itself, so it is still classified a root and the underlying edge write (already idempotent -- see [`add-dep`](#add-dep)) is a no-op. A root that has since reached a terminal status (`done` / `declined`) is EXCLUDED from the root computation on any subsequent call, so a re-run never force-reverts completed work back to `blocked` -- its existing `## Dependencies` row (if wired while the root was still non-terminal) is left untouched, not removed and not rewritten.
+
+**Write set.** Each root's edge is written through the same managed path `add-dep` uses (see [`add-dep`](#add-dep)), so a successful `wire-gate` call writes, per root: the canonical `## Dependencies` row naming `<gate-task-id>`, a `[WU_WIRED] ... [BLOCKED_PENDING_PROPOSAL]` audit marker in the root's own work-unit file, a synced `Dependencies` cell for that root in the `BACKLOG.md` index, AND -- because `add-dep`'s managed path force-sets it whenever the marker is present -- a `## Status: blocked` write to the root's own work-unit file and its `BACKLOG.md` Status Summary/index. This is the complete write set for a fan-in run; a root already in a terminal status is never a candidate for it (see Idempotency above).
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Every eligible root now carries a canonical `## Dependencies` row naming `<gate-task-id>` (newly written this call, or already present from a prior call). Stdout carries a JSON summary: `{"gate_task": "<id>", "wired_roots": ["<id>", ...]}`. |
+| 1 | Pre-write validation failure (no dependency edge written on this run): `<gate-task-id>` not found in the backlog, `<gate-task-id>` is already terminal (`done` / `declined`), a root already wired to a DIFFERENT ancestry-gate task (`ERROR: root '<id>' is already wired to gate task '<other-id>'`), a root's file is missing from disk, or the backlog index itself cannot be read. An ancestry-gate task is recognised by the generated title suffix `(ancestry gate)`; a conflicting gate task's title lacking that suffix is not recognised as a gate task and is silently excluded from the conflict check rather than raising this exit code. Also exit 1 on a write-time failure for an individual root (a dependency-cycle refusal, or an I/O error writing that root's file) -- in that case roots wired earlier in the SAME call remain wired; re-running `wire-gate` after fixing the cause recovers idempotently. |
+| 2 | Usage error: missing/malformed `<gate-task-id>`, an unknown flag, or `--blocks-roots` omitted. |
+
+Example, wiring `E0-F1-S1-T1` (a generated ancestry-gate task) to every root of the backlog's dependency DAG:
+
+```
+$ uv run devbench wire-gate E0-F1-S1-T1 --blocks-roots
+{"gate_task": "E0-F1-S1-T1", "wired_roots": ["E1-F1-S1-T1", "E1-F2-S1-T1", "E2-F1-S1-T1"]}
 ```
 
 ---

@@ -15200,13 +15200,22 @@ def _canonicalize_add_dep_row(
         atomic_write_text(blocked_file, content.replace(placeholder, real_row, 1))
 
 
+# Canonical work-unit-task-id grammar shared by every ``cli.py`` argv
+# parser that validates a bare task id (``add-dep``, ``wire-gate``). A
+# single module-level compiled constant so the two copies can never drift
+# from one another (DRY). ``src/devbench/plugin_helpers/backlog_post_processor.py``
+# keeps its own independent ``_TASK_ID_RE`` -- that module has no import
+# relationship with ``cli.py`` and is out of scope for this consolidation.
+_WORK_UNIT_TASK_ID_RE: re.Pattern[str] = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+
+
 def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
     """Parse the add-dep flag grammar.
 
     Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
     after printing a usage error to stderr so the caller can ``return 1``.
     """
-    task_id_re = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+    task_id_re = _WORK_UNIT_TASK_ID_RE
     positional: list[str] = []
     reason = ""
     i = 0
@@ -15243,6 +15252,293 @@ def _parse_add_dep_argv(argv: tuple[str, ...]) -> tuple[str | None, str, str]:
             )
             return None, "", ""
     return blocked_id, blocker_id, reason
+
+
+# The canonical title suffix `spec-to-backlog`'s "Authoring the ancestry-gate
+# task" template (plugin-authoring/devbench-authoring/skills/spec-to-backlog/
+# SKILL.md) gives every generated gate task: `# E0-F<N>-S1-T1: Verify
+# <dependency-name> dependency has merged (ancestry gate)`. `wire-gate` uses
+# this marker -- not the task's `## Task Type:` line, which a fresh parse of
+# an in-progress edit cannot rely on -- to recognise an existing dependency
+# edge as a PRIOR gate-task wiring rather than a genuine upstream
+# prerequisite (spec 4.9's "already wired to a different gate task" check).
+_ANCESTRY_GATE_TASK_TITLE_MARKER: str = "(ancestry gate)"
+
+
+def _is_ancestry_gate_task(unit_id: str, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return True if ``unit_id`` names a unit carrying the ancestry-gate title marker."""
+    unit = units_by_id.get(unit_id)
+    return unit is not None and _ANCESTRY_GATE_TASK_TITLE_MARKER in unit.title
+
+
+def _classify_wire_gate_candidate(
+    unit: WorkUnit, gate_task_id: str, units_by_id: dict[str, WorkUnit]
+) -> tuple[str, str]:
+    """Classify ``unit`` for ``--blocks-roots`` fan-in against ``gate_task_id``.
+
+    Returns ``(classification, detail)`` where ``classification`` is one of:
+
+    - ``"root"``: no OTHER real (non-``gate_task_id``) upstream dependency --
+      eligible for the fan-in edge. ``detail`` is ``""``.
+    - ``"not_root"``: at least one genuine, non-gate upstream dependency --
+      not a DAG root; excluded from wiring, not an error. ``detail`` is ``""``.
+    - ``"conflict"``: the unit already carries a dependency edge to a
+      DIFFERENT ancestry-gate task (spec 4.9). ``detail`` is that task's id.
+
+    Re-running ``wire-gate <gate_task_id> --blocks-roots`` on an
+    already-wired root is idempotent: that root's only remaining "real" dep
+    is ``gate_task_id`` itself, which is filtered out below, so it is still
+    classified ``"root"`` and the (already-idempotent) edge write is a no-op.
+    """
+    real_deps = [d for d in unit.dependencies if d.lower() != "none" and d != gate_task_id]
+    for dep_id in real_deps:
+        if _is_ancestry_gate_task(dep_id, units_by_id):
+            return "conflict", dep_id
+    if real_deps:
+        return "not_root", ""
+    return "root", ""
+
+
+def _parse_wire_gate_argv(argv: tuple[str, ...]) -> tuple[str | None, bool]:
+    """Parse the ``wire-gate`` flag grammar: ``<gate-task-id> --blocks-roots``.
+
+    Returns ``(gate_task_id, has_blocks_roots)``. Returns ``(None, False)``
+    after printing a usage error to stderr when the positional id is
+    missing/malformed, an unknown flag is given, or an extra positional
+    appears -- the caller returns 2 in that case. When the id parses but
+    ``--blocks-roots`` is absent, returns ``(gate_task_id, False)`` so the
+    caller can print the specific missing-flag message and return 2.
+    """
+    task_id_re = _WORK_UNIT_TASK_ID_RE
+    positional: list[str] = []
+    has_blocks_roots = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--blocks-roots":
+            has_blocks_roots = True
+            i += 1
+            continue
+        if arg.startswith("--"):
+            print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+            return None, False
+        positional.append(arg)
+        i += 1
+
+    if len(positional) != 1:
+        print(
+            "ERROR: wire-gate requires exactly one gate-task id: wire-gate <gate-task-id> --blocks-roots",
+            file=sys.stderr,
+        )
+        return None, False
+    gate_task_id = positional[0]
+    if not task_id_re.match(gate_task_id):
+        print(
+            f"ERROR: wire-gate: gate task id '{gate_task_id}' does not match E<N>-F<N>-S<N>-T<N> format",
+            file=sys.stderr,
+        )
+        return None, False
+    return gate_task_id, has_blocks_roots
+
+
+class _WireGateError(Exception):
+    """Internal control-flow exception carrying ``wire-gate``'s exit code + message.
+
+    ``cmd_wire_gate``'s helpers raise this the moment ANY spec-4.9
+    precondition fails (bad backlog index, unknown/terminal gate task, a
+    conflicting root, a missing root file, or a write failure) so the top
+    level command function has exactly one place that prints the error and
+    returns the exit code -- keeping ``cmd_wire_gate`` itself within the
+    branch/return complexity budget instead of an early-return per check.
+    """
+
+    def __init__(self, exit_code: int, message: str) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.message = message
+
+
+def _prepare_wire_gate(gate_task_id: str) -> tuple[WorkUnit, list[WorkUnit]]:
+    """Load the backlog, validate the gate task, and compute its DAG roots.
+
+    Raises :class:`_WireGateError` the moment any spec-4.9 precondition
+    fails, BEFORE any dependency edge is written: an unreadable backlog
+    index (including a root's ``.md`` file missing from disk --
+    ``BacklogParser.parse_index`` eagerly resolves every indexed unit's
+    file up front, so a missing root file surfaces here, not as a
+    separate later check), an unknown or already-terminal gate task, or a
+    root already wired to a DIFFERENT ancestry-gate task.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        raise _WireGateError(1, f"wire-gate: cannot read backlog index: {exc}") from exc
+
+    units_by_id = {u.id: u for u in units}
+    gate_unit = units_by_id.get(gate_task_id)
+    if gate_unit is None:
+        raise _WireGateError(1, f"gate task '{gate_task_id}' not found in backlog")
+    if gate_unit.status in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED):
+        raise _WireGateError(
+            1,
+            f"gate task '{gate_task_id}' is already terminal (status={gate_unit.status.value}); "
+            "wiring a dependency on a terminal task is a no-op",
+        )
+
+    roots = _compute_wire_gate_roots(units, gate_task_id, units_by_id)
+    return gate_unit, roots
+
+
+def _is_gate_task_ancestor(unit_id: str, gate_task_id: str) -> bool:
+    """Return True if ``unit_id`` names an Epic/Feature/Story ancestor of ``gate_task_id``.
+
+    Work-unit ids are dash-delimited hierarchical segments (``E<N>``,
+    ``E<N>-F<N>``, ``E<N>-F<N>-S<N>``, ``E<N>-F<N>-S<N>-T<N>``), so
+    ``unit_id`` is an ancestor of ``gate_task_id`` iff ``gate_task_id``
+    starts with ``unit_id`` followed by the ``-`` segment separator --
+    matching the full segment, not merely a string prefix, so ``E1`` is
+    never mistaken for an ancestor of ``E10-F1-S1-T1``.
+
+    Every real ``spec-to-backlog``-generated tree indexes the gate task's
+    own parent Story and Feature (and Epic) as candidates. Without this
+    check ``_compute_wire_gate_roots`` wired the gate task into its own
+    ancestry on every real invocation, violating AC-WIRE-001's "and to no
+    other unit": an Epic/Feature/Story cannot meaningfully depend on one of
+    its own descendant Tasks.
+    """
+    return gate_task_id.startswith(f"{unit_id}-")
+
+
+def _compute_wire_gate_roots(
+    units: list[WorkUnit], gate_task_id: str, units_by_id: dict[str, WorkUnit]
+) -> list[WorkUnit]:
+    """Return every DAG root eligible for ``--blocks-roots`` fan-in, ID-sorted.
+
+    A root is any non-Epic unit (Task, Story, or Feature) that is neither
+    the gate task itself nor one of the gate task's own Epic/Feature/Story
+    ancestors (:func:`_is_gate_task_ancestor`), is not already in a
+    terminal status (``done`` / ``declined``), and has no OTHER real
+    upstream dependency -- see :func:`_classify_wire_gate_candidate`. Units
+    with a genuine unrelated dependency are excluded silently; that is
+    correct DAG-root exclusion, not an error.
+
+    Terminal-status exclusion (AC-WIRE-002): a root that has since reached
+    ``done`` / ``declined`` is dropped from the candidate set entirely
+    rather than wired. ``_write_add_dep_edge`` reuses ``add_dep``, whose
+    ``_block_wired_target`` step unconditionally force-writes ``##
+    Status: blocked`` on every wired unit with no status guard -- without
+    this exclusion, a re-run after a root completed its own work would
+    silently revert that root back to ``blocked``, an exit-0 call that
+    destroys completed work and contradicts the idempotency this verb
+    promises. A root already wired while non-terminal keeps its existing
+    ``## Dependencies`` row; it is simply never a candidate for a NEW write
+    once terminal.
+
+    Raises :class:`_WireGateError` the moment a candidate is already wired
+    to a DIFFERENT ancestry-gate task (spec 4.9), before any write.
+    """
+    roots: list[WorkUnit] = []
+    for unit in sorted(units, key=lambda u: u.id):
+        if (
+            unit.id == gate_task_id
+            or unit.unit_type is WorkUnitType.EPIC
+            or _is_gate_task_ancestor(unit.id, gate_task_id)
+            or unit.status in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED)
+        ):
+            continue
+        classification, detail = _classify_wire_gate_candidate(unit, gate_task_id, units_by_id)
+        if classification == "conflict":
+            raise _WireGateError(1, f"root '{unit.id}' is already wired to gate task '{detail}'")
+        if classification == "root":
+            roots.append(unit)
+    return roots
+
+
+def _write_wire_gate_edges(gate_task_id: str, gate_unit: WorkUnit, roots: list[WorkUnit]) -> list[str]:
+    """Write the fan-in edge for every root through the managed ``add-dep`` path.
+
+    Reuses :func:`_write_add_dep_edge` -- the same helper ``cmd_add_dep``
+    calls -- so every row lands in the exact canonical form
+    ``validate-backlog`` reads. Raises :class:`_WireGateError` naming the
+    root that failed to wire; already-validated roots wired earlier in this
+    call remain wired (idempotent re-run recovers cleanly).
+    """
+    wired_ids: list[str] = []
+    for root in roots:
+        try:
+            wired = _write_add_dep_edge(
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                blocked_task_id=root.id,
+                blocked_file=root.file_path,
+                blocker_task_id=gate_task_id,
+                blocker_unit=gate_unit,
+                reason=f"wire-gate {gate_task_id} --blocks-roots fan-in",
+            )
+        except (ProposalError, OSError, UnicodeDecodeError) as exc:
+            raise _WireGateError(
+                1, f"wire-gate: failed to wire '{root.id}' to gate task '{gate_task_id}': {exc}"
+            ) from exc
+        if not wired:
+            raise _WireGateError(1, f"wire-gate: failed to wire '{root.id}' to gate task '{gate_task_id}'")
+        wired_ids.append(root.id)
+    return wired_ids
+
+
+def cmd_wire_gate(*argv: str) -> int:
+    """Fan in an ancestry-gate task to every root of the intra-backlog dependency DAG.
+
+    Usage::
+
+        wire-gate <gate-task-id> --blocks-roots
+
+    Spec `integration-reality-gates-hardening.md` section 4.5 (317-D23) /
+    4.9. Replaces the O(N) LLM-authored ``## Dependencies`` row edits
+    `spec-to-backlog` previously prescribed for wiring a generated
+    ancestry-gate task into every root of the intra-backlog dependency DAG
+    with a single mechanical verb: this command computes the DAG roots
+    itself (:func:`_compute_wire_gate_roots`) and writes each edge through
+    the SAME managed dependency path ``cmd_add_dep`` already owns
+    (:func:`_write_add_dep_edge`), so every row lands in the exact canonical
+    form ``validate-backlog``'s Manifest Conflict Rule / dependency scan
+    reads -- it can never drift from hand-typed markdown.
+
+    Fail-fast (spec 4.9): every root is validated BEFORE any write --
+    unknown gate-task id, a root file missing from disk, or a root already
+    wired to a DIFFERENT ancestry-gate task are all reported and this call
+    exits 1 with ZERO dependency edges written for this invocation. Missing
+    ``--blocks-roots`` (the only supported mode today) is a usage error,
+    exit 2.
+
+    Idempotent: re-running with the same ``gate_task_id`` after a prior
+    successful run writes no duplicate rows and exits 0 (the already-wired
+    roots are still classified ``"root"``; the underlying edge write is
+    itself idempotent).
+    """
+    gate_task_id, has_blocks_roots = _parse_wire_gate_argv(argv)
+    if gate_task_id is None:
+        return 2
+    if not has_blocks_roots:
+        print(
+            "ERROR: wire-gate requires --blocks-roots: wire-gate <gate-task-id> --blocks-roots",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        gate_unit, roots = _prepare_wire_gate(gate_task_id)
+        wired_ids = _write_wire_gate_edges(gate_task_id, gate_unit, roots)
+    except _WireGateError as exc:
+        print(f"ERROR: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    logger.info("wire-gate: %s wired to %d root(s): %s", gate_task_id, len(wired_ids), ", ".join(wired_ids))
+    print(json.dumps({"gate_task": gate_task_id, "wired_roots": wired_ids}))
+    return 0
 
 
 def cmd_reject_proposal(*argv: str) -> int:
@@ -15792,6 +16088,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Wire a cross-task BLOCKED_PENDING_PROPOSAL marker: add-dep <blocked-id> <blocker-id> [--reason <msg>]",
     ),
+    "wire-gate": (
+        cmd_wire_gate,
+        0,
+        "Fan an ancestry-gate task into every DAG root: wire-gate <gate-task-id> --blocks-roots",
+    ),
     "materialise-proposal": (
         cmd_materialise_proposal,
         1,
@@ -15829,6 +16130,9 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "watchdog",
         "notify-test",
         "add-dep",
+        # 317-D23 (E4-F1-S1-T2): owns its own <id> / --blocks-roots parsing,
+        # same rationale as add-dep above.
+        "wire-gate",
         "decline",
         # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
         "green-green-check",

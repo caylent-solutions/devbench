@@ -15932,6 +15932,536 @@ class TestCmdAddDep:
         assert all(call == workspace for call in flock_calls)
 
 
+class TestCmdWireGate:
+    """spec 4.5/317-D23, spec 4.9: `wire-gate <gate-task-id> --blocks-roots`.
+
+    Mechanises the fan-in that previously required hand-authoring a
+    `## Dependencies` row into every root of the intra-backlog dependency DAG
+    -- writes the edge through the same managed path `cmd_add_dep` already
+    owns so every row is written in the exact form `validate-backlog` reads.
+    """
+
+    _GATE_TITLE = "Verify upstream dependency has merged (ancestry gate)"
+
+    @staticmethod
+    def _write_task_file(
+        story_dir: Path,
+        task_id: str,
+        title: str,
+        *,
+        status: str = "in-queue",
+        deps: list[tuple[str, str, str]] | None = None,
+    ) -> Path:
+        """Write a minimal task file with a canonical ``## Dependencies`` table.
+
+        ``deps`` is a list of ``(id, title, status)`` rows; ``None``/empty
+        renders the ``| none | | |`` placeholder row.
+        """
+        if deps:
+            rows = "\n".join(f"| {did} | {dtitle} | {dstatus} |" for did, dtitle, dstatus in deps)
+        else:
+            rows = "| none | | |"
+        path = story_dir / f"{task_id}.md"
+        path.write_text(
+            f"# {task_id}: {title}\n\n## Status: {status}\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"{rows}\n"
+        )
+        return path
+
+    def _build_workspace(
+        self,
+        tmp_path: Path,
+        *,
+        gate_id: str = "E0-F1-S1-T1",
+        gate_title: str | None = None,
+        gate_status: str = "in-queue",
+        extra_index_rows: str = "",
+    ) -> Path:
+        """Build a gate task + two DAG-root tasks + one non-root task.
+
+        Roots: ``E1-F1-S1-T1``, ``E1-F1-S1-T2`` (empty ``## Dependencies``).
+        Non-root: ``E1-F1-S1-T3`` (depends on ``E1-F1-S1-T1``, a real,
+        non-gate dependency -- must never receive the gate row).
+        """
+        gate_title = gate_title if gate_title is not None else self._GATE_TITLE
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Bootstrap | 0 | 0 | 1 | 0 |\n"
+            "| E1 | Work | 0 | 0 | 3 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {gate_id} | {gate_title} | Task | {gate_status} | None | caylent-solutions/example | "
+            f"`backlog/E0/E0-F1/E0-F1-S1/{gate_id}.md` |\n"
+            "| E1-F1-S1-T1 | Root A | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T1.md` |\n"
+            "| E1-F1-S1-T2 | Root B | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T2.md` |\n"
+            "| E1-F1-S1-T3 | Non-root | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T3.md` |\n"
+            f"{extra_index_rows}"
+        )
+        e0_story = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        e0_story.mkdir(parents=True)
+        self._write_task_file(e0_story, gate_id, gate_title, status=gate_status)
+
+        e1_story = tmp_path / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        e1_story.mkdir(parents=True)
+        self._write_task_file(e1_story, "E1-F1-S1-T1", "Root A")
+        self._write_task_file(e1_story, "E1-F1-S1-T2", "Root B")
+        self._write_task_file(
+            e1_story,
+            "E1-F1-S1-T3",
+            "Non-root",
+            deps=[("E1-F1-S1-T1", "Root A", "in-queue")],
+        )
+        return tmp_path
+
+    def _build_hierarchy_workspace(self, tmp_path: Path) -> Path:
+        """Build a full Epic/Feature/Story/Task hierarchy around the gate task.
+
+        Regression fixture for two code_review findings: (1) `wire-gate`
+        previously wired the gate task's OWN ancestor Feature/Story into
+        `wired_roots`, violating AC-WIRE-001's "and to no other unit" --
+        every real `spec-to-backlog`-generated tree has these ancestors, so
+        this reproduced on every invocation; and (2) every fixture in this
+        class previously indexed Task rows only, so the `WorkUnitType.EPIC`
+        exclusion branch was never exercised as True and no Story/Feature
+        root was ever wired (AC-TEST-001). Extends `_build_workspace`'s gate
+        task `E0-F1-S1-T1` and roots `E1-F1-S1-T1` / `E1-F1-S1-T2` with:
+
+        - `E0` (Epic), `E0-F1` (Feature), `E0-F1-S1` (Story): the gate
+          task's OWN ancestors. Must never appear in `wired_roots`.
+        - `E1` (Epic): an unrelated Epic. Excluded by type, not ancestry.
+        - `E1-F1` (Feature), `E1-F1-S1` (Story): unrelated to the gate
+          task's own ancestry, each with an empty `## Dependencies` table.
+          Both ARE DAG roots and MUST be wired.
+        - `E1-F1-S1-T4` (Task, status `done`): an already-terminal root.
+          Must be excluded from `wired_roots` and left byte-identical.
+        """
+        workspace = self._build_workspace(tmp_path)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            index_path.read_text().replace(
+                "|----|-------|------|--------|--------------|------|-----------|\n",
+                "|----|-------|------|--------|--------------|------|-----------|\n"
+                "| E0 | Bootstrap | Epic | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0.md` |\n"
+                "| E0-F1 | Bootstrap Feature | Feature | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0-F1/E0-F1.md` |\n"
+                "| E0-F1-S1 | Bootstrap Story | Story | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1.md` |\n"
+                "| E1 | Work | Epic | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1.md` |\n"
+                "| E1-F1 | Work Feature | Feature | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1.md` |\n"
+                "| E1-F1-S1 | Work Story | Story | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1.md` |\n"
+                "| E1-F1-S1-T4 | Already done | Task | done | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T4.md` |\n",
+            )
+        )
+        backlog_dir = tmp_path / "backlog"
+        for owning_dir, unit_id, title, status in (
+            (backlog_dir / "E0", "E0", "Bootstrap", "in-queue"),
+            (backlog_dir / "E0" / "E0-F1", "E0-F1", "Bootstrap Feature", "in-queue"),
+            (backlog_dir / "E0" / "E0-F1" / "E0-F1-S1", "E0-F1-S1", "Bootstrap Story", "in-queue"),
+            (backlog_dir / "E1", "E1", "Work", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1", "E1-F1", "Work Feature", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1" / "E1-F1-S1", "E1-F1-S1", "Work Story", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1" / "E1-F1-S1", "E1-F1-S1-T4", "Already done", "done"),
+        ):
+            owning_dir.mkdir(parents=True, exist_ok=True)
+            self._write_task_file(owning_dir, unit_id, title, status=status)
+        return workspace
+
+    @staticmethod
+    def _read(path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-004: usage errors, exit 2
+    # ------------------------------------------------------------------
+
+    def test_missing_blocks_roots_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1")
+        assert rc == 2
+        assert "--blocks-roots" in capsys.readouterr().err
+
+    def test_missing_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("--blocks-roots")
+        assert rc == 2
+        assert "gate-task id" in capsys.readouterr().err.lower()
+
+    def test_unknown_flag_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--bogus")
+        assert rc == 2
+        assert "unknown flag" in capsys.readouterr().err
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-004 regression, through the REAL dispatcher: a nonzero
+    # ``min_args`` on the ``_COMMANDS`` registration would let main()'s
+    # pre-dispatch arity check reject a short invocation with a generic
+    # exit-1 message BEFORE cmd_wire_gate's own usage validation ever
+    # runs -- these two drive `cli.main()` end to end (not
+    # `cli.cmd_wire_gate` directly) so that regression can never hide
+    # behind a test that bypasses the dispatcher.
+    # ------------------------------------------------------------------
+
+    def test_main_missing_blocks_roots_flag_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["devbench", "wire-gate", "E0-F1-S1-T1"]):
+            rc = cli.main()
+        assert rc == 2
+        assert "--blocks-roots" in capsys.readouterr().err
+
+    def test_main_missing_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["devbench", "wire-gate", "--blocks-roots"]):
+            rc = cli.main()
+        assert rc == 2
+        assert "gate-task id" in capsys.readouterr().err.lower()
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-003: unknown gate-task id, exit 1, zero edges written
+    # ------------------------------------------------------------------
+
+    def test_unknown_gate_task_id_exits_1_no_writes(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        root_a_before = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E9-F9-S9-T9", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "gate task 'E9-F9-S9-T9' not found in backlog" in err
+        root_a_after = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        assert root_a_before == root_a_after
+
+    def test_malformed_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("not-a-task-id", "--blocks-roots")
+        assert rc == 2
+        assert "does not match" in capsys.readouterr().err
+
+    def test_gate_task_already_terminal_exits_1_no_writes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace = self._build_workspace(tmp_path, gate_status="done")
+        root_a_before = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "already terminal" in err
+        assert "status=Done" in err
+        root_a_after = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        assert root_a_before == root_a_after
+
+    def test_root_file_missing_exits_1_no_writes(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A root indexed in BACKLOG.md but missing from disk fails fast (AC-WIRE-003).
+
+        ``BacklogParser.parse_index`` eagerly resolves every indexed unit's
+        file up front, so this surfaces through `_prepare_wire_gate`'s
+        backlog-read failure path rather than a later per-root check --
+        either way, wire-gate exits 1 naming the missing file with zero
+        edges written.
+        """
+        workspace = self._build_workspace(tmp_path)
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_b_path = story / "E1-F1-S1-T2.md"
+        root_b_path.unlink()
+        root_a_before = self._read(story / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "E1-F1-S1-T2" in err
+        assert "file not found" in err
+        # No partial wiring: root A never got the gate edge either.
+        assert self._read(story / "E1-F1-S1-T1.md") == root_a_before
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-001: wires every root, and only roots
+    # ------------------------------------------------------------------
+
+    def test_wires_every_dag_root_and_no_other_unit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["gate_task"] == "E0-F1-S1-T1"
+        assert sorted(out["wired_roots"]) == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_a = self._read(story / "E1-F1-S1-T1.md")
+        root_b = self._read(story / "E1-F1-S1-T2.md")
+        non_root = self._read(story / "E1-F1-S1-T3.md")
+        assert "| E0-F1-S1-T1 |" in root_a
+        assert "| E0-F1-S1-T1 |" in root_b
+        assert "| E0-F1-S1-T1 |" not in non_root, "wire-gate must never wire a non-root unit"
+
+    def test_gate_own_ancestors_and_epics_excluded_unrelated_hierarchy_wired(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-WIRE-001/AC-TEST-001 regression over a real Epic/Feature/Story/Task tree.
+
+        A gate task's own parent Story and Feature (and its Epic) are
+        candidates in every real `spec-to-backlog`-generated tree; they must
+        never be wired ("and to no other unit"). An unrelated Feature/Story
+        elsewhere in the backlog, with no upstream dependency of its own,
+        IS a legitimate DAG root and must be wired -- exercising the
+        `WorkUnitType.EPIC` exclusion branch as True and covering Story/
+        Feature roots, which no fixture in this class previously did.
+        """
+        workspace = self._build_hierarchy_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        wired = set(out["wired_roots"])
+
+        assert {"E1-F1-S1-T1", "E1-F1-S1-T2"} <= wired
+        assert "E0" not in wired, "wire-gate must never wire the gate task's own ancestor Epic"
+        assert "E0-F1" not in wired, "wire-gate must never wire the gate task's own ancestor Feature"
+        assert "E0-F1-S1" not in wired, "wire-gate must never wire the gate task's own ancestor Story"
+        assert "E1" not in wired, "Epics are never eligible roots"
+        assert "E1-F1" in wired, "an unrelated Feature with no upstream dependency IS a DAG root"
+        assert "E1-F1-S1" in wired, "an unrelated Story with no upstream dependency IS a DAG root"
+        assert "E1-F1-S1-T4" not in wired, "a terminal (done) root must be excluded, not force-blocked"
+
+        backlog_dir = workspace / "backlog"
+        ancestor_story = self._read(backlog_dir / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1.md")
+        ancestor_feature = self._read(backlog_dir / "E0" / "E0-F1" / "E0-F1.md")
+        ancestor_epic = self._read(backlog_dir / "E0" / "E0.md")
+        assert "| E0-F1-S1-T1 |" not in ancestor_story
+        assert "| E0-F1-S1-T1 |" not in ancestor_feature
+        assert "| E0-F1-S1-T1 |" not in ancestor_epic
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-002: idempotent re-run, no duplicate rows, exit 0
+    # ------------------------------------------------------------------
+
+    def test_rerun_is_idempotent_no_duplicate_rows(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc1 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            capsys.readouterr()
+            rc2 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        out2 = json.loads(capsys.readouterr().out)
+        assert rc1 == 0
+        assert rc2 == 0
+        assert out2["gate_task"] == "E0-F1-S1-T1"
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_a = self._read(story / "E1-F1-S1-T1.md")
+        root_b = self._read(story / "E1-F1-S1-T2.md")
+        assert root_a.count("| E0-F1-S1-T1 |") == 1
+        assert root_b.count("| E0-F1-S1-T1 |") == 1
+
+    def test_rerun_after_root_reaches_done_does_not_revert_status(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-WIRE-002 regression: a root that reaches `done` after being wired
+        must never be force-reverted to `blocked` by a later re-run.
+
+        `_write_add_dep_edge` reuses `add_dep`, whose `_block_wired_target`
+        path unconditionally force-sets `## Status: blocked` on every wired
+        unit with no status guard. Before this fix, a second `wire-gate`
+        call on a root that had since completed silently reverted it from
+        `done` back to `blocked`, in both its work-unit file and the
+        `BACKLOG.md` Status cell, while still exiting 0 -- contradicting
+        AC-WIRE-002's idempotency claim.
+        """
+        workspace = self._build_workspace(tmp_path)
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc1 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            capsys.readouterr()
+        assert rc1 == 0
+
+        # Root A completes its own work after the fan-in wire (the first
+        # wire-gate call forced its status to 'blocked'; simulate it later
+        # reaching 'done', independent of the gate task).
+        root_a_path = story / "E1-F1-S1-T1.md"
+        root_a_path.write_text(self._read(root_a_path).replace("## Status: blocked", "## Status: done"))
+        index_path = workspace / "BACKLOG.md"
+        index_path.write_text(
+            index_path.read_text().replace(
+                "| E1-F1-S1-T1 | Root A | Task | in-queue |",
+                "| E1-F1-S1-T1 | Root A | Task | done |",
+            )
+        )
+        done_before = self._read(root_a_path)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc2 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            out2 = json.loads(capsys.readouterr().out)
+        assert rc2 == 0
+        assert "E1-F1-S1-T1" not in out2["wired_roots"], (
+            "a done root must be excluded from a re-run, not force-reverted"
+        )
+        assert self._read(root_a_path) == done_before, "wire-gate must never revert a done root back to 'blocked'"
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-003: a root already wired to a DIFFERENT gate task -> exit 1,
+    # no edge written, before any write for this call.
+    # ------------------------------------------------------------------
+
+    def test_root_already_wired_to_different_gate_task_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._build_workspace(tmp_path, gate_id="E0-F1-S1-T1")
+        # A second gate task, and pre-wire root A to it directly (as a prior
+        # `wire-gate` call would have).
+        (tmp_path / "BACKLOG.md").write_text(
+            (tmp_path / "BACKLOG.md")
+            .read_text()
+            .replace(
+                "|----|-------|------|--------|--------------|------|-----------|\n",
+                "|----|-------|------|--------|--------------|------|-----------|\n"
+                "| E0-F2-S1-T1 | Verify other dependency has merged (ancestry gate) | Task | in-queue | "
+                "None | caylent-solutions/example | `backlog/E0/E0-F2/E0-F2-S1/E0-F2-S1-T1.md` |\n",
+            )
+        )
+        other_gate_story = tmp_path / "backlog" / "E0" / "E0-F2" / "E0-F2-S1"
+        other_gate_story.mkdir(parents=True)
+        self._write_task_file(
+            other_gate_story,
+            "E0-F2-S1-T1",
+            "Verify other dependency has merged (ancestry gate)",
+        )
+        story = tmp_path / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        self._write_task_file(
+            story,
+            "E1-F1-S1-T1",
+            "Root A",
+            deps=[("E0-F2-S1-T1", "Verify other dependency has merged (ancestry gate)", "in-queue")],
+        )
+        root_a_before = self._read(story / "E1-F1-S1-T1.md")
+        root_b_before = self._read(story / "E1-F1-S1-T2.md")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "E1-F1-S1-T1" in err
+        assert "already wired to gate task" in err
+        assert "E0-F2-S1-T1" in err
+        # No partial wiring: neither root gained the E0-F1-S1-T1 edge.
+        assert self._read(story / "E1-F1-S1-T1.md") == root_a_before
+        assert self._read(story / "E1-F1-S1-T2.md") == root_b_before
+
+    # ------------------------------------------------------------------
+    # Argv parsing edge case + write-failure paths.
+    # ------------------------------------------------------------------
+
+    def test_empty_string_argv_tokens_are_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A stray empty-string argv token (e.g. from shell interpolation) is ignored."""
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("", "E0-F1-S1-T1", "", "--blocks-roots", "")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["gate_task"] == "E0-F1-S1-T1"
+
+    def test_write_edge_exception_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli._write_add_dep_edge", side_effect=cli.ProposalError("boom")),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "failed to wire" in err
+        assert "boom" in err
+
+    def test_write_edge_returns_false_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli._write_add_dep_edge", return_value=False),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "failed to wire" in err
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-005: registration + --help description matches docs.
+    # ------------------------------------------------------------------
+
+    def test_wire_gate_registered_in_commands(self) -> None:
+        assert "wire-gate" in cli._COMMANDS
+        func, min_args, usage = cli._COMMANDS["wire-gate"]
+        assert func is cli.cmd_wire_gate
+        # min_args must be 0: wire-gate is variadic (see
+        # test_wire_gate_is_variadic below) and owns ALL of its own usage
+        # validation via _parse_wire_gate_argv, which returns exit 2 for a
+        # missing/malformed id, an unknown flag, or a missing
+        # --blocks-roots. A nonzero min_args here would let main()'s
+        # pre-dispatch arity check reject a short invocation with exit 1
+        # and a generic message BEFORE cmd_wire_gate ever runs, silently
+        # reintroducing the AC-WIRE-004 divergence between the documented
+        # exit-2 usage contract and the actual CLI behaviour.
+        assert min_args == 0
+        assert "--blocks-roots" in usage
+
+    def test_wire_gate_is_variadic(self) -> None:
+        assert "wire-gate" in cli._VARIADIC_COMMANDS
+
+
 class TestProposalCommandsRegistered:
     def test_list_proposals_registered(self) -> None:
         assert "list-proposals" in cli._COMMANDS

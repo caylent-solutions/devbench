@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -11586,44 +11587,100 @@ class TestCmdRunTests:
         assert len(pytest_calls) == 1
 
 
+_SHARED_FILE_IMPACT_REPO = "caylent-solutions/git-repo"
+
+
+def _shared_file_impact_unit(unit_id: str = "E0-F1-S1-T1") -> WorkUnit:
+    return WorkUnit(
+        id=unit_id,
+        title="Test Task",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path(f"backlog/{unit_id}.md"),
+        repo=_SHARED_FILE_IMPACT_REPO,
+        dependencies=[],
+    )
+
+
+def _shared_file_impact_parser(unit: WorkUnit) -> MagicMock:
+    mock_parser = MagicMock()
+    mock_parser.parse_index.return_value = [unit]
+    return mock_parser
+
+
+def _shared_file_impact_runtime_cfg(patterns: tuple[str, ...] = (), default_branch: str | None = None) -> Any:
+    from devbench.config_loader import (
+        GateRepoOverrides,
+        GatesConfig,
+        GateSharedFileImpactOverride,
+        RepoConfig,
+        RuntimeConfig,
+    )
+
+    overrides = GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(patterns=patterns))
+    return RuntimeConfig(
+        repos={_SHARED_FILE_IMPACT_REPO: RepoConfig(default_branch=default_branch)},
+        gates=GatesConfig(repos={_SHARED_FILE_IMPACT_REPO: overrides}),
+    )
+
+
+def _shared_file_impact_git_fixture(
+    tmp_path: Path,
+    *,
+    base_test_content: str,
+    feature_test_content: str | None,
+    feature_extra_path: str | None = None,
+    feature_extra_content: str = "",
+) -> tuple[Path, str]:
+    """Build a real two-branch git fixture: ``main`` at a base commit, ``feature`` diverged from it.
+
+    Returns ``(checkout_path, base_sha)`` where *checkout_path* has
+    ``feature`` checked out (the work unit's current tree) and
+    ``origin/main`` resolvable to *base_sha* (the merge-base / branch
+    point). When *feature_test_content* is given, ``tests/test_suite.py``
+    is rewritten to it on ``feature``; when *feature_extra_path* is given,
+    an additional file is added on ``feature`` without touching
+    ``tests/test_suite.py`` -- used to model an unrelated change that
+    doesn't touch a pre-existing failure.
+    """
+    origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+    _tdd_gate_write(origin, "tests/test_suite.py", base_test_content)
+    _tdd_gate_commit_all(origin, "base")
+    _run_scratch_git(["branch", "-M", "main"], origin)
+
+    checkout = tmp_path / "checkout"
+    _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+    _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+    _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+    base_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+    _run_scratch_git(["checkout", "-b", "feature"], checkout)
+    if feature_test_content is not None:
+        _tdd_gate_write(checkout, "tests/test_suite.py", feature_test_content)
+        _tdd_gate_commit_all(checkout, "feature change")
+    if feature_extra_path is not None:
+        _tdd_gate_write(checkout, feature_extra_path, feature_extra_content)
+        _tdd_gate_commit_all(checkout, "unrelated feature addition")
+
+    return checkout, base_sha
+
+
 class TestCmdCheckSharedFileImpact:
     """Test cmd_check_shared_file_impact -- caylent-solutions/devbench-internal-backlog#13
 
     Shared-file full-suite regression gate.
     """
 
-    REPO = "caylent-solutions/git-repo"
+    REPO = _SHARED_FILE_IMPACT_REPO
 
     def _make_unit(self) -> WorkUnit:
-        return WorkUnit(
-            id="E0-F1-S1-T1",
-            title="Test Task",
-            status=WorkUnitStatus.IN_PROGRESS,
-            unit_type=WorkUnitType.TASK,
-            file_path=Path("backlog/E0-F1-S1-T1.md"),
-            repo=self.REPO,
-            dependencies=[],
-        )
+        return _shared_file_impact_unit()
 
     def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
-        from devbench.config_loader import (
-            GateRepoOverrides,
-            GatesConfig,
-            GateSharedFileImpactOverride,
-            RepoConfig,
-            RuntimeConfig,
-        )
-
-        overrides = GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(patterns=patterns))
-        return RuntimeConfig(
-            repos={self.REPO: RepoConfig()},
-            gates=GatesConfig(repos={self.REPO: overrides}),
-        )
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
 
     def _parser(self, unit: WorkUnit) -> MagicMock:
-        mock_parser = MagicMock()
-        mock_parser.parse_index.return_value = [unit]
-        return mock_parser
+        return _shared_file_impact_parser(unit)
 
     def test_unit_not_found(self) -> None:
         mock_parser = MagicMock()
@@ -11675,159 +11732,6 @@ class TestCmdCheckSharedFileImpact:
         assert payload["shared_file_impact"] is False
         mock_run.assert_not_called()
 
-    def test_matched_file_no_baseline_bootstraps(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """First run for a repo: no baseline exists yet, so the current failing set becomes
-        the baseline and the gate passes (nothing to compare against yet)."""
-        unit = self._make_unit()
-        workspace = tmp_path / "workspace"
-        repo_path = tmp_path / "repo"
-        workspace.mkdir()
-        repo_path.mkdir()
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["make", "-n", "test"]:
-                return (1, "", "no rule")
-            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
-            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
-            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
-
-        assert result == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["shared_file_impact"] is True
-        assert payload["verdict"] == "bootstrap"
-        assert payload["failing_tests"] == ["tests/test_a.py::test_x"]
-
-        baseline_path = workspace / ".devbench" / "test-baselines" / f"{self.REPO.replace('/', '__')}.json"
-        assert baseline_path.exists()
-        baseline = json.loads(baseline_path.read_text())
-        assert baseline["failing_tests"] == ["tests/test_a.py::test_x"]
-        assert baseline["updated_by_unit"] == "E0-F1-S1-T1"
-
-    def test_matched_file_new_failure_blocks(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """A new failure not present in the baseline blocks with exit 1 and is attributed
-        to this unit_id; pre-existing baseline failures never block."""
-        unit = self._make_unit()
-        workspace = tmp_path / "workspace"
-        repo_path = tmp_path / "repo"
-        baseline_dir = workspace / ".devbench" / "test-baselines"
-        baseline_dir.mkdir(parents=True)
-        repo_path.mkdir()
-        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
-        baseline_file.write_text(json.dumps({"repo": self.REPO, "failing_tests": ["tests/test_a.py::test_x"]}))
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["make", "-n", "test"]:
-                return (1, "", "no rule")
-            return (
-                1,
-                "FAILED tests/test_a.py::test_x - AssertionError\nFAILED tests/test_b.py::test_y - TypeError",
-                "",
-            )
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
-            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
-            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
-
-        assert result == 1
-        captured = capsys.readouterr()
-        payload = json.loads(captured.out)
-        assert payload["verdict"] == "block"
-        assert payload["new_failures"] == ["tests/test_b.py::test_y"]
-        assert payload["pre_existing_failures"] == ["tests/test_a.py::test_x"]
-        assert "E0-F1-S1-T1" in captured.err
-        assert "tests/test_b.py::test_y" in captured.err
-
-        # Baseline must NOT be updated on a block -- it stays the pre-change state.
-        baseline_after = json.loads(baseline_file.read_text())
-        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
-
-    def test_matched_file_no_new_failures_ratchets_baseline(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """No new failures: gate passes and the baseline is refreshed to the current
-        failing set, so a test this task happened to fix drops out of the baseline."""
-        unit = self._make_unit()
-        workspace = tmp_path / "workspace"
-        repo_path = tmp_path / "repo"
-        baseline_dir = workspace / ".devbench" / "test-baselines"
-        baseline_dir.mkdir(parents=True)
-        repo_path.mkdir()
-        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
-        baseline_file.write_text(
-            json.dumps(
-                {
-                    "repo": self.REPO,
-                    "failing_tests": ["tests/test_a.py::test_x", "tests/test_old.py::test_fixed_now"],
-                }
-            )
-        )
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["make", "-n", "test"]:
-                return (1, "", "no rule")
-            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
-            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
-            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
-
-        assert result == 0
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["verdict"] == "pass"
-
-        baseline_after = json.loads(baseline_file.read_text())
-        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
-
-    def test_degraded_when_no_recognised_failure_format(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """Non-pytest/go/jest output on a non-zero exit: falls back to a single synthetic
-        marker and flags `degraded: true` rather than silently claiming precision."""
-        unit = self._make_unit()
-        workspace = tmp_path / "workspace"
-        repo_path = tmp_path / "repo"
-        workspace.mkdir()
-        repo_path.mkdir()
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["make", "-n", "test"]:
-                return (1, "", "no rule")
-            return (1, "Build failed for unrelated reasons", "")
-
-        with (
-            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
-            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
-        ):
-            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
-
-        assert result == 0  # bootstrap path: still nothing to compare against
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["degraded"] is True
-
     def test_changed_files_query_failure_reports_error(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -11849,41 +11753,531 @@ class TestCmdCheckSharedFileImpact:
         assert "ERROR" in captured.err
         assert "git diff timed out" in captured.err
 
-    def test_corrupt_baseline_file_treated_as_no_baseline(
+
+class TestCheckSharedFileImpactBaseline:
+    """Test the pre-change shared-file baseline (spec 4.6, 5.4; issue #13 AC2; 318-D2/D3).
+
+    Covers the baseline location/shape, the introduced-vs-pre-existing
+    failure distinction, corrupt/mismatched baselines, the write-side
+    ``fcntl.flock`` and a failed ``git merge-base``.
+    """
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = (), default_branch: str | None = "main") -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns, default_branch=default_branch)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    # -- baseline path / record shape ------------------------------------
+
+    def test_baseline_path_is_keyed_by_repo_and_branch_point(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            path = cli._shared_file_baseline_path(self.REPO, "deadbeef")
+        assert path == tmp_path / ".devbench" / "test-baselines" / "caylent-solutions__git-repo" / "deadbeef.json"
+
+    def test_baseline_record_has_exactly_the_spec_5_4_fields(self) -> None:
+        record = cli._build_shared_file_baseline_record(
+            branch_point="deadbeef", runner=["pytest", "-q"], failing={"tests/test_a.py::test_x"}
+        )
+        assert set(record) == {"schema_version", "captured_at", "branch_point", "runner", "failing"}
+        assert record["branch_point"] == "deadbeef"
+        assert record["runner"] == ["pytest", "-q"]
+        assert record["failing"] == ["tests/test_a.py::test_x"]
+        assert isinstance(record["schema_version"], int)
+        # captured_at must parse back as a real timestamp, not a placeholder string.
+        datetime.fromisoformat(record["captured_at"])
+
+    # -- write-side flock ----------------------------------------------------
+
+    def test_write_baseline_holds_the_lock_until_the_write_is_visible_on_disk(self, tmp_path: Path) -> None:
+        """AC-4 / 318 lost-update finding: the payload must not be visible on disk when the
+        lock is acquired, and must already be visible when the lock is released -- i.e. the
+        lock is held for the full duration of the write, not just called before/after it in
+        some order. Records the target file's on-disk visibility alongside each real
+        ``fcntl.flock`` call (not just the op codes) so a release-before-write mutation is
+        caught even though it would still call LOCK_EX then LOCK_UN in the right order."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        calls: list[tuple[int, bool]] = []
+        real_flock = fcntl.flock
+
+        def recording_flock(fd: int, op: int) -> None:
+            real_flock(fd, op)
+            calls.append((op, path.exists()))
+
+        with patch("devbench.session.fcntl.flock", side_effect=recording_flock):
+            cli._write_shared_file_baseline(path, record)
+
+        assert len(calls) == 2, f"expected exactly one acquire and one release call, got {calls}"
+        (acquire_op, visible_at_acquire), (release_op, visible_at_release) = calls
+        assert acquire_op & fcntl.LOCK_EX and acquire_op & fcntl.LOCK_NB
+        assert visible_at_acquire is False, "payload must not exist on disk when the lock is acquired"
+        assert release_op == fcntl.LOCK_UN
+        assert visible_at_release is True, "payload must already exist on disk before the lock is released"
+        written = json.loads(path.read_text())
+        assert written["branch_point"] == "deadbeef"
+
+    def test_write_baseline_lock_path_is_a_sibling_of_the_baseline_never_the_baseline_itself(
+        self, tmp_path: Path
+    ) -> None:
+        """The lock is taken on ``<path>.lock``, a separate inode from *path* -- never on
+        *path* itself -- so it composes with atomic_write_text's temp-then-rename swap."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        cli._write_shared_file_baseline(path, record)
+        assert (tmp_path / "baseline.json.lock").exists()
+
+    # -- git merge-base failure -----------------------------------------------
+
+    def test_merge_base_failure_raises_with_git_stderr(self, tmp_path: Path) -> None:
+        not_a_repo = tmp_path / "not-a-repo"
+        not_a_repo.mkdir()
+        with patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg()):
+            with pytest.raises(RuntimeError, match=r"ERROR: git merge-base failed for unit UNIT-X") as excinfo:
+                cli._resolve_branch_point_sha(not_a_repo, self.REPO, "UNIT-X")
+        assert "not a git repository" in str(excinfo.value)
+
+    def test_merge_base_failure_at_cmd_level_exits_1_with_git_stderr_on_stderr_stream(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """A baseline file that fails to parse as JSON is treated as absent (bootstrap path),
-        never a hard crash that would block every subsequent task touching a shared file."""
+        """AC-6 exercised through `cmd_check_shared_file_impact` itself, not just the
+        `_resolve_branch_point_sha` helper: the process exit code and stderr stream must
+        both carry the real git failure, not merely the unit-level exception object."""
         unit = self._make_unit()
         workspace = tmp_path / "workspace"
-        repo_path = tmp_path / "repo"
-        baseline_dir = workspace / ".devbench" / "test-baselines"
-        baseline_dir.mkdir(parents=True)
-        repo_path.mkdir()
-        baseline_file = baseline_dir / f"{self.REPO.replace('/', '__')}.json"
-        baseline_file.write_text("{not valid json")
-
-        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
-            if cmd == ["make", "-n", "test"]:
-                return (1, "", "no rule")
-            return (1, "FAILED tests/test_a.py::test_x - AssertionError", "")
+        not_a_repo = tmp_path / "not-a-repo"
+        (not_a_repo / "tests").mkdir(parents=True)
+        (not_a_repo / "tests" / "test_suite.py").write_text("def test_ok():\n    assert True\n")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
-            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: repo_path}),
-            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: not_a_repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
-            patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: git merge-base failed for unit E0-F1-S1-T1" in captured.err
+        assert "not a git repository" in captured.err
+
+    def test_evaluate_gate_timeout_error_exits_1_with_a_single_error_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review advisory: `flock_path` (via `_load_shared_file_baseline` /
+        `_write_shared_file_baseline`) raises `TimeoutError`, an `OSError` subclass, when a
+        stuck lock holder is not released within `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`.
+        Before this fix `cmd_check_shared_file_impact` caught only `RuntimeError`, so a
+        lock timeout escaped as an uncaught traceback instead of the spec Section 7
+        one-line `ERROR: ...` sentence on stderr with a non-zero exit."""
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch(
+                "devbench.cli._evaluate_shared_file_gate",
+                side_effect=TimeoutError("Could not acquire lock at /tmp/x.lock within 30s."),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.err.count("\n") == 1, f"expected a single stderr line, not a traceback: {captured.err!r}"
+        assert captured.err.startswith("ERROR:")
+        assert "E0-F1-S1-T1" in captured.err
+        assert "Could not acquire lock at /tmp/x.lock within 30s." in captured.err
+
+    # -- fail-fast ordering: cheap prerequisites before the full suite -------
+
+    def test_corrupt_baseline_error_precedes_full_suite_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review BLOCKING D: branch-point resolution and baseline validation must
+        happen before the (expensive) current-tree suite run, so a terminal baseline
+        error never costs a full-suite execution first. Patches `_select_test_command`
+        to raise if it is ever called -- if the implementation regresses to running the
+        suite first, this test fails with that AssertionError instead of the expected
+        corrupt-baseline RuntimeError."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        baseline_file.write_bytes(b"{not valid json")
+
+        def _select_test_command_must_not_run(_repo_path: Path) -> list[str]:
+            raise AssertionError("full suite command must not be selected before baseline validation")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli._select_test_command", side_effect=_select_test_command_must_not_run),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: shared-file baseline .* is corrupt", captured.err)
+
+    # -- corrupt / mismatched baseline: loud failure, never rewritten -------
+
+    def test_corrupt_baseline_is_loud_and_leaves_file_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """finding 318-D2: a baseline that fails to parse is a loud ERROR, never a silent re-bootstrap."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        corrupt_bytes = b"{not valid json"
+        baseline_file.write_bytes(corrupt_bytes)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: shared-file baseline .* is corrupt", captured.err)
+        assert baseline_file.read_bytes() == corrupt_bytes
+
+    def test_branch_point_mismatch_is_loud_and_leaves_file_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        stale_record = cli._build_shared_file_baseline_record(branch_point="0" * 40, runner=["pytest"], failing=set())
+        stale_bytes = (json.dumps(stale_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(stale_bytes)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: stored baseline branch_point" in captured.err
+        assert base_sha in captured.err
+        assert baseline_file.read_bytes() == stale_bytes
+
+    # -- pre-change semantics: real two-branch git fixtures ------------------
+
+    def test_pre_existing_failure_at_branch_point_does_not_block(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A failure already present at the merge-base branch point exits 0 (issue #13 AC2, AC-18)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n\n\ndef test_pre_existing_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content=base_content,
+            feature_test_content=None,
+            feature_extra_path="tests/test_feature.py",
+            feature_extra_content="def test_feature_addition():\n    assert True\n",
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch(
+                "devbench.backlog.manifest.list_changed_files",
+                return_value=["tests/test_suite.py", "tests/test_feature.py"],
+            ),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
         payload = json.loads(capsys.readouterr().out)
-        assert payload["verdict"] == "bootstrap"
+        assert payload["verdict"] == "pass"
+        assert payload["branch_point"] == base_sha
 
-        baseline_after = json.loads(baseline_file.read_text())
-        assert baseline_after["failing_tests"] == ["tests/test_a.py::test_x"]
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert set(baseline) == {"schema_version", "captured_at", "branch_point", "runner", "failing"}
+        assert baseline["branch_point"] == base_sha
+        assert baseline["failing"] == ["tests/test_suite.py::test_pre_existing_fail"]
+
+    def test_introduced_failure_blocks_and_names_the_node_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A failure the unit's own diff introduces exits 1 and names the failing node id."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload["branch_point"] == base_sha
+        assert "tests/test_suite.py::test_new_fail" in captured.err
+        assert "E0-F1-S1-T1" in captured.err
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        assert payload["baseline_path"] == str(baseline_path)
+        assert payload["matched_files"] == ["tests/test_suite.py"]
+        assert payload["full_suite_command"] == ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+        assert payload["full_suite_exit_code"] != 0
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["failing"] == []
+
+    # -- degraded per-test parsing (unchanged helper, direct unit coverage) --
+
+    def test_parse_failing_tests_degrades_on_unrecognised_format(self) -> None:
+        """Non-pytest/go/jest output on a non-zero exit falls back to a single synthetic
+        marker and flags `degraded: true` rather than silently claiming precision."""
+        failing, degraded = cli._parse_failing_tests("Build failed for unrelated reasons", 1)
+        assert degraded is True
+        assert failing == {cli._SHARED_FILE_BASELINE_DEGRADED_MARKER}
+
+    def test_degraded_current_tree_run_blocks_against_a_clean_branch_point_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """test_review round-2 COVERAGE_REGRESSION: drives `cmd_check_shared_file_impact`
+        end to end (not just `_parse_failing_tests` in isolation) through a real two-branch
+        git fixture with a pre-populated, valid, clean (empty-failing) branch-point
+        baseline, so `_capture_shared_file_baseline` is never invoked and only the
+        CURRENT-tree run degrades. When the current-tree suite output cannot be
+        attributed to per-test failures, `payload['degraded']` must be True and the
+        synthetic marker must be reported as a new failure against the clean baseline,
+        blocking the gate (exit 1) rather than silently passing."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        clean_record = cli._build_shared_file_baseline_record(branch_point=base_sha, runner=["pytest"], failing=set())
+        clean_bytes = (json.dumps(clean_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(clean_bytes)
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:1] == ["pytest"]:
+                return (1, "Build failed for unrelated reasons", "")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["degraded"] is True
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == [cli._SHARED_FILE_BASELINE_DEGRADED_MARKER]
+        # the capture path must never have run: the pre-populated baseline is untouched.
+        assert baseline_file.read_bytes() == clean_bytes
+
+    # -- _resolve_branch_point_sha error paths -------------------------------
+
+    def test_resolve_branch_point_sha_raises_when_default_branch_unresolvable(self, tmp_path: Path) -> None:
+        not_a_repo = tmp_path / "not-a-repo"
+        not_a_repo.mkdir()
+        with patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(default_branch=None)):
+            with pytest.raises(RuntimeError, match="could not resolve a default branch"):
+                cli._resolve_branch_point_sha(not_a_repo, self.REPO, "UNIT-Y")
+
+    def test_resolve_branch_point_sha_raises_on_empty_merge_base_output(self, tmp_path: Path) -> None:
+        """Defensive branch (real `git merge-base` never exits 0 with empty stdout): a strict
+        allowlisted fake proves the guard fires rather than returning an empty/assumed SHA."""
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "merge-base"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg()),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            with pytest.raises(RuntimeError, match="empty merge-base output"):
+                cli._resolve_branch_point_sha(tmp_path, self.REPO, "UNIT-Z")
+
+    # -- _load_shared_file_baseline: non-object JSON, and the success path --
+
+    def test_load_baseline_raises_when_json_is_not_an_object(self, tmp_path: Path) -> None:
+        path = tmp_path / "baseline.json"
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(RuntimeError, match="is corrupt and will not be rewritten"):
+            cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+        assert path.read_text() == "[1, 2, 3]"
+
+    def test_load_baseline_returns_matching_record(self, tmp_path: Path) -> None:
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(
+            branch_point="deadbeef", runner=["pytest"], failing={"tests/test_a.py::test_x"}
+        )
+        path.write_text(json.dumps(record))
+        loaded = cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+        assert loaded == record
+
+    def test_load_baseline_takes_a_shared_lock_on_the_sibling_lock_file(self, tmp_path: Path) -> None:
+        """test_review WARN (round 2): the read-side shared lock was unasserted --
+        deleting the `with flock_path(..., shared=True)` wrapper around the read in
+        `_load_shared_file_baseline` left all 24 SharedFileImpact tests green. Records
+        the op and the locked inode at each real `fcntl.flock` call, and asserts the
+        locked inode is the sibling `<path>.lock` file's -- never *path* itself --
+        mirroring `test_write_baseline_holds_the_lock_until_the_write_is_visible_on_disk`
+        and `test_write_baseline_lock_path_is_a_sibling_of_the_baseline_never_the_baseline_itself`."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        path.write_text(json.dumps(record))
+        lock_path = tmp_path / "baseline.json.lock"
+        calls: list[tuple[int, int]] = []
+        real_flock = fcntl.flock
+
+        def recording_flock(fd: int, op: int) -> None:
+            real_flock(fd, op)
+            calls.append((op, os.fstat(fd).st_ino))
+
+        with patch("devbench.session.fcntl.flock", side_effect=recording_flock):
+            loaded = cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+
+        assert loaded == record
+        assert len(calls) == 2, f"expected exactly one acquire and one release call, got {calls}"
+        (acquire_op, acquire_ino), (release_op, release_ino) = calls
+        assert acquire_op & fcntl.LOCK_SH and acquire_op & fcntl.LOCK_NB
+        assert not acquire_op & fcntl.LOCK_EX, "read path must never take an exclusive lock"
+        assert release_op == fcntl.LOCK_UN
+        assert acquire_ino == lock_path.stat().st_ino == release_ino, "must lock the sibling .lock inode"
+        assert acquire_ino != path.stat().st_ino, "must never lock the baseline file itself"
+
+    # -- _capture_shared_file_baseline error paths (real git worktree) ------
+
+    def test_capture_baseline_raises_when_worktree_checkout_fails(self, tmp_path: Path) -> None:
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "README.md", "x\n")
+        _tdd_gate_commit_all(repo, "init")
+        with pytest.raises(RuntimeError, match="could not check out branch point"):
+            cli._capture_shared_file_baseline(repo, "0" * 40, "UNIT-W")
+
+    def test_capture_baseline_raises_and_removes_worktree_when_capture_run_is_degraded(self, tmp_path: Path) -> None:
+        """code_review BLOCKING C: a branch-point capture whose suite output could not be
+        attributed to individual failing tests (degraded -- including the runner not even
+        starting, rc 127 per `run_command`'s command-not-found/timeout convention) must
+        raise rather than let the caller persist a synthetic 'suite failed' marker as the
+        permanent, never-rewritten pre-change baseline. The worktree must still be cleaned
+        up (the raise happens inside the try/finally, not instead of it)."""
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(repo, "init")
+        base_sha = _run_scratch_git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:1] == ["pytest"]:
+                return (127, "", "pytest: command not found")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            with pytest.raises(RuntimeError, match="could not attribute per-test failures") as excinfo:
+                cli._capture_shared_file_baseline(repo, base_sha, "UNIT-D")
+
+        assert "pytest: command not found" in str(excinfo.value)
+        worktree_list = _run_scratch_git(["worktree", "list", "--porcelain"], repo).stdout
+        worktree_paths = [line.split(" ", 1)[1] for line in worktree_list.splitlines() if line.startswith("worktree ")]
+        assert worktree_paths == [str(repo)], "the capture worktree must still be removed on the degraded path"
+
+    def test_capture_baseline_removal_failure_does_not_delete_worktree_and_names_prune(self, tmp_path: Path) -> None:
+        """code_review BLOCKING B: on a `git worktree remove` failure the registration in
+        `repo`'s `.git/worktrees` survives even though the caller's `finally` ran, so
+        deleting the worktree directory out from under that registration would orphan it
+        with nothing left to inspect or hand to `git worktree remove --force` again. The
+        error must name `git worktree prune` as the remediation, and the directory must
+        still exist on disk (and the worktree must still be registered) after the raise."""
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(repo, "init")
+        base_sha = _run_scratch_git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "worktree", "remove"]:
+                return (1, "", "fatal: could not remove worktree")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            with pytest.raises(RuntimeError, match="could not remove baseline-capture worktree") as excinfo:
+                cli._capture_shared_file_baseline(repo, base_sha, "UNIT-V")
+
+        assert "git worktree prune" in str(excinfo.value)
+
+        worktree_list = _run_scratch_git(["worktree", "list", "--porcelain"], repo).stdout
+        worktree_paths = [line.split(" ", 1)[1] for line in worktree_list.splitlines() if line.startswith("worktree ")]
+        capture_worktrees = [p for p in worktree_paths if p != str(repo)]
+        assert len(capture_worktrees) == 1, worktree_list
+        assert Path(capture_worktrees[0]).exists(), "the worktree directory must be left in place, not deleted"
 
 
 class TestCmdCheckFixtureConsistency:

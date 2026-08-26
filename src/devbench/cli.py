@@ -86,6 +86,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -274,6 +275,7 @@ from devbench.constants import (
     RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
     RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE,
     RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE,
+    SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -335,7 +337,7 @@ from devbench.scope import (
     _scope_file_path,
     _tokenise,
 )
-from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
+from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog, flock_path
 from devbench.source_classification import SOURCE_EXTENSIONS, is_entry_point_stem, is_source_extension, is_test_path
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
@@ -6316,61 +6318,294 @@ def _parse_failing_tests(output: str, rc: int) -> tuple[set[str], bool]:
     return {_SHARED_FILE_BASELINE_DEGRADED_MARKER}, True
 
 
-def _shared_file_baseline_path(canonical_repo: str) -> Path:
-    """Return the per-repo baseline file path under the workspace's ``.devbench`` state dir."""
+def _shared_file_baseline_path(canonical_repo: str, branch_point: str) -> Path:
+    """Return the per-repo, per-branch-point baseline file path (spec 5.4).
+
+    ``.devbench/test-baselines/<canonical-repo>/<branch-point-sha>.json``,
+    under the workspace's ``.devbench`` state dir. Keying by *branch_point*
+    (rather than only by repo, as PR #318 did) is what makes the baseline a
+    pre-change snapshot instead of a single mutable per-repo record: every
+    distinct branch point a task diverges from gets its own file, so two
+    tasks that diverged at different commits never read or clobber one
+    another's baseline.
+    """
     safe_name = canonical_repo.replace("/", "__")
-    return WORKSPACE_ROOT / ".devbench" / "test-baselines" / f"{safe_name}.json"
+    return WORKSPACE_ROOT / ".devbench" / "test-baselines" / safe_name / f"{branch_point}.json"
 
 
-def _load_shared_file_baseline(path: Path) -> dict[str, Any] | None:
-    """Return the parsed baseline JSON at *path*, or ``None`` when absent/unreadable.
+def _resolve_branch_point_sha(repo_path: Path, canonical_repo: str, unit_id: str) -> str:
+    """Return the merge-base commit SHA between ``HEAD`` and the repo's default branch.
 
-    A corrupt or unreadable baseline is treated the same as "no baseline yet"
-    (bootstrap path) rather than raising -- a hand-edited or partially
-    written baseline file must never be able to turn into a hard crash that
-    blocks every subsequent task touching a shared file.
+    This is the "branch point" spec 4.6 anchors the pre-change baseline to:
+    the last commit ``HEAD`` and ``origin/<default-branch>`` share, i.e.
+    where the unit's branch diverged. Never returns a partial or assumed
+    SHA (spec Section 7) -- raises ``RuntimeError`` (never falls back to
+    ``HEAD`` or an empty string) when the default branch cannot be resolved
+    or ``git merge-base`` exits non-zero, carrying the git stderr so the
+    caller's error message is actionable.
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        raise RuntimeError(
+            f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: "
+            f"could not resolve a default branch for '{canonical_repo}'"
+        )
+    rc, stdout, stderr = run_command(["git", "merge-base", "HEAD", f"origin/{default_branch}"], cwd=repo_path)
+    if rc != 0:
+        raise RuntimeError(f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: {stderr.strip()}")
+    sha = stdout.strip()
+    if not sha:
+        raise RuntimeError(f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: empty merge-base output")
+    return sha
+
+
+def _shared_file_baseline_lock_path(path: Path) -> Path:
+    """Return the sibling lock-file path for baseline *path* (``<path>.lock``).
+
+    A *separate* inode from *path* itself -- never the baseline JSON file --
+    so :func:`flock_path` composes correctly with :func:`atomic_write_text`'s
+    temp-then-rename swap: a writer holds this lock-file's inode for the
+    full duration of the write while the target JSON file is replaced
+    atomically underneath it, and a racing reader or writer opens the *same*
+    lock-file path (not a temp file, not the post-rename target) so it
+    always contends for the same inode as the writer currently holds.
+    """
+    return path.with_name(path.name + ".lock")
+
+
+def _load_shared_file_baseline(path: Path, *, branch_point: str, unit_id: str) -> dict[str, Any] | None:
+    """Return the parsed baseline JSON at *path*, or ``None`` when no baseline exists yet.
+
+    Never silently re-bootstraps (finding 318-D2): raises ``RuntimeError``
+    -- and leaves *path* untouched -- when the file exists but is not
+    parseable JSON, is not a JSON object, or its stored ``branch_point``
+    disagrees with *branch_point* (the merge-base this run just resolved).
+    A stale or hand-edited baseline must never be able to silently mask a
+    regression the way a fresh bootstrap would.
+
+    Reads under a shared ``flock`` (:func:`flock_path` on
+    :func:`_shared_file_baseline_lock_path`, ``shared=True``) so a reader can
+    never observe a write in progress -- it either blocks until the writer's
+    exclusive lock is released, or (since :func:`_write_shared_file_baseline`
+    writes via ``atomic_write_text``'s temp-then-rename swap) simply opens
+    *path* after the rename has already made the new content visible
+    whole. Either way this function never sees a torn file.
     """
     if not path.exists():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, shared=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"ERROR: shared-file baseline {path} is corrupt and will not be rewritten; "
+                "inspect it, then re-run check-shared-file-impact"
+            ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"ERROR: shared-file baseline {path} is corrupt and will not be rewritten; "
+            "inspect it, then re-run check-shared-file-impact"
+        )
+    stored_branch_point = data.get("branch_point")
+    if stored_branch_point != branch_point:
+        raise RuntimeError(
+            f"ERROR: stored baseline branch_point {stored_branch_point} does not match "
+            f"the resolved merge-base {branch_point} for unit {unit_id}"
+        )
+    return data
 
 
-def _write_shared_file_baseline(path: Path, *, canonical_repo: str, failing_tests: set[str], unit_id: str) -> None:
-    """Persist *failing_tests* as the new baseline for *canonical_repo*, attributed to *unit_id*."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "repo": canonical_repo,
-        "failing_tests": sorted(failing_tests),
-        "updated_by_unit": unit_id,
-        "updated_at": datetime.now(tz=UTC).isoformat(),
+def _build_shared_file_baseline_record(*, branch_point: str, runner: list[str], failing: set[str]) -> dict[str, Any]:
+    """Build the spec 5.4 baseline record: exactly ``schema_version``, ``captured_at``,
+    ``branch_point``, ``runner`` and ``failing``.
+
+    The single writer both the merge-base capture path in
+    :func:`_evaluate_shared_file_gate` and any future baseline producer
+    (e.g. an auto-derived cache) share, so the on-disk record shape has one
+    place that can drift from spec 5.4 rather than two independently
+    hand-assembled dicts.
+    """
+    return {
+        "schema_version": 1,
+        "captured_at": datetime.now(tz=UTC).isoformat(),
+        "branch_point": branch_point,
+        "runner": list(runner),
+        "failing": sorted(failing),
     }
-    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def _evaluate_shared_file_gate(
-    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str]
-) -> tuple[dict[str, Any], int]:
-    """Run the full suite and baseline-diff for a matched shared-file impact.
+def _write_shared_file_baseline(path: Path, record: Mapping[str, Any]) -> None:
+    """Persist *record* as the baseline JSON at *path* atomically, under an exclusive lock.
 
-    Isolates the "a shared file WAS touched" branch of
-    :func:`cmd_check_shared_file_impact` into its own function purely to
-    keep the caller's cyclomatic/return-statement complexity low; the
-    bootstrap / block / pass decision described in that function's
-    docstring lives here. Returns ``(json_payload, exit_code)``.
+    Holds an exclusive :func:`flock_path` lock on *path*'s sibling
+    ``<path>.lock`` file (never *path* itself) for the full duration of the
+    write, then writes *path* via :func:`atomic_write_text` (temp-then-rename)
+    while still holding the lock. This is deliberately the composition spec
+    `integration-reality-gates-hardening.md` Section 3 calls for --
+    ``atomic_write_text`` for "baselines, generated files" plus a *sibling*
+    ``flock`` helper for "baseline write locking", not a from-scratch
+    in-place-write-under-lock re-implementation:
+
+    - The write itself is atomic (temp-then-rename), so a reader that opens
+      *path* without taking the read-side lock still never observes a
+      partially-written file -- it sees either the complete prior content or
+      the complete new content, never a truncated in-between state.
+    - The lock is taken on a path distinct from *path*, so the rename does
+      not invalidate anyone's held lock: a second racing writer opens the
+      *same* ``<path>.lock`` inode (not a fresh one) and blocks until this
+      write's ``with`` block releases it (318 lost-update finding).
+    - The wait is bounded by :data:`SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`
+      rather than an unbounded blocking acquire, so a stuck holder produces
+      a loud ``TimeoutError`` naming the lock path instead of hanging the
+      gate forever (fail-fast).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(dict(record), indent=2, sort_keys=True) + "\n"
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS):
+        atomic_write_text(path, payload)
+
+
+def _run_full_suite_and_parse_failures(repo_path: Path) -> tuple[list[str], int, str, str, set[str], bool]:
+    """Select and run the full-suite command in *repo_path*, then parse per-test failures.
+
+    Returns ``(cmd, rc, stdout, stderr, failing, degraded)``. Shared by
+    :func:`_capture_shared_file_baseline` (the branch-point capture run, in
+    an isolated worktree) and :func:`_evaluate_shared_file_gate` (the
+    current-tree run) -- the two callers differ in whose tree they run the
+    suite against and in how the resulting failure set is used afterward,
+    not in how the suite command is selected, run or parsed, so this is the
+    single place that logic lives.
     """
     from devbench.config import TEST_TIMEOUT
 
     cmd = _select_test_command(repo_path)
     rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
     combined_output = "\n".join(part for part in (stdout, stderr) if part.strip())
-    current_failing, degraded = _parse_failing_tests(combined_output, rc)
+    failing, degraded = _parse_failing_tests(combined_output, rc)
+    return cmd, rc, stdout, stderr, failing, degraded
 
-    baseline_path = _shared_file_baseline_path(canonical_repo)
-    baseline = _load_shared_file_baseline(baseline_path)
+
+def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: str) -> tuple[set[str], list[str]]:
+    """Run the full suite at *branch_point* in an isolated worktree; return ``(failing, cmd)``.
+
+    Uses ``git worktree add --detach`` so capturing the pre-change baseline
+    never touches *repo_path*'s own working tree (the caller's staged/
+    unstaged changes, or an in-progress task's dirty tree) -- checking out
+    *branch_point* directly in *repo_path* would discard that state.
+
+    Fail-fast on every path (spec Section 7) -- never silently leaves a
+    stale worktree registered against the repo, and never returns a
+    degraded (unattributed) result for the caller to persist as a
+    baseline:
+
+    - Checkout failure raises ``RuntimeError`` with the git stderr; nothing
+      was registered, so the ``mkdtemp`` scratch directory is removed.
+    - Once the worktree is registered, the suite run and its removal are
+      wrapped in ``try``/``finally`` so removal is attempted even if the
+      suite run itself raises or is interrupted.
+    - A capture run whose output cannot be attributed to individual failing
+      tests (:func:`_parse_failing_tests` returns ``degraded=True`` -- e.g.
+      the runner could not even start, surfaced as ``run_command``'s rc 127
+      command-not-found/timeout convention) raises ``RuntimeError`` naming
+      the runner and its stderr rather than letting the caller persist a
+      synthetic "suite failed" marker as the permanent, never-rewritten
+      pre-change baseline for this branch point.
+    - Worktree removal failure raises ``RuntimeError`` naming ``git
+      worktree prune`` as the remediation, and -- unlike a checkout
+      failure -- does NOT delete the scratch directory: ``git worktree
+      remove`` failing leaves the registration in ``repo_path``'s
+      ``.git/worktrees`` in place, so deleting the directory out from under
+      that registration would orphan it with no path left to inspect or
+      hand to ``git worktree remove --force`` again.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="devbench-shared-file-baseline-"))
+    worktree_path = tmp_dir / "worktree"
+    rc, _stdout, stderr = run_command(
+        ["git", "worktree", "add", "--detach", str(worktree_path), branch_point], cwd=repo_path
+    )
+    if rc != 0:
+        shutil.rmtree(tmp_dir)
+        raise RuntimeError(
+            f"ERROR: could not check out branch point {branch_point} for unit {unit_id} "
+            f"in {repo_path}: {stderr.strip()}"
+        )
+
+    try:
+        cmd, test_rc, stdout, test_stderr, failing, degraded = _run_full_suite_and_parse_failures(worktree_path)
+        if degraded:
+            raise RuntimeError(
+                f"ERROR: shared-file baseline capture for unit {unit_id} could not attribute "
+                f"per-test failures for runner {cmd} at branch point {branch_point} "
+                f"(exit {test_rc}): {(test_stderr.strip() or stdout.strip()) or '<no output>'}"
+            )
+    finally:
+        remove_rc, _remove_stdout, remove_stderr = run_command(
+            ["git", "worktree", "remove", "--force", str(worktree_path)], cwd=repo_path
+        )
+        if remove_rc != 0:
+            raise RuntimeError(
+                f"ERROR: could not remove baseline-capture worktree {worktree_path} for unit "
+                f"{unit_id} in {repo_path}: {remove_stderr.strip()}. The worktree directory was "
+                f"left in place (not deleted) because its registration in {repo_path} survives a "
+                f"failed removal; run 'git worktree prune' in {repo_path} once {worktree_path} "
+                "has been inspected."
+            )
+        shutil.rmtree(tmp_dir)
+
+    return failing, cmd
+
+
+def _evaluate_shared_file_gate(
+    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str]
+) -> tuple[dict[str, Any], int]:
+    """Run the full suite and diff it against the pre-change baseline for a matched shared-file impact.
+
+    Isolates the "a shared file WAS touched" branch of
+    :func:`cmd_check_shared_file_impact` into its own function purely to
+    keep the caller's cyclomatic/return-statement complexity low; the
+    capture / block / pass decision described in that function's docstring
+    lives here. Returns ``(json_payload, exit_code)``.
+
+    Resolves the branch point and loads/validates the stored baseline
+    BEFORE running the (expensive) full suite against the current tree --
+    fail-fast for the two prerequisites that are cheap to detect: a branch
+    point that cannot be resolved, or a stored baseline that is corrupt or
+    branch-point-mismatched (spec 4.6, finding 318-D2). Both raise
+    ``RuntimeError`` immediately, before the current-tree suite ever runs,
+    and no baseline write happens on either path.
+
+    This ordering guarantee does NOT extend to the baseline-capture path.
+    When no baseline exists yet for the branch point, capture happens
+    AFTER the current-tree suite has already run (see below); this
+    placement is a deliberate choice, not a forced one -- the baseline is
+    already loaded by the time the current-tree suite starts, so "no
+    baseline yet" is known beforehand. :func:`_capture_shared_file_baseline`
+    can raise ``RuntimeError`` on three paths, and they do not all cost
+    the same number of full-suite runs: a branch-point worktree checkout
+    failure raises before the capture's own suite run ever starts (the
+    ``git worktree add`` call
+    fails and the function returns via its early ``raise``, never entering
+    the ``try`` block that runs the suite), so that path costs only the
+    current-tree suite run already spent above -- one full-suite run. A
+    degraded/unattributed capture run or a worktree-removal failure (naming
+    ``git worktree prune`` as the remediation) both happen only after the
+    capture's own suite run has completed, so those two paths cost the
+    current-tree suite run plus the branch-point capture's own suite run --
+    two full-suite runs -- before the operator sees the error. Every
+    ``RuntimeError`` this function raises or propagates is never caught
+    here; it is caught by the caller, which prints it to stderr and exits
+    1. ``_load_shared_file_baseline`` and ``_write_shared_file_baseline``
+    can also propagate ``TimeoutError`` (a stuck ``flock_path`` holder)
+    rather than ``RuntimeError`` -- also never caught here, also caught by
+    the caller.
+    """
+    branch_point = _resolve_branch_point_sha(repo_path, canonical_repo, unit_id)
+    baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
+    baseline = _load_shared_file_baseline(baseline_path, branch_point=branch_point, unit_id=unit_id)
+
+    cmd, rc, _stdout, _stderr, current_failing, degraded = _run_full_suite_and_parse_failures(repo_path)
 
     base_payload: dict[str, Any] = {
         "unit_id": unit_id,
@@ -6381,26 +6616,18 @@ def _evaluate_shared_file_gate(
         "full_suite_exit_code": rc,
         "degraded": degraded,
         "baseline_path": str(baseline_path),
+        "branch_point": branch_point,
     }
 
     if baseline is None:
-        _write_shared_file_baseline(
-            baseline_path, canonical_repo=canonical_repo, failing_tests=current_failing, unit_id=unit_id
+        captured_failing, captured_cmd = _capture_shared_file_baseline(repo_path, branch_point, unit_id)
+        record = _build_shared_file_baseline_record(
+            branch_point=branch_point, runner=captured_cmd, failing=captured_failing
         )
-        payload = {
-            **base_payload,
-            "verdict": "bootstrap",
-            "failing_tests": sorted(current_failing),
-            "note": (
-                "No prior baseline existed for this repo; the current failing-test set has "
-                "been recorded as the baseline. This run cannot distinguish pre-existing "
-                "failures from ones this task introduced -- the next task that touches a "
-                "shared file will be checked against this baseline."
-            ),
-        }
-        return payload, 0
+        _write_shared_file_baseline(baseline_path, record)
+        baseline = record
 
-    baseline_failing: set[str] = set(baseline.get("failing_tests") or [])
+    baseline_failing: set[str] = set(baseline.get("failing") or [])
     new_failures = sorted(current_failing - baseline_failing)
 
     if new_failures:
@@ -6412,9 +6639,6 @@ def _evaluate_shared_file_gate(
         }
         return payload, 1
 
-    _write_shared_file_baseline(
-        baseline_path, canonical_repo=canonical_repo, failing_tests=current_failing, unit_id=unit_id
-    )
     payload = {**base_payload, "verdict": "pass", "failing_tests": sorted(current_failing)}
     return payload, 0
 
@@ -6439,19 +6663,35 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     2. Cross-references it against the repo's `shared_file_impact.patterns`
        glob list. No match: no-op (exit 0, `shared_file_impact: false`); the
        task's normal `run-tests` evidence stands.
-    3. On a match (`_evaluate_shared_file_gate`): runs the full-suite
-       command, parses individual failing-test identifiers out of the
-       output (`_parse_failing_tests`), and diffs them against a stored
-       baseline at `<workspace>/.devbench/test-baselines/<repo>.json`.
-       Blocks (exit 1) only on tests failing now that were NOT in the
-       baseline -- so this does not stall on pre-existing/flaky failures.
-       The blocking output names the offending tests AND `unit_id`,
-       attributing the regression to the task that introduced it.
-    4. On a pass (no new failures), the baseline is refreshed to the
-       current failing set -- a ratchet, so a task that fixes a pre-existing
-       failure isn't later blamed by an unrelated task for "un-fixing" it.
-    5. No prior baseline: bootstraps (records current failures as the
-       baseline, exit 0) since there is nothing yet to compare against.
+    3. On a match (`_evaluate_shared_file_gate`): resolves the unit's branch
+       point (`_resolve_branch_point_sha`, `git merge-base HEAD
+       origin/<default-branch>`), runs the full-suite command against the
+       CURRENT tree, and diffs its per-test failures
+       (`_parse_failing_tests`) against a pre-change baseline stored at
+       `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`
+       (spec 5.4). When no baseline exists yet for that branch point, one is
+       captured now by running the same suite in an isolated `git worktree`
+       checked out AT the branch point (`_capture_shared_file_baseline`) --
+       never from the current, already-changed tree -- so the baseline is
+       always a pre-change snapshot, never post-change. Blocks (exit 1)
+       only on tests failing now that were NOT already failing at the
+       branch point -- so this does not stall on pre-existing/flaky
+       failures. The blocking output names the offending tests AND
+       `unit_id`, attributing the regression to the task that introduced
+       it.
+    4. A baseline file that exists but fails to parse, or whose stored
+       `branch_point` disagrees with the resolved merge-base, is a loud
+       error (exit 1, stderr) and is never rewritten (spec 4.6, finding
+       318-D2) -- there is no silent re-bootstrap path.
+    5. A branch point that cannot be resolved (`_resolve_branch_point_sha`,
+       `git merge-base` exiting non-zero or the configured default branch
+       not existing, AC-6) is a loud error (exit 1, stderr) naming the
+       unit and the git failure, raised before any full-suite run starts.
+    6. A `flock_path` acquisition that times out while loading or writing
+       the baseline (a stuck lock holder past
+       `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`) is a loud error (exit 1,
+       stderr, "ERROR: could not acquire the shared-file baseline lock for
+       unit `unit_id`") rather than hanging the gate forever.
 
     Known limitation (v1, documented rather than hidden): this is a
     hand-maintained glob registry, not an auto-derived import/mount-graph
@@ -6459,10 +6699,16 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     the reserved config surface for the eventual auto-derivation successor
     -- see `docs/devbench-yaml-reference.md` for the tradeoff). Per-test
     failure attribution is parsed from common textual formats (pytest,
-    `go test`, jest/mocha-style); other runners still get suite-level
-    bootstrap/ratchet behaviour but degrade to a single synthetic marker
-    instead of per-test identifiers, surfaced via the `degraded` field in
-    the JSON output.
+    `go test`, jest/mocha-style); other runners degrade to a single
+    synthetic marker instead of per-test identifiers. That marker and the
+    `degraded` JSON field apply ONLY to the CURRENT-TREE evaluation run
+    (item 3 above): a degraded current-tree run still gets compared
+    against whatever branch-point baseline is on file, and blocks unless
+    that baseline already contains the same synthetic marker. There is no
+    equivalent suite-level baseline-CAPTURE fallback for an unsupported
+    runner -- a degraded capture run is always a loud error naming the
+    runner and its stderr, and is never persisted as a baseline (see
+    :func:`_capture_shared_file_baseline`).
     """
     from devbench.backlog.manifest import list_changed_files
 
@@ -6503,9 +6749,24 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         print(json.dumps(payload, indent=2))
         return 0
 
-    result_payload, rc = _evaluate_shared_file_gate(
-        unit_id=unit_id, canonical_repo=canonical_repo, repo_path=repo_path, matched_files=matched_files
-    )
+    try:
+        result_payload, rc = _evaluate_shared_file_gate(
+            unit_id=unit_id, canonical_repo=canonical_repo, repo_path=repo_path, matched_files=matched_files
+        )
+    except (RuntimeError, TimeoutError) as exc:
+        # RuntimeError already carries a fully-formed `ERROR: ...` message. TimeoutError
+        # does not: flock_path (via _load_shared_file_baseline / _write_shared_file_baseline)
+        # raises it, an OSError subclass rather than a RuntimeError, when a stuck lock
+        # holder is not released within SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, so it is
+        # wrapped here to still be a single spec Section 7 `ERROR: ...` line instead of an
+        # uncaught traceback.
+        message = (
+            str(exc)
+            if isinstance(exc, RuntimeError)
+            else (f"ERROR: could not acquire the shared-file baseline lock for unit {unit_id}: {exc}")
+        )
+        print(message, file=sys.stderr)
+        return 1
     print(json.dumps(result_payload, indent=2))
     if rc != 0:
         print(

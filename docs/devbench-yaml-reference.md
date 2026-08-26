@@ -209,11 +209,16 @@ Manifest.
 When a work unit's diff touches a path matching one of these patterns,
 `devbench check-shared-file-impact <unit-id>` (invoked by the executor, enforced by the
 `assert-shared-file-impact.sh` guard hook) runs the FULL test suite -- not the task's scoped
-subset -- and diffs the resulting failing-test set against a stored baseline at
-`<workspace>/.devbench/test-baselines/<repo>.json`. It blocks task completion only on **newly
-introduced** failures, so pre-existing/flaky failures never stall an unrelated task. See
+subset -- and diffs the resulting failing-test set against a pre-change baseline stored at
+`<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`, one file per merge-base
+branch point the unit diverged from. It blocks task completion only on **newly introduced**
+failures, so pre-existing/flaky failures never stall an unrelated task. See
 `devbench check-shared-file-impact --help` and `src/devbench/cli.py::cmd_check_shared_file_impact`
-for the full algorithm (bootstrap-on-first-run, ratchet-on-pass).
+for the full algorithm: the baseline is captured once per branch point by running the full
+suite in an isolated `git worktree` checked out AT that branch point (never from the current,
+already-changed tree), and a baseline that exists but fails to parse, or whose stored
+`branch_point` disagrees with the resolved merge-base, is a loud `ERROR` on stderr (exit 1)
+that leaves the file untouched -- there is no silent re-bootstrap path.
 
 **Known limitation (v1):** this registry is hand-maintained per repo, not auto-derived from an
 import/mount-graph analysis of actual fan-in. Auto-derivation (which files are imported by

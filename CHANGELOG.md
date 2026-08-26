@@ -924,7 +924,62 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `assert-shared-file-impact.sh` `PostToolUse` guard hook (mirroring
   `assert-tests-pass.sh`) makes the exit code load-bearing instead of
   advisory, and `executor.md`'s Definition of Done now requires running
-  the gate before logging completion.
+  the gate before logging completion. (E5-F1-S1-T1 replaced the
+  bootstrap-and-ratchet baseline below with a pre-change, per-branch-point
+  baseline; see the "Shared-file baseline is now a pre-change,
+  per-branch-point snapshot" entry below.)
+
+- **Shared-file baseline is now a pre-change, per-branch-point snapshot,
+  written atomically under a sibling `flock`, read under a shared `flock`,
+  captured with fail-fast worktree cleanup, and a corrupt/mismatched/
+  degraded baseline is a loud error instead of a silent re-bootstrap**
+  (spec `integration-reality-gates-hardening.md` sections 3, 4.6 and 5.4;
+  issue #13 AC2; source PR #318 findings 318-D2 and 318-D3). The previous
+  post-change ratchet model wrote the baseline from a run of the
+  already-changed tree, so a regression a task introduced itself was
+  captured as "pre-existing" on the very first run and the gate passed
+  forever after; a missing or corrupt baseline silently re-bootstrapped
+  the same way, making baseline corruption an effective way to disable the
+  gate unnoticed, and two racing gate runs on the same repo could lose one
+  another's writes. `check-shared-file-impact` now resolves the work
+  unit's branch point via `git merge-base HEAD origin/<default-branch>`
+  and stores the baseline at
+  `.devbench/test-baselines/<repo>/<branch-point-sha>.json` (one file per
+  branch point, never overwritten by a later task diverging from a
+  different commit) with the exact fields `schema_version`, `captured_at`,
+  `branch_point`, `runner` and `failing`. When no baseline exists yet for
+  that branch point it is captured by running the full suite in an
+  isolated `git worktree` checked out AT the branch point -- never from
+  the caller's own working tree -- so the baseline is always a true
+  pre-change snapshot; a failure the unit's own diff introduces is no
+  longer indistinguishable from one that predates the branch. Branch-point
+  resolution and baseline validation now run BEFORE the (expensive) current-
+  tree suite, so a corrupt or mismatched stored baseline never costs a
+  full-suite run first; a degraded (unattributed) branch-point capture is
+  still discovered only after the current-tree suite has already run,
+  since the capture itself is a second full-suite run that only happens
+  once the first one has completed. Baseline writes use `atomic_write_text`
+  (temp-then-rename) held under an exclusive lock on a *sibling*
+  `<baseline>.json.lock` file via a new generic
+  `flock_path(lock_path, timeout_seconds, shared=...)` helper
+  in `session.py` (which `flock_backlog` is now a thin wrapper over,
+  rather than a separate re-implementation), bounded by
+  `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS` instead of blocking forever; a
+  reader takes the same lock file in shared mode so it can never observe a
+  write in progress. A baseline file that exists but fails to parse, or
+  whose stored `branch_point` disagrees with the resolved merge-base, now
+  exits 1 with `ERROR: shared-file baseline ... is corrupt and will not be
+  rewritten` (or the branch-point-mismatch equivalent) on stderr and the
+  file is left byte-for-byte untouched; the first-run bootstrap and
+  post-change ratchet write paths are removed entirely, not gated behind a
+  flag. The branch-point capture wraps the suite run and worktree removal
+  in `try`/`finally` so removal is always attempted; a removal failure
+  leaves the worktree directory in place (rather than deleting it out from
+  under a still-registered worktree) and names `git worktree prune` as the
+  remediation; and a capture run whose output cannot be attributed to
+  per-test failures (including the runner not starting at all) is now a
+  loud `ERROR` naming the runner and its stderr instead of silently
+  persisting a synthetic "suite failed" marker as the permanent baseline.
 
 - **Reachability check on the code-review gate**
   (`caylent-solutions/devbench-internal-backlog#10`). A task could

@@ -63,7 +63,8 @@ class TestAssertSharedFileImpactHook:
         assert "check-shared-file-impact" in result.stderr
 
     def test_no_shared_file_match_exits_0(self) -> None:
-        """A clean check-shared-file-impact exit (no match, bootstrap, or pass) is allowed."""
+        """A clean check-shared-file-impact exit (no match, or a pass against the
+        pre-change baseline) is allowed."""
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": "uv run devbench check-shared-file-impact E0-F1-S1-T1"},

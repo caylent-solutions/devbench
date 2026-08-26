@@ -8,8 +8,10 @@
 # <unit-id>` is a no-op (exit 0) unless the task's diff touches a file
 # matching the target repo's `gates.repos.<repo>.shared_file_impact.patterns`
 # (devbench.yaml); when it does match, it runs the FULL test suite and
-# diffs the failure set against a stored baseline, exiting non-zero only on
-# NEWLY introduced failures (pre-existing/flaky failures never block). This
+# diffs the failure set against a stored baseline, exiting non-zero on
+# NEWLY introduced failures (pre-existing/flaky failures never block) or
+# when the gate could not evaluate a baseline at all (corrupt/mismatched
+# baseline, unresolvable branch point, or a lock-acquisition timeout). This
 # hook is the enforcement point: the executor is instructed to run the
 # command, but nothing stops an agent from skipping that instruction under
 # time pressure -- this hook makes the exit code load-bearing instead of
@@ -62,14 +64,20 @@ if [[ "$COMMAND" != *"check-shared-file-impact"* ]]; then
   exit 0
 fi
 
-# Gate passed (no shared-file match, or full-suite ran clean / bootstrap) -- allow.
+# Gate passed (no shared-file match, or full-suite ran clean against the
+# pre-change baseline) -- allow.
 if [[ "$EXIT_CODE" -eq 0 ]]; then
   exit 0
 fi
 
-# Gate blocked: the diff touched a registered shared file and the full-suite
-# run introduced new failures not present in the stored baseline.
-echo "assert-shared-file-impact: check-shared-file-impact exited with code ${EXIT_CODE} -- this task's diff touches a shared/high-fan-in file and introduced new full-suite test failures." >&2
+# Gate blocked: either the diff touched a registered shared file and the
+# full-suite run introduced new failures not present in the stored
+# baseline (JSON payload with a 'new_failures' list), or the gate could
+# not evaluate a baseline at all -- a corrupt/branch-point-mismatched
+# baseline file, an unresolvable branch point, or a timed-out baseline
+# lock acquisition -- in which case the command prints a single stderr
+# 'ERROR: ...' line with no JSON payload instead.
+echo "assert-shared-file-impact: check-shared-file-impact exited with code ${EXIT_CODE} -- this task's diff touches a shared/high-fan-in file and the full-suite regression gate did not pass." >&2
 echo "Command: ${COMMAND}" >&2
-echo "Fix: read the JSON output above for the 'new_failures' list, fix every regression it introduced (do not just delete or skip the failing tests), then re-run check-shared-file-impact." >&2
+echo "Fix: if JSON output above names a 'new_failures' list, fix every regression it introduced (do not just delete or skip the failing tests); otherwise read the single 'ERROR: ...' line above (corrupt/mismatched baseline, unresolvable branch point, or a stuck baseline lock) and resolve that condition. Then re-run check-shared-file-impact." >&2
 exit 2

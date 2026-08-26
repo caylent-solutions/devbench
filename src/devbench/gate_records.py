@@ -17,8 +17,10 @@ module -- E3 through E7), and :func:`latest_gate_pass_record` operates on a
 content string the caller supplies rather than reading a work-unit file
 itself. Every timestamp is timezone-aware UTC, and :func:`compute_scope_hash`
 is a pure function of a caller-supplied file-to-blob-hash mapping (resolved
-from git plumbing output by the caller) -- so the whole module is testable
-without a live repo (spec Section 3.6).
+from git plumbing output by the caller) plus an optional `target_ref_sha`
+input (spec 4.5, internal issue #12 AC3: the ancestry gate's resolved target
+ref commit sha, folded into the digest alongside the file mapping) -- so the
+whole module is testable without a live repo (spec Section 3.6).
 
 The marker is additive to the audit-comment contract (spec Section 5.3): a
 gate command may embed it as the message body of a normal audit comment
@@ -26,6 +28,18 @@ gate command may embed it as the message body of a normal audit comment
 `devbench.cli._BLOCKED_AUDIT_LINE_RE`), so :func:`latest_gate_pass_record`
 locates the tag wherever it appears on a line rather than requiring the
 marker to be the entire line.
+
+This module owns a THIRD marker family alongside `[GATE_PASS]` and
+`[GATE_WAIVER]`: `[GATE_ANCESTRY_TARGET_REF] <target-ref>` (spec 4.5,
+internal issue #12 AC3), composed by :func:`compose_ancestry_target_ref_marker`
+and read back by :func:`latest_ancestry_target_ref`. It is the `[GATE_PASS
+ancestry]` record's companion marker: `cli._write_ancestry_gate_pass_record`
+persists it alongside every `[GATE_PASS ancestry]` record so that
+`BacklogManager._resolve_ancestry_target_ref` can read the EXACT ref a run
+probed back at `mark-done` freshness-recompute time, instead of re-deriving
+the repo's default branch (which would misread a run that used
+`check-ancestry`'s optional explicit `<target-ref>` override as permanently
+stale).
 
 :func:`gate_waiver_records` and :func:`gate_waiver_targets` (spec 4.9, Section
 2 G7) are this module's read side for the sibling `[GATE_WAIVER <gate>]
@@ -124,7 +138,7 @@ def _require_declared_gate(gate: str) -> None:
         raise ValueError(f"Unknown gate {gate!r}; declared gates are: {', '.join(sorted(GATE_TIERS))}.")
 
 
-def compute_scope_hash(file_blob_hashes: Mapping[str, str]) -> str:
+def compute_scope_hash(file_blob_hashes: Mapping[str, str], *, target_ref_sha: str | None = None) -> str:
     """Compute the spec-4.2 scope hash over a changed-file -> blob-hash mapping.
 
     SHA-256 over the sorted changed-file list plus each file's blob hash, so
@@ -137,19 +151,44 @@ def compute_scope_hash(file_blob_hashes: Mapping[str, str]) -> str:
 
     Args:
         file_blob_hashes: Repo-relative changed-file path -> that file's git
-            blob hash (hex string). Must be non-empty.
+            blob hash (hex string). May be empty when `target_ref_sha` is
+            supplied (see below).
+        target_ref_sha: An explicit, named additional scope-hash input
+            (spec 4.5, internal issue #12 AC3): the ancestry gate's
+            resolved target ref commit sha, folded into the digest so a
+            moved target branch invalidates a persisted `[GATE_PASS
+            ancestry]` record even when the unit's Changes Manifest is
+            unchanged. `None` (the default) reproduces the exact
+            pre-existing digest every other gate already relies on --
+            this parameter never changes the hash value for a caller that
+            omits it.
 
     Returns:
-        A lowercase SHA-256 hex digest of the sorted `path:blob_hash` pairs.
+        A lowercase SHA-256 hex digest of the sorted `path:blob_hash` pairs,
+        plus `target_ref_sha` when supplied.
 
     Raises:
-        ValueError: If `file_blob_hashes` is empty -- an empty scope must
-            never hash into a passing record.
+        ValueError: If `file_blob_hashes` is empty AND `target_ref_sha` is
+            `None` -- an empty scope must never hash into a passing record.
+            A non-empty `target_ref_sha` on its own is sufficient scope
+            (ancestry's own record may carry no Changes-Manifest files at
+            all). Also raised when `target_ref_sha` is supplied but is
+            empty or whitespace-only -- an empty string is not a "non-empty
+            target_ref_sha" and must never be accepted as sufficient scope
+            either.
     """
-    if not file_blob_hashes:
+    if target_ref_sha is not None and not target_ref_sha.strip():
+        raise ValueError(
+            "target_ref_sha must be a non-empty, non-whitespace string when supplied; an empty scope must "
+            "never hash into a passing record."
+        )
+    if not file_blob_hashes and target_ref_sha is None:
         raise ValueError("Cannot compute a scope hash over an empty change set; at least one changed file is required.")
 
-    digest_input = "\n".join(f"{path}:{file_blob_hashes[path]}" for path in sorted(file_blob_hashes))
+    lines = [f"{path}:{file_blob_hashes[path]}" for path in sorted(file_blob_hashes)]
+    if target_ref_sha is not None:
+        lines.append(f"target_ref_sha:{target_ref_sha}")
+    digest_input = "\n".join(lines)
     return hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
 
 
@@ -259,6 +298,85 @@ def latest_gate_pass_record(content: str, gate: str) -> GatePassRecord | None:
         if tag_match is None or tag_match.group("gate") != gate:
             continue
         latest = parse_gate_pass_record(line[tag_match.start() :])
+    return latest
+
+
+# `[GATE_ANCESTRY_TARGET_REF] <target-ref>` (spec 4.5, internal issue #12
+# AC3): a companion marker to `[GATE_PASS ancestry]`, persisting the EXACT
+# ref string `cmd_check_ancestry` resolved against for that run. It exists
+# because `check-ancestry` accepts an OPTIONAL explicit `<target-ref>`
+# override (spec 4.5), so the ref used at gate-pass time is not always the
+# repo's default branch -- and the `[GATE_PASS <gate>] <iso-utc>
+# <scope-hash>` grammar itself (spec 5.3) is shared by every gate and
+# carries no room for an ancestry-specific extra field, so it cannot be
+# widened just for this one gate without risking every other gate's
+# already-shipped marker parsing. `BacklogManager._resolve_ancestry_target_ref`
+# reads this marker back at `mark-done` freshness-recompute time instead of
+# re-deriving the default branch, so a run that passed an explicit
+# `<target-ref>` recomputes the SAME ref -- never a different one that would
+# make the record read as permanently stale.
+_ANCESTRY_TARGET_REF_TAG_NAME: str = "GATE_ANCESTRY_TARGET_REF"
+_ANCESTRY_TARGET_REF_RECORD_RE = re.compile(r"^\[" + _ANCESTRY_TARGET_REF_TAG_NAME + r"\] (?P<target_ref>\S+)$")
+_ANCESTRY_TARGET_REF_TAG_RE = re.compile(r"\[" + _ANCESTRY_TARGET_REF_TAG_NAME + r"\]")
+
+
+def compose_ancestry_target_ref_marker(target_ref: str) -> str:
+    """Compose the single-line `[GATE_ANCESTRY_TARGET_REF] <target-ref>` companion marker.
+
+    The sole authorized builder of this marker's text, mirroring
+    :func:`compose_gate_pass_record`'s role for the `[GATE_PASS]` family:
+    a gate command calls this rather than formatting the tag itself.
+    Written by `cli._write_ancestry_gate_pass_record` immediately alongside
+    every `[GATE_PASS ancestry]` record it persists.
+
+    Args:
+        target_ref: The exact, non-empty, whitespace-free ref string
+            `cmd_check_ancestry` resolved against for the run (e.g. an
+            `<remote>/<default-branch>` refspec, or an explicit branch,
+            tag, or commit sha the caller passed).
+
+    Returns:
+        The exact one-line marker text (no trailing newline).
+
+    Raises:
+        ValueError: If `target_ref` is empty or contains whitespace -- a
+            malformed ref is never persisted.
+    """
+    if not target_ref or target_ref != target_ref.strip() or any(ch.isspace() for ch in target_ref):
+        raise ValueError(f"target_ref must be a non-empty, whitespace-free ref string; got {target_ref!r}.")
+    return f"[{_ANCESTRY_TARGET_REF_TAG_NAME}] {target_ref}"
+
+
+def latest_ancestry_target_ref(content: str) -> str | None:
+    """Return the most recent `[GATE_ANCESTRY_TARGET_REF]` marker's ref in *content*, or `None`.
+
+    Scans *content* line by line for the tag -- wherever it appears on the
+    line, the same embedded-anywhere convention :func:`latest_gate_pass_record`
+    uses -- and returns the ref parsed from the LAST matching line (the
+    audit trail is append-only, so the last match is the most recent).
+    Returns `None` when no such marker is present (e.g. a
+    `[GATE_PASS ancestry]` record written before this marker existed).
+
+    Args:
+        content: The text to scan.
+
+    Returns:
+        The most recent persisted target-ref string, or `None`.
+
+    Raises:
+        ValueError: A line tagged `[GATE_ANCESTRY_TARGET_REF]` is present
+            but the remainder of that line does not parse as a well-formed
+            marker -- a malformed marker is never silently skipped.
+    """
+    latest: str | None = None
+    for line in content.splitlines():
+        tag_match = _ANCESTRY_TARGET_REF_TAG_RE.search(line)
+        if tag_match is None:
+            continue
+        record_match = _ANCESTRY_TARGET_REF_RECORD_RE.match(line[tag_match.start() :])
+        if record_match is None:
+            raise ValueError(f"Malformed [GATE_ANCESTRY_TARGET_REF] marker: {line!r}")
+        latest = record_match.group("target_ref")
     return latest
 
 

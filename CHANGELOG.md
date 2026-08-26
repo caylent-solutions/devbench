@@ -1350,6 +1350,53 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
   `tests/test_docs/test_cli_reference_wire_gate.py`.
 
+- **`check-ancestry` is wired into the done path and persists a
+  target-ref-aware `[GATE_PASS ancestry]` record; `mark-done` now enforces
+  it and re-verifies on resume when the target branch has moved** (spec
+  `integration-reality-gates-hardening.md` sections 4.2, 4.3, 4.5, 5.2;
+  AC-6, AC-7, AC-16; internal issue #12 AC3). A passing enabled run appends
+  exactly one `[GATE_PASS ancestry] <iso-utc> <scope-hash>` line to the
+  unit's audit section (surviving `read-unit --strip-comments`) through
+  `devbench.gate_records.compose_gate_pass_record`; a failing, error, or
+  disabled run writes none. The spec 5.2 status line also gains a
+  `scope_hash` field -- the same digest persisted in the record on a
+  passing run, and the empty string on the BLOCKED (`status: "fail"`)
+  line, which persists no record; this JSON field is printed as the
+  first stdout line of an enabled run, copied verbatim into the
+  generated gate task's report-file deliverable, and read by the
+  review judges from there. `devbench.gate_records.compute_scope_hash` gains an
+  explicit, named `target_ref_sha` parameter: the ancestry gate's scope
+  hash folds in the resolved target ref's current commit sha alongside
+  the unit's own Changes-Manifest file blob hashes, so an identical
+  changed-file set with a different target ref sha now hashes
+  differently, and the value is unchanged for every other gate's caller
+  that omits the parameter. `mark-done` on a unit whose repo has
+  `gates.ancestry.enabled` true now refuses (exit 1, no status write)
+  unless a fresh `[GATE_PASS ancestry]` record exists (or an operator has
+  filed a `[GATE_WAIVER ancestry]` -- the same whole-gate waiver bypass
+  every other machine-blocking gate already honours), naming the exact
+  remediation `uv run devbench check-ancestry <unit-id> <dependency-ref>`;
+  a record whose recomputed hash no longer matches -- including when only
+  the target branch has moved, with the Changes Manifest unchanged -- is
+  refused with `ERROR: gate 'ancestry' record is stale (scope changed
+  since it ran)`. Because `check-ancestry` accepts an OPTIONAL explicit
+  `<target-ref>` override, `cmd_check_ancestry` also writes a
+  `[GATE_ANCESTRY_TARGET_REF] <target-ref>` companion marker naming the
+  EXACT ref the passing run probed against
+  (`devbench.gate_records.compose_ancestry_target_ref_marker`), in the
+  SAME atomic write as the `[GATE_PASS ancestry]` record so a write
+  failure can never leave one without the other;
+  `mark_done`'s freshness recompute reads it back
+  (`BacklogManager._resolve_ancestry_target_ref`) instead of
+  re-deriving the repo's default branch, so a record produced with an
+  explicit override recomputes against the SAME ref rather than reading as
+  permanently stale. A `[GATE_PASS ancestry]` record present WITHOUT its
+  `[GATE_ANCESTRY_TARGET_REF]` companion (e.g. one written before this
+  marker existed) now makes `mark-done` refuse with `ERROR: Cannot
+  resolve ancestry gate target ref: no [GATE_ANCESTRY_TARGET_REF] marker
+  recorded ...` naming the same `check-ancestry` remediation, rather than
+  silently treating the record as unchanged.
+
 ## [0.4.0] -- 2026-08-12
 
 ### Changed (model defaults)

@@ -21,6 +21,7 @@ import pytest
 from test_source_classification import _CLI_REACHABILITY_HISTORICAL_EXTENSIONS
 from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
 from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
+from test_tdd_gate import run_scratch_git as _run_scratch_git
 from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli
@@ -4636,6 +4637,28 @@ class _AncestryCmdFixtures:
     real-git-checkout requirement: every ``cmd_check_ancestry`` test drives
     git/`gh` exclusively through the ``run_command`` seam, so a real git
     repo on disk is unnecessary here.
+
+    ``_patch_common`` also seeds a minimal, real work-unit markdown file
+    (E4-F2-S1-T1): a passing enabled run now persists a ``[GATE_PASS
+    ancestry]`` record (spec 4.2, 3.6) into the unit's own file, so every
+    test exercising a pass path needs one to write into, exactly like
+    ``_ReachabilityCmdFixtures``'s git checkout backs
+    ``cmd_check_reachability``'s own record write. ``manifest_files``
+    defaults to empty -- ancestry's own scope always also includes the
+    target ref, and a generated ancestry-gate task's Manifest may name a
+    report-file row that does not exist in the checkout yet -- so most
+    tests never need a real git blob hash and only the ``git rev-parse
+    <target-ref>`` call (added by :func:`_write_ancestry_gate_pass_record`)
+    must be handled by a pass-path test's ``fake_run_command``.
+
+    ``_make_origin_and_checkout``/``_seed_wu``/``_check_ancestry_patches``/
+    ``_mark_done_patches`` are the shared real-git-checkout fixture used by
+    every test class that needs ``cmd_check_ancestry`` and ``cmd_mark_done``
+    to run against an actual git repo on disk rather than a stubbed
+    ``run_command`` (``TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest``,
+    ``TestCheckAncestryAbsentManifestFileRealGit``) -- promoted here so the
+    two classes share one fixture implementation instead of maintaining
+    independent copies.
     """
 
     _REPO = "caylent-solutions/devbench"
@@ -4679,16 +4702,130 @@ class _AncestryCmdFixtures:
         unit: WorkUnit,
         repo_path: Path,
         fake_run_command: Callable[..., tuple[int, str, str]],
+        *,
+        manifest_files: tuple[str, ...] = (),
     ) -> Iterator[None]:
-        """Apply the standard patches shared by every test method."""
+        """Apply the standard patches shared by every test method.
+
+        Seeds a minimal, real work-unit markdown file at ``BACKLOG_ROOT /
+        unit.file_path`` (mirroring ``_seed_scope_backlog``'s shape) so
+        :func:`devbench.cli._write_ancestry_gate_pass_record` -- invoked on
+        every PASS path -- has a real file to read/write, whether or not a
+        given test's scenario actually reaches that write step.
+        """
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        backlog_root = repo_path.parent / "backlog"
+        backlog_root.mkdir(parents=True, exist_ok=True)
+        rows = "".join(f"| `{f}` | modify |\n" for f in manifest_files)
+        wu_file = backlog_root / f"{unit.id}.md"
+        wu_file.write_text(
+            f"# {unit.id}: {unit.title}\n\n## Status: in-progress\n\n"
+            f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{rows}\n\n## Comments\n",
+            encoding="utf-8",
+        )
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch("devbench.cli.BacklogParser", return_value=mock_parser))
             stack.enter_context(patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}))
             stack.enter_context(patch("devbench.cli.get_configured_default_branch", return_value="main"))
             stack.enter_context(patch("devbench.cli.run_command", side_effect=fake_run_command))
+            stack.enter_context(patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent))
+            stack.enter_context(patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent))
             yield
+
+    def _make_origin_and_checkout(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Build a real origin repo plus a real clone of it, both on disk.
+
+        Shared by every test class that needs ``cmd_check_ancestry`` and
+        ``cmd_mark_done`` to run against an actual git checkout rather than
+        a stubbed ``run_command``.
+        """
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "README.md", "baseline\n")
+        _tdd_gate_commit_all(origin, "baseline")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        return origin, checkout
+
+    def _seed_wu(self, tmp_path: Path, unit_id: str, *, manifest_file: str = "README.md") -> tuple[Path, Path, Path]:
+        """Seed a real work-unit markdown file plus a real ``BACKLOG.md`` index.
+
+        ``manifest_file`` is the sole ``## Changes Manifest`` row's declared
+        path -- callers exercising the absent-Manifest-file scope-hash path
+        pass a path that does not exist in the checkout (mirroring the
+        generated ancestry-gate task's own report-file row) instead of the
+        default ``README.md``, which every real checkout built by
+        :meth:`_make_origin_and_checkout` already contains.
+        """
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        wu_file = backlog_root / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}: Ancestry real-git non-empty-manifest test\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `{manifest_file}` | modify |\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            f"| {unit_id} | Real-git test | Task | in-review | None | {self._REPO} | `{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return backlog_root, backlog_index, wu_file
+
+    def _check_ancestry_patches(self, tmp_path: Path, checkout: Path, backlog_root: Path, backlog_index: Path) -> Any:
+        unit = self._make_unit("E1-F1-S1-T1")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: checkout}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        )
+
+    def _mark_done_patches(self, checkout: Path, backlog_root: Path, backlog_index: Path) -> Any:
+        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Real-git test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("E1-F1-S1-T1.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(default_branch="main", resolved_checkout_path=checkout)},
+            gates=GatesConfig(ancestry=GateEnabledConfig(enabled=True)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+        )
 
 
 @pytest.mark.unit
@@ -4716,6 +4853,8 @@ class TestCmdCheckAncestry(_AncestryCmdFixtures):
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 merge_base_calls.append(cmd)
                 return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
             raise AssertionError(f"unexpected command: {cmd}")
 
         with self._patch_common(unit, repo_path, fake_run_command):
@@ -4724,6 +4863,8 @@ class TestCmdCheckAncestry(_AncestryCmdFixtures):
         assert result == 0
         out_lines = capsys.readouterr().out.strip().splitlines()
         payload = json.loads(out_lines[0])
+        assert payload["scope_hash"], "scope_hash must be a non-empty digest"
+        scope_hash = payload.pop("scope_hash")
         assert payload == {
             "gate": "ancestry",
             "tier": "machine-blocking",
@@ -4734,6 +4875,13 @@ class TestCmdCheckAncestry(_AncestryCmdFixtures):
             "target_ref": "origin/main",
         }
         assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
+
+        from devbench.gate_records import latest_gate_pass_record
+
+        wu_content = (repo_path.parent / "backlog" / "E1-F1-S1-T1.md").read_text(encoding="utf-8")
+        record = latest_gate_pass_record(wu_content, "ancestry")
+        assert record is not None
+        assert record.scope_hash == scope_hash
 
     def test_ancestry_probe_rc_two_or_more_is_an_evaluation_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -4792,6 +4940,8 @@ class TestCmdCheckAncestry(_AncestryCmdFixtures):
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 merge_base_calls.append(cmd)
                 return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
             raise AssertionError(f"unexpected command: {cmd}")
 
         with self._patch_common(unit, repo_path, fake_run_command):
@@ -5129,6 +5279,8 @@ class TestCmdCheckAncestryRemoteResolution(_AncestryCmdFixtures):
             if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
                 merge_base_calls.append(cmd)
                 return (0, "", "")
+            if cmd == ["git", "rev-parse", "upstream/main"]:
+                return (0, "deadbeefcafe\n", "")
             raise AssertionError(f"unexpected command: {cmd}")
 
         with self._patch_common(unit, repo_path, fake_run_command):
@@ -5310,6 +5462,977 @@ class TestCmdCheckAncestryDisabled(_AncestryCmdFixtures):
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
         assert "ERROR" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryGatePassRecord(_AncestryCmdFixtures):
+    """AC-REC-001/002: a passing enabled check-ancestry run persists exactly
+    one `[GATE_PASS ancestry] <iso-utc> <scope-hash>` marker (spec 4.2, 3.6)
+    into the audit section that survives `read-unit --strip-comments`
+    (spec 4.3) -- never under `## Comments` itself; a failing, error, or
+    disabled run writes none."""
+
+    def _wu_content(self, repo_path: Path, unit_id: str) -> str:
+        return (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+
+    def test_pass_writes_single_gate_pass_marker_in_the_audit_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS ancestry]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+
+        # The marker survives `read-unit --strip-comments`'s truncation at
+        # the literal "\n## Comments" boundary (spec 4.3) -- it must sit in
+        # the audit section BEFORE that heading, never under it.
+        stripped = content.split("\n## Comments")[0]
+        assert "[GATE_PASS ancestry]" in stripped
+
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        status_line = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        assert record.scope_hash == status_line["scope_hash"]
+
+    def test_blocked_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (1, "", "")
+            if cmd == ["git", "rev-parse", "origin/dep-branch"]:
+                return (0, "abc123deadbeef\n", "")
+            if cmd[:2] == ["gh", "pr"]:
+                return (0, "[]", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_disabled_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_wu_file_missing_at_write_time_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the record cannot be written because
+        the work-unit file no longer exists by the time the passing run
+        reaches the write step -- fails loud, never a silent skip."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            (repo_path.parent / "backlog" / "E1-F1-S1-T1.md").unlink()
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "work unit file not found" in captured.err
+
+    def test_manifest_parse_error_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the work-unit file has no `## Changes
+        Manifest` section at write time -- fails loud, never a silent skip
+        or an empty-scope record."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            wu_file = repo_path.parent / "backlog" / "E1-F1-S1-T1.md"
+            wu_file.write_text("# E1-F1-S1-T1: no manifest section\n\n## Status: in-progress\n\n## Comments\n")
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+
+    def test_git_hash_object_failure_for_a_present_file_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: a Manifest file that DOES exist on
+        disk in the checkout still fails `git hash-object` for some other
+        reason (e.g. a corrupted git object store) -- fails loud, never a
+        partial record. A file simply ABSENT from the checkout is NOT this
+        path any more (doc_review FAIL, round 2, BLOCKING) -- see
+        `TestCheckAncestryAbsentManifestFileRealGit`."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        present_file = repo_path / "src" / "present.py"
+        present_file.parent.mkdir(parents=True, exist_ok=True)
+        present_file.write_text("print('hi')\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "hash-object", "--"]:
+                return (128, "", "fatal: unable to read sha1 file for 'src/present.py'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command, manifest_files=("src/present.py",)):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git hash-object failed" in captured.err
+
+    def test_git_rev_parse_target_ref_failure_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: resolving the target ref's sha fails at
+        write time -- fails loud, never a partial record."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (128, "", "fatal: ambiguous argument 'origin/main'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git rev-parse failed for target ref" in captured.err
+
+    def test_squash_pr_pass_with_record_write_failure_exits_1_and_prints_no_status_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path (test_review FAIL, round 1): the
+        squash-PR pass branch's own `isinstance(written, int): return
+        written` early return was uncovered by any test -- a passing
+        squash-PR probe whose subsequent record write fails must still
+        exit 1 with no status line printed, exactly like the strict-pass
+        branch's equivalent failure."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (1, "", "")
+            if cmd == ["git", "rev-parse", "origin/dep-branch"]:
+                return (0, "abc123deadbeef\n", "")
+            if cmd[:2] == ["gh", "pr"]:
+                return (
+                    0,
+                    '[{"number": 317, "mergedAt": "2026-01-01T00:00:00Z", "title": "Squashed dependency"}]',
+                    "",
+                )
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (128, "", "fatal: ambiguous argument 'origin/main'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "", "a record-write failure must never print a status line"
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git rev-parse failed for target ref" in captured.err
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_unknown_unit_id_at_write_time_prints_error_and_exits_1(self, tmp_path: Path) -> None:
+        """Task-specific error path (test_review FAIL, round 1, AC-TEST-001):
+        `_write_ancestry_gate_pass_record`'s OWN "unit not found" branch --
+        distinct from `cmd_check_ancestry`'s earlier unit-resolution check
+        -- was uncovered by any test. Exercised directly since it is only
+        reachable if the unit disappears from the backlog index between
+        `cmd_check_ancestry`'s own earlier resolution and the write step."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli._write_ancestry_gate_pass_record("E1-F1-S1-T1", tmp_path, "origin/main")
+
+        assert result == 1
+
+    def test_unknown_unit_id_at_write_time_error_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            cli._write_ancestry_gate_pass_record("E1-F1-S1-T1", tmp_path, "origin/main")
+
+        captured = capsys.readouterr()
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1: unit not found" in captured.err
+
+    def test_wu_file_genuinely_unreadable_triggers_the_oserror_branch_not_the_not_found_branch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Fix for test_review FAIL (round 1): the prior version of this
+        test put a DIRECTORY where the work-unit file was expected, but
+        `Path.is_file()` returns False for a directory, so control took the
+        EARLIER "work unit file not found" branch and the `except OSError`
+        handler (the read failure this test claims to exercise) was never
+        entered -- proven by that branch being absent from the coverage
+        report. This version forces `Path.read_text` itself to raise
+        `OSError`, genuinely entering the read-failure branch, and asserts
+        wording distinguishable from the not-found branch so the test
+        fails if the OSError handler is removed."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        real_read_text = Path.read_text
+
+        def failing_read_text(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if self.name == "E1-F1-S1-T1.md":
+                raise OSError("Permission denied (simulated)")
+            return real_read_text(self, encoding, errors)
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            with patch.object(Path, "read_text", failing_read_text):
+                result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "Permission denied (simulated)" in captured.err
+
+    def test_audit_marker_write_failure_exits_1_names_the_unit_file_and_leaves_no_partial_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Declared Error Handling Contract path (test_review FAIL, code_review
+        FAIL, round 1): 'the audit-section write of the [GATE_PASS ancestry]
+        marker fails (unit file unreadable or not writable) -> loud ERROR:
+        naming the unit file path and exit 1, leaving no partial record.'
+        Forces `atomic_write_text` (the write half of
+        `_append_audit_markers_before_comments`) to raise `OSError`, proving
+        BOTH that the write is guarded (no uncaught traceback) AND that the
+        [GATE_PASS ancestry] record is never left orphaned without its
+        [GATE_ANCESTRY_TARGET_REF] companion, since both are written in one
+        call that either fully succeeds or fully fails."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        wu_file_path = repo_path.parent / "backlog" / "E1-F1-S1-T1.md"
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            with patch(
+                "devbench.backlog.manager.atomic_write_text",
+                side_effect=OSError("Disk full (simulated)"),
+            ):
+                result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+            assert result == 1
+            captured = capsys.readouterr()
+            assert captured.out.strip() == ""
+            assert f"ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1: {wu_file_path}" in captured.err
+            assert "Disk full (simulated)" in captured.err
+
+            content = self._wu_content(repo_path, "E1-F1-S1-T1")
+            assert "[GATE_PASS ancestry]" not in content, "a failed write must never leave a partial record"
+            assert "[GATE_ANCESTRY_TARGET_REF]" not in content
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryGatePassRecordRealManifest(_AncestryCmdFixtures):
+    """AC-REC-001/007, AC-TEST-001 (test_review FAIL, code_review FAIL,
+    round 1): every prior ancestry cli-level test used an EMPTY Changes
+    Manifest, so the `git hash-object` half of the scope-hash assembly was
+    never exercised through `cmd_check_ancestry`. This test still stubs
+    `devbench.cli.run_command` wholesale (via `_patch_common`, mirroring
+    every other test in this module) rather than driving a real git
+    process -- its `fake_run_command` fabricates the `git hash-object`
+    output for the NON-EMPTY Manifest file -- but it is the first test to
+    exercise that assembly step through `cmd_check_ancestry` at all and to
+    assert the resulting record's `scope_hash` against
+    `gate_records.compute_scope_hash` computed independently over the same
+    fabricated blob hash. See `TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest`
+    for the real-git, end-to-end (`cmd_check_ancestry` then `cmd_mark_done`)
+    proof over an actual checkout."""
+
+    def _wu_content(self, repo_path: Path, unit_id: str) -> str:
+        return (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+
+    def test_pass_with_non_empty_manifest_folds_in_the_manifest_file_blob_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        manifest_file = repo_path / "src" / "foo.py"
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.write_text("print('foo')\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            if cmd[:3] == ["git", "hash-object", "--"]:
+                return (0, "blob-hash-for-src-foo-py\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command, manifest_files=("src/foo.py",)):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        expected_hash = compute_scope_hash({"src/foo.py": "blob-hash-for-src-foo-py"}, target_ref_sha="deadbeefcafe")
+        assert payload["scope_hash"] == expected_hash
+
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        assert record.scope_hash == expected_hash
+
+
+@pytest.mark.unit
+class TestAncestryScopeHashIncludesTargetRef(_AncestryCmdFixtures):
+    """AC-REC-003 (spec 4.5, internal issue #12 AC3): the persisted/reported
+    ancestry scope hash folds in the resolved target ref's sha, so two
+    passing runs with an identical changed-file set but different target
+    ref shas produce different hashes, and two runs with identical inputs
+    produce identical hashes."""
+
+    def _run_and_get_scope_hash(self, tmp_path: Path, target_sha: str, *, unit_id: str = "E1-F1-S1-T1") -> str:
+        unit = self._make_unit(unit_id)
+        repo_path = tmp_path / f"devbench-{target_sha}"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, f"{target_sha}\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry(unit_id, "origin/dep-branch", "origin/main")
+        assert result == 0
+        content = (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        return record.scope_hash
+
+    def test_different_target_ref_shas_produce_different_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+
+        first = self._run_and_get_scope_hash(tmp_path, "sha-one", unit_id="E1-F1-S1-T1")
+        second = self._run_and_get_scope_hash(tmp_path, "sha-two", unit_id="E1-F1-S1-T2")
+
+        assert first != second
+
+    def test_identical_target_ref_shas_produce_identical_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+
+        first = self._run_and_get_scope_hash(tmp_path, "sha-same", unit_id="E1-F1-S1-T1")
+        second = self._run_and_get_scope_hash(tmp_path, "sha-same", unit_id="E1-F1-S1-T2")
+
+        assert first == second
+
+
+@pytest.mark.unit
+class TestMarkDoneAncestryGate:
+    """AC-REC-004/005/006 (spec 4.2, 4.5; internal issue #12 AC3): mark-done's
+    ancestry-specific record freshness check. Real git fixture repo (a real
+    ``origin`` plus a ``git clone`` checkout tracking it), no mocked git --
+    the Definition of Ready requires the record and its staleness to be
+    exercised through the real CLI."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_origin_and_checkout(self, tmp_path: Path) -> tuple[Path, Path]:
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "README.md", "baseline\n")
+        _tdd_gate_commit_all(origin, "baseline")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        return origin, checkout
+
+    def _seed_wu(self, tmp_path: Path, unit_id: str, *, extra_comments: str = "") -> tuple[Path, Path, Path]:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        wu_file = backlog_root / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}: Ancestry done-path test\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}{extra_comments}",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            f"| {unit_id} | Ancestry done-path test | Task | in-review | None | {self._REPO} | "
+            f"`{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return backlog_root, backlog_index, wu_file
+
+    def _patches(
+        self,
+        unit_id: str,
+        checkout: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+        *,
+        gate_enabled: bool = True,
+    ) -> tuple[Any, ...]:
+        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = WorkUnit(
+            id=unit_id,
+            title="Ancestry done-path test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(default_branch="main", resolved_checkout_path=checkout)},
+            gates=GatesConfig(ancestry=GateEnabledConfig(enabled=gate_enabled)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+        )
+
+    def test_no_record_blocks_with_dependency_ref_remediation(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_no_record_remediation_names_dependency_ref_placeholder(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, _wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            cli.cmd_mark_done(unit_id)
+
+        err = capsys.readouterr().err
+        assert f"uv run devbench check-ancestry {unit_id} <dependency-ref>" in err
+
+    def test_fresh_record_allows_done(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_stale_record_after_target_ref_moves_blocks_with_spec_wording(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+
+        # Advance origin's main branch AFTER the record was captured (AC-7),
+        # then fetch it into the checkout's local origin/main tracking ref
+        # -- the recomputed target ref sha must now differ.
+        _tdd_gate_write(origin, "CHANGED.md", "moved\n")
+        _tdd_gate_commit_all(origin, "advance main")
+        _run_scratch_git(["fetch", "origin"], checkout)
+
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "ERROR: gate 'ancestry' record is stale (scope changed since it ran)" in capsys.readouterr().err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_fresh_record_with_explicit_target_ref_survives_recompute(self, tmp_path: Path) -> None:
+        """Real-defect regression (found during E4-F2-S1-T1 review): ``check-ancestry``
+        accepts an OPTIONAL explicit ``<target-ref>`` override (spec 4.5), so the
+        ref a passing run actually probed against is not always the repo's
+        default branch. A record captured against an explicit ref that PINS an
+        older commit than the CURRENT default branch tip must recompute as
+        fresh -- if the recompute wrongly re-derived ``origin/main`` instead of
+        reading back the persisted ``[GATE_ANCESTRY_TARGET_REF]`` marker, the
+        mismatch between the pinned tag's sha and main's (now-advanced) sha
+        would make this record read as permanently stale."""
+        unit_id = "E1-F1-S1-T1"
+        origin, checkout = self._make_origin_and_checkout(tmp_path)
+
+        # Pin an explicit tag at the baseline commit, then advance origin's
+        # main branch past it -- "origin/main" and the "pinned" tag now
+        # resolve to two different shas.
+        _run_scratch_git(["tag", "pinned"], origin)
+        _tdd_gate_write(origin, "CHANGED.md", "advanced past the pin\n")
+        _tdd_gate_commit_all(origin, "advance main past the pin")
+        _run_scratch_git(["fetch", "--tags", "origin"], checkout)
+        pinned_sha = _run_scratch_git(["rev-parse", "pinned"], checkout).stdout.strip()
+        main_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+        assert pinned_sha != main_sha
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=pinned_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("pinned")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_missing_target_ref_marker_fails_loud_not_silently_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: a ``[GATE_PASS ancestry]`` record with no
+        companion ``[GATE_ANCESTRY_TARGET_REF]`` marker (e.g. hand-authored, or
+        written before this marker existed) must fail loud at recompute time
+        (spec 3.5 fallback ban), never silently guess which ref was used."""
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import compose_gate_pass_record, compute_scope_hash
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path, unit_id, extra_comments=f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR:" in err
+        assert "no [GATE_ANCESTRY_TARGET_REF] marker recorded" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_unresolvable_target_ref_fails_loud_not_silently_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the persisted ``[GATE_ANCESTRY_TARGET_REF]``
+        marker names a ref that can no longer be resolved in the checkout
+        (e.g. its remote-tracking branch was removed) -- the recompute must
+        fail loud (spec 3.5 fallback ban), never silently treat an
+        unresolvable target ref as "unchanged"."""
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+        _run_scratch_git(["update-ref", "-d", "refs/remotes/origin/main"], checkout)
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "ERROR:" in capsys.readouterr().err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index, gate_enabled=False)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest(_AncestryCmdFixtures):
+    """AC-REC-004/005/006, AC-TEST-001 (code_review FAIL, test_review FAIL,
+    round 1): a real end-to-end binding proof over a real git checkout with
+    a NON-EMPTY Changes Manifest -- `cmd_check_ancestry` writes the record
+    (exercising `_compute_ancestry_scope_hash`'s git hash-object loop for
+    real), and `cmd_mark_done` then accepts it (exercising
+    `BacklogManager._recompute_gate_scope_hash`'s delegation to the SAME
+    function). No test previously drove both commands together over a real,
+    non-empty Manifest, so the writer and the recompute were never proven
+    to agree in practice.
+
+    Fixture helpers (``_make_origin_and_checkout``, ``_seed_wu``,
+    ``_check_ancestry_patches``, ``_mark_done_patches``) live on
+    ``_AncestryCmdFixtures`` -- shared with
+    ``TestCheckAncestryAbsentManifestFileRealGit`` below."""
+
+    def test_check_ancestry_record_is_accepted_by_mark_done_over_a_real_non_empty_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+
+        assert check_result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS ancestry]" in content
+        assert "[GATE_ANCESTRY_TARGET_REF]" in content
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_editing_the_manifest_file_after_the_record_was_written_makes_mark_done_refuse_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+        assert check_result == 0
+
+        # Edit the Manifest's declared file's live working-tree content
+        # AFTER the record was written -- the Manifest's declared file list
+        # is unchanged, but the file's blob hash is not.
+        (checkout / "README.md").write_text("edited after the gate ran\n", encoding="utf-8")
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 1
+        err = capsys.readouterr().err
+        assert "gate 'ancestry' record is stale (scope changed since it ran)" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckAncestryAbsentManifestFileRealGit(_AncestryCmdFixtures):
+    """doc_review FAIL, round 2 (BLOCKING): the canonical generated
+    ancestry-gate task's Changes Manifest names exactly one `add` row for
+    its own report file (`docs/gate-reports/<id>-ancestry.md`), which the
+    Approach's final step writes on first execution -- so it provably does
+    NOT exist in the checkout at check-ancestry time. Before this fix,
+    `_compute_ancestry_scope_hash` ran `git hash-object` unconditionally
+    against every declared Manifest file; on a real checkout `git
+    hash-object` exits 128 for a path that does not exist, so the
+    RuntimeError branch fired and `check-ancestry` exited 1 with NO status
+    line even when the dependency HAD merged -- the exact task this whole
+    epic exists to make work was broken on its own first run. Every prior
+    test of this path (`TestCmdCheckAncestryGatePassRecordRealManifest`,
+    `TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest`) either used an
+    empty Manifest or stubbed `git hash-object` to always return 0, so
+    nothing caught this. This class drives a REAL git checkout (no
+    `run_command` stub) end to end: `cmd_check_ancestry` must succeed with
+    a status line over an absent declared file, and the digest folded in
+    for that absence must be a DEFINED, deterministic input -- proven by
+    creating the file afterward and observing `cmd_mark_done` then refuse
+    the now-stale record."""
+
+    _ABSENT_REPORT_FILE = "docs/gate-reports/E1-F1-S1-T1-ancestry.md"
+
+    def test_check_ancestry_succeeds_with_a_status_line_over_a_manifest_file_absent_from_the_checkout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id, manifest_file=self._ABSENT_REPORT_FILE)
+
+        assert not (checkout / self._ABSENT_REPORT_FILE).exists(), "fixture precondition: the file must not exist yet"
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+
+        assert check_result == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out.strip().splitlines()[0])
+        assert payload["status"] == "pass"
+        assert payload["scope_hash"], "a passing run must persist a real, non-empty scope hash"
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS ancestry]" in content
+        assert "[GATE_ANCESTRY_TARGET_REF]" in content
+
+    def test_creating_the_absent_manifest_file_after_the_record_was_written_makes_mark_done_refuse_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id, manifest_file=self._ABSENT_REPORT_FILE)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+        assert check_result == 0
+
+        # The Approach's final step writes the gate task's own report file
+        # -- exactly the moment the absent-file digest marker must stop
+        # applying and the record must read as stale.
+        report_path = checkout / self._ABSENT_REPORT_FILE
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("ancestry gate report, written on first execution\n", encoding="utf-8")
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 1
+        err = capsys.readouterr().err
+        assert "gate 'ancestry' record is stale (scope changed since it ran)" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.unit

@@ -1400,6 +1400,273 @@ class TestRecomputeGateScopeHashErrorPaths:
             with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
                 BacklogManager._recompute_gate_scope_hash(self._REPO, content)
 
+    def test_recompute_scope_hash_for_ancestry_gate_folds_in_target_ref_sha(self, tmp_path: Path) -> None:
+        """gate='ancestry' resolves the persisted [GATE_ANCESTRY_TARGET_REF]
+        marker's ref and folds its CURRENT sha into the digest (spec 4.5,
+        internal issue #12 AC3), leaving the non-ancestry default (gate='')
+        recompute untouched -- the two must differ for the identical content
+        whenever a target-ref marker is present."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker, compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        run_scratch_git(["branch", "-M", "main"], repo_path)
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n"
+            f"## Comments\n\n{compose_ancestry_target_ref_marker('HEAD')}\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            ancestry_hash = BacklogManager._recompute_gate_scope_hash(self._REPO, content, "ancestry")
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content, "")
+
+        assert ancestry_hash == compute_scope_hash({}, target_ref_sha=head_sha)
+
+    def test_recompute_scope_hash_for_ancestry_gate_without_marker_fails_loud(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n## Comments\n\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match=r"no \[GATE_ANCESTRY_TARGET_REF\] marker recorded"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content, "ancestry")
+
+
+class TestResolveAncestryTargetRef:
+    """BacklogManager._resolve_ancestry_target_ref: a PURE function (no git
+    I/O of its own) that reads the persisted [GATE_ANCESTRY_TARGET_REF]
+    marker's ref STRING back, never the repo's default branch (spec 4.5,
+    internal issue #12 AC3) -- the fix for the real defect an explicit
+    `check-ancestry <unit-id> <dependency-ref> <target-ref>` override would
+    otherwise trigger. Resolving that ref string to a commit sha is now the
+    shared `cli._compute_ancestry_scope_hash`'s job (see
+    TestComputeAncestryScopeHash), not this function's."""
+
+    def test_raises_when_no_marker_is_present(self) -> None:
+        with pytest.raises(RuntimeError, match=r"no \[GATE_ANCESTRY_TARGET_REF\] marker recorded"):
+            BacklogManager._resolve_ancestry_target_ref("## Comments\n\nnothing here\n")
+
+    def test_returns_the_persisted_ref_string_verbatim(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        content = f"## Comments\n\n{compose_ancestry_target_ref_marker('pinned')}\n"
+
+        assert BacklogManager._resolve_ancestry_target_ref(content) == "pinned"
+
+    def test_returns_the_last_marker_when_multiple_are_present(self) -> None:
+        """The audit trail is append-only: a later check-ancestry run using
+        a different explicit target-ref must win over an earlier one."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        content = (
+            "## Comments\n\n"
+            f"{compose_ancestry_target_ref_marker('origin/main')}\n"
+            f"{compose_ancestry_target_ref_marker('origin/release')}\n"
+        )
+
+        assert BacklogManager._resolve_ancestry_target_ref(content) == "origin/release"
+
+    def test_raises_runtimeerror_not_valueerror_on_a_malformed_marker(self) -> None:
+        """`gate_records.latest_ancestry_target_ref` raises ValueError on a
+        marker that IS present but malformed; `cmd_mark_done` catches
+        RuntimeError only (cli.py), so an untranslated ValueError would
+        surface as an uncaught traceback instead of a clean ERROR
+        (doc_review FAIL, round 1)."""
+        content = "## Comments\n\n[GATE_ANCESTRY_TARGET_REF] abc def\n"
+
+        with pytest.raises(RuntimeError, match="malformed"):
+            BacklogManager._resolve_ancestry_target_ref(content)
+
+
+class TestComputeAncestryScopeHash:
+    """devbench.cli._compute_ancestry_scope_hash: the SINGLE shared
+    four-step assembly (per-Manifest-file git hash-object, git rev-parse of
+    the target ref, gate_records.compute_scope_hash) both
+    cli._write_ancestry_gate_pass_record and
+    BacklogManager._recompute_gate_scope_hash call for gate="ancestry", so
+    the two can never independently drift (code_review FAIL, round 1)."""
+
+    def test_resolves_the_named_target_ref_not_the_default_branch(self, tmp_path: Path) -> None:
+        """The checkout's default branch (main) and an explicit pinned tag
+        resolve to DIFFERENT shas -- this must hash against the tag's sha,
+        proving it resolves the ref it was GIVEN rather than re-deriving
+        "main"."""
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        run_scratch_git(["branch", "-M", "main"], repo_path)
+        run_scratch_git(["tag", "pinned"], repo_path)
+        pinned_sha = run_scratch_git(["rev-parse", "pinned"], repo_path).stdout.strip()
+        write_scratch_file(repo_path, "src/bar.py", "print('bye')\n")
+        commit_scratch_repo(repo_path, "advance main past the pin")
+        main_sha = run_scratch_git(["rev-parse", "main"], repo_path).stdout.strip()
+        assert pinned_sha != main_sha
+
+        result = _compute_ancestry_scope_hash(repo_path, [], "pinned")
+
+        assert result == compute_scope_hash({}, target_ref_sha=pinned_sha)
+        assert result != compute_scope_hash({}, target_ref_sha=main_sha)
+
+    def test_folds_in_manifest_file_blob_hashes(self, tmp_path: Path) -> None:
+        """The same assembly ALSO hashes each declared Manifest file's live
+        git blob hash -- proven here over a NON-EMPTY Manifest, which no
+        existing cli-level ancestry test previously exercised
+        (test_review FAIL, round 1: the git-hash-object success path was
+        uncovered because every prior fixture used an empty Manifest)."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "src/foo.py"], repo_path).stdout.strip()
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="src/foo.py", change="modify")], "HEAD")
+
+        assert result == compute_scope_hash({"src/foo.py": blob_hash}, target_ref_sha=head_sha)
+
+    def test_raises_when_target_ref_cannot_be_resolved(self, tmp_path: Path) -> None:
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with pytest.raises(RuntimeError, match="git rev-parse failed"):
+            _compute_ancestry_scope_hash(repo_path, [], "does-not-exist")
+
+    def test_absent_manifest_file_does_not_raise_and_folds_in_a_defined_marker(self, tmp_path: Path) -> None:
+        """doc_review FAIL, round 2 (BLOCKING): a Manifest row naming a
+        path that is simply ABSENT from the checkout (the normal shape of
+        a generated ancestry-gate task's own report-file row on its FIRST
+        execution) must NOT raise -- it folds a defined, deterministic
+        marker into the digest instead of hard-failing or silently
+        skipping the row."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _ABSENT_MANIFEST_FILE_SCOPE_MARKER, _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(
+            repo_path, [ManifestRow(file="docs/gate-reports/E1-F1-S1-T1-ancestry.md", change="add")], "HEAD"
+        )
+
+        assert result == compute_scope_hash(
+            {"docs/gate-reports/E1-F1-S1-T1-ancestry.md": _ABSENT_MANIFEST_FILE_SCOPE_MARKER},
+            target_ref_sha=head_sha,
+        )
+
+    def test_absent_manifest_file_digest_changes_once_the_file_is_created(self, tmp_path: Path) -> None:
+        """The absent-file marker must be a DEFINED function of "this file
+        does not exist yet", so it changes the instant the file is
+        created -- otherwise a stale record could stay valid forever
+        across the file's creation."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        row = [ManifestRow(file="docs/gate-reports/E1-F1-S1-T1-ancestry.md", change="add")]
+
+        before = _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+        write_scratch_file(repo_path, "docs/gate-reports/E1-F1-S1-T1-ancestry.md", "report\n")
+        after = _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+
+        assert before != after
+
+    def test_sentinel_manifest_row_is_filtered_like_every_other_manifest_scope_reader(self, tmp_path: Path) -> None:
+        """A legacy literal ``(none)`` row -- which `parse_manifest` still
+        returns as a real row -- must be filtered the same way
+        `BacklogManager._is_real_manifest_path` filters it everywhere else
+        in the codebase, contributing nothing to the digest."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="(none)", change="n/a")], "HEAD")
+
+        assert result == compute_scope_hash({}, target_ref_sha=head_sha)
+
+    def test_raises_when_a_present_manifest_file_cannot_be_hashed(self, tmp_path: Path) -> None:
+        """A Manifest file that DOES exist in the checkout but still fails
+        `git hash-object` (e.g. an unreadable file) is a genuine error --
+        never conflated with the absent-file case above."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        unreadable = repo_path / "src" / "unreadable.py"
+        unreadable.write_text("print('secret')\n", encoding="utf-8")
+        unreadable.chmod(0o000)
+        row = [ManifestRow(file="src/unreadable.py", change="modify")]
+        try:
+            with pytest.raises(RuntimeError, match="git hash-object failed"):
+                _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+        finally:
+            unreadable.chmod(0o644)
+
+    def test_recompute_gate_scope_hash_and_direct_call_agree_on_a_real_manifest(self, tmp_path: Path) -> None:
+        """Binding proof (code_review FAIL, round 1): BacklogManager
+        ._recompute_gate_scope_hash("ancestry") must produce the EXACT same
+        digest _compute_ancestry_scope_hash does when called directly with
+        the same repo/manifest/target-ref inputs -- because the recompute
+        delegates to this exact function rather than re-implementing the
+        assembly."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        repo = "caylent-solutions/devbench"
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | modify |\n\n"
+            f"## Comments\n\n{compose_ancestry_target_ref_marker('HEAD')}\n"
+        )
+        rt_cfg = RuntimeConfig(repos={repo: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            recomputed = BacklogManager._recompute_gate_scope_hash(repo, content, "ancestry")
+
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        direct = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="src/foo.py", change="modify")], "HEAD")
+
+        assert recomputed == direct
+        assert head_sha  # sanity: the checkout actually has a resolvable HEAD
+
 
 def _extract_summary_lines(content: str) -> list[str]:
     """Extract table data lines from the Status Summary section only."""
@@ -9178,6 +9445,20 @@ class TestAppendAuditMarkerBeforeComments:
 
         content = wu.read_text(encoding="utf-8")
         assert content.rstrip("\n").endswith(marker)
+
+    def test_empty_markers_sequence_raises_loud_instead_of_writing_a_blank_line(self, tmp_path: Path) -> None:
+        """doc_review WARN, round 2: the docstring's 'Must be non-empty'
+        precondition was previously unenforced -- an empty sequence
+        silently wrote a blank audit line. Must now fail loud (ValueError)
+        and never touch the file."""
+        original = "# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n"
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="markers must be non-empty"):
+            BacklogManager()._append_audit_markers_before_comments(wu, [])
+
+        assert wu.read_text(encoding="utf-8") == original, "a rejected call must never touch the file"
 
 
 class TestGateWaiverGrammarRule:

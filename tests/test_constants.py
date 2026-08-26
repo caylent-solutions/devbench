@@ -1029,6 +1029,26 @@ class TestGateConstants:
 
         assert GATE_NAMES == self._EXPECTED_GATE_NAMES
 
+    def test_gate_ancestry_is_the_canonical_ancestry_gate_name(self) -> None:
+        """AC-REC (code_review FAIL, E4-F2-S1-T1 round 1): the ancestry gate
+        name is declared exactly once, here, so ``cli.py`` and
+        ``devbench.backlog.manager`` import the same symbol instead of each
+        declaring their own hand-typed module-private literal that can
+        independently drift."""
+        from devbench.constants import GATE_ANCESTRY
+
+        assert GATE_ANCESTRY == "ancestry"
+
+    def test_gate_ancestry_is_a_member_of_gate_names(self) -> None:
+        from devbench.constants import GATE_ANCESTRY, GATE_NAMES
+
+        assert GATE_ANCESTRY in GATE_NAMES
+
+    def test_gate_ancestry_is_machine_blocking(self) -> None:
+        from devbench.constants import GATE_ANCESTRY, GATE_TIER_MACHINE_BLOCKING, GATE_TIERS
+
+        assert GATE_TIERS[GATE_ANCESTRY] == GATE_TIER_MACHINE_BLOCKING
+
     def test_gate_defaults_are_all_disabled(self) -> None:
         """D-17: every gate disabled by default; every tunable off."""
         from devbench.constants import (

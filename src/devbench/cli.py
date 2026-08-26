@@ -247,6 +247,7 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    GATE_ANCESTRY,
     GATE_PROVENANCE_BUILTIN,
     GATE_STATUS_DISABLED,
     GATE_STATUS_FAIL,
@@ -341,6 +342,7 @@ from devbench.utils.process import run_command
 from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeResult, resolve_changed_files
 
 if TYPE_CHECKING:
+    from devbench.backlog.manifest import ManifestRow
     from devbench.config_loader import ResolvedGateConfig, RuntimeConfig
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
@@ -4605,8 +4607,8 @@ def _gate_status_line(gate_name: str, status: str, findings: int, **extra_fields
     set/order (``gate``, ``tier``, ``status``, ``findings``) can never
     drift between gates. ``**extra_fields`` carries each gate's own
     additional fields (ancestry's ``mode``/``dependency_ref``/
-    ``target_ref``; reachability's ``scope_hash``), appended in the order
-    passed.
+    ``target_ref``/``scope_hash``; reachability's ``scope_hash``),
+    appended in the order passed.
     """
     payload: dict[str, object] = {
         "gate": gate_name,
@@ -4650,16 +4652,20 @@ def _load_gate_config_or_report(gate_name: str, canonical_repo: str) -> "Resolve
     return gate_config
 
 
-# Gate identity + mode vocabulary for check-ancestry (spec
+# Gate mode vocabulary for check-ancestry (spec
 # integration-reality-gates-hardening.md sections 4.1, 4.5, 5.2; AC-ANC-*).
-# Local, gate-scoped constant -- the status vocabulary itself
-# (``GATE_STATUS_DISABLED``/``PASS``/``FAIL``) lives once in
-# `constants.py` beside `GATE_NAMES`/`GATE_TIERS` and is shared by every
-# gate command through :func:`_gate_status_line`/:func:`_gate_disabled_line`
-# rather than re-declared per gate; only the ancestry-specific mode values
-# are declared here, once, rather than as inline literals scattered
-# through :func:`cmd_check_ancestry`.
-_ANCESTRY_GATE_NAME: str = "ancestry"
+# Local, gate-scoped constants -- the gate NAME itself is
+# ``constants.GATE_ANCESTRY`` (imported above), the single canonical
+# definition ``GATE_NAMES``/``GATE_TIERS`` are built from, so this module's
+# gate-name comparisons/lookups can never drift from a second, hand-typed
+# copy of the literal "ancestry" (code_review FAIL, round 1: a
+# module-private mirror of this same literal had drifted into a THIRD
+# undetected copy in ``devbench.backlog.manager``). The status vocabulary
+# itself (``GATE_STATUS_DISABLED``/``PASS``/``FAIL``) is likewise imported,
+# not re-declared, and shared by every gate command through
+# :func:`_gate_status_line`/:func:`_gate_disabled_line`; only the
+# ancestry-specific MODE values are declared here, once, rather than as
+# inline literals scattered through :func:`cmd_check_ancestry`.
 _ANCESTRY_MODE_STRICT: str = "strict"
 _ANCESTRY_MODE_SQUASH_PR: str = "squash-pr"
 _ANCESTRY_MODE_NONE: str = "none"
@@ -4818,7 +4824,9 @@ def _parse_squash_probe_response(stdout: str, dependency_ref: str) -> _SquashPro
     return _SquashProbeResult(found=True, pr_number=first["number"])
 
 
-def _ancestry_status_line(status: str, findings: int, mode: str, dependency_ref: str, resolved_target_ref: str) -> str:
+def _ancestry_status_line(
+    status: str, findings: int, mode: str, dependency_ref: str, resolved_target_ref: str, scope_hash: str
+) -> str:
     """Render the spec 5.2 gate status line for an enabled ``check-ancestry`` run.
 
     Thin ancestry-specific wrapper around the shared
@@ -4828,15 +4836,19 @@ def _ancestry_status_line(status: str, findings: int, mode: str, dependency_ref:
     while the three terminal-decision branches in
     :func:`cmd_check_ancestry` (strict pass, squash-pr pass, BLOCKED) keep
     a single call shape for ancestry's own ``mode``/``dependency_ref``/
-    ``target_ref`` fields.
+    ``target_ref``/``scope_hash`` fields. *scope_hash* is the SAME value
+    :func:`_write_ancestry_gate_pass_record` persisted for a passing run
+    (AC-REC-007), or the empty string for the BLOCKED terminal decision,
+    which persists no record.
     """
     return _gate_status_line(
-        _ANCESTRY_GATE_NAME,
+        GATE_ANCESTRY,
         status,
         findings,
         mode=mode,
         dependency_ref=dependency_ref,
         target_ref=resolved_target_ref,
+        scope_hash=scope_hash,
     )
 
 
@@ -4867,6 +4879,240 @@ def _print_ancestry_probe_outcomes(
     print(f"Squash-PR probe (gh pr list --search <sha> --state merged): {squash_outcome}")
 
 
+def _resolve_ancestry_wu_file_and_manifest(unit_id: str) -> "tuple[Path, list[ManifestRow]] | int":
+    """Resolve *unit_id*'s work-unit file and parse its Changes Manifest.
+
+    Split out of :func:`_write_ancestry_gate_pass_record` purely to keep
+    that function's return-count within the project's complexity lint
+    budget: every early-exit condition below that used to live inline in
+    the caller is now internal to this helper.
+
+    Returns:
+        ``(wu_file, manifest_rows)`` on success. An already fully-handled
+        exit code (``1``; the failure has already printed its own
+        ``ERROR:`` message) when the unit is unknown, the work-unit file
+        does not exist or cannot be read, or its Changes Manifest cannot
+        be parsed.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: unit not found",
+            file=sys.stderr,
+        )
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    if not wu_file.is_file():
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: "
+            f"work unit file not found at {wu_file}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest_rows = parse_manifest(wu_content)
+    except ManifestParseError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    return wu_file, manifest_rows
+
+
+# A stable, out-of-band scope-hash input folded in for a Manifest row that
+# names a real (non-sentinel) path not yet present in the checkout at
+# check-ancestry time -- the normal shape of a generated ancestry-gate
+# task's own report-file "add" row on its FIRST execution (the Approach's
+# final step writes that file; it provably does not exist before then --
+# see `_compute_ancestry_scope_hash`). Never a valid `git hash-object`
+# output (those are 40 lowercase hex chars for SHA-1 blobs), so it can
+# never collide with a real blob hash once the file is created.
+_ABSENT_MANIFEST_FILE_SCOPE_MARKER: str = "<absent-at-check-time>"
+
+
+def _compute_ancestry_scope_hash(repo_path: Path, manifest_rows: "list[ManifestRow]", target_ref: str) -> str:
+    """Assemble and hash the ancestry gate's scope-hash inputs from a real git checkout.
+
+    The SINGLE implementation of the four-step assembly spec 4.2/4.5
+    requires -- per-Manifest-file ``git hash-object`` (or the defined
+    absent-file substitute below), ``git rev-parse`` of *target_ref*, and
+    :func:`devbench.gate_records.compute_scope_hash` -- shared by
+    :func:`_write_ancestry_gate_pass_record` (the initial write, called
+    with the target ref it just resolved and probed) and
+    :meth:`devbench.backlog.manager.BacklogManager._recompute_gate_scope_hash`
+    (the ``mark-done`` freshness recompute, called via a lazy import with
+    the ref read back from the persisted ``[GATE_ANCESTRY_TARGET_REF]``
+    marker). Before this function existed the two call sites each
+    re-implemented this assembly independently, with different subprocess
+    timeout policies, and nothing proved they agreed byte-for-byte
+    (code_review FAIL, round 1) -- routing both through this one function
+    makes that drift structurally impossible.
+
+    A Manifest row naming a path that is ABSENT from the checkout (not a
+    sentinel, a real declared path that simply does not exist on disk yet)
+    is a DEFINED, deterministic input to the digest via
+    :data:`_ABSENT_MANIFEST_FILE_SCOPE_MARKER`, never a hard error and
+    never a silent skip: a silent skip would let the digest stay stable
+    while a declared deliverable is created or edited, defeating the very
+    freshness check this gate exists to provide. Folding in a fixed marker
+    that can never equal a real blob hash means the digest changes the
+    instant the file is created (its real blob hash then replaces the
+    marker) or edited afterward. This is the canonical generated
+    ancestry-gate task's own first-run shape: its Manifest's sole row names
+    its own report file (``docs/gate-reports/<id>-ancestry.md``), which the
+    Approach's final step writes -- so it provably does not exist at
+    check-ancestry time (``plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md``,
+    ``docs/cross-backlog-dependencies.md``).
+
+    Sentinel rows (e.g. a legacy literal ``(none)`` row, which
+    :func:`devbench.backlog.manifest.parse_manifest` still returns as a
+    real row) are filtered via
+    :meth:`devbench.backlog.manager.BacklogManager._is_real_manifest_path`
+    -- the same predicate every other Manifest-scope reader in the
+    codebase (``work_unit_scope.real_manifest_paths``,
+    ``backlog.proposal``) uses -- so a sentinel contributes nothing to the
+    digest, consistently with the rest of the codebase.
+
+    Args:
+        repo_path: Local repo checkout root every git call runs against.
+        manifest_rows: The unit's parsed Changes Manifest rows. May
+            contain no real (non-sentinel) file rows: ancestry's own scope
+            always also includes the target ref, so a Manifest with no
+            real file rows is not itself an error here.
+        target_ref: The exact ref string to resolve -- either the caller's
+            explicit override or the ``<remote>/<default-branch>``
+            fallback (:func:`_write_ancestry_gate_pass_record`), or the ref
+            persisted in the ``[GATE_ANCESTRY_TARGET_REF]`` marker
+            (``_recompute_gate_scope_hash``).
+
+    Returns:
+        The resulting scope hash.
+
+    Raises:
+        RuntimeError: A ``git hash-object`` call for a Manifest file that
+            DOES exist in the checkout, or the ``git rev-parse`` call for
+            *target_ref*, exited non-zero or returned empty output. A
+            Manifest row naming a file simply absent from the checkout is
+            NOT an error (see above).
+    """
+    from devbench.gate_records import compute_scope_hash
+
+    file_blob_hashes: dict[str, str] = {}
+    for row in manifest_rows:
+        if not BacklogManager._is_real_manifest_path(row.file):
+            continue
+        if not (repo_path / row.file).is_file():
+            file_blob_hashes[row.file] = _ABSENT_MANIFEST_FILE_SCOPE_MARKER
+            continue
+        rc, stdout, stderr = run_command(["git", "hash-object", "--", row.file], cwd=repo_path)
+        if rc != 0 or not stdout.strip():
+            raise RuntimeError(f"git hash-object failed for {row.file!r}: {stderr.strip()}")
+        file_blob_hashes[row.file] = stdout.strip()
+
+    rc, stdout, stderr = run_command(["git", "rev-parse", target_ref], cwd=repo_path)
+    if rc != 0 or not stdout.strip():
+        raise RuntimeError(f"git rev-parse failed for target ref {target_ref!r}: {stderr.strip()}")
+    target_ref_sha = stdout.strip()
+
+    return compute_scope_hash(file_blob_hashes, target_ref_sha=target_ref_sha)
+
+
+def _write_ancestry_gate_pass_record(unit_id: str, repo_path: Path, resolved_target_ref: str) -> str | int:
+    """Persist ``[GATE_PASS ancestry]`` for a passing enabled ``check-ancestry`` run.
+
+    Spec 3.6/4.2: a machine-blocking gate result is only trustworthy once
+    the gate command itself -- never agent prose -- writes the record.
+    Spec 4.5 (internal issue #12 AC3): the persisted scope hash folds in
+    *resolved_target_ref*'s CURRENT commit sha, computed by
+    :func:`_compute_ancestry_scope_hash` (the single shared assembly, see
+    its own docstring), alongside the unit's own Changes-Manifest file
+    blob hashes. Also writes a
+    :func:`devbench.gate_records.compose_ancestry_target_ref_marker`
+    companion record naming *resolved_target_ref* ITSELF (not just its
+    sha): ``check-ancestry`` accepts an OPTIONAL explicit ``<target-ref>``
+    override, so the ref actually probed is not always the repo's default
+    branch, and
+    :meth:`devbench.backlog.manager.BacklogManager._recompute_gate_scope_hash`
+    reads this companion marker back at ``mark-done`` freshness-recompute
+    time instead of re-deriving the default branch -- so a run that used an
+    explicit override recomputes the SAME ref later, never a different one
+    that would make the record read as permanently stale. The unit's
+    Changes Manifest may name no real (non-sentinel) files -- either
+    because it is genuinely empty/sentinel-only (a legacy literal
+    ``(none)`` row) or because its one row (a generated ancestry-gate
+    task's Manifest genuinely carries exactly one ``add`` row naming its
+    own report file, ``docs/gate-reports/<id>-ancestry.md``) names a file
+    that does not exist in the checkout yet -- the Approach's final step
+    writes it on first execution, so it provably does NOT exist at
+    check-ancestry time. Neither shape is an error here: ancestry's own
+    scope always also includes the target ref, and
+    :func:`_compute_ancestry_scope_hash` folds an absent declared file
+    into the digest as a defined input rather than skipping it (see its
+    own docstring).
+
+    The ``[GATE_PASS ancestry]`` record and its ``[GATE_ANCESTRY_TARGET_REF]``
+    companion are persisted in a SINGLE atomic write
+    (:meth:`devbench.backlog.manager.BacklogManager._append_audit_markers_before_comments`),
+    never two sequential ones -- a reader that finds the first marker
+    without the second treats the record as permanently unresolvable
+    (``BacklogManager._resolve_ancestry_target_ref``), so a failure
+    partway through writing them would otherwise leave exactly that kind
+    of partial record (code_review FAIL, round 1).
+
+    Args:
+        unit_id: The work-unit id whose file the record is appended to.
+        repo_path: Local checkout path of the unit's target repo.
+        resolved_target_ref: The ref :func:`cmd_check_ancestry` actually
+            probed against (either the caller's explicit override or the
+            ``<remote>/<default-branch>`` fallback).
+
+    Returns:
+        The persisted scope hash on success. On failure, prints its own
+        ``ERROR:`` naming the work-unit file path to stderr and returns
+        ``1`` -- never raises past this boundary (a ``RuntimeError`` from
+        :func:`_compute_ancestry_scope_hash` or an ``OSError`` from the
+        audit-marker write are both caught here), and never leaves a
+        partial record (the two markers share one atomic write).
+    """
+    from devbench.backlog.manager import BacklogManager
+    from devbench.gate_records import compose_ancestry_target_ref_marker, compose_gate_pass_record
+
+    resolved = _resolve_ancestry_wu_file_and_manifest(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    wu_file, manifest_rows = resolved
+
+    try:
+        scope_hash = _compute_ancestry_scope_hash(repo_path, manifest_rows, resolved_target_ref)
+    except RuntimeError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    marker = compose_gate_pass_record(GATE_ANCESTRY, scope_hash)
+    target_ref_marker = compose_ancestry_target_ref_marker(resolved_target_ref)
+    backlog_manager = BacklogManager()
+    try:
+        backlog_manager._append_audit_markers_before_comments(wu_file, [marker, target_ref_marker])
+    except OSError as exc:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {wu_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return scope_hash
+
+
 def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") -> int:
     """Verify a declared work-group dependency has actually merged, via real git ancestry.
 
@@ -4886,8 +5132,20 @@ def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") 
     repo, prints exactly ``{"gate":"ancestry","status":"disabled"}`` and
     returns 0 before any git call (AC-ANC-006). On an enabled run, the
     spec 5.2 status line -- ``{"gate","tier","status","findings","mode",
-    "dependency_ref","target_ref"}`` -- is the FIRST stdout line
-    (AC-ANC-007), followed by both probes' human-readable outcomes.
+    "dependency_ref","target_ref","scope_hash"}`` -- is the FIRST stdout
+    line (AC-ANC-007), followed by both probes' human-readable outcomes.
+    ``scope_hash`` is the same digest persisted in the ``[GATE_PASS
+    ancestry]`` record on a passing run (AC-REC-007, spec 4.5); it is the
+    empty string on the BLOCKED (``status: "fail"``) line, which persists
+    no record.
+
+    **Work-unit-file side effect (spec 3.6/4.2).** A passing enabled run
+    appends exactly one ``[GATE_PASS ancestry] <iso-utc> <scope-hash>``
+    marker, together with its ``[GATE_ANCESTRY_TARGET_REF] <target-ref>``
+    companion marker, into the unit's own work-unit file -- in the audit
+    section that survives ``read-unit --strip-comments`` (spec 4.3), never
+    under ``## Comments`` (see :func:`_write_ancestry_gate_pass_record`).
+    A failing, error, or disabled run writes no record.
 
     **Two-probe contract (spec 4.5, 317-D02, AC-17).** A strict
     ``git merge-base --is-ancestor <dependency_ref> <target_ref>`` probe
@@ -4925,7 +5183,15 @@ def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") 
     probe), 1 for a BLOCKED result or any error that prevents a decision
     (unknown work unit, unresolvable repo/default-branch/remote, fetch
     failure, a probe that could not run, an invalid git ref), 2 for the
-    usage error of an empty *dependency_ref*.
+    usage error of an empty *dependency_ref*. A PASSING probe decision can
+    ALSO still exit 1 with no status line printed, when the subsequent
+    record write fails (:func:`_write_ancestry_gate_pass_record`): the
+    work-unit file is missing or unreadable/unwritable, its ``##
+    Changes Manifest`` section cannot be parsed, a Manifest file's ``git
+    hash-object`` fails, or ``git rev-parse`` fails to resolve the target
+    ref -- a probe result that cannot be durably recorded is never
+    reported as a pass (spec 3.6: the gate command's OWN write is what
+    makes a result trustworthy).
 
     Usage: check-ancestry <unit_id> <dependency-ref> [<target-ref>]
     """
@@ -4945,12 +5211,19 @@ def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") 
     )
 
     if rc == 0:
-        print(_ancestry_status_line(GATE_STATUS_PASS, 0, _ANCESTRY_MODE_STRICT, dependency_ref, resolved_target_ref))
+        written = _write_ancestry_gate_pass_record(unit_id, repo_path, resolved_target_ref)
+        if isinstance(written, int):
+            return written
+        print(
+            _ancestry_status_line(
+                GATE_STATUS_PASS, 0, _ANCESTRY_MODE_STRICT, dependency_ref, resolved_target_ref, written
+            )
+        )
         _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, True, None)
         return 0
 
     if rc == 1:
-        return _resolve_ancestry_not_ancestor(dependency_ref, resolved_target_ref, default_branch, repo_path)
+        return _resolve_ancestry_not_ancestor(unit_id, dependency_ref, resolved_target_ref, default_branch, repo_path)
 
     # rc > 1 (or the run_command sentinel 127 for a missing/timed-out git)
     # means git itself could not answer the question -- unknown ref, not a
@@ -4994,7 +5267,7 @@ def _prepare_ancestry_probe_context(
         return 1
     canonical_repo, repo_path = resolved
 
-    gate_config = _load_gate_config_or_report(_ANCESTRY_GATE_NAME, canonical_repo)
+    gate_config = _load_gate_config_or_report(GATE_ANCESTRY, canonical_repo)
     if isinstance(gate_config, int):
         return gate_config
 
@@ -5008,7 +5281,7 @@ def _prepare_ancestry_probe_context(
 
 
 def _resolve_ancestry_not_ancestor(
-    dependency_ref: str, resolved_target_ref: str, default_branch: str, repo_path: Path
+    unit_id: str, dependency_ref: str, resolved_target_ref: str, default_branch: str, repo_path: Path
 ) -> int:
     """Handle the strict probe's rc=1 ("not an ancestor") terminal branch.
 
@@ -5023,11 +5296,18 @@ def _resolve_ancestry_not_ancestor(
         return 1
 
     if squash_result.found:
-        print(_ancestry_status_line(GATE_STATUS_PASS, 0, _ANCESTRY_MODE_SQUASH_PR, dependency_ref, resolved_target_ref))
+        written = _write_ancestry_gate_pass_record(unit_id, repo_path, resolved_target_ref)
+        if isinstance(written, int):
+            return written
+        print(
+            _ancestry_status_line(
+                GATE_STATUS_PASS, 0, _ANCESTRY_MODE_SQUASH_PR, dependency_ref, resolved_target_ref, written
+            )
+        )
         _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
         return 0
 
-    print(_ancestry_status_line(GATE_STATUS_FAIL, 1, _ANCESTRY_MODE_NONE, dependency_ref, resolved_target_ref))
+    print(_ancestry_status_line(GATE_STATUS_FAIL, 1, _ANCESTRY_MODE_NONE, dependency_ref, resolved_target_ref, ""))
     _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
     print(
         f"BLOCKED: '{dependency_ref}' is not yet an ancestor of '{resolved_target_ref}', and no merged "

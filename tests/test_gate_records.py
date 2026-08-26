@@ -241,6 +241,67 @@ class TestLatestGatePassRecord:
 
 
 @pytest.mark.unit
+class TestAncestryTargetRefMarker:
+    """`[GATE_ANCESTRY_TARGET_REF] <target-ref>` (spec 4.5, internal issue
+    #12 AC3): the companion marker persisting the EXACT ref
+    `cmd_check_ancestry` resolved against, so `mark-done`'s freshness
+    recompute can read it back instead of re-deriving the repo's default
+    branch -- the fix for the real defect an explicit `check-ancestry
+    <unit-id> <dependency-ref> <target-ref>` override would otherwise
+    trigger (a permanently-stale record)."""
+
+    def test_compose_round_trips_through_latest(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker, latest_ancestry_target_ref
+
+        marker = compose_ancestry_target_ref_marker("origin/main")
+        content = f"## Comments\n\n{marker}\n"
+
+        assert latest_ancestry_target_ref(content) == "origin/main"
+
+    def test_compose_rejects_empty_target_ref(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        with pytest.raises(ValueError, match="non-empty"):
+            compose_ancestry_target_ref_marker("")
+
+    def test_compose_rejects_whitespace_in_target_ref(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        with pytest.raises(ValueError, match="whitespace"):
+            compose_ancestry_target_ref_marker("origin/ main")
+
+    def test_latest_returns_none_when_no_marker_is_present(self) -> None:
+        from devbench.gate_records import latest_ancestry_target_ref
+
+        assert latest_ancestry_target_ref("## Comments\n\nnothing here\n") is None
+
+    def test_latest_returns_the_most_recent_marker(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker, latest_ancestry_target_ref
+
+        first = compose_ancestry_target_ref_marker("origin/main")
+        second = compose_ancestry_target_ref_marker("origin/release")
+        content = f"## Comments\n\n{first}\n{second}\n"
+
+        assert latest_ancestry_target_ref(content) == "origin/release"
+
+    def test_latest_finds_a_marker_embedded_within_a_larger_audit_comment_line(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker, latest_ancestry_target_ref
+
+        marker = compose_ancestry_target_ref_marker("origin/main")
+        content = f"## Comments\n\n[2026-08-14 02:58 UTC] [agent/check-ancestry] {marker}\n"
+
+        assert latest_ancestry_target_ref(content) == "origin/main"
+
+    def test_latest_raises_on_a_malformed_marker(self) -> None:
+        from devbench.gate_records import latest_ancestry_target_ref
+
+        content = "## Comments\n\n[GATE_ANCESTRY_TARGET_REF] \n"
+
+        with pytest.raises(ValueError, match="Malformed"):
+            latest_ancestry_target_ref(content)
+
+
+@pytest.mark.unit
 class TestComputeScopeHash:
     """SHA-256 scope hash over the changed-file list plus per-file blob hashes (AC-E2-F2-S1-T1-2)."""
 
@@ -287,6 +348,84 @@ class TestComputeScopeHash:
         result = compute_scope_hash({"a.py": "hash-a"})
 
         assert re.fullmatch(r"[0-9a-f]{64}", result)
+
+
+@pytest.mark.unit
+class TestComputeScopeHashTargetRefSha:
+    """`target_ref_sha` (spec 4.5, internal issue #12 AC3): an explicit,
+    named additional-input parameter the ancestry gate folds into the
+    scope hash so a moved target branch invalidates a persisted
+    `[GATE_PASS ancestry]` record. Every other gate calls
+    `compute_scope_hash` with `target_ref_sha` omitted, so this parameter
+    must never change the hash value any existing caller already relies
+    on (DoD: "leaving every other gate's hash value unchanged")."""
+
+    def test_omitted_target_ref_sha_matches_pre_existing_behavior(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        inputs = {"a.py": "hash-a"}
+
+        assert compute_scope_hash(inputs) == compute_scope_hash(inputs, target_ref_sha=None)
+
+    def test_same_files_different_target_ref_sha_produce_different_hashes(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        files = {"a.py": "hash-a"}
+
+        first = compute_scope_hash(files, target_ref_sha="sha-one")
+        second = compute_scope_hash(files, target_ref_sha="sha-two")
+
+        assert first != second
+
+    def test_same_files_and_same_target_ref_sha_produce_identical_hashes(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        files = {"a.py": "hash-a", "b.py": "hash-b"}
+
+        first = compute_scope_hash(dict(files), target_ref_sha="sha-one")
+        second = compute_scope_hash(dict(reversed(files.items())), target_ref_sha="sha-one")
+
+        assert first == second
+
+    def test_target_ref_sha_changes_the_hash_relative_to_files_alone(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        files = {"a.py": "hash-a"}
+
+        assert compute_scope_hash(files) != compute_scope_hash(files, target_ref_sha="sha-one")
+
+    def test_empty_files_with_a_target_ref_sha_succeeds(self) -> None:
+        """Ancestry's own scope may carry no Changes-Manifest files at all
+        (a generated ancestry-gate task's Manifest is empty): the "empty
+        scope must never hash into a passing record" invariant now means
+        "no file AND no target ref", not "no files" alone."""
+        from devbench.gate_records import compute_scope_hash
+
+        result = compute_scope_hash({}, target_ref_sha="sha-one")
+
+        assert re.fullmatch(r"[0-9a-f]{64}", result)
+
+    def test_empty_files_and_no_target_ref_sha_still_raises(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        with pytest.raises(ValueError, match="empty"):
+            compute_scope_hash({}, target_ref_sha=None)
+
+    def test_empty_string_target_ref_sha_raises_not_treated_as_sufficient_scope(self) -> None:
+        """A caller-supplied empty string is not `None`, so the identity
+        check `target_ref_sha is None` alone would let it slip past the
+        "empty scope must never hash into a passing record" guard even
+        with an empty file map -- this must raise, not silently hash."""
+        from devbench.gate_records import compute_scope_hash
+
+        with pytest.raises(ValueError, match="target_ref_sha"):
+            compute_scope_hash({}, target_ref_sha="")
+
+    def test_whitespace_only_target_ref_sha_raises(self) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        with pytest.raises(ValueError, match="target_ref_sha"):
+            compute_scope_hash({"a.py": "hash-a"}, target_ref_sha="   ")
 
 
 @pytest.mark.unit

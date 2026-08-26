@@ -1314,10 +1314,21 @@ SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"
 # literal gate-name list a second time.
 # ---------------------------------------------------------------------------
 
+# Canonical name of the ancestry gate (spec 4.5; internal issue #12 AC3).
+# Declared once here, alongside ``GATE_NAMES``, so every module that needs
+# to compare against or look up this gate by name (``cli.py``,
+# ``devbench.backlog.manager``) imports the SAME symbol instead of each
+# declaring its own hand-typed module-private mirror of the literal
+# "ancestry" -- exactly the drift-prevention pattern ``GATE_STATUS_*``
+# already documents below (code_review FAIL, E4-F2-S1-T1 round 1: two
+# independent module-private copies of this literal had drifted into a
+# third, undetected one).
+GATE_ANCESTRY: str = "ancestry"
+
 # Ordered, canonical list of the eight integration-reality gate names.
 GATE_NAMES: tuple[str, ...] = (
     "reachability",
-    "ancestry",
+    GATE_ANCESTRY,
     "shared_file_impact",
     "fixture_consistency",
     "write_path_audit",
@@ -1402,7 +1413,7 @@ GATE_TIER_ADVISORY: str = "advisory"
 # tier decision here automatically lands in the weaker judge-evidence tier
 # instead of being silently absent from GATE_TIERS.
 _GATE_TIER_D6_MACHINE_BLOCKING_NAMES: frozenset[str] = frozenset(
-    {"reachability", "ancestry", "shared_file_impact", "fixture_consistency"}
+    {"reachability", GATE_ANCESTRY, "shared_file_impact", "fixture_consistency"}
 )
 
 # Declares the tier of all eight gates (spec 4.2, D-6): reachability,

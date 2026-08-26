@@ -38,7 +38,7 @@ import logging
 import re
 import subprocess
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +61,7 @@ from devbench.constants import (
     EXPECTED_OUTPUT_LINE_RE,
     EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_RE,
+    GATE_ANCESTRY,
     GATE_TIER_MACHINE_BLOCKING,
     GATE_TIERS,
     GATE_WAIVER_ATTRIBUTION_EXECUTOR,
@@ -787,6 +788,54 @@ class BacklogManager:
             )
 
     @staticmethod
+    def _run_gate_scope_hash_git(repo_path: Path, args: list[str], description: str) -> str:
+        """Run a ``git -C <repo_path> <args>`` invocation shared by the scope-hash helpers.
+
+        :meth:`_git_blob_hash` (per-file blob hash, for every non-ancestry
+        gate's ``_recompute_gate_scope_hash``) needs "run git with a
+        configurable timeout, fail loud naming the command context on a
+        non-zero exit or a timeout" behaviour; defined once here (DRY)
+        rather than duplicated per caller. The ancestry gate's own git
+        calls (per-Manifest-file blob hash AND target-ref resolution) are
+        NOT routed through this helper -- they go through
+        ``cli._compute_ancestry_scope_hash`` instead, the single shared
+        assembly both ``cli._write_ancestry_gate_pass_record`` and
+        :meth:`_recompute_gate_scope_hash` call for ``gate == "ancestry"``
+        (code_review FAIL, round 1: two independent assemblies with
+        different timeout policies had to agree byte-for-byte forever and
+        nothing enforced that).
+
+        Args:
+            repo_path: Local repo checkout root ``git -C`` runs against.
+            args: The git subcommand and its arguments, e.g.
+                ``["hash-object", "--", rel_path]``.
+            description: A short ``for <...>`` style description of *args*'
+                subject, folded into both the timeout and non-zero-exit
+                ``RuntimeError`` messages.
+
+        Returns:
+            The command's stripped stdout.
+
+        Raises:
+            RuntimeError: The git invocation timed out, or exited non-zero.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_GATE_SCOPE_HASH_GIT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"git {args[0]} timed out {description} in {repo_path}") from exc
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {args[0]} failed {description} in {repo_path} (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    @staticmethod
     def _git_blob_hash(repo_path: Path, rel_path: str) -> str:
         """Return the git blob hash of *rel_path*'s current on-disk content in *repo_path*.
 
@@ -807,25 +856,66 @@ class BacklogManager:
             RuntimeError: If git times out or exits non-zero (e.g. the file
                 no longer exists in the checkout).
         """
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_path), "hash-object", "--", rel_path],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=_GATE_SCOPE_HASH_GIT_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"git hash-object timed out hashing {rel_path!r} in {repo_path}") from exc
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"git hash-object failed for {rel_path!r} in {repo_path} "
-                f"(exit {result.returncode}): {result.stderr.strip()}"
-            )
-        return result.stdout.strip()
+        return BacklogManager._run_gate_scope_hash_git(repo_path, ["hash-object", "--", rel_path], f"for {rel_path!r}")
 
     @staticmethod
-    def _recompute_gate_scope_hash(repo: str, content: str) -> str:
+    def _resolve_ancestry_target_ref(content: str) -> str:
+        """Return the ancestry gate's recorded target-ref STRING (spec 4.5, internal issue #12 AC3).
+
+        Reads the ref back from the ``[GATE_ANCESTRY_TARGET_REF]``
+        companion marker ``cli._write_ancestry_gate_pass_record`` persists
+        alongside every ``[GATE_PASS ancestry]`` record (via
+        ``gate_records.latest_ancestry_target_ref``) -- it never
+        re-derives the repo's default branch itself. ``check-ancestry``
+        accepts an OPTIONAL explicit ``<target-ref>`` override (spec 4.5),
+        so the ref actually probed at gate-pass time is not always the
+        default branch; re-deriving the default here would resolve a
+        DIFFERENT ref than the one folded into the stored record whenever
+        an explicit override was used, making the record read as
+        permanently stale even though nothing about the recorded target
+        ref itself has changed (spec 3.5 fallback ban -- this never
+        silently guesses which ref was used).
+
+        A pure function of *content* -- it performs no git I/O of its own.
+        The caller (:meth:`_recompute_gate_scope_hash`) is responsible for
+        resolving the returned ref string to a commit sha, via the SAME
+        :func:`_compute_ancestry_scope_hash` assembly
+        ``cli._write_ancestry_gate_pass_record`` calls (single source of
+        truth, code_review FAIL round 1).
+
+        Args:
+            content: The full text of the work-unit markdown file.
+
+        Returns:
+            The resolved target ref's exact persisted string (e.g.
+            ``origin/main`` or an explicit override).
+
+        Raises:
+            RuntimeError: No well-formed ``[GATE_ANCESTRY_TARGET_REF]``
+                marker is present in *content* (e.g. a record written
+                before this marker existed), or a marker IS present but
+                malformed -- ``gate_records.latest_ancestry_target_ref``'s
+                ``ValueError`` is translated to ``RuntimeError`` here so
+                every caller of this method (``cmd_mark_done`` catches
+                ``RuntimeError`` only) renders a clean ``ERROR:`` instead
+                of an uncaught traceback.
+        """
+        from devbench.gate_records import latest_ancestry_target_ref
+
+        try:
+            target_ref = latest_ancestry_target_ref(content)
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot resolve ancestry gate target ref: malformed marker: {exc}") from exc
+        if target_ref is None:
+            raise RuntimeError(
+                "Cannot resolve ancestry gate target ref: no [GATE_ANCESTRY_TARGET_REF] marker recorded "
+                "alongside the [GATE_PASS ancestry] record. Run: uv run devbench check-ancestry "
+                "<unit-id> <dependency-ref> to produce a fresh record."
+            )
+        return target_ref
+
+    @staticmethod
+    def _recompute_gate_scope_hash(repo: str, content: str, gate: str = "") -> str:
         """Recompute *content*'s current Changes-Manifest scope hash (spec 4.2, AC-7).
 
         The freshness half of the machine-blocking gate-record invariant: a
@@ -842,6 +932,24 @@ class BacklogManager:
         Args:
             repo: Canonical ``org/repo`` string (``_extract_repo``'s result).
             content: The full text of the work-unit markdown file.
+            gate: The declared gate name this recompute is for. This is the
+                one machine-blocking gate (of ``constants.GATE_TIERS``)
+                whose scope hash is target-ref-aware (spec 4.5, internal
+                issue #12 AC3): the comparison below is keyed off the
+                imported ``constants.GATE_ANCESTRY`` (the single canonical
+                definition ``GATE_NAMES``/``GATE_TIERS`` are built from),
+                never a hand-typed module-private literal -- a mirrored
+                module-private copy of this same string had drifted
+                undetected into a third independent declaration
+                (code_review FAIL, round 1). When this is ``"ancestry"``,
+                the digest is delegated ENTIRELY to
+                ``cli._compute_ancestry_scope_hash`` -- the SAME assembly
+                ``cli._write_ancestry_gate_pass_record`` calls to produce
+                the original record, so the two can never independently
+                drift -- called with the target ref read back via
+                ``_resolve_ancestry_target_ref``. Every other gate name
+                (including the default ``""``) leaves the digest formula
+                byte-identical to before this parameter existed.
 
         Returns:
             The recomputed scope hash.
@@ -849,12 +957,13 @@ class BacklogManager:
         Raises:
             RuntimeError: If the Changes Manifest is missing/malformed, is
                 empty, or a file it declares cannot be hashed in the
-                checkout -- never silently treated as "no change".
+                checkout; or, for ``gate == "ancestry"``, if the recorded
+                target ref cannot be resolved -- never silently treated as
+                "no change".
         """
         from devbench.backlog.manifest import ManifestParseError, parse_manifest
         from devbench.config import RUNTIME_CONFIG, WORKSPACE_ROOT
         from devbench.config_loader import get_repo_local_path
-        from devbench.gate_records import compute_scope_hash
 
         try:
             manifest_rows = parse_manifest(content)
@@ -862,9 +971,21 @@ class BacklogManager:
             raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
 
         repo_path = get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT)
+
+        if gate == GATE_ANCESTRY:
+            from devbench.cli import _compute_ancestry_scope_hash
+
+            target_ref = BacklogManager._resolve_ancestry_target_ref(content)
+            try:
+                return _compute_ancestry_scope_hash(repo_path, manifest_rows, target_ref)
+            except RuntimeError as exc:
+                raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+        from devbench.gate_records import compute_scope_hash
+
         file_blob_hashes = {row.file: BacklogManager._git_blob_hash(repo_path, row.file) for row in manifest_rows}
         try:
-            return compute_scope_hash(file_blob_hashes)
+            return compute_scope_hash(file_blob_hashes, target_ref_sha=None)
         except ValueError as exc:
             raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
 
@@ -940,9 +1061,17 @@ class BacklogManager:
                 continue
 
             remediation = f"uv run devbench {_gate_check_command(gate)} {unit_id}"
+            if gate == GATE_ANCESTRY:
+                # check-ancestry's required positional args are
+                # `<unit-id> <dependency-ref>` (spec 4.5): the remediation
+                # command is not runnable without a dependency ref, so the
+                # refusal names it as a placeholder for the operator to fill
+                # in, mirroring how every other worked-example remediation
+                # in this module names every required argument.
+                remediation += " <dependency-ref>"
             record = latest_gate_pass_record(content, gate)
             if record is not None:
-                current_hash = self._recompute_gate_scope_hash(repo, content)
+                current_hash = self._recompute_gate_scope_hash(repo, content, gate)
                 if current_hash == record.scope_hash:
                     continue
                 raise RuntimeError(
@@ -2757,6 +2886,27 @@ class BacklogManager:
     def _append_audit_marker_before_comments(self, work_unit_path: Path, marker: str) -> None:
         """Insert a single-line structured audit marker immediately before ``## Comments``.
 
+        Thin single-marker convenience wrapper around
+        :meth:`_append_audit_markers_before_comments` (which performs the
+        actual read-modify-write); kept as its own method because most
+        callers (``compose_gate_waiver_record``'s ``[GATE_WAIVER]`` marker,
+        ``log-newly-reachable``'s ``[NEWLY_REACHABLE]`` marker) only ever
+        have one marker to persist per call.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            marker: The exact one-line marker text (no trailing newline).
+
+        Raises:
+            OSError: The file cannot be read or written (propagated
+                unchanged from ``Path.read_text``/``atomic_write_text`` --
+                never swallowed).
+        """
+        self._append_audit_markers_before_comments(work_unit_path, [marker])
+
+    def _append_audit_markers_before_comments(self, work_unit_path: Path, markers: Sequence[str]) -> None:
+        """Insert one or more structured audit markers immediately before ``## Comments``, in ONE atomic write.
+
         ``read-unit --strip-comments`` (``cli.cmd_read_unit``) truncates a
         work unit's content at the literal ``\\n## Comments`` marker before
         every review judge's Evidence fetch reads it (the PM-6
@@ -2767,9 +2917,24 @@ class BacklogManager:
         weigh it. This helper is the alternative insertion point every
         judge-visible structured marker writer must use instead --
         currently ``compose_gate_waiver_record``'s ``[GATE_WAIVER]`` marker
-        (spec 5.3, this task); ``log-newly-reachable``'s
-        ``[NEWLY_REACHABLE]`` marker (spec 4.9(a), E2-F4-S1-T2) is a
-        documented future consumer of the same insertion point.
+        (spec 5.3), ``cli._write_ancestry_gate_pass_record``'s
+        ``[GATE_PASS ancestry]`` record together with its
+        ``[GATE_ANCESTRY_TARGET_REF]`` companion marker (spec 4.5, this
+        task); ``log-newly-reachable``'s ``[NEWLY_REACHABLE]`` marker (spec
+        4.9(a), E2-F4-S1-T2) is a documented future consumer of the same
+        insertion point.
+
+        When a caller needs to persist MULTIPLE markers that must never be
+        observed independently (e.g. a ``[GATE_PASS ancestry]`` record and
+        its ``[GATE_ANCESTRY_TARGET_REF]`` companion: a reader that finds
+        the first without the second treats the record as unresolvable),
+        it MUST pass them all to a single call here rather than calling
+        :meth:`_append_audit_marker_before_comments` once per marker -- this
+        method performs exactly one ``Path.read_text``/``atomic_write_text``
+        round trip for the whole batch, so a write failure can never leave
+        some markers persisted and others missing (code_review FAIL, round
+        1: two sequential single-marker calls left a `[GATE_PASS ancestry]`
+        record with no companion marker on a second-call failure).
 
         Mechanically identical to ``_append_tdd_entry``'s "insert before the
         next ``## `` heading" logic (both delegate to
@@ -2778,21 +2943,39 @@ class BacklogManager:
         the section immediately preceding it -- so this insertion point
         stays correct even if a future template inserts another section
         between TDD Cycle Log and Comments. When the file carries no ``##
-        Comments`` section at all, the marker is appended at EOF (there is
+        Comments`` section at all, the markers are appended at EOF (there is
         nothing to strip against, so any location is judge-visible).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
-            marker: The exact one-line marker text (no trailing newline).
+            markers: The exact one-line marker texts (no trailing newline),
+                inserted in the given order. Must be non-empty.
+
+        Raises:
+            ValueError: ``markers`` is empty. Enforces the precondition
+                stated above: silently writing a blank line for an empty
+                sequence (the fail-open default of ``"\\n".join(())``)
+                would violate the project's fail-fast contract, so this is
+                a loud, immediate failure instead of a silent no-op write.
+            OSError: The file cannot be read or written (propagated
+                unchanged from ``Path.read_text``/``atomic_write_text`` --
+                never swallowed, so a full disk or a read-only file
+                surfaces as a loud, actionable failure to the caller
+                rather than a silent partial write).
         """
+        if not markers:
+            raise ValueError("markers must be non-empty: an empty sequence would silently write a blank audit line.")
+
+        combined_entry = "\n".join(marker.rstrip("\n") for marker in markers)
+
         content = work_unit_path.read_text(encoding="utf-8")
         lines = content.splitlines()
         comments_idx = next((i for i, line in enumerate(lines) if line == COMMENTS_SECTION_HEADER), -1)
 
         if comments_idx == -1:
-            content = content.rstrip("\n") + "\n\n" + marker.rstrip("\n") + "\n"
+            content = content.rstrip("\n") + "\n\n" + combined_entry + "\n"
         else:
-            new_lines = self._insert_entry_before_heading(lines, comments_idx, marker)
+            new_lines = self._insert_entry_before_heading(lines, comments_idx, combined_entry)
             content = "\n".join(new_lines) + "\n"
 
         atomic_write_text(work_unit_path, content)

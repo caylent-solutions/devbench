@@ -83,10 +83,51 @@ _STEP_6A_SECTION_RE = re.compile(
 )
 
 
-def _extract_step_6a_section(skill_text: str) -> str:
-    match = _STEP_6A_SECTION_RE.search(skill_text)
-    assert match, "'## Step 6a -- Wire the ancestry gate' section not found in SKILL.md"
+def _extract_section(pattern: re.Pattern[str], text: str, not_found_message: str) -> str:
+    """Shared regex-extraction primitive every `_extract_*` helper below
+    delegates to (DRY): search `pattern` in `text`, assert a match was
+    found (failing loudly with `not_found_message` otherwise -- a renamed
+    or removed section must fail the pin, not silently extract an empty
+    span), and return the matched span verbatim. Centralising this
+    search-assert-return shape means a future extraction only needs a new
+    compiled pattern plus a one-line wrapper, not a copy of this logic."""
+    match = pattern.search(text)
+    assert match, not_found_message
     return match.group(0)
+
+
+def _extract_step_6a_section(skill_text: str) -> str:
+    return _extract_section(
+        _STEP_6A_SECTION_RE,
+        skill_text,
+        "'## Step 6a -- Wire the ancestry gate' section not found in SKILL.md",
+    )
+
+
+# E4-F1-S1-T4 (317-D01, 317-D23): docs/cross-backlog-dependencies.md's own
+# "Special case" section is the operator-facing twin of SKILL.md's
+# "**Authoring the ancestry-gate task**" block. It must be kept in sync with
+# the same shipped, chore-typed, wire-gate-fanned shape rather than the
+# retired hand-authored per-root wiring instruction and the retired '(none)'
+# Changes Manifest placeholder. Anchored on the section's own heading through
+# the next top-level heading so a future rewording that keeps the substance
+# intact does not silently widen or narrow the extracted span.
+_SPECIAL_CASE_SECTION_RE = re.compile(
+    r"## Special case: the producer is another devbench work group's branch"
+    r".*?(?=\n## The pattern: anchor a manual blocker in this backlog)",
+    re.DOTALL,
+)
+
+
+def _extract_special_case_section(cross_backlog_doc_text: str) -> str:
+    """Return the 'Special case' section verbatim (shared extraction, DRY --
+    consistent with the module's existing extraction-helper convention)."""
+    return _extract_section(
+        _SPECIAL_CASE_SECTION_RE,
+        cross_backlog_doc_text,
+        "'## Special case: the producer is another devbench work group's branch' "
+        "section not found in docs/cross-backlog-dependencies.md -- has it been renamed/removed?",
+    )
 
 
 # The squash-aware section heading SKILL.md's cross-reference must resolve
@@ -101,9 +142,11 @@ def _extract_ancestry_gate_block(skill_text: str) -> str:
     Single shared extraction so every assertion below parses one slice of
     SKILL.md rather than each test re-deriving its own span (DRY).
     """
-    match = _ANCESTRY_BLOCK_RE.search(skill_text)
-    assert match, "'**Authoring the ancestry-gate task**' block not found in SKILL.md -- has it been renamed/removed?"
-    return match.group(0)
+    return _extract_section(
+        _ANCESTRY_BLOCK_RE,
+        skill_text,
+        "'**Authoring the ancestry-gate task**' block not found in SKILL.md -- has it been renamed/removed?",
+    )
 
 
 def _extract_dependency_ref_bullets(skill_text: str) -> str:
@@ -114,33 +157,43 @@ def _extract_dependency_ref_bullets(skill_text: str) -> str:
     with the generator's own dependency_ref/target_ref examples, which is
     what AC-SKILL-EXIT-005 actually governs.
     """
-    match = _DEPENDENCY_REF_BULLET_RE.search(skill_text)
-    assert match, "`dependency_ref`/`target_ref` bullet pair not found in SKILL.md"
-    return match.group(0)
+    return _extract_section(
+        _DEPENDENCY_REF_BULLET_RE,
+        skill_text,
+        "`dependency_ref`/`target_ref` bullet pair not found in SKILL.md",
+    )
 
 
 def _extract_cli_reference_check_ancestry_section(cli_reference_text: str) -> str:
-    match = _CLI_REFERENCE_CHECK_ANCESTRY_RE.search(cli_reference_text)
-    assert match, "'### `check-ancestry`' section not found in docs/cli-reference.md"
-    return match.group(0)
+    return _extract_section(
+        _CLI_REFERENCE_CHECK_ANCESTRY_RE,
+        cli_reference_text,
+        "'### `check-ancestry`' section not found in docs/cli-reference.md",
+    )
 
 
 def _extract_step_4a_gate_task_bullet(skill_text: str) -> str:
-    match = _STEP_4A_GATE_TASK_BULLET_RE.search(skill_text)
-    assert match, "Step 4a 'Declared work-group dependency -> mandatory gate task' bullet not found in SKILL.md"
-    return match.group(0)
+    return _extract_section(
+        _STEP_4A_GATE_TASK_BULLET_RE,
+        skill_text,
+        "Step 4a 'Declared work-group dependency -> mandatory gate task' bullet not found in SKILL.md",
+    )
 
 
 def _extract_rubric_item_9(skill_text: str) -> str:
-    match = _RUBRIC_ITEM_9_RE.search(skill_text)
-    assert match, "Step 4b rubric item 9 ('Work-group dependency gate present') not found in SKILL.md"
-    return match.group(0)
+    return _extract_section(
+        _RUBRIC_ITEM_9_RE,
+        skill_text,
+        "Step 4b rubric item 9 ('Work-group dependency gate present') not found in SKILL.md",
+    )
 
 
 def _extract_rubric_item_13(skill_text: str) -> str:
-    match = _RUBRIC_ITEM_13_RE.search(skill_text)
-    assert match, "Step 5b rubric item 13 ('Ancestry gate present and fully wired') not found in SKILL.md"
-    return match.group(0)
+    return _extract_section(
+        _RUBRIC_ITEM_13_RE,
+        skill_text,
+        "Step 5b rubric item 13 ('Ancestry gate present and fully wired') not found in SKILL.md",
+    )
 
 
 @pytest.fixture(scope="module")
@@ -207,6 +260,11 @@ def rubric_item_13(skill_text: str) -> str:
 @pytest.fixture(scope="module")
 def step_6a_section(skill_text: str) -> str:
     return _extract_step_6a_section(skill_text)
+
+
+@pytest.fixture(scope="module")
+def special_case_section(cross_backlog_doc_text: str) -> str:
+    return _extract_special_case_section(cross_backlog_doc_text)
 
 
 @pytest.mark.unit
@@ -643,6 +701,108 @@ class TestAncestryGateTitleMarkerPinnedToCommand:
             "src/devbench/cli.py::_is_ancestry_gate_task matches against a unit's title -- "
             "otherwise a retitled gate task silently degrades wire-gate's conflict "
             "detection to 'not_root' and the root is skipped at exit 0 instead of failing"
+        )
+
+
+@pytest.mark.unit
+class TestCrossBacklogDocMirrorsWireGateTemplate:
+    """AC-TEST-001 / AC-CODE-001 / AC-CODE-002 / AC-CODE-003 / AC-DOC-001
+    (E4-F1-S1-T4): `docs/cross-backlog-dependencies.md`'s "Special case: the
+    producer is another devbench work group's branch" section is the
+    operator-facing twin of SKILL.md's "**Authoring the ancestry-gate
+    task**" block (E4-F1-S1-T2). Before this unit, that section still
+    prescribed the retired hand-authored per-root wiring instruction
+    ("every other Task in the tree lists it in `## Dependencies`") and
+    never mentioned the `chore` typing or the gate-report Manifest row --
+    both of which the shipped `wire-gate` verb and generated gate task now
+    require. These assertions read the section off disk and can genuinely
+    fail against the pre-fix content.
+    """
+
+    _WIRE_GATE_INVOCATION = "devbench wire-gate <gate-task-id> --blocks-roots"
+    _RETIRED_HAND_AUTHORED_WIRING = (
+        "every other Task in the tree lists it in `## Dependencies` so no work can be claimed until it passes"
+    )
+
+    def test_task_type_chore_prescribed(self, special_case_section: str) -> None:
+        assert "## Task Type: chore" in special_case_section, (
+            "the 'Special case' section must prescribe '## Task Type: chore' for the "
+            "generated ancestry-gate task (317-D01)"
+        )
+
+    def test_chore_typing_rationale_explained(self, special_case_section: str) -> None:
+        assert "behavior-fix" in special_case_section, (
+            "the section must explain that a check-only task must not inherit "
+            "validate-backlog rule 21's RED-gated 'behavior-fix' default -- an "
+            "untyped gate task can never produce the RED evidence that default requires"
+        )
+        assert "RED" in special_case_section
+
+    def test_gate_report_manifest_row_named(self, special_case_section: str) -> None:
+        assert "docs/gate-reports/" in special_case_section and "-ancestry.md" in special_case_section, (
+            "the section must name a gate report file (e.g. "
+            "docs/gate-reports/<this-task-id>-ancestry.md) as the generated task's "
+            "sole '## Changes Manifest' deliverable, in place of the retired '(none)' placeholder"
+        )
+
+    def test_retired_none_manifest_convention_absent(self, special_case_section: str) -> None:
+        assert "| (none) |" not in special_case_section, (
+            "the retired '(none)' Changes Manifest table-row convention must not be "
+            "prescribed for the generated ancestry-gate task -- it must name a real "
+            "gate report file row instead"
+        )
+        assert "Manifest: `(none)`" not in special_case_section, (
+            "the retired '(none)' Changes Manifest instruction must not be prescribed "
+            "for the generated ancestry-gate task"
+        )
+        assert "retired `(none)`" in special_case_section, (
+            "the section must explain that the gate-report Manifest row replaces the "
+            "retired '(none)' placeholder convention, not merely omit any mention of it"
+        )
+
+    def test_approach_fence_writes_the_gate_report(self, special_case_section: str) -> None:
+        fence_start = special_case_section.find("````markdown")
+        assert fence_start != -1, "the '### Approach' template must be a fenced markdown block"
+        fence_body = special_case_section[fence_start:]
+        assert "docs/gate-reports/" in fence_body and "-ancestry.md" in fence_body, (
+            "the fenced Approach template must include a final step, INSIDE the fence, "
+            "that writes/copies the printed check-ancestry status line into the gate "
+            "report file named in the '## Changes Manifest' row above -- otherwise the "
+            "prescribed Manifest row and the prescribed Approach disagree"
+        )
+        assert "status line" in fence_body.lower(), (
+            "the fenced Approach template's final step must reference the printed "
+            "check-ancestry status line it copies into the gate report file"
+        )
+
+    def test_wire_gate_invocation_present_and_linked(self, special_case_section: str) -> None:
+        assert self._WIRE_GATE_INVOCATION in special_case_section, (
+            "the section must replace the retired hand-authoring instruction with the "
+            f"mechanical invocation {self._WIRE_GATE_INVOCATION!r}"
+        )
+        assert "cli-reference.md#wire-gate" in special_case_section, (
+            "the wire-gate invocation must be linked to docs/cli-reference.md#wire-gate"
+        )
+
+    def test_retired_hand_authored_wiring_instruction_absent(self, special_case_section: str) -> None:
+        assert self._RETIRED_HAND_AUTHORED_WIRING not in special_case_section, (
+            "the retired per-root hand-authoring instruction ('every other Task in the "
+            "tree lists it in ## Dependencies so no work can be claimed until it "
+            "passes') must not appear -- wire-gate fans the gate into DAG roots only, "
+            "not every Task in the tree"
+        )
+
+    def test_wiring_description_scoped_to_dag_roots_not_every_task(self, special_case_section: str) -> None:
+        assert "root of the intra-backlog dependency DAG" in special_case_section, (
+            "the section must describe the fan-in as wiring every ROOT of the "
+            "intra-backlog dependency DAG, not every Task in the tree"
+        )
+        assert "not every Task in the tree" in special_case_section, (
+            "the section must explicitly disclaim the retired 'every Task in the tree' shape"
+        )
+        assert "transitively" in special_case_section, (
+            "the section must state that non-root Tasks are blocked transitively "
+            "through their own DAG ancestry, not via a direct gate-task dependency row"
         )
 
 

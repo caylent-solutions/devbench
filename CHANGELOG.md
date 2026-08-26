@@ -927,7 +927,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the gate before logging completion. (E5-F1-S1-T1 replaced the
   bootstrap-and-ratchet baseline below with a pre-change, per-branch-point
   baseline; see the "Shared-file baseline is now a pre-change,
-  per-branch-point snapshot" entry below.)
+  per-branch-point snapshot" entry below. E5-F2-S1-T1 replaced the
+  `list_changed_files` working-tree scan below with the shared ADR-12 scope
+  helper and rewrote the guard hook to fail closed; see the
+  "`check-shared-file-impact` resolves its changed-file set through the
+  shared ADR-12 scope helper..." entry below.)
 
 - **Shared-file baseline is now a pre-change, per-branch-point snapshot,
   written atomically under a sibling `flock`, read under a shared `flock`,
@@ -1064,6 +1068,214 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of a comment) now raises the same dedicated `UnknownTestRunnerError` with
   a single formed `ERROR: ...` line naming the command, instead of an
   uncaught builtin `ValueError` traceback escaping the gate.
+
+- **`check-shared-file-impact` resolves its changed-file set through the
+  shared ADR-12 scope helper instead of a working-tree scan, attributes a
+  new full-suite failure to the unit only when the failure is inside the
+  unit's own scope, and its `PostToolUse` guard hook,
+  `assert-shared-file-impact.sh`, now enforces a self-written verdict
+  record instead of re-parsing the Claude Code payload**
+  (spec `integration-reality-gates-hardening.md` sections 3.5, 4.3 and 4.6;
+  AC-1 through AC-6, AC-9; source PR #318 findings 318-D7 and 318-D13).
+
+  **Scope and attribution (unchanged since first shipped).**
+  `cmd_check_shared_file_impact` previously computed its changed-file set via
+  `list_changed_files`, a raw working-tree scan: a file another, unrelated
+  task left dirty in the shared checkout could both trigger the gate and be
+  blamed for a failure that had nothing to do with the unit under test. It
+  now resolves scope exclusively through
+  `work_unit_scope.resolve_changed_files(unit_id, repo_path, mode)` -- the
+  same ADR-12 mode-aware helper `get-diff` and `check-manifest-scope`
+  already use, shared via a `cmd_check_shared_file_impact` `_resolve_scope_or_report`
+  call rather than a fourth inline `try`/`except` copy -- and matches
+  `gates.repos.<repo>.shared_file_impact.patterns` against the resolved
+  `ScopeResult.files`, never the working tree. A `git` plumbing failure, an
+  unresolvable unit/repo path, or a work-unit file deleted in a
+  same-process race (`FileNotFoundError`) surfaces as
+  `ERROR: cannot resolve scope for unit <unit-id>: <message>` (exit 1). The
+  full-suite RESULT the gate reports remains repo-wide (the suite itself is
+  never scoped), but which of that run's NEW failures actually BLOCK the
+  unit is narrower: a new failure is named in `new_failures` (and blocks)
+  only when `_shared_file_gate_attributable` can attribute its failing node
+  id's file to the unit's own `ScopeResult.files`; every other new failure
+  is still visible in the payload's `unattributed_new_failures` list but
+  never blocks.
+
+  **Guard hook: shipped design (round-5 redesign, replacing four earlier
+  review rounds' payload-parsing attempts described below).** Four review
+  rounds each replaced one sed/jq heuristic for re-deriving this hook's
+  verdict from the Claude Code PostToolUse payload -- first from a
+  nonexistent `tool_response.exit_code` field, then from `tool_input.command`
+  (a bare substring test, then progressively narrower quoted-region/token
+  matchers still defeated by `bash -lc`-style wrapper forms and an
+  apostrophe-sandwich quoting edge case) and `tool_response.stdout` (a
+  tiered JSON-document scan defeated by a decapitated block fragment
+  coexisting with an unrelated complete document). Every one of those
+  defeats shared a root cause: the hook was re-parsing an agent-authored
+  shell string or a composed stdout string it did not control, with no way
+  to prove the parsed result was actually this gate's own verdict. The
+  shipped design removes that entire re-parsing surface instead:
+  `cmd_check_shared_file_impact` now persists its own verdict to a 4-line
+  plain-text record file (`<workspace>/.devbench/shared-file-impact-verdict`,
+  or `<workspace>/.devbench/sessions/<DEVBENCH_SESSION_NAME>/shared-file-impact-verdict`
+  when a named session is active, spec 4.4.4) as the very first thing it
+  does -- `"pending"`, overwritten with `"pass"` or `"block"` only on a
+  clean exit path; every error-return path after that initial write leaves
+  it at `"pending"` on purpose. The record's 4th line is a per-invocation
+  correlator (`cli._shared_file_impact_invocation_id`, a fresh PID+counter
+  value generated once per `check-shared-file-impact` invocation) that only
+  `_write_shared_file_impact_verdict`'s own non-clobbering guard ever reads
+  back -- see finding (1) below; the hook itself never reads or cares about
+  this field. `assert-shared-file-impact.sh` no longer
+  reads `tool_input.command` or `tool_response` at all (it drains stdin
+  unread) and no longer sources `_hook_lib.sh` (there is no payload field
+  left for it to extract; AC-4's "every extracted field goes through
+  `_hook_lib.sh`" is satisfied vacuously). Its entire job is reading that
+  ONE record back on the next Bash PostToolUse event it receives and then
+  consuming it (deleting it after deciding what to do with it): a
+  `"block"` record blocks (exit 2); a `"pass"` record allows (exit 0);
+  `"pending"` (or any other unrecognised value) fails CLOSED (exit 2); no
+  record at all allows (exit 0). `DEVBENCH_SESSION_NAME` routing (the `..`
+  path-segment guard, and ASCII whitespace stripping) mirrors
+  `cli._session_state_file_path` for every ASCII-whitespace and
+  `..`-segment case, verified by a cross-layer test that writes via the
+  real Python function and reads via the real script rather than two
+  independent reimplementations of the same rule. Bounded, not universal
+  (round-6 finding): Python's `str.strip()` also strips several non-ASCII
+  whitespace code points (measured: U+001C, U+0085, U+00A0 among them) the
+  shell script's `[[:space:]]` class does not, so a `DEVBENCH_SESSION_NAME`
+  padded with one of those specific code points resolves to a different
+  record path in each layer -- a narrow, real divergence outside the
+  ASCII-whitespace cases covered above.
+
+  **Round-5 defects found in review and fixed in this same change.**
+  (1) *Block-then-pass clobber, a regression against round 4 (finding A1),
+  and its residual gap (same A1 finding family, closed in a later change).*
+  Two `check-shared-file-impact` invocations chained in a single Bash tool
+  call fire only ONE PostToolUse event for the whole call;
+  `_write_shared_file_impact_verdict` now refuses to overwrite an on-disk
+  `"block"` status with anything, so a DIFFERENT, later unit's own
+  `"pending"`/`"pass"` writes can never silently erase an earlier,
+  unconsumed `"block"` -- verified with a real two-call repro
+  (`pending`->`block` for one unit, then `pending`->`pass` for a second unit
+  in the same process) that now still reads `"block"` and still makes the
+  real hook exit 2. The same finding's residual gap: that guard protected
+  only `"block"`, so an unconsumed `"pending"` -- left behind by an
+  invocation that opened `"pending"` and then CRASHED before reaching its
+  own clean verdict, exactly the "started but the verdict cannot be
+  determined" case spec 3.5 requires to fail closed -- was still freely
+  overwritten by a DIFFERENT, later invocation's own clean `"pass"` write.
+  Every invocation now carries its own identity
+  (`cli._shared_file_impact_invocation_id`), recorded as the record's 4th
+  line; the guard now also refuses to overwrite an unconsumed `"pending"`
+  whose recorded invocation id differs from the id being written under, while
+  a SINGLE invocation's own `"pending"` -> `"pass"`/`"block"` transition
+  (matching id on both writes) is unaffected -- verified with a real
+  two-invocation repro (`pending` for invocation A, then A crashes; `pending`
+  then `pass` for a DIFFERENT invocation B) that now still reads `"pending"`
+  and still makes the real hook exit 2, alongside a regression test proving
+  an ordinary single passing invocation still ends at `"pass"` and the real
+  hook still exits 0.
+  (2) *`DEVBENCH_SESSION_NAME` whitespace-strip divergence.* `cli._session_state_file_path`
+  strips the env var with Python's `str.strip()`; the shell script now
+  strips it identically before routing, so a padded value (`' alpha '`) and
+  an all-whitespace value (`'  '`, equivalent to unset in Python) resolve to
+  the SAME record path in both layers -- previously the shell layer alone
+  left the padded/whitespace-only cases un-stripped, silently missing a
+  record the Python layer had written.
+  (3) *`..` guard divergence, a permanent false positive.* Python rejects
+  only an exact `..` PATH SEGMENT (`".." in Path(session_name).parts`); the
+  shell guard previously rejected any `..` SUBSTRING, so a devbench-accepted
+  session name such as `a..b` made the hook fail closed on every Bash call
+  for that session forever (the guard fired before the record was even
+  checked). The shell guard now implements the identical segment rule
+  (case-matching the wrapped name against `*/../*`), verified to agree with
+  Python on `../escape`, `a..b`, `..` and `x/../y`.
+  (4) *Consume-before-branch under `set -e`.* Unlinking the record requires
+  write permission on its CONTAINING directory. The hook previously
+  unlinked the record unconditionally before branching on its status; a
+  non-writable directory made that `rm -f` fail, and under `set -euo pipefail`
+  the whole script aborted with the OS's own stderr text and a
+  non-blocking exit code (1) instead of this hook's fail-closed exit 2 --
+  silently walking past a real `"block"` verdict. The hook now branches on
+  the record's status first and consumes it as part of reporting that
+  decision; a failed consume fails CLOSED (exit 2) with a controlled
+  message instead of leaking raw `rm` stderr.
+
+  **Round-6 correction (defect introduced by the round-5 residual-gap fix
+  above).** The foreign-pending guard from (1)'s residual gap took no
+  `status` parameter, so it refused EVERY foreign-invocation write over an
+  unconsumed `"pending"`, including a genuine `"block"` -- reproduced end
+  to end with NO concurrency on the exact `unit-a ; unit-b` chained shape
+  the module comment above the verdict-record constants names as the
+  threat model: unit A crashes leaving `"pending"`; unit B's gate
+  genuinely fails and writes `"block"`, which was silently REFUSED; the
+  record stayed `"pending"`/UNIT-A, and an agent following the hook's own
+  prescribed remediation (re-run unit A, which then passes) ended at
+  `"pass"` with the next Bash call ALLOWED, silently discarding unit B's
+  real regression. `_shared_file_impact_verdict_write_is_blocked` now
+  takes the incoming `status` and never refuses a `"block"` write over an
+  unconsumed `"pending"`: escalating `"pending"` straight to `"block"`
+  loses nothing, since `"block"` is itself the sticky, terminal status (1)
+  above protects. Verified with a real two-invocation repro (`"pending"`
+  for invocation A, then a DIFFERENT invocation B's genuine `"block"`)
+  that now reads `"block"` and makes the real hook exit 2 naming the
+  BLOCKING unit (B), not the crashed one (A). `invocation_id` is now a
+  required keyword-only parameter of `_write_shared_file_impact_verdict`
+  (previously defaulted to `""`, so two callers that both omitted it
+  collided and silently defeated the guard against each other).
+
+  **Residual, disclosed rather than fixed by redesign.**
+  (B1) `hooks.json` registers this script on `PostToolUse` for the `Bash`
+  tool only. Measured directly against this repo's own `hook-logs.jsonl`: a
+  Bash tool call that exits NON-ZERO emits a `PostToolUseFailure` event, not
+  `PostToolUse` (222 of 23,836 logged Bash tool-call completions, 0.93%, as
+  of this measurement); this hook is not registered for `PostToolUseFailure`,
+  so it never fires on a blocking `check-shared-file-impact` invocation's
+  OWN call (which exits non-zero). Combined with fix (1) above, the block is
+  not lost -- it is observed on the next Bash tool call whose PostToolUse
+  event actually reaches this hook, which is not guaranteed to be the very
+  next Bash call if intervening calls also exit non-zero. Registering this
+  hook on `PostToolUseFailure` too is a closable follow-up, knowingly
+  deferred with no tracking work unit filed yet (a prior draft,
+  E5-F2-S1-T3, was filed via `write-proposal` and then withdrawn via
+  `reject-proposal` after it deadlocked this unit as an auto-wired
+  blocker). `hooks.json` is a DEFERRED file outside this unit's Manifest,
+  marked ` (ref)` in this unit's own AC-6 and Definition of Done -- per
+  `docs/backlog-contract.md`'s `(ref)` rule, a read-only reference excluded
+  from the diff, which is the authority for it being out of scope here.
+  (C2) The "no record at all" case is reached three ways, not two: the hook
+  has never seen an invocation in this session; the prior record was
+  already consumed; or (previously undocumented) `cmd_check_shared_file_impact`
+  never reached its own first line at all (an unrecognised CLI subcommand,
+  an import-time configuration failure, argparse rejecting the invocation,
+  `devbench` not on PATH, or the initial `"pending"` write itself raising
+  `OSError`) -- none of which produce a record, so this case allows and is
+  not closable from inside this hook (there is nothing on disk to fail
+  closed on), symmetric with the existing `DEVBENCH_WORKSPACE_ROOT`-unset
+  exception.
+  (E1) The record is keyed only by (workspace, session); several agent
+  processes (the executor and every review judge) commonly share one
+  `DEVBENCH_SESSION_NAME` within an orchestrator run. Investigated for a
+  usable per-agent correlator visible to both the gate subprocess's
+  environment and this hook's invocation: the PostToolUse payload's
+  `session_id` and the gate subprocess's `CLAUDE_CODE_SESSION_ID` both
+  identify the top-level orchestrator session, not the individual agent --
+  measured directly against `hook-logs.jsonl`, multiple concurrently-running
+  agent types share the identical `session_id`. No usable correlator was
+  found; a verdict written by one agent's invocation can therefore be
+  consumed by a different, concurrently-running agent's own next Bash
+  PostToolUse event, bounded to agents sharing the same workspace and
+  session name.
+  (E2) AC-5's literal wording and the Definition of Done's `_hook_lib.sh`
+  line both describe the payload-parsing mechanism this redesign removes,
+  so neither is satisfiable verbatim by any implementation of this design;
+  `devbench` offers no mechanism to revise shipped acceptance-criteria text.
+  The shipped design instead satisfies AC-5's INTENT (spec 3.5, 4.6: fail
+  closed rather than allow whenever the verdict cannot be determined), which
+  every path through this hook still honours except the two narrow,
+  explicitly reasoned exceptions (no record at all, `DEVBENCH_WORKSPACE_ROOT`
+  unset).
 
 - **Reachability check on the code-review gate**
   (`caylent-solutions/devbench-internal-backlog#10`). A task could

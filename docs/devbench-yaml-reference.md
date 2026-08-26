@@ -203,22 +203,68 @@ absent from its canonical source, or a canonical source's coverage falls short o
 Optional list of `fnmatch`-style glob patterns, matched against POSIX paths relative to the
 repo root. Identifies "shared/high-fan-in" files for this repo -- app-level composition roots,
 shared shell/container components, widely-consumed hooks -- where a change can silently break
-already-passing code in unrelated features that never appear in the changing task's own Changes
-Manifest.
+already-passing code in unrelated features.
 
-When a work unit's diff touches a path matching one of these patterns,
+When a work unit's diff (resolved through the same ADR-12 mode-aware
+`work_unit_scope.resolve_changed_files` helper `get-diff` and `check-manifest-scope` use, never
+a raw working-tree scan) touches a path matching one of these patterns,
 `devbench check-shared-file-impact <unit-id>` (invoked by the executor, enforced by the
 `assert-shared-file-impact.sh` guard hook) runs the FULL test suite -- not the task's scoped
 subset -- and diffs the resulting failing-test set against a pre-change baseline stored at
 `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`, one file per merge-base
-branch point the unit diverged from. It blocks task completion only on **newly introduced**
-failures, so pre-existing/flaky failures never stall an unrelated task. See
-`devbench check-shared-file-impact --help` and `src/devbench/cli.py::cmd_check_shared_file_impact`
-for the full algorithm: the baseline is captured once per branch point by running the full
-suite in an isolated `git worktree` checked out AT that branch point (never from the current,
-already-changed tree), and a baseline that exists but fails to parse, or whose stored
-`branch_point` disagrees with the resolved merge-base, is a loud `ERROR` on stderr (exit 1)
-that leaves the file untouched -- there is no silent re-bootstrap path.
+branch point the unit diverged from. The full-suite RESULT reported is always repo-wide, but
+which of that run's newly-introduced failures actually **block** task completion is narrower:
+only a failure whose failing node id is attributable to the unit's own Changes Manifest scope
+(the `pytest` parser's `"<file>::<test>"` node ids are checked against that scope; `go test` and
+jest node ids ordinarily carry no `::` at all and are attributable unconditionally -- but this is
+not an absolute guarantee: the jest parser captures the raw description text after the failure
+marker and the `go test` parser captures a bare non-whitespace token, so a test name or
+description that happens to contain a literal `::` is still split on it by the same file-segment
+check the `pytest` case uses, and the leading fragment -- not a real file path -- is then checked
+against scope and can be silently excluded from `new_failures` into `unattributed_new_failures`)
+blocks -- so a regression this task caused in a file outside its own Changes Manifest is reported in the JSON payload's
+`unattributed_new_failures` list but does not block this task, and pre-existing/flaky failures
+never stall an unrelated task either way. See `devbench check-shared-file-impact --help` and
+`src/devbench/cli.py::cmd_check_shared_file_impact` for the full algorithm: the baseline is
+captured once per branch point by running the full suite in an isolated `git worktree` checked
+out AT that branch point (never from the current, already-changed tree), and a baseline that
+exists but fails to parse, or whose stored `branch_point` disagrees with the resolved
+merge-base, is a loud `ERROR` on stderr (exit 1) that leaves the file untouched -- there is no
+silent re-bootstrap path.
+
+The `assert-shared-file-impact.sh` guard hook does not parse the invoking Bash tool call's
+command text or `tool_response.stdout` at all: `cmd_check_shared_file_impact` persists its own
+verdict to a small record file (`<workspace>/.devbench/shared-file-impact-verdict`, or a
+`<workspace>/.devbench/sessions/<DEVBENCH_SESSION_NAME>/` subdirectory when a named session is
+active) as the very first thing it does -- `"pending"`, overwritten with `"pass"` or `"block"`
+only on a clean exit -- and the hook's entire job is reading that ONE record back on the next
+Bash call it receives, then consuming (deleting) it. An unconsumed `"block"` record is never
+overwritten by a later, different invocation's own `"pending"`/`"pass"` writes, so it survives
+until a Bash PostToolUse event actually consumes it. Almost the identical protection applies to
+an unconsumed `"pending"` record: each invocation carries its own identity (a fresh PID+counter
+value recorded on the record's 4th line), and a DIFFERENT, later invocation's own `"pending"`/
+`"pass"` writes can never silently erase an earlier invocation's still-open `"pending"` -- the
+case where that earlier invocation crashed before reaching its own clean verdict -- while that
+SAME invocation's own subsequent `"pass"`/`"block"` write still transitions the record normally.
+The one write this protection deliberately lets through is a DIFFERENT, later invocation's own
+genuine `"block"`: it always escalates over an unconsumed `"pending"` rather than being refused,
+since `"block"` is itself the strongest, sticky status this same paragraph's first sentence
+protects, so nothing is lost by letting the escalation land -- refusing it would instead silently
+discard the escalating invocation's own genuine failing verdict. A `"block"` record blocks (exit 2); a
+`"pass"` record allows; a record still reading `"pending"` (every error path
+`check-shared-file-impact` can exit through AFTER its initial write without reaching a clean
+verdict -- an unrecognised unit id, no local repo path configured, a scope-resolution error, or
+the process crashing or being killed mid-run) fails CLOSED (blocks, exit 2). No record at all
+allows, and is reached three ways, only two of which are the intended "nothing unresolved" case:
+the gate was never invoked in this session; its prior record was already consumed; or (not
+closable from inside this hook) `cmd_check_shared_file_impact` never reached its own first line
+at all -- an unrecognised CLI subcommand, an import-time configuration failure, argparse
+rejecting the invocation, `devbench` not on PATH, or the initial `"pending"` write itself raising
+`OSError` -- none of which produce a record for the hook to find. Note also that a Bash tool call
+exiting non-zero (exactly what a blocking `check-shared-file-impact` invocation itself does)
+emits Claude Code's `PostToolUseFailure` event rather than `PostToolUse`, and this hook is
+registered on `PostToolUse` only, so a block is observed on the next Bash call whose
+`PostToolUse` event reaches this hook rather than necessarily on the gate's own call.
 
 **Known limitation (v1):** this registry is hand-maintained per repo, not auto-derived from an
 import/mount-graph analysis of actual fan-in. Auto-derivation (which files are imported by

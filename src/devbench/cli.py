@@ -78,6 +78,7 @@ import fnmatch
 import functools
 import getpass
 import io
+import itertools
 import json
 import logging
 import os
@@ -4416,12 +4417,43 @@ def _append_branch_vs_default_hunk(
     return None
 
 
-def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str) -> ScopeResult | None:
+def _resolve_scope_mode() -> str:
+    """Return the ADR-12 scope mode for the current run.
+
+    ``MODE_DEFER_PR`` when ``DEVBENCH_DEFER_PR`` resolves true, else
+    ``MODE_PER_TASK_BRANCH``. Every scope-resolving gate/verb
+    (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
+    reachability gate, :func:`cmd_check_shared_file_impact`) calls this
+    single helper instead of re-deriving the same two-branch ternary, so
+    the mode-selection rule can never drift between call sites (spec 4.3,
+    ADR-12).
+    """
+    from devbench.config import DEFER_PR
+
+    return MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
+
+
+def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, message_prefix: str) -> ScopeResult | None:
     """Resolve ``unit_id``'s scope via :func:`resolve_changed_files`, or ``None`` on failure.
 
-    Shared by :func:`cmd_get_diff` and :func:`cmd_check_manifest_scope` (spec
-    4.3, AC-9) so both verbs resolve scope through the single ADR-12
-    mode-aware implementation and report a resolution failure identically.
+    Shared by every gate/verb that needs the unit's ADR-12 mode-aware scope
+    (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
+    reachability gate, and :func:`cmd_check_shared_file_impact`; spec 4.3,
+    AC-9) so every consumer resolves scope through the single mode-aware
+    implementation and reports a resolution failure through one shared
+    error path, never a divergent per-caller try/except copy. Each caller
+    passes its own operator-facing ``message_prefix`` (e.g. ``"Cannot scope
+    diff for '<unit>'"`` or ``"cannot resolve scope for unit <unit>"``) so
+    existing callers' wording is preserved exactly while a new caller can
+    state its own verb.
+
+    ``FileNotFoundError`` is caught alongside ``ValueError``/``RuntimeError``:
+    :func:`resolve_changed_files` can propagate it (via
+    ``work_unit_scope._load_manifest_paths``) when the unit's work-unit file
+    is deleted in a same-process race between the backlog parse and the
+    manifest read; every caller of this helper gets a formed ``ERROR: ...``
+    line for that case instead of an uncaught traceback.
+
     On failure, the verbatim ERROR is already printed to stderr; the caller
     must return 1 without printing anything further.
     """
@@ -4430,10 +4462,10 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str) -> ScopeR
     try:
         return resolve_changed_files(unit_id, repo_path, mode)
     except ManifestParseError as exc:
-        print(f"ERROR: Cannot scope diff for '{unit_id}': Changes Manifest is malformed: {exc}", file=sys.stderr)
+        print(f"ERROR: {message_prefix}: Changes Manifest is malformed: {exc}", file=sys.stderr)
         return None
-    except (ValueError, RuntimeError) as exc:
-        print(f"ERROR: Cannot scope diff for '{unit_id}': {exc}", file=sys.stderr)
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        print(f"ERROR: {message_prefix}: {exc}", file=sys.stderr)
         return None
 
 
@@ -4488,15 +4520,13 @@ def cmd_get_diff(unit_id: str) -> int:
     Used by plugin agents instead of running raw git commands so they do not
     need to know the repo path or the mode.
     """
-    from devbench.config import DEFER_PR
-
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
         return 1
     unit, canonical_repo, repo_path = resolved
 
-    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
-    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
     if scope is None:
         return 1
     if not scope.files:
@@ -4547,15 +4577,14 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
     Manifest fails fast with the same verbatim ERROR as ``get-diff``.
     """
     from devbench.backlog.manifest import assert_staged_matches_manifest
-    from devbench.config import DEFER_PR
 
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
         return 1
     unit, _canonical_repo, repo_path = resolved
 
-    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
-    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
     if scope is None:
         return 1
 
@@ -6100,7 +6129,6 @@ def _reachability_prepare_run(
         contract -- no status line) when the entry-point containment check,
         the waiver read or the scope resolution fails.
     """
-    from devbench.config import DEFER_PR
     from devbench.gate_records import gate_waiver_targets
 
     entry_points = cast("tuple[str, ...]", gate_config.values["entry_points"])
@@ -6144,8 +6172,8 @@ def _reachability_prepare_run(
         if record.attribution == _REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION
     }
 
-    mode = MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
-    scope = _resolve_scope_or_report(unit_id, repo_path, mode)
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
     if scope is None:
         return 1
 
@@ -6338,8 +6366,10 @@ def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -
     """Return the subset of *changed_files* matching any glob in *patterns*.
 
     Patterns are ``fnmatch``-style and matched against POSIX-relative paths
-    (the same shape :func:`devbench.backlog.manifest.list_changed_files`
-    returns). Sorted + de-duplicated for stable output.
+    (the same shape :attr:`devbench.work_unit_scope.ScopeResult.files`
+    carries -- :func:`cmd_check_shared_file_impact` is this function's only
+    caller, and passes ``scope.files``, spec 4.3). Sorted + de-duplicated
+    for stable output.
     """
     return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
 
@@ -6861,8 +6891,326 @@ def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: s
     return failing, runner_key
 
 
+# Shared-file-impact-gate verdict record (spec 4.6, finding 318-D13
+# remediation, round 5 redesign). `cmd_check_shared_file_impact` persists
+# its own outcome here rather than leaving `assert-shared-file-impact.sh`
+# to re-derive it by re-parsing `tool_input.command` (an agent-authored
+# shell string -- wrapper forms, quoting, heredocs) or `tool_response.stdout`
+# (a composed string -- `2>&1`, `| tail`, multi-document output). Four
+# review rounds of sed/jq heuristics against those two surfaces each closed
+# one fail-open and opened another; the process that actually KNOWS the
+# verdict is this one, so it is the one that writes it down, and the hook
+# becomes a plain "is there an unresolved record" read with no command or
+# stdout parsing at all. See the module docstring on
+# `plugin/devbench-orchestrate/scripts/assert-shared-file-impact.sh` for the
+# consuming half of this contract.
+#
+# Staleness bound, corrected (round-5 code_review/test_review finding A1,
+# block-then-pass clobber): a record is bounded to affecting at most the
+# events that occur before it is next CONSUMED (read and deleted) by the
+# hook, never a fixed count of "one Bash call". `_write_shared_file_impact_verdict`
+# refuses to overwrite an on-disk `"block"` status with anything -- see its
+# own docstring -- so an unconsumed `"block"` from one unit's invocation
+# cannot be silently replaced by a later, unrelated unit's `"pending"`/`"pass"`
+# writes (the exact shape of two `check-shared-file-impact` invocations
+# chained in a single Bash tool call, which fire only ONE PostToolUse event
+# for both). Separately (finding B1, documented in full on the hook script's
+# own header): a Bash tool call that exits non-zero -- which is exactly what
+# a blocking `check-shared-file-impact` invocation itself does -- emits a
+# `PostToolUseFailure` event, not `PostToolUse`; `hooks.json` (ref, a
+# DEFERRED file this unit's Manifest does not touch) registers this hook on
+# `PostToolUse` only, so the hook never fires on the gate's OWN invocation
+# when it blocks. Combined with the non-clobbering write above, this means a
+# block is not lost -- it is observed on the next Bash tool call whose
+# PostToolUse event actually reaches this hook, which could be later than
+# the very next Bash call if intervening calls also exit non-zero, rather
+# than being guaranteed to be exactly the next one.
+#
+# Residual gap in the same finding A1 family, closed in this change: the
+# non-clobbering write above protects only an unconsumed `"block"`. An
+# unconsumed `"pending"` -- left behind when an invocation writes its
+# opening `"pending"` and then CRASHES before reaching a clean `"pass"`/
+# `"block"` verdict, exactly the "started but the verdict cannot be
+# determined" case spec 3.5 requires to fail closed -- was still freely
+# overwritten by a DIFFERENT, later invocation's own clean `"pass"` write
+# (the identical single-shared-PostToolUse-event shape as the block case
+# above: `check-shared-file-impact <unit-a> ; check-shared-file-impact
+# <unit-b>`, unit A dying mid-run, unit B legitimately passing). Every
+# `check-shared-file-impact` invocation now carries its own identity
+# (`_shared_file_impact_invocation_id`, a fresh PID+counter value generated
+# once per invocation and threaded through every write that invocation
+# makes) recorded as the record's 4th line; `_write_shared_file_impact_verdict`
+# now also refuses to overwrite an on-disk `"pending"` whose recorded
+# invocation id differs from the id it is writing under. A SINGLE
+# invocation's own `"pending"` -> `"pass"`/`"block"` transition carries the
+# SAME id on both writes, so it is never treated as foreign and an ordinary
+# passing run is unaffected; only a genuinely DIFFERENT invocation's write
+# is refused -- UNLESS that foreign write is itself a `"block"`. A foreign
+# `"block"` write is always let through, never refused (code_review round-6
+# finding): `"block"` is itself the sticky, terminal status protected by the
+# guard above, so escalating an unconsumed foreign `"pending"` straight to
+# `"block"` loses nothing -- it replaces one fail-closed state with a
+# strictly stronger one and the record becomes sticky under its own `"block"`
+# rule the instant the write lands. Refusing that escalation (the round-6
+# regression this note now corrects) instead silently discarded the
+# escalating invocation's genuine failing verdict and left the record
+# pointing at the crashed invocation, which is worse than either write
+# alone. Only a foreign `"pending"` or `"pass"` write over an unconsumed
+# `"pending"` is refused; a foreign `"pending"` write cannot first silently
+# adopt the slot (and thereby make its own later terminal `"pending"`/`"pass"`
+# write look "same-invocation") before that terminal write is even
+# attempted.
+_SHARED_FILE_IMPACT_VERDICT_FILENAME: str = "shared-file-impact-verdict"
+_SHARED_FILE_IMPACT_VERDICT_PENDING: str = "pending"
+_SHARED_FILE_IMPACT_VERDICT_PASS: str = "pass"
+_SHARED_FILE_IMPACT_VERDICT_BLOCK: str = "block"
+_SHARED_FILE_IMPACT_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {_SHARED_FILE_IMPACT_VERDICT_PENDING, _SHARED_FILE_IMPACT_VERDICT_PASS, _SHARED_FILE_IMPACT_VERDICT_BLOCK}
+)
+# Backs `_shared_file_impact_invocation_id` below -- a plain, module-level
+# `itertools.count()` rather than a per-call `uuid4()`/timestamp, since the
+# only property this correlator needs is "distinct within this process,
+# stable across ONE invocation's own writes" (see that function's own
+# docstring); it is never compared across process boundaries without the
+# PID component also matching.
+_SHARED_FILE_IMPACT_INVOCATION_COUNTER: itertools.count[int] = itertools.count()
+
+
+def _shared_file_impact_invocation_id() -> str:
+    """Return a fresh identity for one `check-shared-file-impact` invocation.
+
+    Round-5 finding A1 family, residual-gap fix (see the module comment
+    above the verdict-record constants for the full rationale). Combines
+    this process's PID with a monotonically increasing in-process counter:
+    in real use each `check-shared-file-impact` invocation is its own OS
+    process (a new PID), so the PID distinguishes it from every OTHER
+    invocation running concurrently at the time -- this is a bound, not a
+    global uniqueness guarantee: PID reuse after wraparound, or two
+    invocations in separate PID namespaces (e.g. distinct containers each
+    numbering PIDs from 1), can produce a colliding id, and a colliding id
+    defeats the foreign-write guard for that pair (code_review round-6
+    finding). The counter exists only so two invocations simulated in the
+    SAME process (this module's own test suite calling
+    :func:`cmd_check_shared_file_impact` or
+    :func:`_write_shared_file_impact_verdict` more than once) still get
+    distinct ids despite sharing one PID; it does nothing to widen the bound
+    across separate processes.
+
+    Called exactly once per :func:`cmd_check_shared_file_impact` invocation
+    (at the very top, before the first ``"pending"`` write) and threaded
+    through every :func:`_write_shared_file_impact_verdict` call that
+    invocation makes, so all of that invocation's own writes -- and only
+    that invocation's own writes -- carry the identical value.
+    """
+    return f"{os.getpid()}-{next(_SHARED_FILE_IMPACT_INVOCATION_COUNTER)}"
+
+
+def _shared_file_impact_verdict_path(workspace_root: Path) -> Path:
+    """Return the shared-file-impact verdict record path, honouring ``DEVBENCH_SESSION_NAME``.
+
+    Delegates to :func:`_session_state_file_path` -- the same per-session
+    ``.devbench`` routing rule (spec 4.4.4) :func:`_session_scope_file_path`
+    already applies to ``scope.json`` -- so a second, unrelated per-session
+    state file does not reimplement the ``DEVBENCH_SESSION_NAME`` resolution
+    a third time.
+
+    Args:
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+
+    Returns:
+        The resolved record path.
+
+    Raises:
+        ValueError: If ``DEVBENCH_SESSION_NAME`` contains a ``..`` path segment.
+    """
+    return _session_state_file_path(workspace_root, _SHARED_FILE_IMPACT_VERDICT_FILENAME)
+
+
+def _shared_file_impact_verdict_write_is_blocked(record_path: Path, status: str, invocation_id: str) -> bool:
+    """Return whether writing *status* under *invocation_id* must be suppressed, given the record on disk.
+
+    Used only by :func:`_write_shared_file_impact_verdict`'s non-clobbering guard
+    (round-5 code_review/test_review finding A1, extended in that same change to
+    close the family's residual gap, and corrected in round 6 to stop discarding a
+    genuine escalation -- see the module comment above the verdict-record
+    constants). Two independent sticky conditions, both evaluated from the SAME
+    on-disk record read:
+
+    1. The on-disk status is ``"block"`` -- always blocked, regardless of *status*
+       or *invocation_id*. Only `assert-shared-file-impact.sh` (ref) consuming
+       (reading then deleting) the record clears this.
+    2. The on-disk status is ``"pending"``, *status* is NOT ``"block"``, AND the
+       record's recorded invocation id (line 4) differs from *invocation_id* --
+       blocked, because that ``"pending"`` was opened by a DIFFERENT invocation
+       that has not yet reached its own clean verdict (or crashed before doing
+       so), and this write is neither that invocation's own continuation nor a
+       genuine escalation to the strongest verdict. When *status* IS ``"block"``,
+       this condition never blocks: a foreign ``"block"`` write over an
+       unconsumed ``"pending"`` is always let through, because ``"block"`` is
+       itself the sticky, terminal status condition 1 protects -- escalating
+       ``"pending"`` straight to ``"block"`` replaces one fail-closed state with
+       a strictly stronger one and loses no information a hook consumer would
+       ever have read out of the crashed invocation's stuck ``"pending"``.
+       Refusing that escalation would instead silently discard the escalating
+       invocation's own genuine failing verdict while leaving the record
+       pointing at the crashed invocation -- worse than either write alone, and
+       the exact defect this round's fix removes. When the on-disk ``"pending"``
+       carries the SAME *invocation_id* (any *status*), this is that
+       invocation's own opening write being followed by its own terminal write
+       -- not blocked.
+
+    A record that does not exist, cannot be read, is empty, or (case 2 only)
+    carries fewer than 4 lines (a record written before this field existed, or a
+    test double using the file's own ``_write_record`` helper) is never treated
+    as blocking that condition -- there is nothing, or nothing comparable, to
+    protect.
+    """
+    try:
+        lines = record_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not lines:
+        return False
+    existing_status = lines[0]
+    if existing_status == _SHARED_FILE_IMPACT_VERDICT_BLOCK:
+        return True
+    if (
+        existing_status == _SHARED_FILE_IMPACT_VERDICT_PENDING
+        and status != _SHARED_FILE_IMPACT_VERDICT_BLOCK
+        and len(lines) >= 4
+    ):
+        return lines[3] != invocation_id
+    return False
+
+
+def _write_shared_file_impact_verdict(status: str, *, workspace_root: Path, unit_id: str, invocation_id: str) -> None:
+    """Persist *status* to the shared-file-impact verdict record, atomically.
+
+    `cmd_check_shared_file_impact` calls this function from four distinct call
+    sites (the unconditional opening ``"pending"`` write, the no-match no-op
+    ``"pass"`` write, the blocking-gate ``"block"`` write, and the passing-gate
+    ``"pass"`` write), but at most TWO of those four ever execute for a single
+    invocation: the opening ``"pending"`` write always runs first, followed by
+    exactly one of the three ``"pass"``/``"block"`` clean-exit writes -- never
+    both, and never on an error path (unit not found, no local repo path
+    configured, a scope-resolution error, or `_evaluate_shared_file_gate`
+    raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, or an
+    uncaught exception), so a run that started but could not reach a clean
+    verdict leaves the record at ``"pending"`` -- `assert-shared-file-impact.sh`
+    fails CLOSED on that value, exactly the "started but the verdict cannot be
+    determined" case spec 3.5 requires not to fail open. `cmd_check_shared_file_impact`
+    generates exactly one *invocation_id* (`_shared_file_impact_invocation_id`)
+    at the very top of that call and passes the SAME value to both of its own
+    writes.
+
+    Non-clobbering guard (round-5 code_review/test_review finding A1, this
+    change's extension of the same finding family, and round-6's correction of
+    that extension -- :func:`_shared_file_impact_verdict_write_is_blocked`): if
+    the on-disk record's CURRENT status is ``"block"``, this write is a silent
+    no-op -- an unconsumed ``"block"`` verdict from one `check-shared-file-impact`
+    invocation must never be overwritten by a DIFFERENT, later invocation's own
+    ``"pending"``/``"pass"``/``"block"`` write. The same is now true of an
+    unconsumed ``"pending"`` whose recorded invocation id differs from
+    *invocation_id*: it must never be overwritten by a DIFFERENT invocation's
+    own ``"pending"`` or ``"pass"`` write either, closing the residual gap where
+    a crashed invocation's stuck ``"pending"`` used to be silently erased by a
+    later, unrelated invocation's clean ``"pass"``. The one write this second
+    guard deliberately lets through despite the invocation id differing is a
+    foreign ``"block"``: escalating an unconsumed ``"pending"`` straight to
+    ``"block"`` is never refused, because ``"block"`` immediately becomes the
+    new sticky status the first guard above protects, so nothing is lost by
+    letting it land (round-6 fix; refusing it used to silently discard the
+    escalating invocation's own genuine failing verdict). Without these guards,
+    two invocations chained in a single Bash tool call (e.g.
+    `check-shared-file-impact <unit-a> ; check-shared-file-impact <unit-b>`)
+    fire only ONE PostToolUse event for the whole call, and unit B's own writes
+    would silently erase unit A's unresolved verdict before the hook ever reads
+    it -- a one-line bypass either way. Neither guard interferes with a SINGLE
+    invocation's own ordinary ``"pending"`` -> ``"pass"``/``"block"`` transition:
+    that transition only ever clobbers a status THIS SAME invocation itself
+    just wrote (its own ``"pending"``, carrying its own *invocation_id*), never
+    a foreign ``"block"`` or a foreign-id ``"pending"``. The only way to clear a
+    sticky record is for `assert-shared-file-impact.sh` (ref) to consume it
+    (read then delete) -- see that script's own header for the staleness bound
+    this produces.
+
+    Uses :func:`devbench.utils.io.atomic_write_text` (temp-then-rename) so a
+    concurrent reader (the hook) never observes a partially written record.
+
+    Args:
+        status: One of ``_SHARED_FILE_IMPACT_VERDICT_STATUSES``.
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+        unit_id: The work unit id this verdict belongs to, recorded only for
+            the hook's own diagnostic message -- never read back by Python.
+        invocation_id: This invocation's own identity
+            (`_shared_file_impact_invocation_id`), recorded as the record's
+            4th line and compared only by the non-clobbering guard above --
+            the hook never reads or cares about this field. Required (round-6
+            fix): two callers that both omitted it used to collide on the same
+            empty-string value and silently defeat the foreign-pending guard
+            against each other, so there is no safe default -- every caller,
+            including this module's own test suite, must supply a value that
+            is unique to the invocation it represents.
+
+    Raises:
+        ValueError: If *status* is not a declared status -- an internal
+            invariant (every call site in this module passes a module
+            constant), never user input.
+        OSError: If the record cannot be written (permissions, disk full,
+            etc.) -- propagated unchanged, never swallowed.
+    """
+    if status not in _SHARED_FILE_IMPACT_VERDICT_STATUSES:
+        raise ValueError(
+            f"Internal error: {status!r} is not a declared shared-file-impact verdict status "
+            f"(expected one of {sorted(_SHARED_FILE_IMPACT_VERDICT_STATUSES)})."
+        )
+    record_path = _shared_file_impact_verdict_path(workspace_root)
+    if _shared_file_impact_verdict_write_is_blocked(record_path, status, invocation_id):
+        return
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"{status}\n{unit_id}\n{datetime.now(UTC).isoformat()}\n{invocation_id}\n"
+    atomic_write_text(record_path, content)
+
+
+def _shared_file_gate_attributable(node_id: str, scope_files: frozenset[str]) -> bool:
+    """Return whether a failing *node_id* is attributable to *scope_files* (spec 4.3).
+
+    Only the ``pytest`` entry in ``_SHARED_FILE_RUNNER_PARSERS`` is DESIGNED to
+    emit node ids shaped ``"<file>::<test>"``; ``_parse_pytest_failures`` is the
+    sole producer that always emits that shape (see ``_RUNNER_PARSER_SAMPLES``
+    in ``tests/test_cli.py`` for all three registered runners' actual output
+    shapes). The ``go test`` and ``npm/jest`` parsers (``_parse_go_test_failures``,
+    ``_parse_jest_failures``) ORDINARILY emit bare test/description names with
+    no file segment at all, so there is usually no file to compare against
+    *scope_files* for those two runners' output -- such a node id is treated as
+    attributable rather than silently dropped, since this module can never
+    prove it is OUT of scope (fail-fast: never silently narrow a finding this
+    function cannot actually attribute away). This is NOT an absolute
+    guarantee, only the common case: ``_GO_TEST_FAILURE_LINE`` captures a bare
+    ``\\S+`` token and ``_JEST_FAILURE_LINE`` captures the raw ``.+?`` description
+    text after the failure marker, so a go test name or jest description that
+    happens to contain a literal ``"::"`` (e.g. ``TestThing/case::weird``) is
+    still split on it below exactly like a real pytest node id, and the
+    leading fragment -- not a real file path -- is then checked against scope
+    and can be silently excluded from attribution if it does not happen to
+    match a scope file.
+
+    A node id that does carry a ``"::"`` (whether a real ``"<file>::<test>"``
+    pytest shape, or a go test/jest name that merely happens to contain the
+    same two characters) is attributable only when the text before the first
+    ``"::"`` is a member of *scope_files* -- the unit's own
+    :class:`devbench.work_unit_scope.ScopeResult.files` (spec 4.3's attribution
+    rule: a repo-wide gate reports repo-wide RESULTS but attributes BLAME only
+    within the unit's own scope, D-7).
+    """
+    if "::" not in node_id:
+        return True
+    file_part = node_id.split("::", 1)[0]
+    return file_part in scope_files
+
+
 def _evaluate_shared_file_gate(
-    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str]
+    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str], scope_files: list[str]
 ) -> tuple[dict[str, Any], int]:
     """Run the full suite and diff it against the pre-change baseline for a matched shared-file impact.
 
@@ -6871,6 +7219,15 @@ def _evaluate_shared_file_gate(
     keep the caller's cyclomatic/return-statement complexity low; the
     capture / block / pass decision described in that function's docstring
     lives here. Returns ``(json_payload, exit_code)``.
+
+    ``scope_files`` is the unit's own
+    :attr:`devbench.work_unit_scope.ScopeResult.files` (spec 4.3): the
+    current-tree suite run itself is never scoped by it (the full suite
+    always runs repo-wide, per ``_run_full_suite_and_parse_failures``
+    below), but it bounds which of that run's NEW failures
+    ``_shared_file_gate_attributable`` will let this function attribute to
+    ``unit_id`` -- see the attribution-rule paragraph just above the
+    ``new_failures`` computation near the end of this function.
 
     Resolves the branch point, loads/validates the stored baseline, and
     resolves the current tree's runner key -- all BEFORE running the
@@ -6995,7 +7352,18 @@ def _evaluate_shared_file_gate(
         baseline = record
 
     baseline_failing: set[str] = set(baseline.get("failing") or [])
-    new_failures = sorted(current_failing - baseline_failing)
+    new_failures_all = current_failing - baseline_failing
+
+    # Attribution rule (spec 4.3, D-7): the RESULT above (`full_suite_exit_code`,
+    # `current_failing`) is always the real repo-wide run; BLAME (`new_failures`,
+    # the verdict this function returns) is restricted to failures
+    # `_shared_file_gate_attributable` can attribute to `scope_files` -- the unit's
+    # own Changes Manifest. A new failure whose file is outside that scope is still
+    # visible in `unattributed_new_failures` below (repo-wide result, per G6), but
+    # never blocks this unit and is never named in `new_failures`.
+    scope_file_set = frozenset(scope_files)
+    new_failures = sorted(f for f in new_failures_all if _shared_file_gate_attributable(f, scope_file_set))
+    unattributed_new_failures = sorted(new_failures_all - set(new_failures))
 
     if new_failures:
         payload = {
@@ -7003,10 +7371,16 @@ def _evaluate_shared_file_gate(
             "verdict": "block",
             "new_failures": new_failures,
             "pre_existing_failures": sorted(current_failing & baseline_failing),
+            "unattributed_new_failures": unattributed_new_failures,
         }
         return payload, 1
 
-    payload = {**base_payload, "verdict": "pass", "failing_tests": sorted(current_failing)}
+    payload = {
+        **base_payload,
+        "verdict": "pass",
+        "failing_tests": sorted(current_failing),
+        "unattributed_new_failures": unattributed_new_failures,
+    }
     return payload, 0
 
 
@@ -7024,12 +7398,17 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     that gap for repos with `gates.repos.<repo>.shared_file_impact.patterns`
     configured in devbench.yaml:
 
-    1. Computes the work unit's changed-file set via
-       `list_changed_files` (staged + unstaged + untracked, relative to the
-       repo root -- the same read-only query the claim-scope guard uses).
-    2. Cross-references it against the repo's `shared_file_impact.patterns`
-       glob list. No match: no-op (exit 0, `shared_file_impact: false`); the
-       task's normal `run-tests` evidence stands.
+    1. Resolves the work unit's changed-file set through
+       `work_unit_scope.resolve_changed_files(unit_id, repo_path, mode)`
+       (spec 4.3, AC-9) -- the unit's own ADR-12 mode-aware Changes Manifest
+       scope, never a raw working-tree scan, so a file left dirty in the
+       checkout by a different, unrelated task can neither trigger this gate
+       nor be blamed for a failure that has nothing to do with this unit
+       (318-D7).
+    2. Cross-references the resolved scope's files against the repo's
+       `shared_file_impact.patterns` glob list. No match: no-op (exit 0,
+       `shared_file_impact: false`); the task's normal `run-tests` evidence
+       stands.
     3. On a match (`_evaluate_shared_file_gate`): resolves the unit's branch
        point (`_resolve_branch_point_sha`, `git merge-base HEAD
        origin/<default-branch>`), runs the full-suite command against the
@@ -7048,10 +7427,28 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
        never from the current, already-changed tree -- so the baseline is
        always a pre-change snapshot, never post-change. Blocks (exit 1)
        only on tests failing now that were NOT already failing at the
-       branch point -- so this does not stall on pre-existing/flaky
-       failures. The blocking output names the offending tests AND
-       `unit_id`, attributing the regression to the task that introduced
-       it.
+       branch point AND that `_shared_file_gate_attributable` can attribute
+       to the unit's own scope (spec 4.3 attribution rule, item 3a) -- so
+       this does not stall on pre-existing/flaky failures. The blocking
+       output names the offending tests AND `unit_id`, attributing the
+       regression to the task that introduced it.
+    3a. Attribution (spec 4.3, D-7, AC-9): the full-suite RESULT reported
+       above (`full_suite_exit_code`, and every failing node id the
+       registered parser attributes) is always repo-wide -- the suite
+       itself is never scoped. Which of that run's NEW failures actually
+       BLOCK this unit is narrower: only a node id `_shared_file_gate_attributable`
+       can attribute to the unit's own `ScopeResult.files` (its Changes
+       Manifest) is named in `new_failures`/blocks the gate; every other new
+       failure is still visible in the payload's `unattributed_new_failures`
+       list (repo-wide result, not silently dropped) but never blocks. Only
+       the `pytest` parser's node ids (`"<file>::<test>"`) are DESIGNED to
+       carry a file segment to check against scope; `go test` and jest node
+       ids ordinarily carry no file segment and so are attributable -- but
+       this is not an absolute guarantee (a go test name or jest description
+       that happens to contain a literal `::` is still split on it by the
+       same file-segment check, and the leading fragment can then be checked
+       against scope like a real file path) -- see
+       `_shared_file_gate_attributable`'s docstring for the exact rule.
     4. A baseline file that exists but fails to parse, or whose stored
        `branch_point` disagrees with the resolved merge-base, is a loud
        error (exit 1, stderr) and is never rewritten (spec 4.6, finding
@@ -7146,8 +7543,33 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     `docs/devbench-yaml-reference.md`'s `shared_file_impact` section (a
     documentation gap recorded in this unit's escalation log, not a stale
     reference here).
+
+    Verdict record (spec 4.6, finding 318-D13 remediation, round 5
+    redesign): before doing anything else, this command writes a
+    ``"pending"`` shared-file-impact verdict record
+    (`_write_shared_file_impact_verdict`) that
+    `plugin/devbench-orchestrate/scripts/assert-shared-file-impact.sh`
+    reads back on the very next Bash PostToolUse event -- fail-closed
+    (blocked) while it still reads ``"pending"``, allowed once it reads
+    ``"pass"``, blocked (with the offending tests named) once it reads
+    ``"block"``. The record is overwritten with a clean ``"pass"``/``"block"``
+    verdict only on the two clean-exit paths below (a no-match no-op, or
+    `_evaluate_shared_file_gate` returning a result); every error-return
+    path (unit not found, no local repo path, a scope-resolution error, or
+    `_evaluate_shared_file_gate` raising) leaves the record at ``"pending"``
+    on purpose, so the hook never has to re-derive this command's own
+    outcome by re-parsing `tool_input.command` or `tool_response.stdout`.
+    Every write this invocation makes -- the opening ``"pending"`` and
+    whichever clean-exit write follows it -- carries the SAME
+    `_shared_file_impact_invocation_id`, generated exactly once here, so
+    `_write_shared_file_impact_verdict`'s non-clobbering guard can tell this
+    invocation's own transition apart from a foreign one (round-5 finding A1
+    family; see that function's own docstring).
     """
-    from devbench.backlog.manifest import list_changed_files
+    invocation_id = _shared_file_impact_invocation_id()
+    _write_shared_file_impact_verdict(
+        _SHARED_FILE_IMPACT_VERDICT_PENDING, workspace_root=WORKSPACE_ROOT, unit_id=unit_id, invocation_id=invocation_id
+    )
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -7167,28 +7589,47 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
     patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
 
-    try:
-        changed_files = list_changed_files(repo_path)
-    except RuntimeError as exc:
-        print(f"ERROR: could not compute changed files for '{canonical_repo}': {exc}", file=sys.stderr)
+    mode = _resolve_scope_mode()
+    # Shares the single scope-resolution error path every other scope-resolving
+    # gate/verb uses (`_resolve_scope_or_report`, spec 4.3, AC-9) rather than
+    # re-implementing the try/except locally: `ValueError` (unknown unit id, bad
+    # repo path, or a `ManifestParseError` subclass instance), `RuntimeError`
+    # (git plumbing rc>=2) and `FileNotFoundError` (the unit's work-unit file
+    # deleted in a same-process race between the backlog parse and the manifest
+    # read) are every error type `work_unit_scope.resolve_changed_files` can
+    # raise or propagate; each already carries a fully-formed, actionable
+    # message, so it is surfaced verbatim rather than re-derived.
+    message_prefix = f"cannot resolve scope for unit {unit_id}"
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=message_prefix)
+    if scope is None:
         return 1
 
-    matched_files = _matched_shared_files(changed_files, patterns) if patterns else []
+    matched_files = _matched_shared_files(scope.files, patterns) if patterns else []
     if not matched_files:
         payload: dict[str, Any] = {
             "unit_id": unit_id,
             "repo": canonical_repo,
             "shared_file_impact": False,
-            "changed_files": changed_files,
+            "changed_files": scope.files,
         }
         if not patterns:
             payload["reason"] = "no gates.repos.<repo>.shared_file_impact.patterns configured for this repo"
         print(json.dumps(payload, indent=2))
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
         return 0
 
     try:
         result_payload, rc = _evaluate_shared_file_gate(
-            unit_id=unit_id, canonical_repo=canonical_repo, repo_path=repo_path, matched_files=matched_files
+            unit_id=unit_id,
+            canonical_repo=canonical_repo,
+            repo_path=repo_path,
+            matched_files=matched_files,
+            scope_files=scope.files,
         )
     except (RuntimeError, UnknownTestRunnerError, TimeoutError) as exc:
         # RuntimeError and UnknownTestRunnerError already carry a fully-formed `ERROR: ...`
@@ -7210,12 +7651,25 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         return 1
     print(json.dumps(result_payload, indent=2))
     if rc != 0:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_BLOCK,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
         print(
             f"ERROR: {unit_id} touches shared file(s) {matched_files} and introduces "
             f"{len(result_payload.get('new_failures', []))} new full-suite failure(s) not present "
             f"in the baseline: {result_payload.get('new_failures')}. "
             "Fix these before this task can be marked done.",
             file=sys.stderr,
+        )
+    else:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
         )
     return rc
 
@@ -13347,6 +13801,40 @@ def cmd_prepare_plugin_shadow() -> int:
     return 0
 
 
+def _session_state_file_path(workspace_root: Path, filename: str) -> Path:
+    """Return ``<workspace_root>/.devbench/<filename>``, honouring ``DEVBENCH_SESSION_NAME``.
+
+    When a session name is active, the file lives at:
+    ``<workspace>/.devbench/sessions/<name>/<filename>``
+
+    When no session is active, the file lives at:
+    ``<workspace>/.devbench/<filename>``
+
+    Generalises the per-session ``DEVBENCH_SESSION_NAME`` routing rule (spec
+    4.4.4) that was previously spelled out only inline in
+    :func:`_session_scope_file_path`, so a second, unrelated per-session
+    state file (:func:`_shared_file_impact_verdict_path`) does not
+    reimplement the same session-name resolution and ``..`` path-traversal
+    guard a second time.
+
+    Args:
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+        filename: The bare filename to place under the resolved directory.
+
+    Returns:
+        The resolved ``Path`` for the current session context.
+
+    Raises:
+        ValueError: If ``DEVBENCH_SESSION_NAME`` contains ``..`` path segments.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return workspace_root / ".devbench" / filename
+    if ".." in Path(session_name).parts:
+        raise ValueError(f"DEVBENCH_SESSION_NAME contains invalid path segment '..': {session_name!r}")
+    return workspace_root / ".devbench" / "sessions" / session_name / filename
+
+
 def _session_scope_file_path(workspace_root: Path) -> Path:
     """Return the scope.json path, honouring ``DEVBENCH_SESSION_NAME`` when set.
 
@@ -13355,6 +13843,12 @@ def _session_scope_file_path(workspace_root: Path) -> Path:
 
     When no session is active, scope.json lives at:
     ``<workspace>/.devbench/scope.json``
+
+    Delegates to :func:`_session_state_file_path` for the routing rule
+    itself (see that function's docstring); this wrapper exists so every
+    existing caller keeps its scope.json-specific name and return-path
+    parity with :func:`_scope_file_path` is preserved for the no-session
+    case (both resolve to ``<workspace_root>/.devbench/scope.json``).
 
     Args:
         workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
@@ -13365,12 +13859,7 @@ def _session_scope_file_path(workspace_root: Path) -> Path:
     Raises:
         ValueError: If ``DEVBENCH_SESSION_NAME`` contains ``..`` path segments.
     """
-    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
-    if not session_name:
-        return _scope_file_path(workspace_root)
-    if ".." in Path(session_name).parts:
-        raise ValueError(f"DEVBENCH_SESSION_NAME contains invalid path segment '..': {session_name!r}")
-    return workspace_root / ".devbench" / "sessions" / session_name / "scope.json"
+    return _session_state_file_path(workspace_root, "scope.json")
 
 
 def _scope_set(include: str, exclude: str, workspace_root: Path) -> int:

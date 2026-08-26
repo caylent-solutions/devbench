@@ -386,16 +386,43 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
   ```
   This is a no-op (exit 0, `shared_file_impact: false`) for most tasks -- it only does
   anything when the target repo has `gates.repos.<repo>.shared_file_impact.patterns`
-  configured in `backlog/config/devbench.yaml` AND this task's diff touches one of those patterns (an
-  app-level composition root, a shared shell/container component, a widely-consumed shared
-  hook). When it matches, the command runs the FULL test suite (not just the files this task
-  touched) and blocks (non-zero exit) on any NEWLY introduced failure vs. the stored baseline
-  -- a regression this task caused in code that was never in its own Changes Manifest, and
-  therefore never exercised by the task's own scoped test run. A `PostToolUse` guard hook
-  (`assert-shared-file-impact.sh`) enforces this: a non-zero exit here blocks progression the
-  same way a failing `pytest` / `make test` already does via `assert-tests-pass.sh`. If it
+  configured in `backlog/config/devbench.yaml` AND this task's diff (resolved through the
+  same ADR-12 mode-aware scope helper `get-diff` uses, never a raw working-tree scan)
+  touches one of those patterns (an app-level composition root, a shared shell/container
+  component, a widely-consumed shared hook). When it matches, the command runs the FULL
+  test suite (not just the files this task touched) and reports that repo-wide RESULT, but
+  BLOCKS (non-zero exit) only on a new failure vs. the stored baseline whose failing node id
+  is attributable to THIS task's own Changes Manifest scope -- a regression this task caused
+  in a file it actually touched. A new failure whose file is outside that scope (a regression
+  this task caused in code that was never in its own Changes Manifest) is still surfaced in
+  the JSON payload's `unattributed_new_failures` list, but never blocks and never fails this
+  task; `go test` / jest node ids ordinarily carry no file segment and so are attributable
+  unconditionally (a test name or description that happens to contain a literal `::` is a rare
+  exception -- it is still split on the file-segment check). A `PostToolUse` guard hook
+  (`assert-shared-file-impact.sh`) enforces this: `check-shared-file-impact` persists its own
+  verdict to a small record file as the very first thing it does (`"pending"`, overwritten with
+  `"pass"` or `"block"` only on a clean exit), and the hook's entire job is reading that record
+  back on the next Bash call whose `PostToolUse` event reaches it -- never re-parsing the command
+  text or its own printed JSON output. A `"block"` record blocks progression the same way a
+  failing `pytest` / `make test` already does via `assert-tests-pass.sh`, and stays blocking
+  (never silently overwritten by a DIFFERENT, later invocation's own write) until the hook
+  actually consumes it; the hook also fails CLOSED (blocks) when the record still reads
+  `"pending"` -- covering every error path `check-shared-file-impact` can exit through, after its
+  initial write, without reaching a clean verdict (an unrecognised unit id, no local repo path
+  configured, a scope-resolution error, or the process crashing or being killed mid-run). A
+  `"pending"` left by an invocation that crashed mid-run is protected almost the same way as a
+  `"block"`: it is never silently overwritten by a DIFFERENT invocation's own `"pending"` or
+  `"pass"` write, only by that same crashed invocation's own follow-up write (which never comes),
+  by the hook consuming it, or by a DIFFERENT invocation's own genuine `"block"` write -- a foreign
+  `"block"` always escalates over an unconsumed `"pending"` (never refused), since `"block"` is
+  itself the strongest, sticky status and nothing is lost by letting the escalation land. If it
   blocks, fix every failure it names in `new_failures` (do not delete or skip those tests) and
-  re-run it before logging completion -- do not mark the task done with an unresolved block.
+  re-run it before logging completion -- do not mark the task done with an unresolved block. This
+  verdict record is keyed only by (workspace, session) -- not by which agent wrote it -- so on a
+  workspace/session shared with other concurrently-running agents (e.g. review judges) a
+  `"block"` naming a DIFFERENT unit id than the one you are executing can, in rare cases, surface
+  on your own next Bash call; treat it the same way (resolve the named unit's failure, or escalate
+  if it is not yours to fix) rather than assuming the hook misfired.
 - Document all verification steps in the log comment below.
 
 ---

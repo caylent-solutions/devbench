@@ -11588,6 +11588,13 @@ class TestCmdRunTests:
 
 
 _SHARED_FILE_IMPACT_REPO = "caylent-solutions/git-repo"
+# The real `assert-shared-file-impact.sh` hook (ref) -- used by the handful of
+# tests in this module that drive the real Python write path AND the real
+# shell consumer end to end, rather than the shell-side fixtures already
+# exercised more thoroughly in `tests/unit/test_assert_shared_file_impact.py`.
+_HOOK_SCRIPT_PATH = (
+    Path(__file__).parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / ("assert-shared-file-impact.sh")
+)
 
 
 def _shared_file_impact_unit(unit_id: str = "E0-F1-S1-T1") -> WorkUnit:
@@ -11781,12 +11788,14 @@ class TestSharedFileRunnerParsers:
             calls.append(list(cmd))
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._select_test_command_with_recipe", return_value=(["bazel", "test", "//..."], "")),
             patch("devbench.cli.run_command", side_effect=recording_run_command),
         ):
@@ -11825,11 +11834,16 @@ class TestSharedFileRunnerParsers:
         Reverting the `except` clause back to the builtin `ValueError` makes this test fail
         (the exception is swallowed and misreported as exit 1 instead of raised)."""
         unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        workspace = tmp_path / "workspace"
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch(
                 "devbench.cli._evaluate_shared_file_gate",
                 side_effect=ValueError("unrelated value error, not an unrecognised-runner error"),
@@ -11838,6 +11852,10 @@ class TestSharedFileRunnerParsers:
             with pytest.raises(ValueError, match="unrelated value error"):
                 cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
         assert capsys.readouterr().err == "", "an unrelated ValueError must never be printed as a formed ERROR line"
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending", (
+            "an uncaught exception must leave the verdict record at 'pending' (fail-closed for the hook)"
+        )
 
     def test_resolve_runner_key_recognises_npm_yarn_npx_jest_invocations(self) -> None:
         assert cli._resolve_runner_key(["npm", "test"]) == "npm/jest"
@@ -12034,30 +12052,54 @@ class TestCmdCheckSharedFileImpact:
     def _parser(self, unit: WorkUnit) -> MagicMock:
         return _shared_file_impact_parser(unit)
 
-    def test_unit_not_found(self) -> None:
+    def test_unit_not_found(self, tmp_path: Path) -> None:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = []
-        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+        workspace = tmp_path / "workspace"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
             result = cli.cmd_check_shared_file_impact("NONEXISTENT")
         assert result == 1
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists(), (
+            "the unconditional 'pending' write at the very start of cmd_check_shared_file_impact "
+            "must land even when the unit id is unrecognised -- an unknown-unit-id early return "
+            "must never leave the hook with no record to fail closed on"
+        )
+        assert record.read_text().splitlines()[0] == "pending"
 
-    def test_no_local_path(self) -> None:
+    def test_no_local_path(self, tmp_path: Path) -> None:
         unit = self._make_unit()
+        workspace = tmp_path / "workspace"
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
         assert result == 1
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists(), (
+            "the unconditional 'pending' write at the very start of cmd_check_shared_file_impact "
+            "must land even when no local repo path is configured -- this early return must never "
+            "leave the hook with no record to fail closed on"
+        )
+        assert record.read_text().splitlines()[0] == "pending"
 
     def test_no_patterns_configured_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """No shared_file_impact patterns for the repo -- always a no-op, full suite never runs."""
         unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/app/Shell.tsx"]),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command") as mock_run,
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12066,15 +12108,21 @@ class TestCmdCheckSharedFileImpact:
         payload = json.loads(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         mock_run.assert_not_called()
+        verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", "a no-patterns-configured no-op must record 'pass'"
 
     def test_changed_files_do_not_match_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """Patterns configured, but this task's diff doesn't touch any of them -- no-op."""
         unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated/foo.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["src/unrelated/foo.py"]),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command") as mock_run,
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12083,27 +12131,508 @@ class TestCmdCheckSharedFileImpact:
         payload = json.loads(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         mock_run.assert_not_called()
+        verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", "a no-match no-op must record 'pass'"
 
-    def test_changed_files_query_failure_reports_error(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    @pytest.mark.parametrize(
+        ("exc", "match"),
+        [
+            (
+                ValueError("Unknown work unit id: 'E0-F1-S1-T1'. No matching entry in the backlog index."),
+                "Unknown work unit id",
+            ),
+            (
+                RuntimeError("'git hash-object -- src/app/Shell.tsx' failed in '/repo' (exit 128): fatal: bad object"),
+                "git hash-object",
+            ),
+            (
+                FileNotFoundError(2, "No such file or directory", "/backlog/E0-F1-S1-T1.md"),
+                "No such file or directory",
+            ),
+        ],
+        ids=["value_error", "runtime_error", "file_not_found_error"],
+    )
+    def test_scope_resolution_error_reports_and_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], exc: Exception, match: str
     ) -> None:
-        """`list_changed_files` raising RuntimeError (git query timeout/failure) fails loudly."""
+        """AC-3 (spec 4.3): every error type `work_unit_scope.resolve_changed_files` can
+        raise or propagate -- `ValueError` (unknown unit id, bad repo path),
+        `RuntimeError` (git plumbing exiting >= 2), and `FileNotFoundError` (the unit's
+        work-unit file deleted in a same-process race between the backlog parse and the
+        manifest read, propagated from `work_unit_scope._load_manifest_paths`) -- surface
+        as exit 1 with the helper's own message on stderr, and no partial gate verdict (no
+        JSON payload) is ever printed."""
         unit = self._make_unit()
+        workspace = tmp_path / "workspace"
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
-            patch(
-                "devbench.backlog.manifest.list_changed_files",
-                side_effect=RuntimeError("git diff timed out"),
-            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.resolve_changed_files", side_effect=exc),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 1
         captured = capsys.readouterr()
-        assert "ERROR" in captured.err
-        assert "git diff timed out" in captured.err
+        assert captured.out == "", "no JSON payload must be printed when scope resolution fails"
+        assert "ERROR: cannot resolve scope for unit E0-F1-S1-T1" in captured.err
+        assert match in captured.err
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending", (
+            "a scope-resolution error must leave the verdict record at 'pending' (fail-closed for the hook), "
+            f"got: {record!r}"
+        )
+
+
+class TestCheckSharedFileImpactScope:
+    """AC-1/AC-2 (spec 4.3, 4.6, AC-9): the gate's changed-file list and attribution
+    boundary come from `work_unit_scope.resolve_changed_files`'s `ScopeResult`, never a
+    raw working-tree scan (finding 318-D7)."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    @pytest.mark.parametrize(
+        ("node_id", "scope_files", "expected"),
+        [
+            ("tests/test_suite.py::test_new_fail", frozenset({"tests/test_suite.py"}), True),
+            ("tests/test_suite.py::test_new_fail", frozenset({"src/other.py"}), False),
+            ("tests/test_suite.py::test_new_fail", frozenset(), False),
+            # `go test` / jest node ids carry no file segment at all (no "::"): always
+            # attributable regardless of scope, since there is no file to compare.
+            ("TestFoo", frozenset(), True),
+            ("renders without crashing (15 ms)", frozenset({"tests/test_suite.py"}), True),
+        ],
+        ids=["in_scope", "out_of_scope", "empty_scope", "go_test_bare_name", "jest_bare_name"],
+    )
+    def test_shared_file_gate_attributable(self, node_id: str, scope_files: frozenset[str], expected: bool) -> None:
+        assert cli._shared_file_gate_attributable(node_id, scope_files) is expected
+
+    def test_uses_work_unit_scope_not_working_tree(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-1: the gate's changed-file list comes ONLY from
+        `work_unit_scope.resolve_changed_files`, proven two ways at once: (a) a recording
+        double wrapping the real implementation shows it is called exactly once with this
+        unit's own `(unit_id, repo_path, mode)`; (b) an untracked file dirty in the
+        working tree, matching the configured pattern but absent from the unit's own
+        Changes Manifest, never appears in the gate's `changed_files` -- the exact
+        318-D7 defect this task fixes (a file another, unrelated task left dirty could
+        previously both trigger the gate and be blamed for a failure it never caused)."""
+        unit = self._make_unit()
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        (checkout / "src").mkdir()
+        (checkout / "src" / "other_leftover.py").write_text("# left dirty by a different, unrelated task\n")
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+
+        real_resolve = cli.resolve_changed_files
+        calls: list[tuple[str, Path, str]] = []
+
+        def recording_resolve(unit_id: str, repo_path: Path, mode: str) -> Any:
+            calls.append((unit_id, repo_path, mode))
+            return real_resolve(unit_id, repo_path, mode)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/other_leftover.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.resolve_changed_files", side_effect=recording_resolve),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        assert payload["changed_files"] == ["tests/test_suite.py"]
+        assert "src/other_leftover.py" not in payload["changed_files"]
+        assert len(calls) == 1, f"resolve_changed_files must be the sole scope source, called once, got: {calls}"
+        assert calls[0] == ("E0-F1-S1-T1", checkout, cli.MODE_PER_TASK_BRANCH)
+
+    def test_new_failure_outside_scope_is_reported_but_not_attributed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-2 (spec 4.3 attribution rule): a NEW full-suite failure whose file is
+        outside the unit's own `ScopeResult.files` is still visible in the repo-wide
+        RESULT (`full_suite_exit_code`, `unattributed_new_failures`) but is never named
+        in `new_failures` and never blocks -- the gate exits 0 (G6 worked example: "a
+        file untouched by the unit never appears under 'introduced by this unit'")."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+        # The unit's own Changes Manifest is a DIFFERENT file from the one the new
+        # failure actually lives in: it still matches the configured
+        # shared_file_impact pattern (so the gate triggers), but "tests/test_suite.py"
+        # (where `test_new_fail` lives) is outside this unit's own scope.
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/shared_module.py",))
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/shared_module.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "pass"
+        assert payload["matched_files"] == ["src/shared_module.py"]
+        assert payload["full_suite_exit_code"] != 0, "the repo-wide RESULT must still show the real suite exit"
+        assert payload["unattributed_new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload.get("new_failures") is None, "an out-of-scope new failure must never be named in new_failures"
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["failing"] == [], "the pre-change baseline itself is unaffected by this attribution rule"
+
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            "an out-of-scope new failure must never turn the verdict record itself into 'block'"
+        )
+
+
+class TestSharedFileImpactVerdictRecord:
+    """Direct unit coverage for the verdict-record primitives themselves (spec 4.6, finding
+    318-D13 remediation, round 5 redesign) -- `_write_shared_file_impact_verdict` and
+    `_shared_file_impact_verdict_path` -- independent of the full `cmd_check_shared_file_impact`
+    call graph exercised elsewhere in this file."""
+
+    def test_write_rejects_an_undeclared_status(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not a declared shared-file-impact verdict status"):
+            cli._write_shared_file_impact_verdict(
+                "maybe", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="test-invocation"
+            )
+
+    def test_write_creates_the_devbench_directory_when_absent(self, tmp_path: Path) -> None:
+        assert not (tmp_path / ".devbench").exists()
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="test-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists()
+        lines = record.read_text().splitlines()
+        assert lines[0] == "pending"
+        assert lines[1] == "E0-F1-S1-T1"
+        # Third line is an ISO-8601 UTC timestamp -- round-trips through fromisoformat.
+        assert datetime.fromisoformat(lines[2]).tzinfo is not None
+
+    def test_write_overwrites_a_prior_record_rather_than_appending(self, tmp_path: Path) -> None:
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "block", "the second write must replace, not append to, the first"
+
+    def test_own_pending_to_terminal_transition_still_works(self, tmp_path: Path) -> None:
+        """The non-clobbering guard (round-5 finding A1) must not interfere with a SINGLE
+        invocation's ordinary `"pending"` -> `"pass"` transition: that overwrite only ever
+        clobbers a status THIS SAME call itself just wrote, never a foreign `"block"`."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pass"
+
+    @pytest.mark.parametrize("later_status", ["pending", "pass", "block"], ids=["pending", "pass", "block"])
+    def test_pass_and_pending_writes_never_clobber_an_unconsumed_block(self, tmp_path: Path, later_status: str) -> None:
+        """AC-5 (spec 3.5, 4.6): round-5 finding A1, a regression against round 4. An
+        unconsumed `"block"` verdict from one invocation must survive EVERY write a
+        later, different invocation can make (its own `"pending"` start-of-call write,
+        a `"pass"` clean-exit write, or even a redundant `"block"` write) -- only the
+        hook consuming (reading then deleting) the record may clear it."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "block"
+
+        cli._write_shared_file_impact_verdict(
+            later_status, workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "block", (
+            f"a later invocation's own {later_status!r} write must never clobber an unconsumed "
+            "'block' from a different, earlier invocation"
+        )
+        assert "E9-F1-S1-T1" in record.read_text(), "the surviving block record must still name the unit that earned it"
+
+    def test_consuming_a_block_record_unblocks_the_next_write(self, tmp_path: Path) -> None:
+        """Once the record is actually consumed (deleted, as `assert-shared-file-impact.sh`
+        does on every read), the non-clobbering guard no longer applies -- it protects an
+        UNCONSUMED block, not the status forever."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.unlink()
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "pass"
+
+    def test_empty_record_file_is_never_treated_as_a_sticky_block(self, tmp_path: Path) -> None:
+        """`_shared_file_impact_verdict_write_is_blocked` must not treat a zero-byte
+        record (no content to read a status from) as an unconsumed block -- there is
+        nothing to protect, so a write must proceed normally."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_text("", encoding="utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F3-S1-T3", invocation_id="test-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass"
+
+    def test_pending_record_with_missing_or_empty_fourth_line_is_freely_overwritten(self, tmp_path: Path) -> None:
+        """Test-review round-5/6 warn W1: a `"pending"` record with fewer than 4 lines
+        (no correlator recorded at all -- a record format that has never actually
+        shipped, but is reachable if a future/older writer omits the field) is a
+        DEGRADED record the foreign-pending guard cannot compare an invocation id
+        against. The shipped choice (see `_shared_file_impact_verdict_write_is_blocked`'s
+        own docstring, "fewer than 4 lines... never treated as blocking") is fail-OPEN
+        for this specific degraded shape: since there is nothing comparable to protect,
+        a foreign write is allowed through rather than guessing "same invocation" or
+        refusing unconditionally. This is deliberately narrower than the `"pending"`
+        guard's normal behaviour and is safe only because `atomic_write_text` means a
+        real 4-line record is never partially observable and no production call site
+        ever omits `invocation_id` (it is a required parameter): a 3-line record can
+        only originate from a hand-written test double or a pre-round-5 record format,
+        never from this module's own writer."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_text("pending\nE9-F4-S1-T1\n2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F5-S1-T1", invocation_id="foreign-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass", (
+            "a pending record with no recorded correlator (fewer than 4 lines) has nothing "
+            "comparable to protect and must be freely overwritten, by design"
+        )
+
+    def test_undecodable_record_is_freely_overwritten(self, tmp_path: Path) -> None:
+        """Test-review round-5/6 warn W1: a record this process cannot decode as UTF-8
+        text (`UnicodeDecodeError`) is caught by the SAME broad `except (OSError,
+        UnicodeDecodeError)` clause as a genuinely absent/unreadable record, and is
+        therefore also fail-OPEN by the shipped design -- there is no status this
+        function can extract from bytes it cannot decode, so (as with the missing-file
+        case) it treats the write as unblocked rather than guessing. This is a narrow,
+        deliberate choice: `atomic_write_text` (this function's own writer) always
+        writes valid UTF-8, so an undecodable record can only originate outside this
+        module's own write path (disk corruption, a different process writing raw
+        bytes), a case this function has no principled status to fail closed ON."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_bytes(b"\xff\xfe\x00\xff not valid utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F6-S1-T1", invocation_id="foreign-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass", (
+            "a record this process cannot decode has no status to protect and must be freely overwritten, by design"
+        )
+
+    def test_invocation_id_is_unique_per_call_in_the_same_process(self) -> None:
+        """`_shared_file_impact_invocation_id` combines this process's PID with a
+        monotonically increasing in-process counter (round-5 finding A1 family): two
+        calls in the SAME process must never collide, since the whole point of the
+        correlator is to tell two invocations apart even when they share a PID (this
+        test process itself)."""
+        first = cli._shared_file_impact_invocation_id()
+        second = cli._shared_file_impact_invocation_id()
+        assert first != second
+        assert str(os.getpid()) in first
+        assert str(os.getpid()) in second
+
+    def test_two_cmd_check_shared_file_impact_invocations_use_different_invocation_ids(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Each real `cmd_check_shared_file_impact` call generates its own fresh
+        invocation id (spec 3.5/4.6, round-5 finding A1 family) rather than reusing a
+        shared default -- two separate no-patterns-configured no-op runs must record
+        two different correlators on line 4."""
+        unit = _shared_file_impact_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / "repo").mkdir()
+        (tmp_path / "repo" / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path / "repo", files=("src/unrelated/foo.py",))
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {_SHARED_FILE_IMPACT_REPO: tmp_path / "repo"}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=())),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+            first_invocation_id = record.read_text().splitlines()[3]
+            cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+            second_invocation_id = record.read_text().splitlines()[3]
+        capsys.readouterr()
+        assert first_invocation_id != second_invocation_id, (
+            "two separate invocations must never share the same correlator"
+        )
+
+    @pytest.mark.parametrize("later_status", ["pending", "pass"], ids=["pending", "pass"])
+    def test_writes_never_clobber_an_unconsumed_foreign_pending(self, tmp_path: Path, later_status: str) -> None:
+        """AC-5 (spec 3.5, 4.6): round-5 finding A1 family, residual gap. An unconsumed
+        `"pending"` verdict opened by one invocation (e.g. it crashed before reaching a
+        clean pass/block verdict, exactly the "started but the verdict cannot be
+        determined" case spec 3.5 requires to fail closed) must survive a DIFFERENT,
+        later invocation's own NON-ESCALATING writes (its own `"pending"` start-of-call
+        write, or a `"pass"` clean-exit write) -- only the hook consuming (reading then
+        deleting) the record, that SAME invocation's own follow-up write, or a foreign
+        invocation's own genuine `"block"` (see
+        `test_a_foreign_block_write_escalates_an_unconsumed_foreign_pending` immediately
+        below -- round-6 code_review finding: a foreign `"block"` must NEVER be refused
+        here, unlike `"pending"`/`"pass"`) may clear or replace it."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pending"
+
+        cli._write_shared_file_impact_verdict(
+            later_status, workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "pending", (
+            f"a later, DIFFERENT invocation's own {later_status!r} write must never clobber an "
+            "unconsumed 'pending' opened by a different invocation"
+        )
+        assert "E9-F1-S1-T1" in record.read_text(), (
+            "the surviving pending record must still name the unit that opened it"
+        )
+        assert "invocation-a" in record.read_text(), "the surviving pending record must still carry its own correlator"
+
+    def test_a_foreign_block_write_escalates_an_unconsumed_foreign_pending(self, tmp_path: Path) -> None:
+        """Round-6 code_review REQUIRED FIX: reproduces, end to end and with NO
+        concurrency, the exact chained shape the module comment above the verdict-record
+        constants names as the threat model (`check-shared-file-impact <unit-a> ;
+        check-shared-file-impact <unit-b>`): unit A's invocation writes its opening
+        `"pending"` and is killed before reaching a clean verdict; unit B's invocation
+        then genuinely FAILS its own gate and writes `"block"`. Before this fix,
+        `_shared_file_impact_verdict_write_is_blocked` refused EVERY foreign write over
+        an unconsumed `"pending"`, including this one, so unit B's real regression was
+        silently discarded and the record stayed pointed at the crashed unit A -- an
+        agent following the hook's own prescribed remediation (re-run unit A, which then
+        passes) would end at `"pass"` and the next Bash call would be ALLOWED, even
+        though unit B's genuine failure was never fixed. A foreign `"block"` must always
+        be allowed to escalate an unconsumed `"pending"`, since `"block"` is itself the
+        strongest, sticky status and nothing is lost by letting the escalation land.
+        Drives the REAL `cli._write_shared_file_impact_verdict` function for both writes
+        and then the REAL `assert-shared-file-impact.sh` hook, asserting it reports the
+        BLOCKING unit (B), not the crashed one (A)."""
+        workspace = tmp_path / "workspace"
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=workspace, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pending", "unit A's opening write must land normally"
+
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=workspace, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "block", (
+            "unit B's genuine 'block' verdict must escalate over unit A's unconsumed "
+            "'pending', never be silently discarded"
+        )
+        assert "E9-F2-S1-T2" in record.read_text(), (
+            "the escalated record must name unit B, the unit that actually earned the block"
+        )
+
+        hook_env = {
+            k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_SESSION_NAME")
+        }
+        hook_env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+        result = subprocess.run(
+            [str(_HOOK_SCRIPT_PATH)],
+            input="{}",
+            capture_output=True,
+            text=True,
+            env=hook_env,
+        )
+        assert result.returncode == 2, "the real hook must block on the escalated 'block' record"
+        assert "E9-F2-S1-T2" in result.stderr, (
+            "the real hook must name the BLOCKING unit (B), never the crashed unit (A) whose "
+            "'pending' was correctly superseded"
+        )
+        assert "E9-F1-S1-T1" not in result.stderr, (
+            "the crashed unit's own id must not be what the hook tells the agent to re-run -- "
+            "that remediation would silently drop unit B's real failure"
+        )
+
+    @pytest.mark.parametrize("terminal_status", ["pass", "block"], ids=["pass", "block"])
+    def test_own_invocation_id_can_transition_its_own_pending_to_a_terminal_status(
+        self, tmp_path: Path, terminal_status: str
+    ) -> None:
+        """The foreign-pending guard must not interfere with a SINGLE invocation's own
+        `"pending"` -> `"pass"`/`"block"` transition when both writes carry the SAME
+        explicit `invocation_id` -- exactly what a real `check-shared-file-impact` run
+        does (one id generated once, threaded through every write it makes)."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="same-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            terminal_status, workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="same-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == terminal_status
+
+    def test_verdict_path_default_has_no_session_subdirectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        assert cli._shared_file_impact_verdict_path(tmp_path) == tmp_path / ".devbench" / "shared-file-impact-verdict"
+
+    def test_verdict_path_honours_devbench_session_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC (spec 4.4.4): two concurrent named sessions targeting the same workspace must
+        never share one verdict record -- each session's own
+        `assert-shared-file-impact.sh` invocation only ever observes verdicts written by
+        `check-shared-file-impact` calls made under that SAME session name."""
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "alpha")
+        assert (
+            cli._shared_file_impact_verdict_path(tmp_path)
+            == tmp_path / ".devbench" / "sessions" / "alpha" / "shared-file-impact-verdict"
+        )
+
+    def test_verdict_path_rejects_a_path_traversal_session_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "../escape")
+        with pytest.raises(ValueError, match="invalid path segment"):
+            cli._shared_file_impact_verdict_path(tmp_path)
 
 
 class TestCheckSharedFileImpactBaseline:
@@ -12205,13 +12734,23 @@ class TestCheckSharedFileImpactBaseline:
         not_a_repo = tmp_path / "not-a-repo"
         (not_a_repo / "tests").mkdir(parents=True)
         (not_a_repo / "tests" / "test_suite.py").write_text("def test_ok():\n    assert True\n")
+        # An empty `.git` directory (not a real, `git init`-ed repository) satisfies
+        # `work_unit_scope._require_git_work_tree`'s cheap existence check (so scope
+        # resolution reaches `_evaluate_shared_file_gate`'s own `git merge-base` call
+        # below) while still genuinely failing that later `git merge-base` call with
+        # "not a git repository" -- `git hash-object` (scope resolution's own git call,
+        # over the on-disk `tests/test_suite.py` above) does not require repo validity
+        # and succeeds regardless.
+        (not_a_repo / ".git").mkdir()
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: not_a_repo}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12230,11 +12769,15 @@ class TestCheckSharedFileImpactBaseline:
         lock timeout escaped as an uncaught traceback instead of the spec Section 7
         one-line `ERROR: ...` sentence on stderr with a non-zero exit."""
         unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch(
                 "devbench.cli._evaluate_shared_file_gate",
                 side_effect=TimeoutError("Could not acquire lock at /tmp/x.lock within 30s."),
@@ -12273,12 +12816,14 @@ class TestCheckSharedFileImpactBaseline:
         def _select_test_command_must_not_run(_repo_path: Path) -> tuple[list[str], str]:
             raise AssertionError("full suite command must not be selected before baseline validation")
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._select_test_command_with_recipe", side_effect=_select_test_command_must_not_run),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12304,12 +12849,14 @@ class TestCheckSharedFileImpactBaseline:
         corrupt_bytes = b"{not valid json"
         baseline_file.write_bytes(corrupt_bytes)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12333,12 +12880,14 @@ class TestCheckSharedFileImpactBaseline:
         stale_bytes = (json.dumps(stale_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
         baseline_file.write_bytes(stale_bytes)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12365,15 +12914,16 @@ class TestCheckSharedFileImpactBaseline:
             feature_extra_content="def test_feature_addition():\n    assert True\n",
         )
 
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, files=("tests/test_suite.py", "tests/test_feature.py")
+        )
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch(
-                "devbench.backlog.manifest.list_changed_files",
-                return_value=["tests/test_suite.py", "tests/test_feature.py"],
-            ),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12388,6 +12938,11 @@ class TestCheckSharedFileImpactBaseline:
         assert baseline["branch_point"] == base_sha
         assert baseline["failing"] == ["tests/test_suite.py::test_pre_existing_fail"]
 
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            f"a passing gate run must overwrite the record with 'pass', got: {verdict_record!r}"
+        )
+
     def test_introduced_failure_blocks_and_names_the_node_id(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -12400,12 +12955,14 @@ class TestCheckSharedFileImpactBaseline:
             tmp_path, base_test_content=base_content, feature_test_content=feature_content
         )
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12425,6 +12982,15 @@ class TestCheckSharedFileImpactBaseline:
         assert payload["full_suite_exit_code"] != 0
         baseline = json.loads(baseline_path.read_text())
         assert baseline["failing"] == []
+
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        record_lines = verdict_record.splitlines()
+        assert record_lines[0] == "block", (
+            f"a blocking gate run must overwrite the record with 'block', got: {verdict_record!r}"
+        )
+        assert record_lines[1] == "E0-F1-S1-T1", (
+            "the record must name the unit id for the hook's own diagnostic message"
+        )
 
     # -- BLOCKING (code_review/changes_manifest/doc_review, round 1): the gate must run to
     # -- completion, end to end, on a Makefile-driven repo -----------------------------
@@ -12449,12 +13015,14 @@ class TestCheckSharedFileImpactBaseline:
             makefile_content="test:\n\tpytest --no-header -q -p no:cacheprovider tests/\n",
         )
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12497,12 +13065,14 @@ class TestCheckSharedFileImpactBaseline:
             calls.append(list(cmd))
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command", side_effect=recording_run_command),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12548,12 +13118,14 @@ class TestCheckSharedFileImpactBaseline:
             calls.append(list(cmd))
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command", side_effect=recording_run_command),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12603,12 +13175,14 @@ class TestCheckSharedFileImpactBaseline:
                 return (2, "", "ImportError while importing test module 'tests/test_suite.py'\n")
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12662,12 +13236,14 @@ class TestCheckSharedFileImpactBaseline:
             calls.append(list(cmd))
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command", side_effect=recording_run_command),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
@@ -12715,12 +13291,14 @@ class TestCheckSharedFileImpactBaseline:
         _run_scratch_git(["rm", "Makefile"], checkout)
         _tdd_gate_commit_all(checkout, "drop Makefile on feature")
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -12747,12 +13325,14 @@ class TestCheckSharedFileImpactBaseline:
             tmp_path, base_test_content=base_content, feature_test_content=feature_content
         )
 
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
         with (
             patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
-            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 

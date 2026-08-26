@@ -981,6 +981,90 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   loud `ERROR` naming the runner and its stderr instead of silently
   persisting a synthetic "suite failed" marker as the permanent baseline.
 
+- **Shared-file per-test failure parsing is now an explicit registry keyed by
+  the repo's configured test command, and an unrecognized format is a loud
+  pre-suite error instead of a degraded-but-passing marker** (spec
+  `integration-reality-gates-hardening.md` sections 3.5 and 4.6; issue #13;
+  source PR #318 finding 318-D4). As originally cherry-picked from PR #318 --
+  before the capture-path hardening described above -- the parser tried a
+  fixed list of regexes (pytest, `go test`, jest/mocha-style) against the
+  suite output and, when a non-zero exit matched none of them, wrote a single
+  synthetic `<suite-failed-no-per-test-detail-parsed>` marker into the
+  baseline as if it were a real failing test -- so an unrecognized runner
+  produced an opaque "failure" that compared equal on every later run, the
+  gate reported a pass over a suite it could not actually read, and nothing
+  told the operator that per-test attribution had been lost.
+  `check-shared-file-impact` now resolves the repo's test command
+  (`_select_test_command`) to one of three registered runner families -- a
+  bare `pytest` invocation, a `go test` invocation, or the npm/yarn/npx-
+  invoked jest form -- through a `_SHARED_FILE_RUNNER_PARSERS` registry. A
+  `make test` command (the shape returned whenever the repo's Makefile has a
+  `test` target -- the dominant shape for any Makefile-driven repo,
+  including this one) is not a fourth runner family and not assumed to wrap
+  pytest: each registry entry's invoker token is matched, by token
+  containment, against the `shlex.split(..., comments=True)` tokens of its
+  dry-run recipe (`make -n test`), comment-stripped so a trailing recipe
+  comment is never mistaken for the recipe itself. A Makefile `test` target
+  wrapping `go test`, jest, or an unregistered runner resolves (or errors)
+  the same way a direct invocation of that runner would, and a recipe whose
+  tokens contain more than one registered runner's invoker token (e.g. one
+  invoking both `go test` and `pytest` -- not necessarily ambiguous to a
+  human, e.g. a Python repo's recipe that installs JS dependencies before
+  running pytest also trips this) is now also a loud `ERROR: cannot parse
+  test output for runner '<cmd>'` naming the recipe and the matching
+  candidates rather than a silent pick of whichever registry entry happens
+  to iterate first. The no-match `ERROR` also now names the inspected
+  recipe text, not just the bare `make test` command. Token containment is
+  a narrower guarantee than "what the recipe actually invokes": a
+  registered runner's token appearing anywhere
+  in the recipe still selects that runner's parser even inside an uncovered
+  wrapper script's own arguments (e.g. `npm ci && ./scripts/run-tests.sh`
+  resolves to the npm/jest parser) or in a recipe that never runs that
+  runner at all (e.g. `echo skipping pytest` resolves to the pytest parser)
+  -- both are documented, known v1 limitations of the make-wrapped
+  resolution path (see `cmd_check_shared_file_impact`'s docstring), not
+  silently hidden. Each registry
+  entry owns a dedicated parser function for that runner's own failure-line
+  shape, a command-matching predicate for direct invocations, and a
+  recipe-matching predicate for `make`-wrapped invocations, so
+  `_resolve_runner_key` iterates the registry rather than restating the
+  runner list in a hand-written if-chain -- onboarding a new runner family
+  is exactly one new registry entry, never also an edit to
+  `_resolve_runner_key` itself, for either resolution path. A command (or,
+  for `make test`, a recipe) matching none of them is `ERROR: cannot parse
+  test output for runner '<cmd>'` on stderr, exit 1, raised before that
+  run's own suite subprocess is spawned -- for the current-tree evaluation
+  run and for a branch-point baseline capture alike, via a dedicated
+  `UnknownTestRunnerError`
+  (a `ValueError` subclass) rather than the builtin, so an unrelated
+  `ValueError` raised elsewhere in the gate is never misreported as an
+  unrecognized-runner error -- so an unsupported runner never produces a
+  partial or guessed result. The baseline record's `runner` field now stores
+  the resolved registry key (spec 5.4) rather than the raw command, so a
+  later run resolved to a different runner is detected as `ERROR: baseline
+  was captured with runner '<stored>' but the repo is configured for
+  '<cmd>'; failure sets are not comparable across runners` -- checked BEFORE
+  the current-tree suite runs (costing zero full-suite runs on the mismatch
+  path against an already-loaded baseline) rather than silently diffing
+  incomparable failure sets; the same check also applies to a freshly
+  captured baseline, since the branch-point worktree it is captured from may
+  carry a different Makefile than the current tree. The current-tree
+  evaluation run is now held to the same rule the branch-point capture run
+  has always had: a current-tree suite that exits non-zero yet whose
+  registered parser attributes zero failing node ids (e.g. a pytest
+  collection/import error, which never prints a `FAILED <node-id>` line) is
+  a loud `ERROR` rather than a `verdict: "pass"` reported over a suite that
+  could not actually be read. The degraded-marker constant and the combined
+  guess-every-format parser are deleted, not merely superseded. The
+  make-wrapped recipe is now split with `shlex.split(..., comments=True)`
+  rather than shlex's plain default: a trailing shell comment on the recipe
+  line (an ordinary, valid Makefile annotation) is stripped before token
+  matching instead of tokenised alongside the real recipe, and a recipe that
+  is not shell-tokenizable at all (an unmatched quote or apostrophe outside
+  of a comment) now raises the same dedicated `UnknownTestRunnerError` with
+  a single formed `ERROR: ...` line naming the command, instead of an
+  uncaught builtin `ValueError` traceback escaping the gate.
+
 - **Reachability check on the code-review gate**
   (`caylent-solutions/devbench-internal-backlog#10`). A task could
   previously build a component, hook, slice, or pure function as a

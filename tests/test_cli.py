@@ -11631,6 +11631,7 @@ def _shared_file_impact_git_fixture(
     feature_test_content: str | None,
     feature_extra_path: str | None = None,
     feature_extra_content: str = "",
+    makefile_content: str | None = None,
 ) -> tuple[Path, str]:
     """Build a real two-branch git fixture: ``main`` at a base commit, ``feature`` diverged from it.
 
@@ -11641,9 +11642,15 @@ def _shared_file_impact_git_fixture(
     is rewritten to it on ``feature``; when *feature_extra_path* is given,
     an additional file is added on ``feature`` without touching
     ``tests/test_suite.py`` -- used to model an unrelated change that
-    doesn't touch a pre-existing failure.
+    doesn't touch a pre-existing failure. When *makefile_content* is given,
+    a ``Makefile`` carrying it is committed on the base commit (so it is
+    present at the branch point too, which a branch-point capture worktree
+    needs) -- used to exercise `_select_test_command`'s ``["make", "test"]``
+    branch instead of the bare ``pytest`` fallback.
     """
     origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+    if makefile_content is not None:
+        _tdd_gate_write(origin, "Makefile", makefile_content)
     _tdd_gate_write(origin, "tests/test_suite.py", base_test_content)
     _tdd_gate_commit_all(origin, "base")
     _run_scratch_git(["branch", "-M", "main"], origin)
@@ -11663,6 +11670,351 @@ def _shared_file_impact_git_fixture(
         _tdd_gate_commit_all(checkout, "unrelated feature addition")
 
     return checkout, base_sha
+
+
+# Real-shaped sample output per registered runner (AC-2), keyed off the registry itself so
+# this map cannot silently drift out of sync with `_SHARED_FILE_RUNNER_PARSERS` in either
+# direction: REMOVING a registered runner surfaces as a `KeyError` in the parametrized tests
+# below (they iterate this map's keys and look each one up in the production registry).
+# ADDING one does NOT raise a `KeyError` here -- the parametrize source is this map, not the
+# registry, so an added registry entry with no matching sample here is simply never exercised
+# by the parametrized cases. `test_registry_matches_the_documented_sample_coverage` below is
+# the drift detector for that direction: it asserts the two key sets are exactly equal.
+_RUNNER_PARSER_SAMPLES: dict[str, tuple[str, set[str]]] = {
+    "pytest": (
+        "============================= FAILURES ==============================\n"
+        "________________________________ test_foo ____________________________\n"
+        "assert 1 == 2\n"
+        "=========================== short test summary info ===========================\n"
+        "FAILED tests/test_foo.py::test_foo - AssertionError: assert 1 == 2\n"
+        "FAILED tests/test_bar.py::TestBar::test_bar - assert False\n"
+        "===================== 2 failed, 3 passed in 0.12s ======================\n",
+        {"tests/test_foo.py::test_foo", "tests/test_bar.py::TestBar::test_bar"},
+    ),
+    "go test": (
+        "=== RUN   TestFoo\n"
+        "--- FAIL: TestFoo (0.00s)\n"
+        "    foo_test.go:10: expected 1 got 2\n"
+        "=== RUN   TestBar\n"
+        "--- PASS: TestBar (0.00s)\n"
+        "=== RUN   TestBaz\n"
+        "--- FAIL: TestBaz (0.01s)\n"
+        "    baz_test.go:22: expected true got false\n"
+        "FAIL\n"
+        "FAIL\texample.com/pkg\t0.014s\n",
+        {"TestFoo", "TestBaz"},
+    ),
+    "npm/jest": (
+        "FAIL src/foo.test.js\n"
+        "  App\n"
+        "    ✕ renders without crashing (15 ms)\n"
+        "    ✓ handles click (5 ms)\n"
+        "    ✗ submits the form (8 ms)\n",
+        {"renders without crashing (15 ms)", "submits the form (8 ms)"},
+    ),
+}
+
+
+class TestSharedFileRunnerParsers:
+    """Explicit runner-parser registry (spec 4.6, finding 318-D4; issue #13 AC1-AC5).
+
+    Replaces the guess-every-format-and-degrade parser with a registry keyed by the
+    repo's configured test command: each registered runner has its own parser, and a
+    command matching none of them is a loud, pre-suite error rather than a synthetic
+    "suite failed" marker.
+    """
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    # -- AC-2: each registered runner parses the exact failing node-id set --
+    #
+    # Parametrized off `_RUNNER_PARSER_SAMPLES` (this module's own fixture map) rather
+    # than `cli._SHARED_FILE_RUNNER_PARSERS` directly: a `pytest.mark.parametrize` argument
+    # is evaluated at collection time, so referencing a production symbol there would turn
+    # any absence of that symbol into a collection error for the whole module instead of a
+    # reportable test failure. `test_registry_matches_the_documented_sample_coverage` below
+    # closes the loop by asserting the two key sets never drift apart.
+
+    @pytest.mark.parametrize("runner_key", sorted(_RUNNER_PARSER_SAMPLES))
+    def test_registered_runner_parses_exact_failing_node_ids(self, runner_key: str) -> None:
+        sample_output, expected = _RUNNER_PARSER_SAMPLES[runner_key]
+        parser = cli._SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+        assert parser(sample_output) == expected
+
+    @pytest.mark.parametrize("runner_key", sorted(_RUNNER_PARSER_SAMPLES))
+    def test_registered_runner_parses_zero_failures_on_a_clean_run(self, runner_key: str) -> None:
+        """A passing suite's output (no failure-shaped lines) parses to the empty set --
+        the zero-failure case an all-formats-must-match design could get wrong."""
+        parser = cli._SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+        assert parser("3 passed in 0.05s\n") == set()
+
+    def test_registry_matches_the_documented_sample_coverage(self) -> None:
+        """Keeps `_RUNNER_PARSER_SAMPLES` (this file's parametrize source, see above) from
+        silently drifting out of sync with the production registry it exercises."""
+        assert set(cli._SHARED_FILE_RUNNER_PARSERS) == set(_RUNNER_PARSER_SAMPLES)
+
+    # -- AC-1/AC-5: an unregistered command is a single loud error, pre-suite -------
+
+    def test_unregistered_runner_exits_one_before_running_suite(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli._select_test_command_with_recipe", return_value=(["bazel", "test", "//..."], "")),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'bazel test //\.\.\.'", captured.err)
+        assert captured.err.count("\n") == 1, f"expected a single stderr sentence, not: {captured.err!r}"
+        assert ["bazel", "test", "//..."] not in calls, "the suite subprocess double must never be invoked"
+
+    def test_resolve_runner_parser_raises_valueerror_naming_the_full_command(self) -> None:
+        with pytest.raises(ValueError, match=r"cannot parse test output for runner 'bazel test //\.\.\.'"):
+            cli._resolve_runner_parser(["bazel", "test", "//..."])
+
+    # -- BLOCKING (test_review, round 2): the raised type must be the dedicated subclass,
+    # -- not merely satisfy the builtin `ValueError` a mutation to the builtin also satisfies.
+
+    def test_resolve_runner_key_raises_the_dedicated_unknown_runner_type(self) -> None:
+        """Reverting `_resolve_runner_key`'s raise to the builtin `ValueError` still passes
+        `test_resolve_runner_parser_raises_valueerror_naming_the_full_command` above (a
+        `ValueError` subclass instance still satisfies `pytest.raises(ValueError, ...)`), so
+        that test alone does not pin the narrowing `cmd_check_shared_file_impact` depends on
+        to avoid misreporting an unrelated `ValueError` as an unrecognised-runner error. This
+        asserts the concrete type."""
+        with pytest.raises(cli.UnknownTestRunnerError):
+            cli._resolve_runner_key(["bazel", "test", "//..."])
+
+    def test_cmd_check_shared_file_impact_does_not_misreport_an_unrelated_valueerror(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`cmd_check_shared_file_impact` catches `UnknownTestRunnerError` specifically, not
+        the builtin `ValueError` -- an unrelated `ValueError` raised deeper in the gate (e.g.
+        from `_evaluate_shared_file_gate`) must propagate as an uncaught exception rather than
+        being printed as if it were a formed `ERROR: cannot parse test output ...` sentence.
+        Reverting the `except` clause back to the builtin `ValueError` makes this test fail
+        (the exception is swallowed and misreported as exit 1 instead of raised)."""
+        unit = self._make_unit()
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch(
+                "devbench.cli._evaluate_shared_file_gate",
+                side_effect=ValueError("unrelated value error, not an unrecognised-runner error"),
+            ),
+        ):
+            with pytest.raises(ValueError, match="unrelated value error"):
+                cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+        assert capsys.readouterr().err == "", "an unrelated ValueError must never be printed as a formed ERROR line"
+
+    def test_resolve_runner_key_recognises_npm_yarn_npx_jest_invocations(self) -> None:
+        assert cli._resolve_runner_key(["npm", "test"]) == "npm/jest"
+        assert cli._resolve_runner_key(["yarn", "test"]) == "npm/jest"
+        assert cli._resolve_runner_key(["npx", "jest"]) == "npm/jest"
+        assert cli._resolve_runner_key(["go", "test", "./..."]) == "go test"
+
+    # -- BLOCKING (code_review/changes_manifest/doc_review, round 2): `make test` is not a
+    # -- fourth runner family -- it must be resolved from what its dry-run recipe actually
+    # -- invokes, never assumed to be pytest -------------------------------------------
+
+    def test_resolve_runner_key_resolves_make_wrapped_pytest_recipe_to_the_pytest_parser(self) -> None:
+        """`_select_test_command`'s first branch -- returned whenever the repo's Makefile
+        has a `test` target, the dominant shape for any Makefile-driven repo including this
+        one -- must resolve when its recipe invokes pytest, via the recipe, not via the
+        literal `["make", "test"]` command."""
+        assert cli._resolve_runner_key(["make", "test"], "uv run pytest tests/ -v --tb=short -q\n") == "pytest"
+        assert (
+            cli._resolve_runner_parser(["make", "test"], "uv run pytest tests/ -v --tb=short -q\n")
+            is cli._parse_pytest_failures
+        )
+
+    def test_resolve_runner_key_resolves_make_wrapped_go_test_recipe_to_the_go_test_parser(self) -> None:
+        assert cli._resolve_runner_key(["make", "test"], "go test ./...\n") == "go test"
+        assert cli._resolve_runner_parser(["make", "test"], "go test ./...\n") is cli._parse_go_test_failures
+
+    def test_resolve_runner_key_raises_for_a_make_wrapped_unregistered_recipe(self) -> None:
+        """A Makefile `test` target need not wrap pytest -- mapping `make test` unconditionally
+        to the pytest parser was a guess, not a mapping, and would silently misparse a
+        non-pytest recipe's output. A recipe naming no registered runner must reach the same
+        `UnknownTestRunnerError`, naming both the `make test` command and the inspected
+        recipe text, so an operator can see what was actually checked rather than a bare
+        command with no diagnostic pointer."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "bazel test //...\n")
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        assert "bazel test //..." in message, f"expected the inspected recipe text in the message, got: {message!r}"
+
+    # -- BLOCKING 1 (code_review, round 4): `shlex.split(make_recipe)` with shlex's default
+    # -- `comments=False` is comment-unaware -- a trailing shell comment naming a different
+    # -- runner would be tokenised right along with the real recipe, and an apostrophe inside
+    # -- an untokenised comment raises the builtin `ValueError` uncaught anywhere in the call
+    # -- chain, crashing the gate with a traceback instead of a formed AC-5 error line ------
+
+    def test_resolve_runner_key_ignores_a_trailing_shell_comment_when_resolving_a_make_wrapped_recipe(self) -> None:
+        """A recipe line's trailing `#`-comment is not part of what the recipe invokes --
+        shlex must be told `comments=True` so it is stripped before token matching, both
+        so a comment naming a different runner cannot hijack resolution and so an
+        apostrophe inside the comment (ordinary English punctuation, not shell syntax)
+        never reaches shlex's quote-balancing at all."""
+        assert (
+            cli._resolve_runner_key(["make", "test"], "go test ./...  # do not run this in CI, it's slow\n")
+            == "go test"
+        )
+        with pytest.raises(cli.UnknownTestRunnerError, match=r"cannot parse test output for runner 'make test'"):
+            cli._resolve_runner_key(["make", "test"], "bazel test //...  # run pytest here\n")
+
+    def test_resolve_runner_key_raises_the_dedicated_error_not_a_bare_valueerror_for_an_unparsable_recipe(
+        self,
+    ) -> None:
+        """A recipe that is not shell-tokenizable even with `comments=True` (an unmatched
+        quote/apostrophe outside of a comment, e.g. a bare `don't` in an `@echo` line) must
+        still surface as the dedicated `UnknownTestRunnerError` naming the offending command
+        and shlex's reason the recipe could not be tokenized -- never the builtin
+        `shlex.split`-raised `ValueError` propagating uncaught, which
+        `cmd_check_shared_file_impact`'s `except (RuntimeError, UnknownTestRunnerError,
+        TimeoutError)` clause does not catch."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "@echo don't forget && pytest\n")
+        assert type(exc_info.value) is cli.UnknownTestRunnerError
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        assert "\n" not in message, f"expected a single-line ERROR message, got: {message!r}"
+
+    # -- BLOCKING 3 (code_review, round 4): more than one registry entry's `wraps`
+    # -- predicate can accept the SAME recipe (`_recipe_invokes_go_test`'s any-position
+    # -- rule and the pytest entry's `"pytest" in tokens` rule are not mutually exclusive
+    # -- the way each `matches` predicate is for a direct invocation), so a recipe naming
+    # -- two runner families is ambiguous rather than resolvable by "first match wins" --
+    # -- spec 3.5 bans guessing, so this must be a loud error naming the recipe and the
+    # -- candidates, not a silent pick of whichever registry entry happens to iterate first.
+
+    def test_resolve_runner_key_raises_when_a_make_recipe_matches_more_than_one_registered_runner(self) -> None:
+        """A recipe invoking both `go test` and `pytest` (e.g. a monorepo `test` target
+        that runs a Go suite then a Python suite) matches two registry entries' `wraps`
+        predicates -- neither is more correct than the other, so resolving it silently to
+        whichever entry iterates first would drop attribution for the other runner's
+        failures without ever telling the operator. Must raise `UnknownTestRunnerError`
+        naming both candidates, not pick one."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "go test ./... && pytest -q\n")
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        # -- The recipe text echoed into the message ALSO contains the literal substrings
+        # -- "go test" and "pytest" (it is the recipe `go test ./... && pytest -q`), so a
+        # -- bare `"go test" in message` / `"pytest" in message` pair does not pin the
+        # -- candidate-list segment specifically -- deleting the joined-candidates clause
+        # -- from the raised message still leaves both substrings present via the echoed
+        # -- recipe alone. Assert on the candidate-list segment by name instead.
+        assert "matches multiple registered runners (go test, pytest), which is ambiguous" in message, (
+            f"candidate-list segment missing or reordered, got: {message!r}"
+        )
+        assert "\n" not in message, f"expected a single-line ERROR message, got: {message!r}"
+
+    def test_resolve_runner_key_make_wrapped_resolution_requires_no_prefix_anchor(self) -> None:
+        """A recipe commonly prefixes the runner with a version manager, an env var, or a
+        working-directory change -- the wrapped runner is not always the recipe's first
+        token, unlike a direct invocation's `matches` predicate."""
+        assert cli._resolve_runner_key(["make", "test"], "cd pkg && go test ./...\n") == "go test"
+        assert cli._resolve_runner_key(["make", "test"], "NODE_ENV=test npx jest --ci\n") == "npm/jest"
+
+    # -- BLOCKING (code_review, round 1, LSP/contract): a tuple must resolve identically --
+
+    def test_resolve_runner_key_normalises_tuple_input_identically_to_list(self) -> None:
+        """`test_command` is annotated `Sequence[str]`, so a tuple must resolve exactly like
+        the equivalent list -- not fall through to `UnknownTestRunnerError` because a slice
+        of a tuple compares unequal to a list literal."""
+        assert cli._resolve_runner_key(("pytest", "-q")) == cli._resolve_runner_key(["pytest", "-q"]) == "pytest"
+        recipe = "uv run pytest tests/ -v --tb=short -q\n"
+        assert (
+            cli._resolve_runner_key(("make", "test"), recipe)
+            == cli._resolve_runner_key(["make", "test"], recipe)
+            == "pytest"
+        )
+        assert (
+            cli._resolve_runner_key(("go", "test", "./..."))
+            == cli._resolve_runner_key(["go", "test", "./..."])
+            == "go test"
+        )
+
+    # -- BLOCKING (code_review, round 1, SOLID/OCP): the registry must be the real ------
+    # -- extension point -- a new entry must be reachable WITHOUT editing the resolver --
+
+    def test_registry_is_open_for_extension_without_editing_resolve_runner_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Registers a brand-new runner family purely by adding a `_SHARED_FILE_RUNNER_PARSERS`
+        entry -- no monkeypatching or editing of `_resolve_runner_key` itself -- and proves
+        it is reachable. Before the round-1 fix, `_resolve_runner_key`'s hand-written
+        if-chain restated the runner list independently, so a fourth registry entry was
+        dead config: this test would have failed with `UnknownTestRunnerError` even though
+        the entry existed in the mapping."""
+
+        def _tsr_parser(_output: str) -> set[str]:
+            return {"tsr::node"}
+
+        extended = dict(cli._SHARED_FILE_RUNNER_PARSERS)
+        extended["tsr"] = cli._RunnerSpec(
+            matches=lambda cmd: cmd[:1] == ("tsr",), wraps=lambda tokens: "tsr" in tokens, parse=_tsr_parser
+        )
+        monkeypatch.setattr(cli, "_SHARED_FILE_RUNNER_PARSERS", extended)
+
+        assert cli._resolve_runner_key(["tsr", "run"]) == "tsr"
+        assert cli._resolve_runner_parser(["tsr", "run"]) is _tsr_parser
+        # every pre-existing entry must still resolve too -- extension, not replacement.
+        assert cli._resolve_runner_key(["pytest"]) == "pytest"
+
+    def test_registry_extension_is_reachable_through_make_wrapped_resolution_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registry is the extension point for BOTH resolution paths (BLOCKING-1,
+        round 2): a newly registered runner must be reachable when a Makefile `test`
+        target wraps it, exactly like a direct invocation, without editing
+        `_resolve_runner_key`."""
+
+        def _tsr_parser(_output: str) -> set[str]:
+            return {"tsr::node"}
+
+        extended = dict(cli._SHARED_FILE_RUNNER_PARSERS)
+        extended["tsr"] = cli._RunnerSpec(
+            matches=lambda cmd: cmd[:1] == ("tsr",), wraps=lambda tokens: "tsr" in tokens, parse=_tsr_parser
+        )
+        monkeypatch.setattr(cli, "_SHARED_FILE_RUNNER_PARSERS", extended)
+
+        assert cli._resolve_runner_key(["make", "test"], "tsr run\n") == "tsr"
+        assert cli._resolve_runner_parser(["make", "test"], "tsr run\n") is _tsr_parser
 
 
 class TestCmdCheckSharedFileImpact:
@@ -11782,11 +12134,11 @@ class TestCheckSharedFileImpactBaseline:
 
     def test_baseline_record_has_exactly_the_spec_5_4_fields(self) -> None:
         record = cli._build_shared_file_baseline_record(
-            branch_point="deadbeef", runner=["pytest", "-q"], failing={"tests/test_a.py::test_x"}
+            branch_point="deadbeef", runner="pytest", failing={"tests/test_a.py::test_x"}
         )
         assert set(record) == {"schema_version", "captured_at", "branch_point", "runner", "failing"}
         assert record["branch_point"] == "deadbeef"
-        assert record["runner"] == ["pytest", "-q"]
+        assert record["runner"] == "pytest"
         assert record["failing"] == ["tests/test_a.py::test_x"]
         assert isinstance(record["schema_version"], int)
         # captured_at must parse back as a real timestamp, not a placeholder string.
@@ -11802,7 +12154,7 @@ class TestCheckSharedFileImpactBaseline:
         ``fcntl.flock`` call (not just the op codes) so a release-before-write mutation is
         caught even though it would still call LOCK_EX then LOCK_UN in the right order."""
         path = tmp_path / "baseline.json"
-        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
         calls: list[tuple[int, bool]] = []
         real_flock = fcntl.flock
 
@@ -11828,7 +12180,7 @@ class TestCheckSharedFileImpactBaseline:
         """The lock is taken on ``<path>.lock``, a separate inode from *path* -- never on
         *path* itself -- so it composes with atomic_write_text's temp-then-rename swap."""
         path = tmp_path / "baseline.json"
-        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
         cli._write_shared_file_baseline(path, record)
         assert (tmp_path / "baseline.json.lock").exists()
 
@@ -11904,10 +12256,10 @@ class TestCheckSharedFileImpactBaseline:
     ) -> None:
         """code_review BLOCKING D: branch-point resolution and baseline validation must
         happen before the (expensive) current-tree suite run, so a terminal baseline
-        error never costs a full-suite execution first. Patches `_select_test_command`
-        to raise if it is ever called -- if the implementation regresses to running the
-        suite first, this test fails with that AssertionError instead of the expected
-        corrupt-baseline RuntimeError."""
+        error never costs a full-suite execution first. Patches
+        `_select_test_command_with_recipe` to raise if it is ever called -- if the
+        implementation regresses to running the suite first, this test fails with that
+        AssertionError instead of the expected corrupt-baseline RuntimeError."""
         unit = self._make_unit()
         workspace = tmp_path / "workspace"
         checkout, base_sha = _shared_file_impact_git_fixture(
@@ -11918,7 +12270,7 @@ class TestCheckSharedFileImpactBaseline:
         baseline_file = baseline_dir / f"{base_sha}.json"
         baseline_file.write_bytes(b"{not valid json")
 
-        def _select_test_command_must_not_run(_repo_path: Path) -> list[str]:
+        def _select_test_command_must_not_run(_repo_path: Path) -> tuple[list[str], str]:
             raise AssertionError("full suite command must not be selected before baseline validation")
 
         with (
@@ -11927,7 +12279,7 @@ class TestCheckSharedFileImpactBaseline:
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
             patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
-            patch("devbench.cli._select_test_command", side_effect=_select_test_command_must_not_run),
+            patch("devbench.cli._select_test_command_with_recipe", side_effect=_select_test_command_must_not_run),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
@@ -11977,7 +12329,7 @@ class TestCheckSharedFileImpactBaseline:
         baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
         baseline_dir.mkdir(parents=True)
         baseline_file = baseline_dir / f"{base_sha}.json"
-        stale_record = cli._build_shared_file_baseline_record(branch_point="0" * 40, runner=["pytest"], failing=set())
+        stale_record = cli._build_shared_file_baseline_record(branch_point="0" * 40, runner="pytest", failing=set())
         stale_bytes = (json.dumps(stale_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
         baseline_file.write_bytes(stale_bytes)
 
@@ -12074,26 +12426,162 @@ class TestCheckSharedFileImpactBaseline:
         baseline = json.loads(baseline_path.read_text())
         assert baseline["failing"] == []
 
-    # -- degraded per-test parsing (unchanged helper, direct unit coverage) --
+    # -- BLOCKING (code_review/changes_manifest/doc_review, round 1): the gate must run to
+    # -- completion, end to end, on a Makefile-driven repo -----------------------------
 
-    def test_parse_failing_tests_degrades_on_unrecognised_format(self) -> None:
-        """Non-pytest/go/jest output on a non-zero exit falls back to a single synthetic
-        marker and flags `degraded: true` rather than silently claiming precision."""
-        failing, degraded = cli._parse_failing_tests("Build failed for unrelated reasons", 1)
-        assert degraded is True
-        assert failing == {cli._SHARED_FILE_BASELINE_DEGRADED_MARKER}
-
-    def test_degraded_current_tree_run_blocks_against_a_clean_branch_point_baseline(
+    def test_end_to_end_gate_resolves_a_make_wrapped_pytest_recipe_to_the_pytest_parser(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """test_review round-2 COVERAGE_REGRESSION: drives `cmd_check_shared_file_impact`
-        end to end (not just `_parse_failing_tests` in isolation) through a real two-branch
-        git fixture with a pre-populated, valid, clean (empty-failing) branch-point
-        baseline, so `_capture_shared_file_baseline` is never invoked and only the
-        CURRENT-tree run degrades. When the current-tree suite output cannot be
-        attributed to per-test failures, `payload['degraded']` must be True and the
-        synthetic marker must be reported as a new failure against the clean baseline,
-        blocking the gate (exit 1) rather than silently passing."""
+        """`_select_test_command`'s FIRST branch (`["make", "test"]`, chosen whenever the
+        repo's Makefile has a `test` target -- the dominant shape for any Makefile-driven
+        repo, including this one) must resolve its recipe to the `pytest` registry entry and
+        run the gate to completion, not raise `UnknownTestRunnerError` before any suite runs.
+        The other Makefile-driven end-to-end tests in this class cover only the make-wrapped
+        ERROR paths, which is precisely why this make-wrapped SUCCESS path stayed uncovered."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content=base_content,
+            feature_test_content=feature_content,
+            makefile_content="test:\n\tpytest --no-header -q -p no:cacheprovider tests/\n",
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        captured = capsys.readouterr()
+        assert result == 1, f"gate must run to completion and block, not error: {captured.err}"
+        payload = json.loads(captured.out)
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload["full_suite_command"] == ["make", "test"]
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["runner"] == "pytest"
+        assert baseline["failing"] == []
+
+    def test_end_to_end_gate_reports_the_ac1_error_when_a_makefile_wraps_an_unregistered_runner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """BLOCKING-1 (round 2): mapping `make test` unconditionally to the pytest parser
+        was a guess, not a mapping -- it would silently misparse the output of ANY
+        non-pytest runner a Makefile `test` target happens to wrap. This fixture's Makefile
+        wraps `bazel test //...`, a runner with no registered parser, so the gate must
+        reach the exact same AC-1 unrecognised-runner error a bare `bazel test //...`
+        command reaches (see `TestSharedFileRunnerParsers`) -- not the pytest parser, and
+        not a guessed/degraded result -- and the wrapped runner must never be invoked."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content="def test_ok():\n    assert True\n",
+            feature_test_content=None,
+            makefile_content="test:\n\tbazel test //...\n",
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'make test'", captured.err)
+        # BLOCKING (test_review, round 4): `bazel` is only ever spawned as a CHILD process
+        # of `make test` -- it never appears as its own entry in `calls`, which only records
+        # this module's own `run_command` invocations, under ANY implementation, so an
+        # assertion phrased over `calls` containing a `["bazel", "test"]` entry can never
+        # fail regardless of whether the wrapped suite actually runs. The real invariant is
+        # that `["make", "test"]` itself -- the command that would spawn `bazel` as its
+        # child -- is never invoked; only the dry run `["make", "-n", "test"]` may
+        # legitimately appear in `calls`.
+        assert ["make", "test"] not in calls, (
+            f"the make-wrapped, unregistered suite must never be invoked, calls were: {calls}"
+        )
+
+    def test_end_to_end_gate_reports_a_formed_error_not_a_traceback_when_the_make_recipe_is_not_shell_tokenizable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """BLOCKING-1 (code_review, round 4): a Makefile recipe with an apostrophe that
+        `shlex.split` cannot tokenize (even with `comments=True`) must still reach the
+        gate's formed AC-5 single-sentence `ERROR: ...` stderr line -- never an uncaught
+        `ValueError` traceback, which `cmd_check_shared_file_impact`'s narrowed `except
+        (RuntimeError, UnknownTestRunnerError, TimeoutError)` clause does not catch -- and
+        the wrapped `make test` suite must never be invoked."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content="def test_ok():\n    assert True\n",
+            feature_test_content=None,
+            makefile_content="test:\n\t@echo don't forget && pytest\n",
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'make test'", captured.err)
+        assert captured.err.count("\n") == 1, f"expected a single stderr sentence, not: {captured.err!r}"
+        assert ["make", "test"] not in calls, (
+            f"the make-wrapped suite with an unparsable recipe must never be invoked, calls were: {calls}"
+        )
+
+    # -- BLOCKING (code_review/test_review, round 1): the current-tree run must be held to
+    # -- the same "never silently pass over an unattributed failure" rule the branch-point
+    # -- capture path has always had, restoring the coverage a prior round removed --------
+
+    def test_current_tree_run_blocks_when_suite_exits_nonzero_with_zero_attributed_failures(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A pytest collection/import error exits non-zero and prints `ERROR tests/x.py`,
+        never a `FAILED <node-id>` short-summary line the registered parser matches, so
+        `current_failing` parses to the empty set even though the suite did not actually
+        pass. Against an already-captured, clean baseline this must raise loudly (exit 1)
+        rather than report `verdict: "pass"` over a suite that could not be read -- exactly
+        the spec 3.5 degraded-but-passing outcome this task exists to eliminate, now pinned
+        for the current-tree path specifically (the guard the round-1 diff had only on the
+        branch-point capture path, `_capture_shared_file_baseline`'s `test_rc != 0 and not
+        failing` check, with no current-tree equivalent)."""
         unit = self._make_unit()
         workspace = tmp_path / "workspace"
         checkout, base_sha = _shared_file_impact_git_fixture(
@@ -12102,7 +12590,7 @@ class TestCheckSharedFileImpactBaseline:
         baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
         baseline_dir.mkdir(parents=True)
         baseline_file = baseline_dir / f"{base_sha}.json"
-        clean_record = cli._build_shared_file_baseline_record(branch_point=base_sha, runner=["pytest"], failing=set())
+        clean_record = cli._build_shared_file_baseline_record(branch_point=base_sha, runner="pytest", failing=set())
         clean_bytes = (json.dumps(clean_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
         baseline_file.write_bytes(clean_bytes)
 
@@ -12112,7 +12600,7 @@ class TestCheckSharedFileImpactBaseline:
             cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
         ) -> tuple[int, str, str]:
             if cmd[:1] == ["pytest"]:
-                return (1, "Build failed for unrelated reasons", "")
+                return (2, "", "ImportError while importing test module 'tests/test_suite.py'\n")
             return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
 
         with (
@@ -12126,12 +12614,151 @@ class TestCheckSharedFileImpactBaseline:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: shared-file gate for unit E0-F1-S1-T1 could not attribute per-test failures" in captured.err
+        assert "ImportError while importing test module" in captured.err
+        assert captured.out == "", "no JSON payload must be printed on this fail-fast path"
+        assert baseline_file.read_bytes() == clean_bytes, "the clean, already-captured baseline must be untouched"
+
+    # -- runner registry: mismatch detection (AC-4) --------------------------
+
+    def test_stored_runner_mismatch_blocks_before_running_the_current_tree_suite(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-4 (spec 5.4): a baseline captured under one runner registry key must never
+        be diffed against a current run resolved to a different key -- the two failure
+        sets are not comparable. Pre-populates a clean baseline stored under the `go test`
+        key while the fixture's current tree resolves to `pytest` (no Makefile present),
+        so the mismatch must be caught, exit 1, and the baseline file must be left
+        untouched (no diff, no rewrite).
+
+        BLOCKING (test_review, round 2): exit code and stderr sentence alone do not
+        distinguish "checked before the suite runs" from "checked after" -- a
+        run-then-compare ordering produces the identical exit 1 and error text, just
+        after spending a full suite run that `_evaluate_shared_file_gate`'s own
+        docstring says never happens on this path. Pinned here with a recording
+        wrapper around the real `run_command`: the resolved current-tree suite
+        command must never appear in the recorded calls."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        mismatched_record = cli._build_shared_file_baseline_record(
+            branch_point=base_sha, runner="go test", failing=set()
+        )
+        mismatched_bytes = (json.dumps(mismatched_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(mismatched_bytes)
+
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert (
+            "ERROR: baseline was captured with runner 'go test' but the repo is configured "
+            "for 'pytest'; failure sets are not comparable across runners" in captured.err
+        )
+        assert baseline_file.read_bytes() == mismatched_bytes
+        resolved_suite_cmd = ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+        assert resolved_suite_cmd not in calls, (
+            f"the current-tree suite must never run on the mismatch path, calls were: {calls}"
+        )
+
+    def test_freshly_captured_baseline_mismatch_blocks_before_writing_the_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The runner-mismatch guard (AC-4) must also apply to a FRESHLY captured baseline,
+        not only a previously stored one -- the branch-point worktree a fresh capture runs
+        against may carry a different Makefile than the current tree (e.g. a unit that adds
+        or removes a Makefile `test` target between the branch point and HEAD), so two
+        incomparable failure sets could otherwise be diffed under a single freshly written
+        baseline. This fixture's base commit carries a Makefile whose recipe wraps `go test`
+        (via `true go test`, which exits 0 without requiring a real `go` toolchain); the
+        feature branch drops the Makefile entirely, so the current tree resolves to the bare
+        `pytest` fallback -- the two runners must never be compared, and no baseline file may
+        be written."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "Makefile", "test:\n\ttrue go test\n")
+        _tdd_gate_write(origin, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(origin, "base")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        base_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        _run_scratch_git(["checkout", "-b", "feature"], checkout)
+        _run_scratch_git(["rm", "Makefile"], checkout)
+        _tdd_gate_commit_all(checkout, "drop Makefile on feature")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert (
+            "ERROR: baseline was captured with runner 'go test' but the repo is configured "
+            "for 'pytest'; failure sets are not comparable across runners" in captured.err
+        )
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        assert not baseline_path.exists(), "no baseline may be written when the fresh capture's runner mismatches"
+
+    def test_payload_no_longer_carries_a_degraded_field(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-3: the guess-and-degrade concept (and its `degraded` payload field) is
+        deleted in full, not merely renamed -- an introduced-failure run's payload must
+        not carry that key any more."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.backlog.manifest.list_changed_files", return_value=["tests/test_suite.py"]),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
         payload = json.loads(capsys.readouterr().out)
-        assert payload["degraded"] is True
-        assert payload["verdict"] == "block"
-        assert payload["new_failures"] == [cli._SHARED_FILE_BASELINE_DEGRADED_MARKER]
-        # the capture path must never have run: the pre-populated baseline is untouched.
-        assert baseline_file.read_bytes() == clean_bytes
+        assert "degraded" not in payload
 
     # -- _resolve_branch_point_sha error paths -------------------------------
 
@@ -12170,7 +12797,7 @@ class TestCheckSharedFileImpactBaseline:
     def test_load_baseline_returns_matching_record(self, tmp_path: Path) -> None:
         path = tmp_path / "baseline.json"
         record = cli._build_shared_file_baseline_record(
-            branch_point="deadbeef", runner=["pytest"], failing={"tests/test_a.py::test_x"}
+            branch_point="deadbeef", runner="pytest", failing={"tests/test_a.py::test_x"}
         )
         path.write_text(json.dumps(record))
         loaded = cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
@@ -12185,7 +12812,7 @@ class TestCheckSharedFileImpactBaseline:
         mirroring `test_write_baseline_holds_the_lock_until_the_write_is_visible_on_disk`
         and `test_write_baseline_lock_path_is_a_sibling_of_the_baseline_never_the_baseline_itself`."""
         path = tmp_path / "baseline.json"
-        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner=["pytest"], failing=set())
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
         path.write_text(json.dumps(record))
         lock_path = tmp_path / "baseline.json.lock"
         calls: list[tuple[int, int]] = []
@@ -12216,13 +12843,15 @@ class TestCheckSharedFileImpactBaseline:
         with pytest.raises(RuntimeError, match="could not check out branch point"):
             cli._capture_shared_file_baseline(repo, "0" * 40, "UNIT-W")
 
-    def test_capture_baseline_raises_and_removes_worktree_when_capture_run_is_degraded(self, tmp_path: Path) -> None:
-        """code_review BLOCKING C: a branch-point capture whose suite output could not be
-        attributed to individual failing tests (degraded -- including the runner not even
+    def test_capture_baseline_raises_and_removes_worktree_when_capture_run_is_unattributed(
+        self, tmp_path: Path
+    ) -> None:
+        """code_review BLOCKING C: a branch-point capture that exits non-zero yet whose
+        registered parser found no failing node ids (including the runner not even
         starting, rc 127 per `run_command`'s command-not-found/timeout convention) must
-        raise rather than let the caller persist a synthetic 'suite failed' marker as the
-        permanent, never-rewritten pre-change baseline. The worktree must still be cleaned
-        up (the raise happens inside the try/finally, not instead of it)."""
+        raise rather than let the caller persist an empty failing set as the permanent,
+        never-rewritten pre-change baseline. The worktree must still be cleaned up (the
+        raise happens inside the try/finally, not instead of it)."""
         repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
         _tdd_gate_write(repo, "tests/test_suite.py", "def test_ok():\n    assert True\n")
         _tdd_gate_commit_all(repo, "init")
@@ -12244,7 +12873,7 @@ class TestCheckSharedFileImpactBaseline:
         assert "pytest: command not found" in str(excinfo.value)
         worktree_list = _run_scratch_git(["worktree", "list", "--porcelain"], repo).stdout
         worktree_paths = [line.split(" ", 1)[1] for line in worktree_list.splitlines() if line.startswith("worktree ")]
-        assert worktree_paths == [str(repo)], "the capture worktree must still be removed on the degraded path"
+        assert worktree_paths == [str(repo)], "the capture worktree must still be removed on the unattributed path"
 
     def test_capture_baseline_removal_failure_does_not_delete_worktree_and_names_prune(self, tmp_path: Path) -> None:
         """code_review BLOCKING B: on a `git worktree remove` failure the registration in

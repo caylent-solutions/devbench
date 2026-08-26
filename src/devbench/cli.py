@@ -82,6 +82,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -5329,11 +5330,36 @@ def _select_test_command(repo_path: Path) -> list[str]:
     and :func:`cmd_check_shared_file_impact` (full-suite regression gate),
     which always run the same command -- the two commands differ in how the
     result is interpreted, not in what gets invoked.
+
+    Delegates to :func:`_select_test_command_with_recipe` and discards the
+    ``make -n test`` dry-run recipe that helper also returns -- callers
+    that need to resolve *which* runner a ``make test`` command wraps (i.e.
+    :func:`_resolve_full_suite_command`) must call that helper directly
+    instead, so the dry run only ever runs once per resolution.
     """
-    rc, _stdout, _stderr = run_command(["make", "-n", "test"], cwd=repo_path)
+    cmd, _make_recipe = _select_test_command_with_recipe(repo_path)
+    return cmd
+
+
+def _select_test_command_with_recipe(repo_path: Path) -> tuple[list[str], str]:
+    """Return ``(cmd, make_recipe)`` for *repo_path*.
+
+    *cmd* is exactly :func:`_select_test_command`'s return value. *make_recipe*
+    is the ``make -n test`` dry-run stdout when *cmd* is ``["make", "test"]``
+    (the literal, unexpanded-further recipe line(s) that target resolves to),
+    or ``""`` when *cmd* is the bare ``pytest`` fallback. A Makefile ``test``
+    target can wrap any runner behind an arbitrary recipe (``uv run pytest
+    ...``, ``go test ./...``, a shell wrapper script, ...), so the runner
+    family a ``make test`` command resolves to cannot be read off
+    ``["make", "test"]`` itself -- :func:`_resolve_runner_key` resolves it
+    by matching a registered runner's invoker token against *make_recipe*'s
+    tokens (token containment, not "what the recipe actually invokes";
+    see that function's docstring for the exact rule and its limitations).
+    """
+    rc, stdout, _stderr = run_command(["make", "-n", "test"], cwd=repo_path)
     if rc == 0:
-        return ["make", "test"]
-    return ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+        return ["make", "test"], stdout
+    return ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"], ""
 
 
 def cmd_run_tests(unit_id: str) -> int:
@@ -6275,18 +6301,37 @@ def cmd_check_reachability(unit_id: str) -> int:
     return 1 if total_findings else 0
 
 
-# Best-effort per-test failure extraction for the shared-file regression gate.
-# Covers pytest's short summary line, `go test`'s `--- FAIL:` line, and the
-# jest/mocha-style spec-runner glyph. This is intentionally NOT a general
-# solution for every test runner devbench's target repos might use -- see
-# `_parse_failing_tests` docstring for the documented fallback behaviour.
-_FAILING_TEST_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^FAILED\s+(\S+)", re.MULTILINE),
-    re.compile(r"^---\s+FAIL:\s+(\S+)", re.MULTILINE),
-    re.compile(r"^\s*(?:✕|✗)\s+(.+?)\s*$", re.MULTILINE),
-)
+# Per-runner failing-test extraction for the shared-file regression gate
+# (spec 4.6, finding 318-D4). Each pattern is owned by exactly one parser
+# function below and matched against that runner's own characteristic
+# failure-line shape -- there is no shared "try every pattern and guess"
+# path. `_resolve_runner_key` resolves the runner FAMILY (which parser
+# applies), which is a narrower guarantee than "what actually ran": a
+# direct invocation is matched on its command's own leading token(s)
+# (unambiguous by construction), but a `make test` command is resolved by
+# TOKEN CONTAINMENT over the target's dry-run recipe -- a registered
+# runner's invoker token appearing ANYWHERE in the recipe selects that
+# runner's parser, even when the recipe's actual last word is an uncovered
+# wrapper script (e.g. `npm ci && ./scripts/run-tests.sh` still resolves to
+# the npm/jest parser on the `npm` token) or invokes nothing at all (e.g.
+# `echo skipping pytest` resolves to the pytest parser on the word
+# `pytest`). See `_resolve_runner_key` for the exact matching rule and its
+# known limitations, and `cmd_check_shared_file_impact`'s docstring item 7
+# for the disclosed tradeoff.
+_PYTEST_FAILURE_LINE = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_GO_TEST_FAILURE_LINE = re.compile(r"^---\s+FAIL:\s+(\S+)", re.MULTILINE)
+_JEST_FAILURE_LINE = re.compile(r"^\s*(?:✕|✗)\s+(.+?)\s*$", re.MULTILINE)
 
-_SHARED_FILE_BASELINE_DEGRADED_MARKER = "<suite-failed-no-per-test-detail-parsed>"
+# npm/yarn/npx-invoked jest form (`npm test`, `npm run test`, `yarn test`,
+# `npx jest`, ...). Two different consumers read this frozenset with two
+# different matching rules: `_RunnerSpec.matches` (direct invocation)
+# anchors it to the command's LEADING token only, since the underlying
+# `jest`/`mocha` binary is rarely invoked directly in a target repo's
+# configured test command; `_RunnerSpec.wraps` (a `make test` target's
+# recipe) accepts the token at ANY position, mirroring `_recipe_invokes_go_test`'s
+# documented any-position rule for `go test` -- a recipe commonly prefixes
+# the runner with a working-directory change or an environment variable.
+_NPM_JEST_INVOKERS: frozenset[str] = frozenset({"npm", "yarn", "npx"})
 
 
 def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -> list[str]:
@@ -6299,23 +6344,242 @@ def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -
     return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
 
 
-def _parse_failing_tests(output: str, rc: int) -> tuple[set[str], bool]:
-    """Best-effort extraction of individual failing-test identifiers from *output*.
+def _extract_node_ids(pattern: re.Pattern[str], output: str) -> set[str]:
+    """Return the stripped first capture group of every *pattern* match in *output*.
 
-    Returns ``(failing_tests, degraded)``. ``degraded`` is ``True`` when the
-    suite failed (``rc != 0``) but none of the recognised formats (pytest,
-    ``go test``, jest/mocha-style) matched anything -- in that case
-    ``failing_tests`` is a single synthetic marker so the baseline-diff
-    logic still has something to compare, but callers surface ``degraded``
-    so it is visible that per-test attribution could not be computed for
-    this repo's test runner rather than silently treating it as precise.
+    Shared by every `_SHARED_FILE_RUNNER_PARSERS` entry below -- each parser
+    owns its own compiled *pattern* (one characteristic failure-line shape
+    per runner family), but the "find every match, strip it, de-duplicate
+    into a set" mechanics are identical across all of them, so that part
+    lives once here rather than being copy-pasted per parser.
     """
-    found: set[str] = set()
-    for pattern in _FAILING_TEST_PATTERNS:
-        found.update(match.group(1).strip() for match in pattern.finditer(output))
-    if rc == 0 or found:
-        return found, False
-    return {_SHARED_FILE_BASELINE_DEGRADED_MARKER}, True
+    return {match.group(1).strip() for match in pattern.finditer(output)}
+
+
+def _parse_pytest_failures(output: str) -> set[str]:
+    """Extract failing pytest node ids from *output*.
+
+    Matches pytest's short test summary line (``FAILED <node-id> ...``,
+    emitted by the default and ``-q`` reporters) -- one match per failing
+    node id.
+    """
+    return _extract_node_ids(_PYTEST_FAILURE_LINE, output)
+
+
+def _parse_go_test_failures(output: str) -> set[str]:
+    """Extract failing Go test names from *output*.
+
+    Matches ``go test``'s ``--- FAIL: <TestName> (<duration>)`` line -- one
+    match per failing test name.
+    """
+    return _extract_node_ids(_GO_TEST_FAILURE_LINE, output)
+
+
+def _parse_jest_failures(output: str) -> set[str]:
+    """Extract failing jest/mocha-style spec descriptions from *output*.
+
+    Matches the ``✕``/``✗`` glyph line jest/mocha reporters print for each
+    failing spec -- one match per failing spec description (including any
+    trailing duration annotation the reporter appends, e.g. ``(15 ms)``).
+    """
+    return _extract_node_ids(_JEST_FAILURE_LINE, output)
+
+
+class _RunnerSpec(NamedTuple):
+    """One `_SHARED_FILE_RUNNER_PARSERS` registry entry.
+
+    ``matches`` recognises *test_command* (normalised to a ``tuple[str,
+    ...]``, never the suite output) as belonging to this runner family when
+    the repo's configured test command invokes the runner directly (e.g.
+    ``["pytest", ...]``).
+
+    ``wraps`` recognises the SAME runner family from the ``shlex.split``
+    tokens of a ``make test`` target's dry-run recipe (``make -n test``'s
+    stdout), by TOKEN CONTAINMENT: this runner's invoker token matching
+    anywhere in the recipe's tokens. A Makefile ``test`` target can wrap
+    any runner behind an arbitrary recipe line (``uv run pytest ...``,
+    ``go test ./...``, a shell wrapper script, an entirely unregistered
+    runner, ...), so the runner family a ``["make", "test"]`` command
+    resolves to can never be read off that literal command -- it is
+    resolved by matching each registry entry's ``wraps`` predicate against
+    the recipe's tokens, one at a time, unlike ``matches``, which anchors
+    on the command's own leading token(s) for a direct invocation. Token
+    containment is a strictly weaker guarantee than "what the recipe
+    actually invokes": a registered runner's invoker token appearing
+    anywhere in the recipe (including inside an uncovered wrapper script's
+    arguments, or a recipe that never runs that runner at all) still
+    selects that runner's parser. See `_resolve_runner_key`'s docstring for
+    the disclosed cases this does not handle correctly.
+
+    ``parse`` extracts the exact set of failing node ids from that runner's
+    combined stdout/stderr, shared by both invocation shapes since the
+    output format belongs to the runner, not to how it was invoked.
+
+    Keeping all three on one entry (rather than separately-keyed mappings
+    that could drift apart) is what makes `_resolve_runner_key` an actual
+    extension point (SOLID/OCP): adding a runner is exactly one new entry
+    here, never an edit to `_resolve_runner_key` itself, for both the
+    direct-invocation and the make-wrapped resolution path.
+    """
+
+    matches: Callable[[tuple[str, ...]], bool]
+    wraps: Callable[[tuple[str, ...]], bool]
+    parse: Callable[[str], set[str]]
+
+
+def _recipe_invokes_go_test(tokens: tuple[str, ...]) -> bool:
+    """True when *tokens* (a ``make -n test`` recipe line, whitespace-split via
+    :func:`shlex.split` with ``comments=True``) contains the consecutive ``go test``
+    invocation anywhere -- not only as the first two tokens, since a recipe commonly
+    prefixes the runner with a working-directory change or a version manager (e.g.
+    ``cd pkg && go test ./...``). Token containment, not proof that ``go test`` is
+    what the recipe's *last* command actually runs -- see `_resolve_runner_key`'s
+    docstring for the disclosed limitation this shares with every other `wraps`
+    predicate in this registry.
+    """
+    return any(tokens[i : i + 2] == ("go", "test") for i in range(len(tokens) - 1))
+
+
+# Explicit registry (spec 4.6, finding 318-D4): `_resolve_runner_key` below iterates
+# this mapping and returns the key whose `matches` predicate accepts the repo's
+# directly-configured test command -- or, when that command is `["make", "test"]`,
+# the SOLE key whose `wraps` predicate accepts the tokens of that target's dry-run
+# recipe (`make -n test`'s stdout, captured once by `_select_test_command_with_recipe`;
+# tokenised via `shlex.split(..., comments=True)` so a trailing recipe comment is never
+# matched). Zero matching entries, or more than one, both raise `UnknownTestRunnerError`
+# naming the full configured command -- no match because the runner is unregistered, more
+# than one match because which runner the recipe invokes is genuinely ambiguous from token
+# containment alone -- before any suite subprocess is spawned.
+#
+# `_select_test_command` has exactly two possible return values (see that function's
+# docstring): `["make", "test"]` when the repo's Makefile has a `test` target, or a
+# bare `pytest` invocation otherwise. `["make", "test"]` is NOT a fourth runner family
+# of its own and is never a registry key here -- a Makefile `test` target can wrap any
+# of the runners below, or none of them, so which one it wraps is resolved from its
+# recipe, never assumed to be pytest. `go test` and the npm/yarn/npx-invoked jest form
+# are registered for the direct (non-`make`-wrapped) invocation shape a repo's test
+# command is expected to take once a non-Python target repo is onboarded -- fixed per
+# the Definition of Ready, not a speculative addition -- and are equally reachable
+# through a Makefile-wrapped recipe via `wraps`.
+_SHARED_FILE_RUNNER_PARSERS: Mapping[str, _RunnerSpec] = {
+    "pytest": _RunnerSpec(
+        matches=lambda cmd: cmd[:1] == ("pytest",),
+        wraps=lambda tokens: "pytest" in tokens,
+        parse=_parse_pytest_failures,
+    ),
+    "go test": _RunnerSpec(
+        matches=lambda cmd: cmd[:2] == ("go", "test"),
+        wraps=_recipe_invokes_go_test,
+        parse=_parse_go_test_failures,
+    ),
+    "npm/jest": _RunnerSpec(
+        matches=lambda cmd: bool(cmd[:1]) and cmd[0] in _NPM_JEST_INVOKERS,
+        wraps=lambda tokens: any(token in _NPM_JEST_INVOKERS for token in tokens),
+        parse=_parse_jest_failures,
+    ),
+}
+
+
+class UnknownTestRunnerError(ValueError):
+    """Raised by `_resolve_runner_key` when a test command matches no
+    `_SHARED_FILE_RUNNER_PARSERS` entry (spec 4.6, finding 318-D4).
+
+    A dedicated `ValueError` subclass rather than the builtin: callers that
+    only need "this is a bad-input error" can still catch `ValueError`, but
+    `cmd_check_shared_file_impact` catches this type specifically instead of
+    the builtin, so an unrelated `ValueError` raised deeper in the gate
+    (e.g. a `json.JSONDecodeError` that somehow escaped
+    `_load_shared_file_baseline`'s own conversion to `RuntimeError`) is
+    never misreported as an unrecognised-runner error.
+    """
+
+
+def _resolve_runner_key(test_command: Sequence[str], make_recipe: str = "") -> str:
+    """Return the `_SHARED_FILE_RUNNER_PARSERS` key matching *test_command*.
+
+    Normalises *test_command* to a ``tuple`` before matching, so every
+    sequence the `Sequence[str]` annotation admits -- a ``list[str]`` or a
+    ``tuple[str, ...]`` alike -- resolves identically.
+
+    When *test_command* is ``["make", "test"]``, the runner family cannot be
+    read off the command itself -- a Makefile ``test`` target can wrap any
+    runner behind an arbitrary recipe -- so it is resolved from
+    *make_recipe* instead (the ``make -n test`` dry-run stdout
+    :func:`_select_test_command_with_recipe` already captured): each
+    registry entry's `_RunnerSpec.wraps` predicate is matched against
+    *make_recipe*'s tokens, split via ``shlex.split(make_recipe,
+    comments=True)`` so a trailing ``#``-comment on the recipe line (an
+    ordinary, valid Makefile recipe annotation) is stripped before matching
+    rather than tokenised alongside the real recipe -- a comment cannot
+    silently steer resolution toward a runner name it happens to mention,
+    and English punctuation inside the comment (an apostrophe, for example)
+    is never handed to shlex's quote-balancing at all. Because `wraps` (unlike
+    `matches`) accepts a token appearing anywhere in the recipe, more than
+    one registry entry's `wraps` predicate can accept the SAME recipe (e.g.
+    a monorepo `test` target running both a Go suite and a Python suite) --
+    that is ambiguous, not resolvable by "first match wins", so it is
+    raised rather than silently resolved to whichever entry happens to
+    iterate first (spec 3.5 bans guessing). Otherwise, iterates
+    `_SHARED_FILE_RUNNER_PARSERS` and returns the first key whose
+    `_RunnerSpec.matches` predicate accepts *test_command* directly --
+    never depends on a suite having run either way. A direct invocation can
+    never be ambiguous this way: each `matches` predicate anchors on the
+    command's own leading token(s), which is unique per registered runner
+    by construction.
+
+    Raises `UnknownTestRunnerError` naming the full command (spec 4.6,
+    finding 318-D4) when no runner family matches, so the caller can report
+    the exact configured command that has no registered parser instead of
+    guessing or degrading -- on the `make test` no-match path, the message
+    also names the normalised recipe text that was inspected, so a recipe
+    that genuinely runs a registered runner but tokenizes oddly (e.g. an
+    unquoted mid-word `#` inside a path or flag, which `shlex(comments=True)`
+    treats as a comment start) is diagnosable rather than a bare "make test"
+    with nothing pointing at why. Also raises `UnknownTestRunnerError` naming both
+    the recipe and every matching candidate when more than one registry
+    entry's `wraps` predicate accepts the same recipe. Also raises
+    `UnknownTestRunnerError` -- never the builtin `shlex.split`-raised
+    `ValueError` uncaught -- when *make_recipe* itself is not
+    shell-tokenizable (e.g. an unmatched quote/apostrophe outside of a
+    comment), so a malformed-but-real recipe still reaches a single formed
+    spec Section 7 `ERROR: ...` line instead of a traceback.
+    """
+    cmd = tuple(test_command)
+    if cmd[:2] == ("make", "test"):
+        try:
+            recipe_tokens = tuple(shlex.split(make_recipe, comments=True))
+        except ValueError as exc:
+            raise UnknownTestRunnerError(
+                f"ERROR: cannot parse test output for runner '{' '.join(cmd)}' (recipe not shell-tokenizable: {exc})"
+            ) from exc
+        matching_keys = [key for key, spec in _SHARED_FILE_RUNNER_PARSERS.items() if spec.wraps(recipe_tokens)]
+        recipe_text = " ".join(make_recipe.split())
+        if len(matching_keys) > 1:
+            raise UnknownTestRunnerError(
+                f"ERROR: cannot parse test output for runner '{' '.join(cmd)}': "
+                f"recipe '{recipe_text}' matches multiple registered runners "
+                f"({', '.join(sorted(matching_keys))}), which is ambiguous"
+            )
+        if matching_keys:
+            return matching_keys[0]
+        raise UnknownTestRunnerError(
+            f"ERROR: cannot parse test output for runner '{' '.join(cmd)}': recipe '{recipe_text}' "
+            "matches no registered runner"
+        )
+    for key, spec in _SHARED_FILE_RUNNER_PARSERS.items():
+        if spec.matches(cmd):
+            return key
+    raise UnknownTestRunnerError(f"ERROR: cannot parse test output for runner '{' '.join(cmd)}'")
+
+
+def _resolve_runner_parser(test_command: Sequence[str], make_recipe: str = "") -> Callable[[str], set[str]]:
+    """Return the parser callable registered for *test_command*'s runner family.
+
+    Delegates matching to `_resolve_runner_key` -- raises the same
+    `UnknownTestRunnerError` when *test_command* (and, for a ``["make",
+    "test"]`` command, *make_recipe*) has no registered parser.
+    """
+    return _SHARED_FILE_RUNNER_PARSERS[_resolve_runner_key(test_command, make_recipe)].parse
 
 
 def _shared_file_baseline_path(canonical_repo: str, branch_point: str) -> Path:
@@ -6416,12 +6680,15 @@ def _load_shared_file_baseline(path: Path, *, branch_point: str, unit_id: str) -
     return data
 
 
-def _build_shared_file_baseline_record(*, branch_point: str, runner: list[str], failing: set[str]) -> dict[str, Any]:
+def _build_shared_file_baseline_record(*, branch_point: str, runner: str, failing: set[str]) -> dict[str, Any]:
     """Build the spec 5.4 baseline record: exactly ``schema_version``, ``captured_at``,
     ``branch_point``, ``runner`` and ``failing``.
 
-    The single writer both the merge-base capture path in
-    :func:`_evaluate_shared_file_gate` and any future baseline producer
+    *runner* is the resolved `_SHARED_FILE_RUNNER_PARSERS` registry key
+    (e.g. ``"pytest"``), not the raw command list, so a later run against a
+    different runner key is detected as a mismatch (AC-4) rather than
+    silently compared. The single writer both the merge-base capture path
+    in :func:`_evaluate_shared_file_gate` and any future baseline producer
     (e.g. an auto-derived cache) share, so the on-disk record shape has one
     place that can drift from spec 5.4 rather than two independently
     hand-assembled dicts.
@@ -6430,7 +6697,7 @@ def _build_shared_file_baseline_record(*, branch_point: str, runner: list[str], 
         "schema_version": 1,
         "captured_at": datetime.now(tz=UTC).isoformat(),
         "branch_point": branch_point,
-        "runner": list(runner),
+        "runner": runner,
         "failing": sorted(failing),
     }
 
@@ -6467,28 +6734,63 @@ def _write_shared_file_baseline(path: Path, record: Mapping[str, Any]) -> None:
         atomic_write_text(path, payload)
 
 
-def _run_full_suite_and_parse_failures(repo_path: Path) -> tuple[list[str], int, str, str, set[str], bool]:
+def _resolve_full_suite_command(repo_path: Path) -> tuple[list[str], str, Callable[[str], set[str]]]:
+    """Select *repo_path*'s configured test command and resolve its runner key and parser.
+
+    Returns ``(cmd, runner_key, parser)``. Does NOT run the suite -- this is
+    deliberately the cheap half of :func:`_run_full_suite_and_parse_failures`
+    split out on its own, so :func:`_evaluate_shared_file_gate` can learn
+    *runner_key* (to compare against a stored baseline's ``runner`` field)
+    before spending a full-suite run on a baseline that turns out not to be
+    comparable anyway. Resolves *cmd* and its ``make -n test`` dry-run
+    recipe (when applicable) via :func:`_select_test_command_with_recipe` in
+    a single dry run, then resolves *runner_key* from that recipe when *cmd*
+    is ``["make", "test"]`` (never assumed to be pytest). An unrecognised
+    command raises `UnknownTestRunnerError` naming *cmd* here, before any
+    suite subprocess is spawned (spec 4.6, finding 318-D4).
+    """
+    cmd, make_recipe = _select_test_command_with_recipe(repo_path)
+    runner_key = _resolve_runner_key(cmd, make_recipe)
+    parser = _SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+    return cmd, runner_key, parser
+
+
+def _run_full_suite_and_parse_failures(
+    repo_path: Path,
+    *,
+    resolved: tuple[list[str], str, Callable[[str], set[str]]] | None = None,
+) -> tuple[list[str], int, str, str, set[str], str]:
     """Select and run the full-suite command in *repo_path*, then parse per-test failures.
 
-    Returns ``(cmd, rc, stdout, stderr, failing, degraded)``. Shared by
+    Returns ``(cmd, rc, stdout, stderr, failing, runner_key)``. Shared by
     :func:`_capture_shared_file_baseline` (the branch-point capture run, in
     an isolated worktree) and :func:`_evaluate_shared_file_gate` (the
     current-tree run) -- the two callers differ in whose tree they run the
     suite against and in how the resulting failure set is used afterward,
-    not in how the suite command is selected, run or parsed, so this is the
-    single place that logic lives.
+    not in how the suite command is selected, resolved or run, so this is
+    the single place that logic lives.
+
+    *resolved*, when given, is an already-computed ``(cmd, runner_key,
+    parser)`` triple from :func:`_resolve_full_suite_command` -- passed by
+    :func:`_evaluate_shared_file_gate`, which must resolve the runner key
+    BEFORE this call in order to compare it against a stored baseline's
+    ``runner`` field, so this function does not redundantly re-resolve (and
+    re-invoke `_select_test_command`'s own ``make -n test`` dry run) when
+    the caller already has. When omitted (the
+    :func:`_capture_shared_file_baseline` caller), resolution happens here,
+    still strictly before the suite subprocess is spawned.
     """
     from devbench.config import TEST_TIMEOUT
 
-    cmd = _select_test_command(repo_path)
+    cmd, runner_key, parser = resolved if resolved is not None else _resolve_full_suite_command(repo_path)
     rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
     combined_output = "\n".join(part for part in (stdout, stderr) if part.strip())
-    failing, degraded = _parse_failing_tests(combined_output, rc)
-    return cmd, rc, stdout, stderr, failing, degraded
+    failing = parser(combined_output)
+    return cmd, rc, stdout, stderr, failing, runner_key
 
 
-def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: str) -> tuple[set[str], list[str]]:
-    """Run the full suite at *branch_point* in an isolated worktree; return ``(failing, cmd)``.
+def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: str) -> tuple[set[str], str]:
+    """Run the full suite at *branch_point* in an isolated worktree; return ``(failing, runner_key)``.
 
     Uses ``git worktree add --detach`` so capturing the pre-change baseline
     never touches *repo_path*'s own working tree (the caller's staged/
@@ -6496,22 +6798,24 @@ def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: s
     *branch_point* directly in *repo_path* would discard that state.
 
     Fail-fast on every path (spec Section 7) -- never silently leaves a
-    stale worktree registered against the repo, and never returns a
-    degraded (unattributed) result for the caller to persist as a
-    baseline:
+    stale worktree registered against the repo, and never persists an
+    unattributed result as a baseline:
 
     - Checkout failure raises ``RuntimeError`` with the git stderr; nothing
       was registered, so the ``mkdtemp`` scratch directory is removed.
+    - An unrecognised runner (`_run_full_suite_and_parse_failures` raising
+      `UnknownTestRunnerError`, spec 4.6) propagates before the suite
+      subprocess is spawned; the worktree is still cleaned up because the
+      call happens inside the ``try`` block below.
     - Once the worktree is registered, the suite run and its removal are
       wrapped in ``try``/``finally`` so removal is attempted even if the
       suite run itself raises or is interrupted.
-    - A capture run whose output cannot be attributed to individual failing
-      tests (:func:`_parse_failing_tests` returns ``degraded=True`` -- e.g.
-      the runner could not even start, surfaced as ``run_command``'s rc 127
-      command-not-found/timeout convention) raises ``RuntimeError`` naming
-      the runner and its stderr rather than letting the caller persist a
-      synthetic "suite failed" marker as the permanent, never-rewritten
-      pre-change baseline for this branch point.
+    - A capture run that exits non-zero yet whose registered parser found
+      no failing node ids (e.g. the runner could not even start, surfaced
+      as ``run_command``'s rc 127 command-not-found/timeout convention)
+      raises ``RuntimeError`` naming the runner and its stderr rather than
+      letting the caller persist an empty failing set as the permanent,
+      never-rewritten pre-change baseline for this branch point.
     - Worktree removal failure raises ``RuntimeError`` naming ``git
       worktree prune`` as the remediation, and -- unlike a checkout
       failure -- does NOT delete the scratch directory: ``git worktree
@@ -6533,8 +6837,8 @@ def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: s
         )
 
     try:
-        cmd, test_rc, stdout, test_stderr, failing, degraded = _run_full_suite_and_parse_failures(worktree_path)
-        if degraded:
+        cmd, test_rc, stdout, test_stderr, failing, runner_key = _run_full_suite_and_parse_failures(worktree_path)
+        if test_rc != 0 and not failing:
             raise RuntimeError(
                 f"ERROR: shared-file baseline capture for unit {unit_id} could not attribute "
                 f"per-test failures for runner {cmd} at branch point {branch_point} "
@@ -6554,7 +6858,7 @@ def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: s
             )
         shutil.rmtree(tmp_dir)
 
-    return failing, cmd
+    return failing, runner_key
 
 
 def _evaluate_shared_file_gate(
@@ -6568,35 +6872,76 @@ def _evaluate_shared_file_gate(
     capture / block / pass decision described in that function's docstring
     lives here. Returns ``(json_payload, exit_code)``.
 
-    Resolves the branch point and loads/validates the stored baseline
-    BEFORE running the (expensive) full suite against the current tree --
-    fail-fast for the two prerequisites that are cheap to detect: a branch
-    point that cannot be resolved, or a stored baseline that is corrupt or
-    branch-point-mismatched (spec 4.6, finding 318-D2). Both raise
-    ``RuntimeError`` immediately, before the current-tree suite ever runs,
-    and no baseline write happens on either path.
+    Resolves the branch point, loads/validates the stored baseline, and
+    resolves the current tree's runner key -- all BEFORE running the
+    (expensive) full suite against the current tree -- fail-fast for every
+    prerequisite that is cheap to detect:
 
-    This ordering guarantee does NOT extend to the baseline-capture path.
-    When no baseline exists yet for the branch point, capture happens
-    AFTER the current-tree suite has already run (see below); this
-    placement is a deliberate choice, not a forced one -- the baseline is
-    already loaded by the time the current-tree suite starts, so "no
-    baseline yet" is known beforehand. :func:`_capture_shared_file_baseline`
-    can raise ``RuntimeError`` on three paths, and they do not all cost
-    the same number of full-suite runs: a branch-point worktree checkout
-    failure raises before the capture's own suite run ever starts (the
-    ``git worktree add`` call
+    - A branch point that cannot be resolved, or a stored baseline that is
+      corrupt or branch-point-mismatched (spec 4.6, finding 318-D2), raises
+      ``RuntimeError`` immediately.
+    - An unrecognised test command (`_resolve_full_suite_command` raising
+      `UnknownTestRunnerError`, spec 4.6, finding 318-D4) raises before any
+      suite subprocess is spawned -- symmetric with the branch-point
+      capture run :func:`_capture_shared_file_baseline` may perform below,
+      which resolves its own runner key the same way, before its own suite
+      run.
+    - A resolved but mismatched runner (the stored baseline's ``runner``
+      key differs from the currently-resolved one, AC-4) is detected here,
+      before the current-tree suite runs: resolving the runner key never
+      requires running a suite (`_resolve_full_suite_command` only invokes
+      `_select_test_command_with_recipe`'s cheap ``make -n test`` dry run,
+      never the full suite), and the baseline is already loaded by this
+      point, so nothing about a mismatch is only knowable after the fact.
+      This costs zero full-suite runs on the mismatch path.
+
+    None of the three checks above write a baseline.
+
+    When no baseline exists yet for the branch point, capture happens AFTER
+    the current-tree suite has run (see below); that placement remains a
+    deliberate choice, not a forced one -- the baseline's absence is
+    already known beforehand, since it was loaded above. The runner
+    resolved by that fresh capture (run against the branch-point worktree,
+    which may carry a different Makefile than the current tree) is checked
+    against the current tree's resolved runner too, so a unit that adds or
+    removes a Makefile ``test`` target between the branch point and HEAD
+    still cannot diff two incomparable failure sets under a single freshly
+    written baseline. :func:`_capture_shared_file_baseline` can raise ``RuntimeError`` on
+    three paths, and they do not all cost the same number of full-suite
+    runs: a branch-point worktree checkout failure raises before the
+    capture's own suite run ever starts (the ``git worktree add`` call
     fails and the function returns via its early ``raise``, never entering
     the ``try`` block that runs the suite), so that path costs only the
-    current-tree suite run already spent above -- one full-suite run. A
-    degraded/unattributed capture run or a worktree-removal failure (naming
-    ``git worktree prune`` as the remediation) both happen only after the
-    capture's own suite run has completed, so those two paths cost the
-    current-tree suite run plus the branch-point capture's own suite run --
-    two full-suite runs -- before the operator sees the error. Every
-    ``RuntimeError`` this function raises or propagates is never caught
-    here; it is caught by the caller, which prints it to stderr and exits
-    1. ``_load_shared_file_baseline`` and ``_write_shared_file_baseline``
+    current-tree suite run already spent above -- one full-suite run. An
+    unattributed capture run (non-zero exit with no parsed failures) only
+    happens after the capture's own suite run has completed, so that path
+    costs the current-tree suite run plus the branch-point capture's own
+    suite run -- two full-suite runs -- before the operator sees the
+    error. A worktree-removal failure (naming ``git worktree prune`` as the
+    remediation) is attempted from the ``finally`` block regardless of how
+    the ``try`` block above it exited, so it does NOT always cost two
+    full-suite runs: when the branch-point tree resolves to no registered
+    runner (`UnknownTestRunnerError` propagating before the capture's own
+    suite is spawned, per the second bullet above), a subsequent removal
+    failure supersedes that propagating error and the path costs only the
+    current-tree suite run already spent above -- one full-suite run. It
+    costs two full-suite runs only when the capture's own suite run did
+    complete (whether cleanly or via the unattributed-capture-run error
+    above) before removal was attempted.
+
+    The current-tree suite run itself is held to the same "never silently
+    persist an unattributed result" rule the branch-point capture always
+    has: a current-tree run that exits non-zero yet whose registered
+    parser attributes zero failing node ids (e.g. a pytest collection or
+    import error, which prints ``ERROR tests/x.py`` rather than a
+    ``FAILED`` short-summary line the registered parser matches) raises
+    ``RuntimeError`` rather than treating an unattributed failure as if the
+    suite had passed cleanly (spec 3.5 bans exactly this degraded-but-
+    passing outcome).
+
+    Every ``RuntimeError`` this function raises or propagates is never
+    caught here; it is caught by the caller, which prints it to stderr and
+    exits 1. ``_load_shared_file_baseline`` and ``_write_shared_file_baseline``
     can also propagate ``TimeoutError`` (a stuck ``flock_path`` holder)
     rather than ``RuntimeError`` -- also never caught here, also caught by
     the caller.
@@ -6605,7 +6950,25 @@ def _evaluate_shared_file_gate(
     baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
     baseline = _load_shared_file_baseline(baseline_path, branch_point=branch_point, unit_id=unit_id)
 
-    cmd, rc, _stdout, _stderr, current_failing, degraded = _run_full_suite_and_parse_failures(repo_path)
+    resolved = _resolve_full_suite_command(repo_path)
+    _cmd, runner_key, _parser = resolved
+
+    if baseline is not None:
+        stored_runner = baseline.get("runner")
+        if stored_runner != runner_key:
+            raise RuntimeError(
+                f"ERROR: baseline was captured with runner '{stored_runner}' but the repo is "
+                f"configured for '{runner_key}'; failure sets are not comparable across runners"
+            )
+
+    cmd, rc, stdout, stderr, current_failing, _runner_key = _run_full_suite_and_parse_failures(
+        repo_path, resolved=resolved
+    )
+    if rc != 0 and not current_failing:
+        raise RuntimeError(
+            f"ERROR: shared-file gate for unit {unit_id} could not attribute per-test failures "
+            f"for runner {cmd} in {repo_path} (exit {rc}): {(stderr.strip() or stdout.strip()) or '<no output>'}"
+        )
 
     base_payload: dict[str, Any] = {
         "unit_id": unit_id,
@@ -6614,15 +6977,19 @@ def _evaluate_shared_file_gate(
         "matched_files": matched_files,
         "full_suite_command": cmd,
         "full_suite_exit_code": rc,
-        "degraded": degraded,
         "baseline_path": str(baseline_path),
         "branch_point": branch_point,
     }
 
     if baseline is None:
-        captured_failing, captured_cmd = _capture_shared_file_baseline(repo_path, branch_point, unit_id)
+        captured_failing, captured_runner_key = _capture_shared_file_baseline(repo_path, branch_point, unit_id)
+        if captured_runner_key != runner_key:
+            raise RuntimeError(
+                f"ERROR: baseline was captured with runner '{captured_runner_key}' but the repo is "
+                f"configured for '{runner_key}'; failure sets are not comparable across runners"
+            )
         record = _build_shared_file_baseline_record(
-            branch_point=branch_point, runner=captured_cmd, failing=captured_failing
+            branch_point=branch_point, runner=captured_runner_key, failing=captured_failing
         )
         _write_shared_file_baseline(baseline_path, record)
         baseline = record
@@ -6666,8 +7033,14 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     3. On a match (`_evaluate_shared_file_gate`): resolves the unit's branch
        point (`_resolve_branch_point_sha`, `git merge-base HEAD
        origin/<default-branch>`), runs the full-suite command against the
-       CURRENT tree, and diffs its per-test failures
-       (`_parse_failing_tests`) against a pre-change baseline stored at
+       CURRENT tree, and diffs its per-test failures (parsed by the
+       runner-specific parser callable that `_resolve_full_suite_command`
+       resolves -- it resolves the runner key via `_resolve_runner_key` and
+       takes that registry entry's `parse` callable directly, spec 4.6;
+       `_resolve_runner_parser` performs the equivalent lookup and exists
+       per this unit's Definition of Done, but the gate path itself does
+       not call it, to avoid a second resolution pass)
+       against a pre-change baseline stored at
        `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`
        (spec 5.4). When no baseline exists yet for that branch point, one is
        captured now by running the same suite in an isolated `git worktree`
@@ -6682,7 +7055,20 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     4. A baseline file that exists but fails to parse, or whose stored
        `branch_point` disagrees with the resolved merge-base, is a loud
        error (exit 1, stderr) and is never rewritten (spec 4.6, finding
-       318-D2) -- there is no silent re-bootstrap path.
+       318-D2) -- there is no silent re-bootstrap path. A baseline whose
+       stored `runner` registry key disagrees with the currently-resolved
+       one is likewise a loud error (exit 1, stderr, AC-4) -- failure sets
+       captured under one runner are never diffed against another. This
+       runner-mismatch check applies twice, on two distinct paths that can
+       raise at different points: once against an EXISTING stored baseline
+       (checked before the current-tree suite runs, so this path costs zero
+       full-suite runs), and, separately, when no baseline yet exists and
+       one is FRESHLY captured from an isolated branch-point worktree (see
+       item 3) -- that worktree may carry a different Makefile than the
+       current tree, so the freshly-resolved runner is checked against the
+       current tree's resolved runner too, after the capture's own suite
+       run but before the fresh baseline is written, so an incomparable
+       baseline is never persisted to disk.
     5. A branch point that cannot be resolved (`_resolve_branch_point_sha`,
        `git merge-base` exiting non-zero or the configured default branch
        not existing, AC-6) is a loud error (exit 1, stderr) naming the
@@ -6692,23 +7078,74 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
        `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`) is a loud error (exit 1,
        stderr, "ERROR: could not acquire the shared-file baseline lock for
        unit `unit_id`") rather than hanging the gate forever.
+    7. The repo's configured test command (`_select_test_command`) is
+       resolved to a runner parser through the explicit
+       `_SHARED_FILE_RUNNER_PARSERS` registry (spec 4.6, finding 318-D4) --
+       a bare `pytest` invocation, a `go test` invocation, or the
+       npm/yarn/npx-invoked jest form, matched directly on the command's
+       own leading token(s). A `make test` command is resolved by TOKEN
+       CONTAINMENT: each registry entry's invoker token is matched against
+       the `shlex.split` tokens of its dry-run recipe (`make -n test`,
+       comment-stripped), not against proof of what the recipe's last
+       command actually runs -- it is not assumed to wrap pytest, but a
+       registered runner's token appearing anywhere in the recipe (inside
+       an uncovered wrapper script's own arguments, or a recipe that never
+       runs that runner at all) still selects that runner's parser; see
+       `_resolve_runner_key`'s docstring for the exact rule and its
+       disclosed limitations. A command (or, for `make test`, a recipe)
+       matching no registered runner, or matching more than one (a recipe
+       containing more than one registered runner's invoker token, e.g. one
+       invoking both `go test` and `pytest` -- not necessarily ambiguous to
+       a human, e.g. a Python repo's recipe that installs JS dependencies
+       before running pytest also trips this), is `ERROR: cannot parse
+       test output for runner '<cmd>'` on stderr, exit 1, raised before
+       that run's own suite subprocess is spawned -- for the CURRENT-tree
+       run and for a branch-point capture alike -- so
+       neither case produces a partial or guessed result.
+    8. A current-tree suite run that exits non-zero yet whose registered
+       parser attributes zero failing node ids (e.g. a pytest collection or
+       import error, which never prints a `FAILED` short-summary line) is a
+       loud error (exit 1, stderr) rather than a `verdict: "pass"` over a
+       suite that could not actually be read -- symmetric with the
+       equivalent guard `_capture_shared_file_baseline` has always had on
+       the branch-point capture run (spec 3.5).
 
-    Known limitation (v1, documented rather than hidden): this is a
-    hand-maintained glob registry, not an auto-derived import/mount-graph
-    of actual fan-in (`gates.shared_file_impact.auto_derive_registry` is
-    the reserved config surface for the eventual auto-derivation successor
-    -- see `docs/devbench-yaml-reference.md` for the tradeoff). Per-test
-    failure attribution is parsed from common textual formats (pytest,
-    `go test`, jest/mocha-style); other runners degrade to a single
-    synthetic marker instead of per-test identifiers. That marker and the
-    `degraded` JSON field apply ONLY to the CURRENT-TREE evaluation run
-    (item 3 above): a degraded current-tree run still gets compared
-    against whatever branch-point baseline is on file, and blocks unless
-    that baseline already contains the same synthetic marker. There is no
-    equivalent suite-level baseline-CAPTURE fallback for an unsupported
-    runner -- a degraded capture run is always a loud error naming the
-    runner and its stderr, and is never persisted as a baseline (see
-    :func:`_capture_shared_file_baseline`).
+    Known limitation (v1, documented rather than hidden): the shared-file
+    pattern list itself is a hand-maintained glob registry, not an
+    auto-derived import/mount-graph of actual fan-in
+    (`gates.shared_file_impact.auto_derive_registry` is the reserved config
+    surface for the eventual auto-derivation successor -- see
+    `docs/devbench-yaml-reference.md` for the tradeoff). Separately, the
+    runner-parser registry (item 7) ships with exactly three entries
+    (`pytest`, `go test`, npm/yarn/npx-invoked jest); a repo whose
+    configured test command (or, for `make test`, whose recipe) matches
+    none of those has no path to a passing gate run until a matching entry
+    is added to `_SHARED_FILE_RUNNER_PARSERS` -- adding one is the only
+    change required (`_resolve_runner_key` iterates the registry itself,
+    for both direct and `make`-wrapped resolution, and never restates the
+    runner list, so it never needs editing to onboard a new runner family).
+
+    A second, distinct known limitation applies only to the `make test`
+    resolution path in item 7: it is TOKEN CONTAINMENT over the dry-run
+    recipe, not proof of what the recipe's last command actually invokes.
+    Two failure directions follow from that, both silent rather than a
+    loud error, and neither is the no-match direction item 7 already
+    covers: (1) a recipe that runs a registered runner's invoker token
+    only inside an uncovered wrapper script's own arguments (e.g. `npm ci
+    && ./scripts/run-tests.sh`) resolves to that runner's parser even
+    though the wrapper script -- not the registered runner -- is what
+    actually determines pass/fail; (2) a recipe that mentions a runner's
+    name without invoking it at all (e.g. `echo skipping pytest`) resolves
+    to that runner's parser over output the recipe never produced. Only
+    the case where MORE THAN ONE registered runner's token matches the
+    same recipe is upgraded to a loud `UnknownTestRunnerError` (item 7);
+    these two single-match cases are not detected. A Makefile `test`
+    target that delegates to a wrapper script or an equivalent
+    indirection is the concrete case a config author must avoid for this
+    gate to be trustworthy -- this constraint is not yet reflected in
+    `docs/devbench-yaml-reference.md`'s `shared_file_impact` section (a
+    documentation gap recorded in this unit's escalation log, not a stale
+    reference here).
     """
     from devbench.backlog.manifest import list_changed_files
 
@@ -6753,16 +7190,20 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         result_payload, rc = _evaluate_shared_file_gate(
             unit_id=unit_id, canonical_repo=canonical_repo, repo_path=repo_path, matched_files=matched_files
         )
-    except (RuntimeError, TimeoutError) as exc:
-        # RuntimeError already carries a fully-formed `ERROR: ...` message. TimeoutError
-        # does not: flock_path (via _load_shared_file_baseline / _write_shared_file_baseline)
-        # raises it, an OSError subclass rather than a RuntimeError, when a stuck lock
-        # holder is not released within SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, so it is
-        # wrapped here to still be a single spec Section 7 `ERROR: ...` line instead of an
-        # uncaught traceback.
+    except (RuntimeError, UnknownTestRunnerError, TimeoutError) as exc:
+        # RuntimeError and UnknownTestRunnerError already carry a fully-formed `ERROR: ...`
+        # message (UnknownTestRunnerError specifically from `_resolve_runner_key` naming an
+        # unrecognised test command, spec 4.6, finding 318-D4). Catching the dedicated
+        # `UnknownTestRunnerError` subclass here -- never the builtin `ValueError` -- means an
+        # unrelated `ValueError` raised deeper in the gate is never misreported as this error.
+        # TimeoutError does not carry a formed message: flock_path (via
+        # _load_shared_file_baseline / _write_shared_file_baseline) raises it, an OSError
+        # subclass rather than a RuntimeError, when a stuck lock holder is not released
+        # within SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, so it is wrapped here to still be
+        # a single spec Section 7 `ERROR: ...` line instead of an uncaught traceback.
         message = (
             str(exc)
-            if isinstance(exc, RuntimeError)
+            if isinstance(exc, (RuntimeError, UnknownTestRunnerError))
             else (f"ERROR: could not acquire the shared-file baseline lock for unit {unit_id}: {exc}")
         )
         print(message, file=sys.stderr)

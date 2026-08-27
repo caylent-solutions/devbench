@@ -514,11 +514,11 @@ validate:
 #       # explicitly when more than one canonical source is configured.
 #       - path: tests/fixtures/mock_catalog_lookup.json
 #         identifier_field: sku
-#         # Explicit opt-out for fixtures that intentionally model a
-#         # not-found/empty-state edge case -- values here never produce a
-#         # missing-key finding for this scan target.
-#         allow_missing:
-#           - SKU-DOES-NOT-EXIST
+#         # Opt-out for fixtures that intentionally model a not-found/empty-state edge case is
+#         # NOT a workspace-config key any more (spec 4.7 bullet 5): attach a structured
+#         # {"allow_missing": {"reason": "<non-empty reason>"}} marker directly to the waived
+#         # record in the scanned fixture file itself, so the waiver is visible in the same
+#         # diff a reviewer is already looking at, instead of hidden here.
 #     extract_source_literals: false    # reserved for a future literal-extraction scan mode
 #   write_path_audit:                   # caylent-solutions/devbench-internal-backlog#16
 #     enabled: false

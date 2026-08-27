@@ -516,16 +516,11 @@ class FixtureScanTarget:
         canonical_source: ``path`` of the ``FixtureCanonicalSource`` this
             target checks against. ``None`` is valid only when exactly one
             canonical source is configured (it is inferred in that case).
-        allow_missing: Identifier values explicitly permitted to be absent
-            from the canonical source -- the opt-out/scoping mechanism for
-            fixtures that intentionally model a not-found/empty-state edge
-            case (caylent-solutions/devbench-internal-backlog#17 AC3).
     """
 
     path: str
     identifier_field: str
     canonical_source: str | None = None
-    allow_missing: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -1263,10 +1258,13 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
     Args:
         path: Config file path (used in error messages).
         raw: Raw ``gates.fixture_consistency`` dict from YAML (already
-            schema-validated for unknown keys and types). May be an empty
-            dict when the section is absent -- that is the default,
-            opt-out state (the check becomes a no-op regardless of
-            ``enabled``).
+            schema-validated for unknown keys and types, and already past
+            ``_reject_removed_fixture_allow_missing_key``'s pre-schema
+            removed-key check -- spec 4.7 bullet 5, E6-F1-S1-T2 -- so no
+            ``scan[]`` entry reaching this function still carries
+            ``allow_missing``). May be an empty dict when the section is
+            absent -- that is the default, opt-out state (the check
+            becomes a no-op regardless of ``enabled``).
 
     Returns:
         A populated ``FixtureConsistencyConfig``.
@@ -1336,7 +1334,6 @@ def _parse_fixture_consistency_config(path: Path, raw: dict) -> FixtureConsisten
                 path=str(entry["path"]),
                 identifier_field=str(entry["identifier_field"]),
                 canonical_source=canonical_source,
-                allow_missing=frozenset(str(v) for v in entry.get("allow_missing") or []),
             )
         )
 
@@ -2475,6 +2472,58 @@ def _validate_auto_finalize_auto_merge(
         )
 
 
+def _reject_removed_fixture_allow_missing_key(path: Path, raw: Mapping[str, object]) -> None:
+    """Fail fast on a residual ``gates.fixture_consistency.scan[].allow_missing`` key.
+
+    Spec integration-reality-gates-hardening.md 4.7 bullet 5 (E6-F1-S1-T2, PM-5's in-diff
+    exception): the workspace-config waiver allowlist is a complete replacement, retired in
+    favour of a structured marker attached directly to the waived record IN the scanned fixture
+    artifact -- see ``fixture_consistency.check_fixture_consistency``. ``allow_missing`` is fully
+    DELETED from ``config-schema.json``'s ``gates.fixture_consistency.scan[].items.properties``
+    (``additionalProperties: false``), so ``jsonschema.validate`` would already reject a residual
+    key on its own -- but only with the generic "Additional properties are not allowed" message,
+    which cannot name the in-fixture replacement the AC demands. This check therefore runs
+    BEFORE schema validation and intercepts the removed key first, so the operator sees the more
+    actionable message instead.
+
+    Args:
+        path: Config file path (used in the error message).
+        raw: The FULL raw YAML mapping (pre-schema-validation), not just the
+            ``gates.fixture_consistency`` sub-mapping -- called once, early, in
+            ``load_runtime_config``.
+
+    Raises:
+        ValueError: If any ``gates.fixture_consistency.scan[]`` entry still sets
+            ``allow_missing``, naming the removed key, the offending scan target path(s), and the
+            in-fixture marker that replaced it.
+    """
+    gates_raw = raw.get("gates")
+    if not isinstance(gates_raw, dict):
+        return
+    fixture_consistency_raw = gates_raw.get("fixture_consistency")
+    if not isinstance(fixture_consistency_raw, dict):
+        return
+    scan_raw = fixture_consistency_raw.get("scan")
+    if not isinstance(scan_raw, list):
+        return
+    offending_paths = [
+        str(entry.get("path", "<unknown>"))
+        for entry in scan_raw
+        if isinstance(entry, dict) and "allow_missing" in entry
+    ]
+    if not offending_paths:
+        return
+    raise ValueError(
+        f"Config file '{path}': gates.fixture_consistency.scan[].allow_missing is a removed "
+        "config key (spec integration-reality-gates-hardening.md 4.7 bullet 5; "
+        f"caylent-solutions/devbench-internal-backlog#17 E6-F1-S1-T2) on scan target(s): "
+        f"{', '.join(sorted(offending_paths))}. The waiver now lives IN the fixture artifact "
+        'itself: add a {"allow_missing": {"reason": "<non-empty reason>"}} marker directly to '
+        "the waived record in the scanned fixture file, then remove allow_missing from this "
+        "workspace config."
+    )
+
+
 def _schema_error_message(path: Path, exc: jsonschema.ValidationError) -> str:
     """Format a schema validation error with the dotted field path for actionable diagnostics.
 
@@ -2597,6 +2646,12 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
 
     if not isinstance(raw, dict):
         raise ValueError(f"Config file '{path}' must be a YAML mapping at the top level, got {type(raw).__name__}.")
+
+    # Pre-schema removed-key check (spec 4.7 bullet 5, E6-F1-S1-T2): allow_missing is fully
+    # deleted from config-schema.json, so schema validation below would already reject a
+    # residual key -- but only with the generic additionalProperties message, which cannot name
+    # the in-fixture replacement. Runs first so the operator sees the more actionable message.
+    _reject_removed_fixture_allow_missing_key(path, raw)
 
     # JSON Schema validation -- catches unknown keys, type errors, and enum violations.
     try:

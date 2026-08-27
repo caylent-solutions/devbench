@@ -4408,10 +4408,16 @@ class TestFixtureConsistencyConfig:
         assert scan.identifier_field == "sku"
         # Inferred from the single configured canonical source.
         assert scan.canonical_source == "tests/fixtures/catalog.json"
-        assert scan.allow_missing == frozenset()
 
-    def test_expected_count_and_allow_missing_parse(self, tmp_path: Path) -> None:
-        """expected_count and allow_missing round-trip into their respective dataclasses."""
+    def test_expected_count_parses(self, tmp_path: Path) -> None:
+        """expected_count round-trips into FixtureCanonicalSource.
+
+        ``allow_missing`` used to round-trip here too, but that config key is retired (spec 4.7
+        bullet 5, E6-F1-S1-T2) and the ``FixtureScanTarget.allow_missing`` field itself is fully
+        removed: see ``TestGatesFixtureAllowMissingKeyRemoved`` for the config key's fail-fast
+        rejection and ``tests/test_fixture_consistency.py::TestInFixtureAllowMissingMarker`` for
+        the in-fixture marker that replaced it.
+        """
         cfg = self._write(
             tmp_path / "cfg.yaml",
             """\
@@ -4426,14 +4432,10 @@ class TestFixtureConsistencyConfig:
                 scan:
                   - path: tests/fixtures/mock_lookup.json
                     identifier_field: sku
-                    allow_missing:
-                      - SKU-NOT-FOUND
-                      - SKU-EMPTY-STATE
             """,
         )
         rt = load_runtime_config(cfg, {})
         assert rt.gates.fixture_consistency.canonical_sources[0].expected_count == 24
-        assert rt.gates.fixture_consistency.scan[0].allow_missing == frozenset({"SKU-NOT-FOUND", "SKU-EMPTY-STATE"})
 
     def test_enabled_and_extract_source_literals_parse(self, tmp_path: Path) -> None:
         """enabled and extract_source_literals (the new spec-4.1 tunables) round-trip."""
@@ -4589,6 +4591,113 @@ class TestFixtureConsistencyConfig:
         fake_path = tmp_path / "cfg.yaml"
         with pytest.raises(ValueError, match=r"gates\.fixture_consistency\.enabled must be a boolean"):
             _parse_fixture_consistency_config(fake_path, {"enabled": "yes"})
+
+
+class TestGatesFixtureAllowMissingKeyRemoved:
+    """spec 4.1 (8-step toggle checklist), spec 4.7 bullet 5, AC-E6-F1-S1-T2-4: the retired
+    ``gates.fixture_consistency.scan[].allow_missing`` workspace-config allowlist fails config
+    load with a message naming BOTH the removed key and its in-fixture marker replacement
+    (E6-F1-S1-T2 complete replacement -- the waiver now lives in the fixture artifact itself, see
+    ``tests/test_fixture_consistency.py::TestInFixtureAllowMissingMarker``). This is deliberately
+    NOT the JSON Schema's generic ``additionalProperties`` rejection: that message names only the
+    offending key, never the replacement, so ``config_loader.py`` intercepts the removed key
+    itself, before schema validation ever runs, to produce the more actionable message."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_residual_allow_missing_key_fails_load(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_error_names_removed_key_and_in_fixture_replacement(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+                      - SKU-EMPTY-STATE
+            """,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            load_runtime_config(cfg, {})
+
+        message = str(exc_info.value)
+        assert "gates.fixture_consistency.scan[].allow_missing" in message
+        assert "removed" in message.lower()
+        assert '"allow_missing": {"reason"' in message
+
+    def test_error_names_the_offending_scan_target_path(self, tmp_path: Path) -> None:
+        """The error names which scan target(s) still carry the removed key, not just the key
+        name in the abstract -- an operator with several scan entries needs to know which one(s)
+        to migrate."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+            """,
+        )
+        with pytest.raises(ValueError, match=r"tests/fixtures/mock_lookup\.json"):
+            load_runtime_config(cfg, {})
+
+    def test_config_without_the_removed_key_still_loads(self, tmp_path: Path) -> None:
+        """A workspace config that never set the retired key is unaffected (no false positive)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.scan[0].path == "tests/fixtures/mock_lookup.json"
 
 
 class TestGatesConfigParsing:
@@ -5123,6 +5232,42 @@ class TestGatesMigrationRemovesPreReleaseKeys:
             f"{surface_path.relative_to(Path(__file__).parent.parent)} still shows the retired "
             f"top-level 'fixture_consistency:' key ({len(matches)} occurrence(s)); migrate to "
             "gates.fixture_consistency."
+        )
+
+
+class TestFixtureConsistencyAllowMissingKeyRemoved:
+    """spec 4.1 (8-step toggle checklist), spec 4.7 bullet 5, AC-E6-F1-S1-T2-5: a residual
+    ``allow_missing`` property under ``gates.fixture_consistency.scan[].items`` in
+    ``config-schema.json``, or a residual ``allow_missing:`` line in ``sample-config.yaml``'s
+    commented ``gates:`` block, must fail this drift guard -- the config-level waiver allowlist
+    is a complete replacement (E6-F1-S1-T2), not merely superseded, so neither surface may
+    silently reintroduce it.
+    """
+
+    _SCHEMA_PATH = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+    _SAMPLE_CONFIG_PATH = Path(__file__).parent.parent / "sample-config.yaml"
+
+    def test_schema_scan_item_properties_do_not_declare_allow_missing(self) -> None:
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        scan_item_properties = schema["properties"]["gates"]["properties"]["fixture_consistency"]["properties"]["scan"][
+            "items"
+        ]["properties"]
+        assert "allow_missing" not in scan_item_properties, (
+            f"{self._SCHEMA_PATH} still declares gates.fixture_consistency.scan[].allow_missing; "
+            "the config-level waiver was replaced by the in-fixture allow_missing marker "
+            "(spec 4.7 bullet 5)."
+        )
+
+    def test_sample_config_does_not_show_allow_missing(self) -> None:
+        """Matches only the retired YAML KEY shape (``allow_missing:`` on its own line), not
+        every prose mention of the term -- the replacement paragraph documenting the in-fixture
+        marker legitimately names it inside a JSON example, which is not a YAML config key."""
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        matches = re.findall(r"^#?\s*allow_missing:\s*$", text, re.MULTILINE)
+        assert not matches, (
+            f"{self._SAMPLE_CONFIG_PATH} still shows the retired allow_missing key under "
+            "gates.fixture_consistency; the waiver now lives in the fixture artifact itself "
+            "(spec 4.7 bullet 5)."
         )
 
 

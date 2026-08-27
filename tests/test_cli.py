@@ -15079,27 +15079,36 @@ class TestCmdCheckFixtureConsistency:
         assert "FAIL" in rest
         assert "GHOST-SKU" in rest
 
-    def test_allow_missing_scoped_fixture_does_not_fail(
+    def test_in_fixture_allow_missing_marker_suppresses_the_missing_key_finding_and_passes_the_gate(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """An allow_missing-scoped edge-case fixture passes even though its key is absent (AC3, internal-backlog#17)."""
+        """An edge-case fixture whose ONLY problem record carries a valid in-fixture
+        ``allow_missing`` marker is successfully waived: the gate's findings output for the
+        waived key names only ``waiver_applied``, never ``missing_key`` (AC-E6-F1-S1-T2-1), AND
+        the run itself PASSES (``status: "pass"``, exit 0) because ``waiver_applied`` is not a
+        BLOCKING finding kind (``fixture_consistency.BLOCKING_FINDING_KINDS`` is exactly
+        ``missing_key``/``coverage_shortfall``/``load_error``) -- a validly waived record is not
+        an unresolved cross-reference problem for the gate to fail on. The applied waiver stays
+        visible in the report on this pass path too (AC-E6-F1-S1-T2-2), so the suppression can
+        still be challenged in review even though it did not block the gate. A hand-built
+        ``FixtureScanTarget`` can no longer suppress anything on its own: the pre-T2
+        ``allow_missing`` field is fully removed, so passing it as a keyword argument raises
+        ``TypeError`` rather than being silently accepted and ignored (see the sibling test
+        below)."""
         unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
         (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
-        (tmp_path / "mock_not_found.json").write_text(json.dumps([{"sku": "SKU-DOES-NOT-EXIST"}]), encoding="utf-8")
+        (tmp_path / "mock_not_found.json").write_text(
+            json.dumps([{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}]),
+            encoding="utf-8",
+        )
 
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
-            scan=(
-                FixtureScanTarget(
-                    path="mock_not_found.json",
-                    identifier_field="sku",
-                    allow_missing=frozenset({"SKU-DOES-NOT-EXIST"}),
-                ),
-            ),
+            scan=(FixtureScanTarget(path="mock_not_found.json", identifier_field="sku"),),
         )
 
         with (
@@ -15116,9 +15125,68 @@ class TestCmdCheckFixtureConsistency:
             "gate": "fixture_consistency",
             "tier": "machine-blocking",
             "status": "pass",
-            "findings": 0,
+            "findings": 1,
         }
         assert "OK" in rest
+        assert "[waiver_applied]" in rest
+        assert "[missing_key]" not in rest
+        assert "SKU-DOES-NOT-EXIST" in rest
+
+    def test_fails_with_both_a_waived_and_an_unwaived_record_and_shows_both_findings(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """test_review round 1 Blocking 2: the ``status: "fail"`` / exit-1 / both-findings-listed
+        contract had zero coverage -- every other test in this class seeds a fixture whose ONLY
+        problem record is either waived (the pass path) or unwaived (a single-finding fail path),
+        so mutating the FAIL branch's ``_print_fixture_findings(findings)`` call to
+        ``_print_fixture_findings(blocking_findings)`` (which would hide every applied waiver
+        whenever the run ALSO has a blocking finding) survived the entire suite. This fixture
+        seeds one validly-waived record AND one unwaived record in the SAME scan target: the run
+        must still report ``status: "fail"`` (a blocking ``missing_key`` finding is present) with
+        BOTH ``[waiver_applied]`` and ``[missing_key]`` visible in the printed output, and
+        ``findings`` must count both (2), not only the blocking one."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(
+            json.dumps(
+                [
+                    {"sku": "SKU-WAIVED-GHOST", "allow_missing": {"reason": "models an empty lookup response"}},
+                    {"sku": "SKU-UNWAIVED-GHOST"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
+        assert result == 1
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 2,
+        }
+        assert "FAIL" in rest
+        assert "[waiver_applied]" in rest
+        assert "[missing_key]" in rest
+        assert "SKU-WAIVED-GHOST" in rest
+        assert "SKU-UNWAIVED-GHOST" in rest
 
 
 @pytest.mark.unit

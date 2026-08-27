@@ -200,6 +200,41 @@ the check as review evidence and fails the review if a scanned fixture reference
 absent from its canonical source, or a canonical source's coverage falls short of an
 `expected_count`. See `docs/backlog-contract.md`.
 
+**The in-fixture `allow_missing` waiver marker (spec `integration-reality-gates-hardening.md`
+4.7 bullet 5; PM-5's in-diff exception; E6-F1-S1-T2).** A scan target that intentionally models a
+not-found/empty-state edge case is scoped out of `missing_key` findings by attaching a
+structured marker directly to the waived record IN the scanned fixture file itself, not by a
+workspace-config key:
+
+```json
+{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}
+```
+
+`reason` must be a non-empty string; a marker of any other shape (missing `reason`, an
+empty-string `reason`, or a value that is not a `{"reason": "..."}` mapping) fails the check with
+a `ValueError` naming the fixture path and the offending record's identifier value, rather than
+silently suppressing anything. The marker is validated unconditionally wherever it appears, not
+only on a dict that also resolves the configured `identifier_field`: a marker attached to a
+record whose identifier field has no value in that same record (a typo'd or absent field name, or
+a marker placed at the fixture's envelope level rather than on an individual record) fails the
+same way, naming the fixture path and the record's own keys in place of an identifier value it
+does not have -- a waiver that can never be matched to a record is dead configuration, not a
+silent no-op. Every applied waiver is itself surfaced as a `waiver_applied`
+finding in the check's own report, so the suppression is visible there too, not only in the
+fixture's diff -- printed on both the `pass` and `fail` output, since a validly waived record is
+informational, not a blocking problem: `check-fixture-consistency`'s `status` is computed from
+the BLOCKING finding kinds only (`missing_key`, `coverage_shortfall`, `load_error`), so a run
+whose only finding is an applied waiver still reports `status: "pass"` and exits 0. See
+`docs/cli-reference.md`'s `check-fixture-consistency` entry for the exact status/exit-code rule.
+
+**`gates.fixture_consistency.scan[].allow_missing` (the pre-E6-F1-S1-T2 workspace-config
+allowlist) is a REMOVED key** -- a complete replacement, not an addition. It shipped only in an
+unmerged draft PR (#322), so no migration path is owed (spec Section 6). A workspace config that
+still sets it fails `load_runtime_config` with a `ValueError` naming the removed key and the
+in-fixture marker above that replaced it, checked before JSON Schema validation runs so the
+message can name the replacement (the schema's own `additionalProperties: false` rejection
+cannot).
+
 ### `gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` -- auto-derived shared-file registry (caylent-solutions/devbench-internal-backlog#13 AC4)
 
 The hand-maintained glob list below (`gates.repos.<org/repo>.shared_file_impact.patterns`) decays:

@@ -357,6 +357,7 @@ from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeR
 if TYPE_CHECKING:
     from devbench.backlog.manifest import ManifestRow
     from devbench.config_loader import ResolvedGateConfig, RuntimeConfig
+    from devbench.fixture_consistency import FixtureFinding
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
 
@@ -8619,27 +8620,47 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
       resolved config cannot produce a meaningful check at all: a
       configured ``identifier_field`` that matches zero records in a
       canonical source (a typo, or an empty canonical set for any other
-      reason), or the gate configured with a non-empty
-      ``canonical_sources`` and an empty resolved ``scan`` list. Both raise
-      a ``fixture_consistency.FixtureConsistencyConfigError`` (checked
-      before any file is read for the empty-scan case) and are caught
-      here, printed as the one-line ``ERROR: ...`` diagnostic on stderr
-      (it names the problem -- e.g. ``identifier field 'idd' matched zero
-      records in catalog.json`` -- rather than prescribing a fix; the
-      message's file/field names are themselves the actionable detail),
-      exit 1. The status line's ``findings`` is hard-coded ``0`` on this
-      path -- any ``FixtureFinding``s already accumulated for canonical
-      sources processed before the raise (e.g. a ``load_error`` on an
-      earlier source) are discarded, not reported, since the run as a whole
-      never reached a meaningful findings-based verdict.
-    - ``status`` is ``"fail"`` when the check ran to completion and found
-      at least one ``missing_key``/``coverage_shortfall``/``load_error``
-      finding -- ``load_error`` now also covers a canonical/scan file
-      configured with an extension other than ``.json``/``.yaml``/``.yml``
-      (spec 4.7 bullet 3; no implicit JSON-parse fallback is attempted for
-      any other extension), exit 1.
+      reason); the gate configured with a non-empty ``canonical_sources``
+      and an empty resolved ``scan`` list; a fixture (canonical source or
+      scan target) carrying a malformed in-fixture ``allow_missing``
+      marker (wrong shape, or a missing/empty ``reason``); or an
+      ``allow_missing`` marker attached to a record whose configured
+      ``identifier_field`` resolves no value (spec 4.7 bullet 5,
+      E6-F1-S1-T2 -- see ``fixture_consistency.FixtureConsistencyConfigError``'s
+      own docstring for the authoritative four-path enumeration). All four
+      raise a ``fixture_consistency.FixtureConsistencyConfigError``
+      (checked before any file is read for the empty-scan case; discovered
+      mid-parse of the offending fixture for the two marker cases) and are
+      caught here, printed as the one-line ``ERROR: ...`` diagnostic on
+      stderr (it names the problem -- e.g. ``identifier field 'idd'
+      matched zero records in catalog.json`` -- rather than prescribing a
+      fix; the message's file/field names are themselves the actionable
+      detail), exit 1. The status line's ``findings`` is hard-coded ``0``
+      on this path -- any ``FixtureFinding``s already accumulated for
+      canonical sources processed before the raise (e.g. a ``load_error``
+      on an earlier source) are discarded, not reported, since the run as
+      a whole never reached a meaningful findings-based verdict.
+    - ``status`` is ``"fail"`` when the check ran to completion and found at
+      least one BLOCKING finding -- a ``kind`` in
+      ``fixture_consistency.BLOCKING_FINDING_KINDS`` (``missing_key``,
+      ``coverage_shortfall``, ``load_error``) -- ``load_error`` now also
+      covers a canonical/scan file configured with an extension other than
+      ``.json``/``.yaml``/``.yml`` (spec 4.7 bullet 3; no implicit
+      JSON-parse fallback is attempted for any other extension), exit 1.
     - ``status`` is ``"pass"`` when the check ran to completion with zero
-      findings, exit 0.
+      BLOCKING findings, exit 0 -- a run whose only findings are
+      informational ``waiver_applied`` entries (spec 4.7 bullet 5,
+      E6-F1-S1-T2: a record's in-fixture ``allow_missing`` marker
+      suppressed what would otherwise have been a ``missing_key`` finding)
+      still passes, because a validly waived record is not an unresolved
+      cross-reference problem (AC-E6-F1-S1-T2-1). The ``"findings"`` count
+      on the status line is the TOTAL finding count (blocking and
+      informational together, i.e. ``len(findings)``), not just the
+      blocking count -- it tells the reader how many ``[<kind>] ...`` lines
+      to expect below, and every finding (including every applied waiver)
+      is printed on BOTH the pass and the fail path, so the suppression
+      stays visible in the report even when it does not block the gate
+      (AC-E6-F1-S1-T2-2).
 
     No ``scope_hash`` field (spec 5.2; unlike ``check-reachability`` and
     ``check-shared-file-impact``, which both compute one via
@@ -8675,6 +8696,7 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
     Used as review evidence by the test-reviewer agent.
     """
     from devbench.fixture_consistency import (
+        BLOCKING_FINDING_KINDS,
         FixtureConsistencyConfigError,
         check_fixture_consistency,
     )
@@ -8692,32 +8714,50 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
     try:
         findings = check_fixture_consistency(repo_path, fixture_config)
     except FixtureConsistencyConfigError as exc:
-        # The empty-scan-list (322-D05) and zero-match-identifier-field
-        # (322-D02/D03) config errors are the ONLY exceptions of this
-        # specific type that ever escape `check_fixture_consistency` --
-        # every parse-time `ValueError` (malformed JSON/YAML, an
-        # unrecognized extension) is already caught internally and
-        # converted into a `load_error` finding, and neither of those is a
-        # `FixtureConsistencyConfigError`, so narrowing the catch to this
-        # subclass (rather than the bare builtin `ValueError`) means an
-        # unrelated `ValueError` can never be mis-handled as a config error
-        # here -- it propagates as an uncaught exception instead, exactly
-        # as every other unexpected failure in this command does.
+        # The empty-scan-list (322-D05), zero-match-identifier-field
+        # (322-D02/D03), malformed-in-fixture-`allow_missing`-marker, and
+        # unmatchable-`allow_missing`-marker (spec 4.7 bullet 5,
+        # E6-F1-S1-T2; see `fixture_consistency.FixtureConsistencyConfigError`'s
+        # own docstring for the authoritative four-path enumeration) config
+        # errors are the ONLY exceptions of this specific type that ever
+        # escape `check_fixture_consistency` -- every parse-time
+        # `ValueError` (malformed JSON/YAML, an unrecognized extension) is
+        # already caught internally and converted into a `load_error`
+        # finding, and none of those is a `FixtureConsistencyConfigError`,
+        # so narrowing the catch to this subclass (rather than the bare
+        # builtin `ValueError`) means an unrelated `ValueError` can never
+        # be mis-handled as a config error here -- it propagates as an
+        # uncaught exception instead, exactly as every other unexpected
+        # failure in this command does.
         print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, GATE_STATUS_ERROR, 0))
         print(str(exc), file=sys.stderr)
         return 1
 
-    status = GATE_STATUS_FAIL if findings else GATE_STATUS_PASS
+    blocking_findings = [finding for finding in findings if finding.kind in BLOCKING_FINDING_KINDS]
+    status = GATE_STATUS_FAIL if blocking_findings else GATE_STATUS_PASS
     print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, status, len(findings)))
-    if not findings:
+    if not blocking_findings:
         sources = ", ".join(source.path for source in fixture_config.canonical_sources)
         print(f"OK: fixture-catalog cross-reference check passed against canonical source(s): {sources}")
+        _print_fixture_findings(findings)
         return 0
 
     print("FAIL: fixture-catalog cross-reference check found issue(s):")
+    _print_fixture_findings(findings)
+    return 1
+
+
+def _print_fixture_findings(findings: "list[FixtureFinding]") -> None:
+    """Print every ``FixtureFinding`` (blocking and informational alike) on its own line.
+
+    Shared by both the pass and the fail branch of ``cmd_check_fixture_consistency``:
+    a ``waiver_applied`` finding (spec 4.7 bullet 5, E6-F1-S1-T2) must stay visible on
+    BOTH paths -- an applied waiver is review evidence regardless of whether the run
+    also happens to contain a blocking finding -- so there is exactly one print loop
+    rather than two copies that could drift.
+    """
     for finding in findings:
         print(f"  [{finding.kind}] {finding.message}")
-    return 1
 
 
 def _reject_em_dash(field_name: str, text: str) -> int | None:

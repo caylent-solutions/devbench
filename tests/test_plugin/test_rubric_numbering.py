@@ -208,7 +208,10 @@ class TestAllocationTablePlacement:
         text = TEST_REVIEWER_PATH.read_text(encoding="utf-8")
         assert "FIXTURE_CATALOG_MISMATCH" in _line_for_item(text, 54)
         assert "canonical_sources" in _line_for_item(text, 55)
-        assert "allow_missing" in _line_for_item(text, 56)
+        line_56 = _line_for_item(text, 56)
+        assert "allow_missing" in line_56
+        assert "in-fixture" in line_56
+        assert "workspace's config" not in line_56
 
     def test_code_reviewer_insertions_occupy_53_to_55(self) -> None:
         text = CODE_REVIEWER_PATH.read_text(encoding="utf-8")

@@ -736,13 +736,6 @@
                   "canonical_source": {
                     "type": "string",
                     "description": "The `path` of the canonical_sources entry this scan target checks against. Optional and inferred when exactly one canonical_sources entry is configured; required (and validated against the configured canonical_sources paths) when more than one is configured."
-                  },
-                  "allow_missing": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    },
-                    "description": "Explicit allowlist of identifier values in this fixture that are permitted to be absent from the canonical source -- e.g. a fixture that deliberately models a not-found/empty-state edge case. This is the opt-out/scoping mechanism for legitimate edge-case fixtures; values listed here never produce a missing_key finding for this scan target."
                   }
                 }
               }

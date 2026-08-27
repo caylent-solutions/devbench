@@ -7,12 +7,14 @@ Covers:
 - check_fixture_consistency: opt-out no-op when no canonical_sources are
   configured; a fixture whose keys are all present in the canonical
   source passes; a fixture referencing a key absent from the canonical
-  source is flagged (missing_key); an explicitly allow_missing-scoped
-  edge-case fixture does not false-positive
-  (caylent-solutions/devbench-internal-backlog#17 AC3); a canonical
-  source's coverage shortfall relative to expected_count is flagged
-  (backfill-coverage / AC4); missing/unparseable files are flagged as
-  load_error rather than raising.
+  source is flagged (missing_key); a record carrying the structured
+  in-fixture ``allow_missing`` marker does not false-positive
+  (caylent-solutions/devbench-internal-backlog#17 AC3; spec
+  integration-reality-gates-hardening.md 4.7 bullet 5, E6-F1-S1-T2); a
+  canonical source's coverage shortfall relative to expected_count is
+  flagged (backfill-coverage / AC4); missing/unparseable files are flagged
+  as load_error rather than raising; a malformed in-fixture marker raises
+  loudly rather than silently suppressing.
 """
 
 from __future__ import annotations
@@ -201,52 +203,44 @@ class TestCheckFixtureConsistency:
         assert "mock_lookup.json" in findings[0].message
         assert "catalog.json" in findings[0].message
 
-    def test_allow_missing_scoped_edge_case_fixture_does_not_false_positive(self, tmp_path: Path) -> None:
-        """A fixture intentionally modeling a not-found/empty edge case is not flagged (AC3, internal-backlog#17)."""
+    def test_hand_built_fixture_scan_target_rejects_allow_missing_kwarg(self, tmp_path: Path) -> None:
+        """``FixtureScanTarget`` no longer accepts an ``allow_missing`` field at all -- the pre-T2
+        hand-built-config affordance is fully removed, not merely disconnected from YAML. There is
+        no config-allowlist read path left anywhere in this module (spec 4.7 bullet 5, E6-F1-S1-T2).
+        The sole production waiver mechanism for a real workspace is the in-fixture ``allow_missing``
+        marker exercised by ``TestInFixtureAllowMissingMarker`` below."""
         cl = _config_loader()
-        fc = _fixture_consistency()
-        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
-        _write_json_fixture(tmp_path / "mock_not_found.json", [{"sku": "SKU-DOES-NOT-EXIST"}])
 
-        config = cl.FixtureConsistencyConfig(
-            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
-            scan=(
-                cl.FixtureScanTarget(
-                    path="mock_not_found.json",
-                    identifier_field="sku",
-                    allow_missing=frozenset({"SKU-DOES-NOT-EXIST"}),
-                ),
-            ),
-        )
+        with pytest.raises(TypeError):
+            cl.FixtureScanTarget(
+                path="mock_not_found.json",
+                identifier_field="sku",
+                allow_missing=frozenset({"SKU-DOES-NOT-EXIST"}),
+            )
 
-        assert fc.check_fixture_consistency(tmp_path, config) == []
-
-    def test_allow_missing_does_not_suppress_other_missing_keys(self, tmp_path: Path) -> None:
-        """allow_missing only scopes the exact listed values, not every missing key in the fixture."""
+    def test_in_fixture_allow_missing_marker_suppresses_via_check_fixture_consistency(self, tmp_path: Path) -> None:
+        """Top-level smoke test: an in-fixture ``allow_missing`` marker is honoured end-to-end
+        through ``check_fixture_consistency`` (not only via the dedicated ``TestInFixtureAllowMissingMarker``
+        class below), and the applied waiver is itself surfaced as a ``waiver_applied`` finding
+        (spec 4.7 bullet 5 AC-19/PM-5: the suppression must be visible, never silent)."""
         cl = _config_loader()
         fc = _fixture_consistency()
         _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
         _write_json_fixture(
-            tmp_path / "mock_lookup.json",
-            [{"sku": "SKU-DOES-NOT-EXIST"}, {"sku": "UNRELATED-GHOST"}],
+            tmp_path / "mock_not_found.json",
+            [{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}],
         )
 
         config = cl.FixtureConsistencyConfig(
             canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
-            scan=(
-                cl.FixtureScanTarget(
-                    path="mock_lookup.json",
-                    identifier_field="sku",
-                    allow_missing=frozenset({"SKU-DOES-NOT-EXIST"}),
-                ),
-            ),
+            scan=(cl.FixtureScanTarget(path="mock_not_found.json", identifier_field="sku"),),
         )
 
         findings = fc.check_fixture_consistency(tmp_path, config)
         assert len(findings) == 1
-        assert findings[0].kind == "missing_key"
-        assert "UNRELATED-GHOST" in findings[0].message
-        assert "SKU-DOES-NOT-EXIST" not in findings[0].message
+        assert findings[0].kind == "waiver_applied"
+        assert "SKU-DOES-NOT-EXIST" in findings[0].message
+        assert "models an empty lookup response" in findings[0].message
 
     def test_expected_count_shortfall_is_flagged(self, tmp_path: Path) -> None:
         """A canonical source covering fewer records than expected_count is flagged (backfill coverage, AC4)."""
@@ -459,8 +453,10 @@ class TestCheckFixtureConsistency:
         assert len(findings) == 1
         assert "gates.fixture_consistency.scan[].canonical_source" in findings[0].message
 
-    def test_missing_key_message_names_gates_fixture_consistency_allow_missing_key(self, tmp_path: Path) -> None:
-        """The missing_key remediation message names gates.fixture_consistency.scan[].allow_missing."""
+    def test_missing_key_message_names_the_in_fixture_allow_missing_marker(self, tmp_path: Path) -> None:
+        """The missing_key remediation message names the in-fixture ``allow_missing`` marker
+        (spec 4.7 bullet 5) rather than the retired ``gates.fixture_consistency.scan[].allow_missing``
+        config key -- the waiver moved into the artifact itself."""
         cl = _config_loader()
         fc = _fixture_consistency()
         _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
@@ -473,7 +469,9 @@ class TestCheckFixtureConsistency:
 
         findings = fc.check_fixture_consistency(tmp_path, config)
         assert len(findings) == 1
-        assert "gates.fixture_consistency.scan[].allow_missing" in findings[0].message
+        assert "gates.fixture_consistency.scan[].allow_missing" not in findings[0].message
+        assert '"allow_missing": {"reason"' in findings[0].message
+        assert "mock_lookup.json" in findings[0].message
 
     def test_fixture_finding_is_frozen_dataclass(self) -> None:
         """FixtureFinding is immutable -- mutating a field raises FrozenInstanceError."""
@@ -492,6 +490,276 @@ class TestCheckFixtureConsistency:
         assert replaced.kind == "load_error"
         assert replaced.message == "test"
         assert finding.kind == "missing_key"
+
+
+@pytest.mark.unit
+class TestInFixtureAllowMissingMarker:
+    """spec integration-reality-gates-hardening.md 4.7 bullet 5 (PM-5's in-diff exception,
+    AC-19, E6-F1-S1-T2): the ``allow_missing`` waiver moves INTO the fixture artifact as a
+    structured ``{"allow_missing": {"reason": "<non-empty reason>"}}`` marker attached to the
+    waived record, replacing the retired ``gates.fixture_consistency.scan[].allow_missing``
+    workspace-config allowlist. A waived record produces no ``missing_key`` finding; an unwaived
+    record in the same fixture still does; and the applied waiver is itself surfaced as a
+    ``waiver_applied`` finding so the suppression is visible in the check's own report, not only
+    in the fixture diff."""
+
+    def test_waived_record_suppressed_unwaived_record_still_reported(self, tmp_path: Path) -> None:
+        """AC-E6-F1-S1-T2-1: the waived key is suppressed; the unwaived key still mismatches."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(
+            tmp_path / "mock_lookup.json",
+            [
+                {"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty-state lookup response"}},
+                {"sku": "UNRELATED-GHOST"},
+            ],
+        )
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        kinds = {finding.kind for finding in findings}
+        assert kinds == {"missing_key", "waiver_applied"}
+        missing_finding = next(f for f in findings if f.kind == "missing_key")
+        assert "UNRELATED-GHOST" in missing_finding.message
+        assert "SKU-DOES-NOT-EXIST" not in missing_finding.message
+
+    def test_applied_waiver_is_surfaced_in_findings(self, tmp_path: Path) -> None:
+        """AC-E6-F1-S1-T2-2: every applied waiver is named in the gate's findings output, with its
+        reason, so the suppression is visible in the review diff and in `report`."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(
+            tmp_path / "mock_lookup.json",
+            [{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models a cart-abandonment edge case"}}],
+        )
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        assert len(findings) == 1
+        assert findings[0].kind == "waiver_applied"
+        assert "SKU-DOES-NOT-EXIST" in findings[0].message
+        assert "models a cart-abandonment edge case" in findings[0].message
+        assert "mock_lookup.json" in findings[0].message
+
+    def test_waiver_on_a_key_that_is_not_actually_missing_produces_no_waiver_finding(self, tmp_path: Path) -> None:
+        """A marker on a record whose key IS present in the canonical source has nothing to waive
+        -- no waiver_applied finding for a suppression that was never needed."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(
+            tmp_path / "mock_lookup.json",
+            [{"sku": "A1", "allow_missing": {"reason": "superfluous marker"}}],
+        )
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        assert fc.check_fixture_consistency(tmp_path, config) == []
+
+    def test_waiver_applied_message_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (test_review round 1 W2): the other assertions in this class derive
+        their expected substrings from the fixture content, not from ``fc._MSG_WAIVER_APPLIED``
+        itself, so a pure reword of the constant would survive every test above. Hand-typed
+        against the constant, not derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_WAIVER_APPLIED == (
+            "Fixture '{path}' waives missing key '{key}' via its in-fixture allow_missing marker (reason: {reason})."
+        )
+
+
+@pytest.mark.unit
+class TestInFixtureAllowMissingMarkerInvalid:
+    """spec 4.7 bullet 5 (AC-E6-F1-S1-T2-3): a malformed in-fixture ``allow_missing`` marker
+    raises rather than silently suppressing a finding, naming the fixture path and the offending
+    key (the record's own identifier value)."""
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            pytest.param("SKU-DOES-NOT-EXIST", id="wrong-shape-string"),
+            pytest.param(["models a not-found lookup"], id="wrong-shape-list"),
+            pytest.param({}, id="missing-reason"),
+            pytest.param({"reason": ""}, id="empty-string-reason"),
+            pytest.param({"reason": "   "}, id="whitespace-only-reason"),
+            pytest.param({"reason": "x", "note": "y"}, id="extra-key"),
+        ],
+    )
+    def test_malformed_marker_raises_naming_path_and_key(self, tmp_path: Path, marker: object) -> None:
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(
+            tmp_path / "mock_lookup.json",
+            [{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": marker}],
+        )
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with pytest.raises(fc.FixtureConsistencyConfigError) as exc_info:
+            fc.check_fixture_consistency(tmp_path, config)
+
+        message = str(exc_info.value)
+        assert str(tmp_path / "mock_lookup.json") in message
+        assert "SKU-DOES-NOT-EXIST" in message
+
+    @pytest.mark.parametrize(
+        ("record", "kind"),
+        [
+            pytest.param(
+                {"skus": "SKU-GHOST", "allow_missing": {"reason": ""}},
+                "malformed",
+                id="misspelled-identifier-field-and-malformed-marker",
+            ),
+            pytest.param(
+                {"allow_missing": 12345, "items": [{"sku": "SKU-GHOST"}]},
+                "malformed",
+                id="envelope-level-marker-and-malformed-marker",
+            ),
+            pytest.param(
+                {"skus": "SKU-GHOST", "allow_missing": {"reason": "models an empty lookup response"}},
+                "unmatched",
+                id="misspelled-identifier-field-and-well-formed-marker",
+            ),
+        ],
+    )
+    def test_marker_unmatched_to_any_identifier_raises_the_matching_error(
+        self, tmp_path: Path, record: dict, kind: str
+    ) -> None:
+        """AC-E6-F1-S1-T2-3 (code_review round 1 Blocking 1; test_review round 2 W-a/W-b): a
+        marker is validated UNCONDITIONALLY, not only on a dict that also happens to resolve the
+        configured ``identifier_field``, so a record whose identifier key is misspelled or an
+        envelope-level dict that merely wraps the real records can never be matched to a record --
+        that must raise loudly rather than silently doing nothing. Collapses the three
+        byte-near-identical round-1 tests this replaces (misspelled-field + malformed marker,
+        envelope-level + malformed marker, misspelled-field + well-formed marker) into one
+        parametrize.
+
+        test_review round 2 W-b: the collapsed cases assert the FULL expected message built from
+        the production message constants, not just a path/field substring both raise paths would
+        satisfy, so this proves WHICH of the two raise paths actually fired. In particular the
+        first case pairs a malformed marker with an unmatchable record: shape validation must run
+        BEFORE the unmatched check (a probe that skips shape validation for unmatched records --
+        ``reason = _validate_waiver_marker(...) if has_identifier else "unvalidated"`` -- would
+        make this case raise the UNMATCHED message instead of the MALFORMED one it must raise,
+        and this assertion catches that)."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(tmp_path / "mock_lookup.json", [record])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with pytest.raises(fc.FixtureConsistencyConfigError) as exc_info:
+            fc.check_fixture_consistency(tmp_path, config)
+
+        scan_path = str(tmp_path / "mock_lookup.json")
+        locator = fc._MSG_NO_IDENTIFIER_VALUE_LOCATOR.format(field="sku", keys=sorted(record.keys()))
+        marker = record["allow_missing"]
+
+        if kind == "malformed":
+            if isinstance(marker, dict) and set(marker) == {"reason"}:
+                detail = fc._MSG_MARKER_REASON_INVALID_DETAIL.format(reason_key="reason", reason=marker["reason"])
+            else:
+                detail = fc._MSG_MARKER_WRONG_SHAPE_DETAIL.format(reason_key="reason", marker=marker)
+            expected = fc._MSG_MALFORMED_WAIVER_MARKER.format(path=scan_path, key=locator, detail=detail)
+        else:
+            expected = fc._MSG_UNMATCHED_WAIVER_MARKER.format(path=scan_path, field="sku", keys=sorted(record.keys()))
+
+        assert str(exc_info.value) == f"ERROR: {expected}"
+
+    def test_malformed_marker_on_canonical_source_also_raises(self, tmp_path: Path) -> None:
+        """The malformed-marker check runs through the same shared parse-and-walk helper used by
+        both the canonical-source reader and the scan-target reader (spec 4.7 bullet 5 REFACTOR:
+        one helper, not a second parse path) -- a malformed marker anywhere raises, not only in a
+        scan target."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(
+            tmp_path / "catalog.json",
+            [{"sku": "A1", "allow_missing": {"reason": ""}}],
+        )
+        _write_json_fixture(tmp_path / "mock_lookup.json", [{"sku": "A1"}])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with pytest.raises(fc.FixtureConsistencyConfigError) as exc_info:
+            fc.check_fixture_consistency(tmp_path, config)
+
+        message = str(exc_info.value)
+        assert str(tmp_path / "catalog.json") in message
+        assert "A1" in message
+
+    def test_malformed_marker_message_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (code_review/test_review round 1 W2): every other assertion in this
+        class derives its expected substrings from the marker/message content, not from
+        ``fc._MSG_MALFORMED_WAIVER_MARKER`` itself, so a pure reword of the constant would
+        survive every test above. Hand-typed against the constant, not derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_MALFORMED_WAIVER_MARKER == (
+            "Fixture '{path}' has a malformed in-fixture allow_missing marker for key '{key}': {detail}"
+        )
+
+    def test_unmatched_marker_message_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (code_review round 1 Blocking 1) for the message raised when an
+        ``allow_missing`` marker is present on a dict but the configured ``identifier_field``
+        resolves no value on that same dict (misspelled/absent field, or an envelope-level
+        marker) -- hand-typed against the constant, not derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_UNMATCHED_WAIVER_MARKER == (
+            "Fixture '{path}' has an allow_missing marker that cannot be matched to any record: "
+            "identifier field '{field}' has no value in this record (keys present: {keys}). A waiver "
+            "must be attached to the same record whose '{field}' value it protects."
+        )
+
+    def test_marker_wrong_shape_detail_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (code_review round 2 warn) for the ``{detail}`` sub-template plugged
+        into ``_MSG_MALFORMED_WAIVER_MARKER`` when a marker is not a mapping at all, or carries
+        the wrong keys -- promoted out of an inline f-string so this module carries no inline
+        literal message strings. Hand-typed against the constant, not derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_MARKER_WRONG_SHAPE_DETAIL == (
+            "expected a mapping of exactly {{'{reason_key}': '<non-empty reason>'}}, got {marker!r}."
+        )
+
+    def test_marker_reason_invalid_detail_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (code_review round 2 warn) for the ``{detail}`` sub-template plugged
+        into ``_MSG_MALFORMED_WAIVER_MARKER`` when a marker's ``reason`` value is not a non-empty
+        string -- promoted out of an inline f-string. Hand-typed against the constant, not
+        derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_MARKER_REASON_INVALID_DETAIL == "'{reason_key}' must be a non-empty string, got {reason!r}."
+
+    def test_no_identifier_value_locator_constant_pins_the_exact_wording(self) -> None:
+        """Literal anchor (code_review round 2 warn) for the locator string substituted for a
+        record's own identifier value when the marker's host dict never resolves the configured
+        ``identifier_field`` -- used both as the offending key named by a malformed-marker raise
+        and internally to compute the ``waivers`` dict key for a well-formed-but-unmatched marker
+        before the unmatched raise fires -- promoted out of an inline f-string. Hand-typed against
+        the constant, not derived from it."""
+        fc = _fixture_consistency()
+        assert fc._MSG_NO_IDENTIFIER_VALUE_LOCATOR == "<no '{field}' value on this record; keys present: {keys}>"
 
 
 @pytest.mark.unit

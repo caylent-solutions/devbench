@@ -5,6 +5,37 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **The `allow_missing` fixture-catalog waiver moves into the fixture artifact**
+  (spec `integration-reality-gates-hardening.md` section 4.7 bullet 5, PM-5's
+  in-diff exception; issue #17, E6-F1-S1-T2). A waiver that scopes an
+  intentional not-found/empty-state edge-case fixture used to live in
+  workspace config (`gates.fixture_consistency.scan[].allow_missing`),
+  invisible to a reviewer who never opens `devbench.yaml` for the unit under
+  review. It now lives IN the scanned fixture file itself, as a structured
+  `{"allow_missing": {"reason": "<non-empty reason>"}}` marker attached
+  directly to the waived record -- visible in the same diff the reviewer is
+  already looking at. Complete replacement, not an addition:
+  `gates.fixture_consistency.scan[].allow_missing` is a removed config key
+  (it shipped only in unmerged draft PR #322, so no migration path is owed
+  per spec Section 6) -- `config_loader.py` fails config load fast on a
+  residual key, naming the in-fixture replacement. A malformed marker (wrong
+  shape, or a record missing a non-empty `reason`) raises rather than
+  silently suppressing, and so does a well-formed marker attached to a
+  record whose identifier field never resolves (a typo'd/absent field name,
+  or a marker at the fixture's envelope level) -- validated unconditionally,
+  never only on a dict that also happens to resolve an identifier, since a
+  waiver that can never be matched to a record is dead configuration.
+  Every applied waiver is itself surfaced as a
+  `waiver_applied` finding in `check-fixture-consistency`'s own report --
+  on BOTH the pass and the fail path, since visibility must not depend on
+  whether the run also happens to contain an unrelated blocking finding.
+  A validly waived record does not itself fail the gate:
+  `cmd_check_fixture_consistency` computes `status`/exit code from the
+  BLOCKING finding kinds only (`fixture_consistency.BLOCKING_FINDING_KINDS`
+  -- `missing_key`, `coverage_shortfall`, `load_error`), so a scan whose
+  only finding is `waiver_applied` still reports `status: "pass"` and
+  exits 0.
+
 - **`check-fixture-consistency` no longer degrades a misconfigured gate into a
   passing or misleading result** (spec `integration-reality-gates-hardening.md`
   section 4.7, register findings 322-D02/D03/D05; issue #17). At HEAD, two
@@ -1059,7 +1090,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from its canonical source, or a canonical source falls short of a
   declared `expected_count`. (E2-F1-S1-T1 re-nested this block under the
   unified `gates:` config section; see the "Unified `gates:` config section"
-  entry below.)
+  entry below. The per-target `allow_missing` scoping described here was a
+  workspace-config allowlist; E6-F1-S1-T2 superseded it with a structured
+  in-fixture marker and removed the config key entirely -- see "The
+  `allow_missing` fixture-catalog waiver moves into the fixture artifact"
+  entry above.)
 
 - **Shared-file full-suite regression gate**
   (`caylent-solutions/devbench-internal-backlog#13`). A task's regression

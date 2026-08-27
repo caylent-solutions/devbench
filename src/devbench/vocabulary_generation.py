@@ -178,9 +178,10 @@ CATEGORY_DESCRIPTIONS: Final[dict[str, dict[str, tuple[str, str]]]] = {
             "`devbench check-fixture-consistency` reported a `FAIL:` finding -- a mock/fixture "
             "file references an identifier absent from its designated canonical dataset, or a "
             "canonical source's coverage fell short of a declared `expected_count`",
-            "Fix the fixture to reference a real canonical key, add the value to "
-            "`gates.fixture_consistency.scan[].allow_missing` if it is an intentional edge case, "
-            "or complete the backfill to satisfy `expected_count`.",
+            "Fix the fixture to reference a real canonical key, attach a "
+            '`{"allow_missing": {"reason": "<non-empty reason>"}}` marker directly to the record '
+            "in the scanned fixture file if it is an intentional edge case, or complete the "
+            "backfill to satisfy `expected_count`.",
         ),
         "COMPOSITION_ROOT_MISSING": (
             "Only coverage for a state-consuming UI component is an isolated render with "

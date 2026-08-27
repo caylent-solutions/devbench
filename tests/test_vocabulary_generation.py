@@ -325,6 +325,33 @@ class TestUnreachableArtifactRemediationPointsAtLogWaiver:
 
 
 # ---------------------------------------------------------------------------
+# CATEGORY_DESCRIPTIONS content pin -- FIXTURE_CATALOG_MISMATCH remediation
+# ---------------------------------------------------------------------------
+
+
+class TestFixtureCatalogMismatchRemediationNamesInFixtureMarker:
+    """`gates.fixture_consistency.scan[].allow_missing` is a removed config key
+    (spec 4.7 bullet 5, E6-F1-S1-T2): `src/devbench/config_loader.py` fails
+    config load fast when it is still present. The `FIXTURE_CATALOG_MISMATCH`
+    remediation string must therefore never again point an operator at that
+    removed key -- following the old advice would now hard-fail config load.
+    The sole production waiver mechanism is the structured in-fixture
+    `{"allow_missing": {"reason": "<non-empty reason>"}}` marker attached
+    directly to the waived record in the scanned fixture artifact."""
+
+    @pytest.mark.unit
+    def test_remediation_does_not_name_the_removed_config_key(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["test_review"]["FIXTURE_CATALOG_MISMATCH"]
+        assert "gates.fixture_consistency.scan[].allow_missing" not in remediation
+
+    @pytest.mark.unit
+    def test_remediation_names_the_in_fixture_marker(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["test_review"]["FIXTURE_CATALOG_MISMATCH"]
+        assert '{"allow_missing": {"reason": "<non-empty reason>"}}' in remediation
+        assert "scanned fixture file" in remediation
+
+
+# ---------------------------------------------------------------------------
 # Module-internal consistency
 # ---------------------------------------------------------------------------
 

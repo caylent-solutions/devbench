@@ -1237,7 +1237,17 @@ For each `scan` entry, ask for:
 - `path` (full dotted key template: `gates.fixture_consistency.scan.<item>.path`) -- repo-relative path to the mock/fixture file to scan. **Free-form:** any repo-relative path.
 - `identifier_field` (full dotted key template: `gates.fixture_consistency.scan.<item>.identifier_field`) -- key name within each scanned record holding the identifier literal(s). **Free-form:** any string key name.
 - `canonical_source` (full dotted key template: `gates.fixture_consistency.scan.<item>.canonical_source`) -- the `path` of the `canonical_sources` entry this scan target checks against. **Free-form:** inferred automatically when exactly one `canonical_sources` entry is configured; required and validated against the configured paths when more than one is configured.
-- `allow_missing` (optional; full dotted key template: `gates.fixture_consistency.scan.<item>.allow_missing`) -- explicit allowlist of identifier values in this fixture permitted to be absent from the canonical source (e.g. a deliberate not-found/empty-state edge case). **Free-form:** a comma-separated list of identifier literals, or leave blank.
+
+There is no `allow_missing` field to collect here. A deliberate not-found/empty-state edge-case
+fixture is waived by attaching a structured `{"allow_missing": {"reason": "<non-empty reason>"}}`
+marker directly to the waived record IN the scanned fixture file itself (spec
+`integration-reality-gates-hardening.md` 4.7 bullet 5, PM-5's in-diff exception; E6-F1-S1-T2), not
+by a config key under `gates.fixture_consistency.scan.<item>`. `gates.fixture_consistency.scan[].allow_missing`
+is a REMOVED workspace-config key: a stale value there fails `load_runtime_config` naming the
+removed key and the in-fixture replacement above. Do not offer it as a configurable field; tell
+the operator to edit the scanned fixture file directly instead. See
+`docs/devbench-yaml-reference.md`'s `gates.fixture_consistency` section for the marker's exact
+shape.
 
 ### `gates.repos` (dynamic per-repo override map)
 

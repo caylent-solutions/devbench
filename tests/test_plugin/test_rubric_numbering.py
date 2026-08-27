@@ -207,7 +207,7 @@ class TestAllocationTablePlacement:
     def test_test_reviewer_insertions_occupy_54_to_56(self) -> None:
         text = TEST_REVIEWER_PATH.read_text(encoding="utf-8")
         assert "FIXTURE_CATALOG_MISMATCH" in _line_for_item(text, 54)
-        assert "canonical_sources" in _line_for_item(text, 55) or "skip note" in _line_for_item(text, 55)
+        assert "canonical_sources" in _line_for_item(text, 55)
         assert "allow_missing" in _line_for_item(text, 56)
 
     def test_code_reviewer_insertions_occupy_53_to_55(self) -> None:

@@ -1501,7 +1501,7 @@ uv run devbench check-fixture-consistency <id>
 
 Cross-reference the work unit's target repo's mock/fixture files against a workspace-designated canonical fixture/dataset (caylent-solutions/devbench-internal-backlog#17, fixture-catalog cross-reference lint). Catches the pattern where a feature's data-fetch logic is correct but reads from a mock lookup table whose keys were fabricated, keyed in the wrong namespace, or left incomplete relative to the project's canonical shared fixture data -- functionally dead or crash-on-save for real records even though the underlying logic is sound.
 
-**Opt-in and project-specific.** devbench cannot infer a target repo's fixture-file layout, so this is a deliberate no-op (prints a skip note, exits 0) unless the workspace configures `gates.fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml`:
+**Opt-in and project-specific.** devbench cannot infer a target repo's fixture-file layout, so this is a deliberate no-op unless the workspace configures `gates.fixture_consistency.canonical_sources` in `backlog/config/devbench.yaml`: a run with no `canonical_sources` configured prints the spec 5.2 disabled line `{"gate": "fixture_consistency", "status": "disabled"}` and exits 0.
 
 ```yaml
 gates:
@@ -1518,7 +1518,17 @@ gates:
           - SKU-DOES-NOT-EXIST
 ```
 
-Exit 0 when every `scan` target's identifier values (other than those listed in `allow_missing`) are present in their `canonical_source`, and every canonical source's distinct-identifier count matches its `expected_count` (when set). Exit 1 with one `[missing_key|coverage_shortfall|load_error]` finding line per problem otherwise. Used as review evidence by `test_review` (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`; see `docs/review-feedback-vocabulary.md`).
+Prints the spec 5.2 gate status line as the FIRST stdout line for every run that reaches gate resolution (spec 4.1, 4.7 hardening; register findings 322-D02/D03/D05). Unlike `check-reachability` and `check-shared-file-impact`, this command never consults the per-repo `gates.fixture_consistency.enabled` flag -- the only gate-config key it reads to decide whether to run at all is `gates.fixture_consistency.canonical_sources`; the rest of the block (`scan`, `identifier_field`, `expected_count`, `allow_missing`) drives the check itself. When no `canonical_sources` are configured: `{"gate": "fixture_consistency", "status": "disabled"}`, exit 0. A repo with `enabled: false` but a non-empty `canonical_sources` list still runs the check and can exit 1 -- `enabled` is a documented per-repo tunable consumed by `mark-done`'s gate-record invariant and reported by `devbench gates`, not by this command. When `canonical_sources` are configured and the run completes: `{"gate": "fixture_consistency", "tier": "machine-blocking", "status": "pass"|"fail", "findings": <int>}`, followed by the human-readable findings -- `pass` on zero findings (exit 0), `fail` with one `[missing_key|coverage_shortfall|load_error]` finding line per problem (exit 1). When the resolved config cannot produce a meaningful check at all -- a configured `identifier_field` that matches zero records in a canonical source, or an enabled gate with an empty resolved `scan` list -- the status line reports `{"gate": "fixture_consistency", "tier": "machine-blocking", "status": "error", "findings": 0}` followed by a one-line `ERROR: <detail>` sentence on stderr naming the problem (e.g. `ERROR: identifier field 'idd' matched zero records in catalog.json` for the zero-match case, or `ERROR: gate enabled but scan list is empty` for the empty-`scan`-list case), exit 1; no scan is attempted on this path. There is no `scope_hash` field on any shape, unlike `check-reachability`/`check-shared-file-impact`: this gate is not scoped to the calling unit's own Changes Manifest.
+
+Scan and canonical targets are parsed with explicit extension dispatch over `.json`/`.yaml`/`.yml`; any other configured extension produces a `load_error` finding naming the file rather than an implicit JSON-parse guess.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | No `canonical_sources` configured (this command does not check `gates.fixture_consistency.enabled`, unlike `check-reachability`/`check-shared-file-impact`), or a run with `canonical_sources` configured completed with zero findings. |
+| 1 | Work unit not found, no local path configured for its repo, the check completed with at least one `[missing_key\|coverage_shortfall\|load_error]` finding, or the resolved config could not produce a meaningful check (identifier field matched zero canonical records, or an enabled gate has an empty resolved `scan` list) -- both of the latter print `status: "error"` and an `ERROR: ...` stderr sentence. |
+| 2 | Usage error: an empty/whitespace `<unit-id>`. |
+
+Used as review evidence by `test_review` (rejection-feedback code `FIXTURE_CATALOG_MISMATCH`; see `docs/review-feedback-vocabulary.md`).
 
 ### `log`
 

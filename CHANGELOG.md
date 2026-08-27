@@ -5,6 +5,48 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-fixture-consistency` no longer degrades a misconfigured gate into a
+  passing or misleading result** (spec `integration-reality-gates-hardening.md`
+  section 4.7, register findings 322-D02/D03/D05; issue #17). At HEAD, two
+  distinct degenerate-but-configured shapes each silently produced the wrong
+  outcome. First: a typo'd `identifier_field` and a canonical source that is
+  genuinely empty of that field were INDISTINGUISHABLE (both reduced to an
+  empty resolved canonical identifier set), and both mass-false-positived
+  every scanned reference as a `missing_key` finding (322-D02 typo, 322-D03
+  genuinely-empty; an exit-1 failure, never a silent self-disable). Second,
+  and separately: an enabled gate (non-empty `canonical_sources`) with a
+  resolved `scan` list of zero targets DID silently self-disable, printing a
+  passing result despite inspecting nothing (322-D05). Both shapes now raise
+  before any misleading output is produced -- the empty-`scan` case before
+  any file is even read -- and `cmd_check_fixture_consistency` catches the
+  raise, exits 1, and prints the one-line diagnostic
+  `ERROR: identifier field '<f>' matched zero records in <path>` or
+  `ERROR: gate enabled but scan list is empty` to stderr (these name the
+  misconfiguration, not a prescribed fix -- the field/file names in the
+  message are themselves the actionable detail). Scan and canonical file
+  parsing also moves off the old implicit-JSON-fallback: a
+  `.json`/`.yaml`/`.yml` extension dispatches explicitly, and any other
+  configured extension is now exactly one `load_error` finding naming the
+  file, never a silent (and possibly wrong) JSON-parse attempt on unrelated
+  content. The command now prints the spec 5.2 gate status line as the FIRST
+  stdout line on every path that reaches gate resolution (an unresolvable
+  unit id or a repo with no configured local path still write nothing to
+  stdout, exactly as before this change):
+  `{"gate": "fixture_consistency", "status": "disabled"}` when unconfigured,
+  and otherwise `{"gate": "fixture_consistency", "tier": "machine-blocking",
+  "status": "pass"|"fail"|"error", "findings": <int>}` -- `"error"` is new
+  vocabulary for the two loud pre-flight failures above, since every prior
+  gate command's status line only ever needed `"pass"`/`"fail"`; the shared
+  `constants.GATE_STATUS_ERROR` constant backs it, alongside the existing
+  `_DISABLED`/`_PASS`/`_FAIL` members. A correctly configured gate (non-empty
+  `canonical_sources`, non-empty `scan`, a resolvable `identifier_field`) is
+  unaffected: it reports the same findings as before this change. An
+  empty-or-whitespace `<unit-id>` argument is also now a usage error caught
+  before any other resolution step, printing
+  `ERROR: check-fixture-consistency requires a non-empty <unit-id>` to
+  stderr and exiting 2 -- at HEAD such a value fell through to the
+  work-unit-lookup failure and exited 1.
+
 - **`check-shared-file-impact` is wired into the done path and persists a
   `[GATE_PASS shared_file_impact]` machine record, making an already-enabled
   gate satisfiable for the first time** (spec

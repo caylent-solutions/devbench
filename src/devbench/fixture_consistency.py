@@ -29,14 +29,34 @@ The check is a deliberate no-op (returns no findings) when the workspace
 has not configured any ``canonical_sources`` -- devbench cannot infer a
 target repo's fixture-file layout on its own, so this is an explicit,
 opt-in config surface rather than a default-on heuristic.
+
+Hardening over the E1 cherry-pick of PR #322 (spec 4.7, register findings
+322-D02/D03/D05, issue #17): a *configured* (non-empty ``canonical_sources``)
+gate can no longer degrade into a silent pass or a mass false positive. At
+the pre-hardening HEAD, a typo'd ``identifier_field`` and a canonical
+source that is genuinely empty were indistinguishable -- both reduced to
+an empty resolved identifier set -- and BOTH mass-false-positived every
+scanned reference as a ``missing_key`` finding (an exit-1 failure, never a
+silent pass). Only a *different* degenerate shape, an enabled gate with a
+resolved ``scan`` list of zero targets, silently passed with zero findings
+(exit 0) despite having inspected nothing. This module now raises loudly,
+before any file is read, for the empty-``scan``-list shape (322-D05); and
+raises loudly for the zero-match ``identifier_field`` shape (322-D02/D03,
+now unified into one loud path instead of a mass false positive) as soon as
+a canonical source's resolved identifier set comes back empty, for any
+reason. Scan/canonical file parsing dispatches on an explicit
+``.json``/``.yaml``/``.yml`` extension table -- any other configured
+extension is a ``load_error`` finding naming the file; no extension ever
+falls back to an implicit JSON parse attempt.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import yaml
 
@@ -48,6 +68,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "FixtureConsistencyConfigError",
     "FixtureFinding",
     "check_fixture_consistency",
     "collect_identifiers",
@@ -58,6 +79,117 @@ __all__ = [
 # migration (top-level `fixture_consistency:` -> `gates.fixture_consistency:`)
 # cannot drift key-by-key across the four finding sites below.
 _CONFIG_KEY_PREFIX = "gates.fixture_consistency"
+
+# Explicit extension -> parser dispatch (spec 4.7 bullet 3). Shared by both
+# the canonical-source reader and the scan-target reader (both funnel
+# through `_load_parsed`/`collect_identifiers`), so recognized formats can
+# never drift between the two, and an unconfigured extension is never
+# handed to a parser at all -- closing the old implicit-JSON-fallback
+# defect where a `.txt`/`.csv` target whose content happened to be valid
+# JSON was silently accepted.
+_EXTENSION_PARSERS: dict[str, Callable[[str], Any]] = {
+    ".json": json.loads,
+    ".yaml": yaml.safe_load,
+    ".yml": yaml.safe_load,
+}
+
+# Named message templates (spec 4.7; Code Standards Critical Rule 4 -- no
+# inline literal message strings in this module). Every ``FixtureFinding``
+# and every raised loud error is built from exactly one of these, so a
+# message's wording is defined once regardless of how many call sites (or
+# parametrized tests) reference it.
+#
+# The first three are the loud-error summaries: `_raise_loud_error` is the
+# single site that prefixes each with the spec Section 7 `ERROR: <summary>`
+# shape, so the empty-scan-list (322-D05) and zero-match-identifier-field
+# (322-D02/D03) raise sites can never independently drift the prefix.
+_MSG_EMPTY_SCAN_LIST: str = "gate enabled but scan list is empty"
+_MSG_IDENTIFIER_FIELD_ZERO_MATCH: str = "identifier field '{field}' matched zero records in {path}"
+_MSG_UNSUPPORTED_EXTENSION: str = (
+    "Unsupported fixture file extension '{ext}' for '{path}'; expected one of: {allowed} "
+    "(configured under {prefix}.canonical_sources or {prefix}.scan)."
+)
+
+# The remaining templates back a `FixtureFinding` (never raised) --
+# `check_fixture_consistency`'s two loops format each at their one call
+# site.
+_MSG_CANONICAL_FILE_NOT_FOUND: str = (
+    "Canonical fixture file not found: '{path}' (configured under {prefix}.canonical_sources)."
+)
+_MSG_CANONICAL_PARSE_FAILED: str = "Failed to parse canonical fixture '{path}': {exc}"
+_MSG_COVERAGE_SHORTFALL: str = (
+    "Canonical fixture '{path}' has {count} distinct '{field}' value(s); expected {expected}. "
+    "A backfill task may have left the canonical dataset incomplete relative to its documented "
+    "expectation."
+)
+_MSG_SCAN_TARGET_AMBIGUOUS: str = (
+    "Scan target '{path}' does not resolve to a valid canonical_source (configured "
+    "canonical_sources: {available}). Set {prefix}.scan[].canonical_source explicitly when more "
+    "than one canonical_sources entry is configured."
+)
+_MSG_SCAN_FILE_NOT_FOUND: str = "Scan target fixture file not found: '{path}' (configured under {prefix}.scan)."
+_MSG_SCAN_PARSE_FAILED: str = "Failed to parse fixture '{path}': {exc}"
+_MSG_MISSING_KEY: str = (
+    "Fixture '{path}' field '{field}' references {count} key(s) absent from canonical source "
+    "'{canonical_path}': {keys}. Fix the fixture to reference a real canonical key, or if this is "
+    "an intentional edge-case fixture (e.g. testing an empty/not-found state), add the value(s) to "
+    "{prefix}.scan[].allow_missing for this scan target."
+)
+
+
+class FixtureConsistencyConfigError(ValueError):
+    """A ``gates.fixture_consistency`` configuration cannot produce a meaningful check.
+
+    Raised only by :func:`_raise_loud_error` for the two spec 4.7 loud-error
+    paths (322-D02/D03 zero-match ``identifier_field``, 322-D05 empty
+    resolved ``scan`` list while the gate is enabled). A plain ``ValueError``
+    also carries two unrelated meanings inside this module -- the
+    unsupported-extension raise from ``_load_parsed`` (converted into a
+    ``load_error`` finding by ``_check_canonical_sources`` and
+    ``_check_scan_targets``, so it never reaches ``cmd_check_fixture_
+    consistency``, though it still propagates uncaught out of the public
+    ``collect_identifiers`` when that function is called directly) and
+    ``json.JSONDecodeError`` (also caught and converted internally by those
+    same two callers) -- so callers (``cli.cmd_check_fixture_consistency``)
+    catch this specific subclass rather than the bare builtin to avoid
+    mis-handling an unrelated ``ValueError`` as a config error.
+    """
+
+
+def _raise_loud_error(summary: str) -> NoReturn:
+    """Raise the shared ``ERROR: <summary>`` shape for every fixture-consistency loud-error path.
+
+    Single site that prefixes a config-error summary with the spec
+    Section 7 ``ERROR: <summary>`` shape, so the empty-scan-list (322-D05)
+    and zero-match-identifier-field (322-D02/D03) raise sites cannot drift
+    into two independently-formatted strings. The exception itself is a
+    :class:`FixtureConsistencyConfigError` -- a misconfigured gate is a
+    value/config problem, not a generic failure -- and is deliberately never
+    caught by this module's own ``_check_canonical_sources``/
+    ``_check_scan_targets`` try/except blocks (those wrap only their
+    ``collect_identifiers`` parse calls, not this function), so it always
+    propagates to the caller.
+    """
+    raise FixtureConsistencyConfigError(f"ERROR: {summary}")
+
+
+class _UnsupportedFixtureExtensionError(ValueError):
+    """A fixture file's extension is not a key of ``_EXTENSION_PARSERS``.
+
+    Raised only by ``_load_parsed``, whose sole caller is the public
+    :func:`collect_identifiers` (which has no try/except of its own and does
+    not catch this). ``_check_canonical_sources``/``_check_scan_targets`` --
+    the two internal callers of ``collect_identifiers`` -- catch it ahead of
+    their generic ``(OSError, ValueError, yaml.YAMLError)`` parse-failure
+    guard, so the resulting ``load_error`` finding uses the unsupported-
+    extension message verbatim instead of being re-wrapped in the "Failed to
+    parse" phrasing that guard applies to genuine parse failures -- no parser
+    was ever invoked for this path, so the finding must not claim one was.
+    ``collect_identifiers`` is public and exported in ``__all__``, so a
+    caller that invokes it directly (rather than through those two internal
+    callers) sees this exception propagate uncaught, as the ``ValueError``
+    subclass documented in ``collect_identifiers``'s own ``Raises`` section.
+    """
 
 
 @dataclass(frozen=True)
@@ -79,17 +211,34 @@ class FixtureFinding:
 
 
 def _load_parsed(path: Path) -> Any:
-    """Load and parse a fixture file's content as JSON or YAML.
+    """Load and parse a fixture file's content via the explicit extension dispatch table.
 
-    Dispatches on file extension: ``.yaml``/``.yml`` parses as YAML,
-    everything else (including ``.json``) parses as JSON. Both formats
+    Dispatches on ``path.suffix.lower()`` against ``_EXTENSION_PARSERS``:
+    ``.json`` parses as JSON, ``.yaml``/``.yml`` parse as YAML. Both formats
     round-trip through the same in-memory shape (dicts/lists/scalars), so
-    the rest of the pipeline is format-agnostic.
+    the rest of the pipeline is format-agnostic. Any other extension (or no
+    extension) raises :class:`_UnsupportedFixtureExtensionError` *before*
+    any parser is invoked -- no implicit JSON-parse attempt is ever made on
+    an unrecognized extension, even when its content happens to be valid
+    JSON (spec 4.7 bullet 3).
+
+    Raises:
+        _UnsupportedFixtureExtensionError: If *path*'s extension is not a
+            key of ``_EXTENSION_PARSERS``.
     """
+    suffix = path.suffix.lower()
+    parser = _EXTENSION_PARSERS.get(suffix)
+    if parser is None:
+        raise _UnsupportedFixtureExtensionError(
+            _MSG_UNSUPPORTED_EXTENSION.format(
+                ext=suffix or "(none)",
+                path=path,
+                allowed=", ".join(sorted(_EXTENSION_PARSERS)),
+                prefix=_CONFIG_KEY_PREFIX,
+            )
+        )
     text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() in (".yaml", ".yml"):
-        return yaml.safe_load(text)
-    return json.loads(text)
+    return parser(text)
 
 
 def _walk_identifier_values(node: Any, field_name: str, out: set[str]) -> None:
@@ -125,7 +274,11 @@ def collect_identifiers(path: Path, field_name: str) -> set[str]:
 
     Raises:
         OSError: If *path* cannot be read.
-        ValueError: If *path* is not valid JSON.
+        ValueError: If *path* is not valid JSON, or if *path*'s extension is
+            not one of ``.json``/``.yaml``/``.yml`` (the sole caller of
+            ``_load_parsed``, so a ``_UnsupportedFixtureExtensionError`` for
+            an unrecognized extension propagates as this same ``ValueError``
+            subclass before any parser is ever invoked).
         yaml.YAMLError: If *path* is not valid YAML.
     """
     data = _load_parsed(path)
@@ -153,69 +306,100 @@ def _resolve_canonical_path(
     return None
 
 
-def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig) -> list[FixtureFinding]:
-    """Run the configured fixture-catalog cross-reference check against a repo checkout.
+def _check_canonical_sources(
+    repo_path: Path, canonical_sources: tuple[FixtureCanonicalSource, ...]
+) -> tuple[list[FixtureFinding], dict[str, set[str]]]:
+    """Load every configured canonical source, flag coverage shortfalls, and collect its identifier set.
 
-    Args:
-        repo_path: Local checkout path of the target repo.
-        config: Parsed ``fixture_consistency`` configuration.
+    Split out of :func:`check_fixture_consistency` purely to keep that
+    function's branch count within the project's complexity lint budget
+    (SRP: this loop owns canonical-source loading, the sibling
+    :func:`_check_scan_targets` owns scan-target cross-referencing).
 
-    Returns:
-        A list of ``FixtureFinding``s. Empty when the check passes --
-        including the trivial pass when ``config.canonical_sources`` is
-        empty (the workspace has not opted in).
+    Raises:
+        FixtureConsistencyConfigError: If a canonical source's resolved
+            identifier set is empty for any reason -- a typo'd
+            ``identifier_field`` (322-D02) or records that genuinely never
+            carry that field (322-D03) both take this same loud path rather
+            than silently passing or mass-false-positiving every scan
+            target.
     """
     findings: list[FixtureFinding] = []
-    if not config.canonical_sources:
-        return findings
-
-    canonical_by_path: dict[str, FixtureCanonicalSource] = {source.path: source for source in config.canonical_sources}
     canonical_values: dict[str, set[str]] = {}
 
-    for source in config.canonical_sources:
+    for source in canonical_sources:
         full_path = repo_path / source.path
         if not full_path.is_file():
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Canonical fixture file not found: '{source.path}' "
-                    f"(configured under {_CONFIG_KEY_PREFIX}.canonical_sources).",
+                    _MSG_CANONICAL_FILE_NOT_FOUND.format(path=source.path, prefix=_CONFIG_KEY_PREFIX),
                 )
             )
             continue
         try:
             values = collect_identifiers(full_path, source.identifier_field)
+        except _UnsupportedFixtureExtensionError as exc:
+            # No parser was ever invoked for this path -- report the
+            # dispatch-table rejection verbatim rather than through the
+            # "Failed to parse" wrapper below, which would falsely imply a
+            # parse attempt happened.
+            findings.append(FixtureFinding("load_error", str(exc)))
+            continue
         except (OSError, ValueError, yaml.YAMLError) as exc:
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Failed to parse canonical fixture '{source.path}': {exc}",
+                    _MSG_CANONICAL_PARSE_FAILED.format(path=source.path, exc=exc),
                 )
             )
             continue
+
+        if not values:
+            _raise_loud_error(_MSG_IDENTIFIER_FIELD_ZERO_MATCH.format(field=source.identifier_field, path=source.path))
 
         canonical_values[source.path] = values
         if source.expected_count is not None and len(values) != source.expected_count:
             findings.append(
                 FixtureFinding(
                     "coverage_shortfall",
-                    f"Canonical fixture '{source.path}' has {len(values)} distinct "
-                    f"'{source.identifier_field}' value(s); expected {source.expected_count}. "
-                    "A backfill task may have left the canonical dataset incomplete relative "
-                    "to its documented expectation.",
+                    _MSG_COVERAGE_SHORTFALL.format(
+                        path=source.path,
+                        count=len(values),
+                        field=source.identifier_field,
+                        expected=source.expected_count,
+                    ),
                 )
             )
 
-    for scan in config.scan:
-        canonical_path = _resolve_canonical_path(scan, config.canonical_sources)
+    return findings, canonical_values
+
+
+def _check_scan_targets(
+    repo_path: Path,
+    scan_targets: tuple[FixtureScanTarget, ...],
+    canonical_sources: tuple[FixtureCanonicalSource, ...],
+    canonical_values: dict[str, set[str]],
+) -> list[FixtureFinding]:
+    """Cross-reference every configured scan target against its resolved canonical identifier set.
+
+    Split out of :func:`check_fixture_consistency` for the same
+    branch-count/SRP reason as :func:`_check_canonical_sources`.
+    """
+    findings: list[FixtureFinding] = []
+    canonical_by_path: dict[str, FixtureCanonicalSource] = {source.path: source for source in canonical_sources}
+
+    for scan in scan_targets:
+        canonical_path = _resolve_canonical_path(scan, canonical_sources)
         if canonical_path is None or canonical_path not in canonical_by_path:
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Scan target '{scan.path}' does not resolve to a valid canonical_source "
-                    f"(configured canonical_sources: {sorted(canonical_by_path)}). Set "
-                    f"{_CONFIG_KEY_PREFIX}.scan[].canonical_source explicitly when more than one "
-                    "canonical_sources entry is configured.",
+                    _MSG_SCAN_TARGET_AMBIGUOUS.format(
+                        path=scan.path,
+                        available=sorted(canonical_by_path),
+                        prefix=_CONFIG_KEY_PREFIX,
+                    ),
                 )
             )
             continue
@@ -228,17 +412,24 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Scan target fixture file not found: '{scan.path}' (configured under {_CONFIG_KEY_PREFIX}.scan).",
+                    _MSG_SCAN_FILE_NOT_FOUND.format(path=scan.path, prefix=_CONFIG_KEY_PREFIX),
                 )
             )
             continue
         try:
             scan_values = collect_identifiers(full_path, scan.identifier_field)
+        except _UnsupportedFixtureExtensionError as exc:
+            # No parser was ever invoked for this path -- report the
+            # dispatch-table rejection verbatim rather than through the
+            # "Failed to parse" wrapper below, which would falsely imply a
+            # parse attempt happened.
+            findings.append(FixtureFinding("load_error", str(exc)))
+            continue
         except (OSError, ValueError, yaml.YAMLError) as exc:
             findings.append(
                 FixtureFinding(
                     "load_error",
-                    f"Failed to parse fixture '{scan.path}': {exc}",
+                    _MSG_SCAN_PARSE_FAILED.format(path=scan.path, exc=exc),
                 )
             )
             continue
@@ -248,13 +439,45 @@ def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig)
             findings.append(
                 FixtureFinding(
                     "missing_key",
-                    f"Fixture '{scan.path}' field '{scan.identifier_field}' references "
-                    f"{len(missing)} key(s) absent from canonical source '{canonical_path}': "
-                    f"{', '.join(missing)}. Fix the fixture to reference a real canonical key, "
-                    "or if this is an intentional edge-case fixture (e.g. testing an "
-                    "empty/not-found state), add the value(s) to "
-                    f"{_CONFIG_KEY_PREFIX}.scan[].allow_missing for this scan target.",
+                    _MSG_MISSING_KEY.format(
+                        path=scan.path,
+                        field=scan.identifier_field,
+                        count=len(missing),
+                        canonical_path=canonical_path,
+                        keys=", ".join(missing),
+                        prefix=_CONFIG_KEY_PREFIX,
+                    ),
                 )
             )
 
     return findings
+
+
+def check_fixture_consistency(repo_path: Path, config: FixtureConsistencyConfig) -> list[FixtureFinding]:
+    """Run the configured fixture-catalog cross-reference check against a repo checkout.
+
+    Args:
+        repo_path: Local checkout path of the target repo.
+        config: Parsed ``fixture_consistency`` configuration.
+
+    Returns:
+        A list of ``FixtureFinding``s. Empty when the check passes --
+        including the trivial pass when ``config.canonical_sources`` is
+        empty (the workspace has not opted in).
+
+    Raises:
+        FixtureConsistencyConfigError: If ``config.canonical_sources`` is
+            non-empty (the gate is opted in) but ``config.scan`` is empty
+            (322-D05) -- checked before any file is read; or (via
+            :func:`_check_canonical_sources`) if a canonical source's
+            resolved identifier set is empty for any reason (322-D02/D03).
+    """
+    if not config.canonical_sources:
+        return []
+
+    if not config.scan:
+        _raise_loud_error(_MSG_EMPTY_SCAN_LIST)
+
+    canonical_findings, canonical_values = _check_canonical_sources(repo_path, config.canonical_sources)
+    scan_findings = _check_scan_targets(repo_path, config.scan, config.canonical_sources, canonical_values)
+    return canonical_findings + scan_findings

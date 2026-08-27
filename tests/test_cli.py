@@ -27,6 +27,7 @@ from test_tdd_gate import run_scratch_git as _run_scratch_git
 from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli
+from devbench import fixture_consistency as fixture_consistency_module
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
 from devbench.config_loader import (
@@ -14938,19 +14939,26 @@ class TestCheckSharedFileImpactBaseline:
         assert Path(capture_worktrees[0]).exists(), "the worktree directory must be left in place, not deleted"
 
 
+def _make_fixture_consistency_test_unit() -> WorkUnit:
+    """Build the shared test WorkUnit for the fixture-consistency command test classes below.
+
+    Module-level factory (DRY): `TestCmdCheckFixtureConsistency` and
+    `TestCmdCheckFixtureConsistencyLoudModes` previously each declared their
+    own byte-identical `_make_unit` method.
+    """
+    return WorkUnit(
+        id="E0-F1-S1-T1",
+        title="Test Task",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path("backlog/E0-F1-S1-T1.md"),
+        repo="caylent-solutions/git-repo",
+        dependencies=[],
+    )
+
+
 class TestCmdCheckFixtureConsistency:
     """Test cmd_check_fixture_consistency command (caylent-solutions/devbench-internal-backlog#17)."""
-
-    def _make_unit(self) -> WorkUnit:
-        return WorkUnit(
-            id="E0-F1-S1-T1",
-            title="Test Task",
-            status=WorkUnitStatus.IN_PROGRESS,
-            unit_type=WorkUnitType.TASK,
-            file_path=Path("backlog/E0-F1-S1-T1.md"),
-            repo="caylent-solutions/git-repo",
-            dependencies=[],
-        )
 
     def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Unknown work unit id returns 1."""
@@ -14965,7 +14973,7 @@ class TestCmdCheckFixtureConsistency:
 
     def test_no_local_path_configured(self, capsys: pytest.CaptureFixture[str]) -> None:
         """No local path configured for the resolved repo returns 1."""
-        unit = self._make_unit()
+        unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
@@ -14979,8 +14987,8 @@ class TestCmdCheckFixtureConsistency:
         assert "No local path configured" in capsys.readouterr().err
 
     def test_skips_as_no_op_when_unconfigured(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """No gates.fixture_consistency.canonical_sources configured -> prints a skip note, exits 0."""
-        unit = self._make_unit()
+        """No gates.fixture_consistency.canonical_sources configured -> spec 5.2 disabled line, exits 0."""
+        unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_runtime_cfg = MagicMock()
@@ -14994,11 +15002,11 @@ class TestCmdCheckFixtureConsistency:
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
         assert result == 0
-        assert "skipped" in capsys.readouterr().out
+        assert json.loads(capsys.readouterr().out.strip()) == {"gate": "fixture_consistency", "status": "disabled"}
 
     def test_passes_when_fixtures_are_consistent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """A configured check with no cross-reference issues returns 0 and prints OK."""
-        unit = self._make_unit()
+        unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
@@ -15018,14 +15026,28 @@ class TestCmdCheckFixtureConsistency:
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
         assert result == 0
-        assert "OK" in capsys.readouterr().out
+        # Exactly four keys, deliberately with no `scope_hash` (unlike
+        # check-reachability/check-shared-file-impact's status lines): this
+        # gate cross-references a workspace-wide configured file set, not
+        # the calling unit's own Changes Manifest, so there is no per-unit
+        # scope for a hash to be computed over (see
+        # cmd_check_fixture_consistency's docstring).
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+        }
+        assert "OK" in rest
 
     def test_fails_and_prints_findings_when_key_is_missing(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """A mock fixture referencing a key absent from the canonical source returns 1 and prints FAIL."""
-        unit = self._make_unit()
+        unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
@@ -15046,15 +15068,22 @@ class TestCmdCheckFixtureConsistency:
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
         out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
         assert result == 1
-        assert "FAIL" in out
-        assert "GHOST-SKU" in out
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 1,
+        }
+        assert "FAIL" in rest
+        assert "GHOST-SKU" in rest
 
     def test_allow_missing_scoped_fixture_does_not_fail(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """An allow_missing-scoped edge-case fixture passes even though its key is absent (AC3, internal-backlog#17)."""
-        unit = self._make_unit()
+        unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
@@ -15080,8 +15109,167 @@ class TestCmdCheckFixtureConsistency:
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
         assert result == 0
-        assert "OK" in capsys.readouterr().out
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+        }
+        assert "OK" in rest
+
+
+@pytest.mark.unit
+class TestCmdCheckFixtureConsistencyLoudModes:
+    """spec 4.7 bullets 1-3 (322-D02/D03/D05): the three degenerate configurations that must exit 1
+    with a one-line stderr diagnostic instead of a passing/misleading result (AC-19)."""
+
+    def _run(self, tmp_path: Path, fixture_config: FixtureConsistencyConfig) -> tuple[int, str, str]:
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.fixture_consistency = fixture_config
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        captured = self._capsys.readouterr()
+        return result, captured.out, captured.err
+
+    @pytest.fixture(autouse=True)
+    def _inject_capsys(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._capsys = capsys
+
+    def test_identifier_field_typo_exits_1_with_error_status_line(self, tmp_path: Path) -> None:
+        (tmp_path / "catalog.json").write_text(json.dumps([{"id": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"id": "A1"}]), encoding="utf-8")
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="idd"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="id"),),
+        )
+
+        result, out, err = self._run(tmp_path, config)
+
+        assert result == 1
+        assert json.loads(out.strip()) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "error",
+            "findings": 0,
+        }
+        expected_summary = fixture_consistency_module._MSG_IDENTIFIER_FIELD_ZERO_MATCH.format(
+            field="idd", path="catalog.json"
+        )
+        assert f"ERROR: {expected_summary}" in err
+
+    def test_empty_scan_list_exits_1_with_error_status_line(self, tmp_path: Path) -> None:
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(),
+        )
+
+        result, out, err = self._run(tmp_path, config)
+
+        assert result == 1
+        assert json.loads(out.strip()) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "error",
+            "findings": 0,
+        }
+        assert f"ERROR: {fixture_consistency_module._MSG_EMPTY_SCAN_LIST}" in err
+
+    def test_unknown_extension_scan_target_exits_1_with_load_error_finding_count(self, tmp_path: Path) -> None:
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.txt").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.txt", identifier_field="sku"),),
+        )
+
+        result, out, err = self._run(tmp_path, config)
+
+        first_line, _, rest = out.partition("\n")
+        assert result == 1
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 1,
+        }
+        assert "load_error" in rest
+        assert "mock_lookup.txt" in rest
+        assert ".txt" not in fixture_consistency_module._EXTENSION_PARSERS
+        assert err == ""
+
+    def test_totally_omitted_unit_id_argument_is_rejected_by_the_shared_dispatcher(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An entirely OMITTED <unit-id> never reaches this handler at all.
+
+        `main()`'s shared argument-count check (every registered command,
+        not just this gate) returns 1 with a `Command '<name>' requires at
+        least <n> argument(s)` message before `cmd_check_fixture_consistency`
+        is ever called -- documented here as the measured behavior of the
+        shared dispatcher this command is registered against, distinct from
+        the handler-level usage-error guard exercised below.
+        """
+        with patch("sys.argv", ["devbench", "check-fixture-consistency"]):
+            result = cli.main()
+
+        assert result == 1
+        assert "requires at least 1 argument" in capsys.readouterr().err
+
+    def test_missing_unit_id_argument_is_a_usage_error_exit_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A PRESENT but empty <unit-id> is a usage error, exit 2 (spec Section 7, AC-6).
+
+        Mirrors the existing `cmd_check_ancestry` precedent (`cli.py`'s empty
+        `dependency_ref` guard): a handler-level arity/usage guard, not
+        `main()`'s shared argument-COUNT guard above (which only ever
+        returns 1, and cannot see a positional argument's VALUE). Called
+        directly, exactly as `main()` would invoke it once the shared
+        argument-count check has already been satisfied by a present (even if
+        empty) positional.
+        """
+        result = cli.cmd_check_fixture_consistency("")
+
+        assert result == 2
+        assert "requires a non-empty <unit-id>" in capsys.readouterr().err
+
+    def test_unrelated_value_error_propagates_uncaught(self, tmp_path: Path) -> None:
+        """The CLI catch is narrowed to ``FixtureConsistencyConfigError``, not the bare builtin
+        ``ValueError`` (round-1 remediation, code_review): an unrelated ``ValueError`` raised by
+        ``check_fixture_consistency`` itself must propagate uncaught, exactly as every other
+        unexpected failure in this command does, rather than being mis-reported as ``status:
+        "error"`` with a misleading exit 1 (test_review round 2, 5d -- pins the narrowing so a
+        future re-broadening back to a bare ``except ValueError`` turns this test red)."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch(
+                "devbench.fixture_consistency.check_fixture_consistency",
+                side_effect=ValueError("unrelated parse failure"),
+            ),
+            pytest.raises(ValueError, match="unrelated parse failure"),
+        ):
+            cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
 
 class TestCmdLogVerdict:

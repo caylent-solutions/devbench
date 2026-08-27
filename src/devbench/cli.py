@@ -254,6 +254,7 @@ from devbench.constants import (
     GATE_ANCESTRY,
     GATE_PROVENANCE_BUILTIN,
     GATE_STATUS_DISABLED,
+    GATE_STATUS_ERROR,
     GATE_STATUS_FAIL,
     GATE_STATUS_PASS,
     GATE_TIER_MACHINE_BLOCKING,
@@ -8526,29 +8527,44 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     return rc
 
 
-def cmd_check_fixture_consistency(unit_id: str) -> int:
-    """Cross-reference the work unit's target repo's mock/fixture files against its canonical dataset.
+# Fixture-consistency is a machine-blocking gate (`constants.GATE_TIERS`).
+# Named once here, alongside `_REACHABILITY_GATE_NAME`/
+# `_SHARED_FILE_IMPACT_GATE_NAME` above, so `cmd_check_fixture_consistency`
+# never re-types the literal "fixture_consistency" a second time.
+_FIXTURE_CONSISTENCY_GATE_NAME: str = "fixture_consistency"
 
-    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog cross-reference lint): a
-    feature's data-fetch logic is frequently correct but reads from a mock/fixture lookup table
-    whose keys were fabricated, keyed in the wrong namespace, or left
-    incomplete relative to the project's canonical shared fixture dataset --
-    functionally dead or crash-on-save for real records even though the
-    underlying logic is sound.
+# Spec 5.2 declares the enabled-run status vocabulary as
+# `"<pass|fail|error>"`; `constants.GATE_STATUS_DISABLED`/`_PASS`/`_FAIL`/
+# `_ERROR` cover all four values every gate command needs. fixture_consistency
+# is the first gate whose command can hard-stop on a MISCONFIGURED run rather
+# than merely a failing one -- a configured `identifier_field` that matches
+# zero canonical records, or an enabled gate with an empty resolved `scan`
+# list (spec 4.7 322-D02/D05). Unlike the ancestry-only `_ANCESTRY_MODE_*`
+# constants above, the status vocabulary itself is imported from
+# `constants.py`, not re-declared here -- it is shared by every gate command
+# through `_gate_status_line`/`_gate_disabled_line`.
 
-    Opt-in and project-specific: devbench cannot infer a target repo's
-    fixture-file layout, so this is a deliberate no-op (prints a note,
-    exits 0) unless the workspace configures
-    ``gates.fixture_consistency.canonical_sources`` in
-    ``backlog/config/devbench.yaml``. When configured, scans every
-    ``gates.fixture_consistency.scan`` target for identifier literals
-    absent from its designated canonical source, and checks each canonical
-    source's distinct-identifier count against an optional
-    ``expected_count`` (backfill coverage).
 
-    Used as review evidence by the test-reviewer agent.
+def _resolve_fixture_consistency_repo_path(unit_id: str) -> Path | int:
+    """Resolve everything :func:`cmd_check_fixture_consistency` needs before running the check.
+
+    Split out purely to keep that function's return-count within the
+    project's complexity lint budget (mirrors the existing
+    ``_prepare_ancestry_probe_context``-style helpers this module already
+    uses for the same reason). Bundles every early-exit condition -- a
+    usage-error (empty) *unit_id* (spec Section 7, exit 2, mirroring
+    ``cmd_check_ancestry``'s empty ``dependency_ref`` guard), an
+    unresolvable work unit, and a repo with no configured local path --
+    into one caller-side ``isinstance(..., int)`` check.
+
+    Returns:
+        The resolved local checkout ``Path`` when every resolution step
+        succeeds; otherwise the ``int`` exit code the caller should return
+        as-is (the offending step has already printed its own diagnostic).
     """
-    from devbench.fixture_consistency import check_fixture_consistency
+    if not unit_id.strip():
+        print("ERROR: check-fixture-consistency requires a non-empty <unit-id>", file=sys.stderr)
+        return 2
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -8564,15 +8580,135 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
+    return Path(repo_path)
+
+
+def cmd_check_fixture_consistency(unit_id: str) -> int:
+    """Cross-reference the work unit's target repo's mock/fixture files against its canonical dataset.
+
+    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog cross-reference lint): a
+    feature's data-fetch logic is frequently correct but reads from a mock/fixture lookup table
+    whose keys were fabricated, keyed in the wrong namespace, or left
+    incomplete relative to the project's canonical shared fixture dataset --
+    functionally dead or crash-on-save for real records even though the
+    underlying logic is sound.
+
+    Opt-in and project-specific: devbench cannot infer a target repo's
+    fixture-file layout, so this is a deliberate no-op unless the workspace
+    configures ``gates.fixture_consistency.canonical_sources`` in
+    ``backlog/config/devbench.yaml``. When configured, scans every
+    ``gates.fixture_consistency.scan`` target for identifier literals
+    absent from its designated canonical source, and checks each canonical
+    source's distinct-identifier count against an optional
+    ``expected_count`` (backfill coverage).
+
+    Prints the spec 5.2 gate status line as the FIRST stdout line for every
+    run that reaches gate resolution: ``{"gate":"fixture_consistency",
+    "status":"disabled"}`` and exits 0 when no ``canonical_sources`` are
+    configured (spec 4.1); otherwise ``{"gate":"fixture_consistency",
+    "tier":"machine-blocking","status":"pass"|"fail"|"error",
+    "findings":<int>}`` followed by the human-readable findings (spec 4.7
+    hardening, register findings 322-D02/D03/D05). The three terminals that
+    precede gate resolution -- an empty-or-whitespace *unit_id* (exit 2), an
+    unresolvable *unit_id* (exit 1), and a repo with no configured local
+    path (exit 1) -- print ``ERROR: ...`` to stderr only and write ZERO
+    bytes to stdout; there is no status line to be "first" on those three
+    paths.
+
+    - ``status`` is ``"error"`` -- never a passing status line -- when the
+      resolved config cannot produce a meaningful check at all: a
+      configured ``identifier_field`` that matches zero records in a
+      canonical source (a typo, or an empty canonical set for any other
+      reason), or the gate configured with a non-empty
+      ``canonical_sources`` and an empty resolved ``scan`` list. Both raise
+      a ``fixture_consistency.FixtureConsistencyConfigError`` (checked
+      before any file is read for the empty-scan case) and are caught
+      here, printed as the one-line ``ERROR: ...`` diagnostic on stderr
+      (it names the problem -- e.g. ``identifier field 'idd' matched zero
+      records in catalog.json`` -- rather than prescribing a fix; the
+      message's file/field names are themselves the actionable detail),
+      exit 1. The status line's ``findings`` is hard-coded ``0`` on this
+      path -- any ``FixtureFinding``s already accumulated for canonical
+      sources processed before the raise (e.g. a ``load_error`` on an
+      earlier source) are discarded, not reported, since the run as a whole
+      never reached a meaningful findings-based verdict.
+    - ``status`` is ``"fail"`` when the check ran to completion and found
+      at least one ``missing_key``/``coverage_shortfall``/``load_error``
+      finding -- ``load_error`` now also covers a canonical/scan file
+      configured with an extension other than ``.json``/``.yaml``/``.yml``
+      (spec 4.7 bullet 3; no implicit JSON-parse fallback is attempted for
+      any other extension), exit 1.
+    - ``status`` is ``"pass"`` when the check ran to completion with zero
+      findings, exit 0.
+
+    No ``scope_hash`` field (spec 5.2; unlike ``check-reachability`` and
+    ``check-shared-file-impact``, which both compute one via
+    ``gate_records.compute_scope_hash`` over the calling unit's own Changes
+    Manifest). This check is deliberately NOT scoped to the calling unit's
+    Changes Manifest at all -- it cross-references the workspace-wide
+    configured ``gates.fixture_consistency.canonical_sources``/``scan``
+    file set against each other, independent of which unit happens to
+    invoke it, so there is no per-unit scope for a hash to be computed
+    over.
+
+    This command does not currently persist a ``[GATE_PASS
+    fixture_consistency]`` record at all. That is a SEPARATE fact from the
+    ``scope_hash`` omission above -- ``mark-done`` DOES require a fresh
+    ``[GATE_PASS fixture_consistency]`` record (or operator ``[GATE_WAIVER
+    fixture_consistency]``) whenever ``gates.fixture_consistency`` resolves
+    enabled for the unit's repo: ``constants.GATE_TIERS`` marks
+    ``fixture_consistency`` machine-blocking, and
+    ``BacklogManager._check_gate_pass_done_invariant`` iterates every
+    machine-blocking gate and refuses ``mark-done`` on the missing-record
+    case, matching ``docs/cli-reference.md``'s done-gate section. Because
+    this command writes no such record today, there is no way to satisfy
+    that invariant via a ``[GATE_PASS fixture_consistency]`` record until
+    this command persists one; the only route through ``mark-done`` today
+    for a unit whose repo resolves this gate enabled is an
+    operator-attributed ``[GATE_WAIVER fixture_consistency]`` marker
+    (``_check_gate_pass_done_invariant`` checks the waiver before it ever
+    looks for a record), written with ``uv run devbench log-waiver <judge>
+    <unit-id> --gate fixture_consistency --target <t> --reason <r>
+    --operator``. Closing the missing-record gap itself is tracked outside
+    this docstring's scope.
+
+    Used as review evidence by the test-reviewer agent.
+    """
+    from devbench.fixture_consistency import (
+        FixtureConsistencyConfigError,
+        check_fixture_consistency,
+    )
+
+    resolved = _resolve_fixture_consistency_repo_path(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    repo_path = resolved
+
     fixture_config = RUNTIME_CONFIG.gates.fixture_consistency
     if not fixture_config.canonical_sources:
-        print(
-            "(fixture-consistency check skipped: no gates.fixture_consistency.canonical_sources "
-            "configured in backlog/config/devbench.yaml)"
-        )
+        print(_gate_disabled_line(_FIXTURE_CONSISTENCY_GATE_NAME))
         return 0
 
-    findings = check_fixture_consistency(Path(repo_path), fixture_config)
+    try:
+        findings = check_fixture_consistency(repo_path, fixture_config)
+    except FixtureConsistencyConfigError as exc:
+        # The empty-scan-list (322-D05) and zero-match-identifier-field
+        # (322-D02/D03) config errors are the ONLY exceptions of this
+        # specific type that ever escape `check_fixture_consistency` --
+        # every parse-time `ValueError` (malformed JSON/YAML, an
+        # unrecognized extension) is already caught internally and
+        # converted into a `load_error` finding, and neither of those is a
+        # `FixtureConsistencyConfigError`, so narrowing the catch to this
+        # subclass (rather than the bare builtin `ValueError`) means an
+        # unrelated `ValueError` can never be mis-handled as a config error
+        # here -- it propagates as an uncaught exception instead, exactly
+        # as every other unexpected failure in this command does.
+        print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, GATE_STATUS_ERROR, 0))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    status = GATE_STATUS_FAIL if findings else GATE_STATUS_PASS
+    print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, status, len(findings)))
     if not findings:
         sources = ", ".join(source.path for source in fixture_config.canonical_sources)
         print(f"OK: fixture-catalog cross-reference check passed against canonical source(s): {sources}")

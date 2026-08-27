@@ -1166,14 +1166,24 @@ class TestGateConstants:
         actual = {gate for gate, tier in GATE_TIERS.items() if tier == GATE_TIER_JUDGE_EVIDENCE}
         assert actual == expected
 
-    def test_gate_status_vocabulary_is_three_distinct_strings(self) -> None:
+    def test_gate_status_vocabulary_is_four_distinct_strings(self) -> None:
         """spec 5.2, 4.1: the single-sourced status vocabulary every gate
         command's status/disabled line reports, shared instead of each gate
         command declaring its own byte-identical ``_<GATE>_STATUS_*`` set."""
-        from devbench.constants import GATE_STATUS_DISABLED, GATE_STATUS_FAIL, GATE_STATUS_PASS
+        from devbench.constants import (
+            GATE_STATUS_DISABLED,
+            GATE_STATUS_ERROR,
+            GATE_STATUS_FAIL,
+            GATE_STATUS_PASS,
+        )
 
-        assert (GATE_STATUS_DISABLED, GATE_STATUS_PASS, GATE_STATUS_FAIL) == ("disabled", "pass", "fail")
-        assert len({GATE_STATUS_DISABLED, GATE_STATUS_PASS, GATE_STATUS_FAIL}) == 3
+        assert (GATE_STATUS_DISABLED, GATE_STATUS_PASS, GATE_STATUS_FAIL, GATE_STATUS_ERROR) == (
+            "disabled",
+            "pass",
+            "fail",
+            "error",
+        )
+        assert len({GATE_STATUS_DISABLED, GATE_STATUS_PASS, GATE_STATUS_FAIL, GATE_STATUS_ERROR}) == 4
 
 
 class TestGateWaiverAttributionConstants:

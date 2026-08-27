@@ -1428,7 +1428,7 @@ GATE_TIERS: Mapping[str, str] = {
 # ---------------------------------------------------------------------------
 # Gate status vocabulary (spec integration-reality-gates-hardening.md
 # section 5.2, 4.1). Every gate command's spec 5.2 status line and spec 4.1
-# disabled line report ``status`` as exactly one of these three values;
+# disabled line report ``status`` as exactly one of these four values;
 # declared once here, beside ``GATE_NAMES``/``GATE_TIERS``, so per-gate
 # command implementations in ``cli.py`` (``cmd_check_ancestry``,
 # ``cmd_check_reachability``, and future gate commands) share a single
@@ -1438,6 +1438,7 @@ GATE_TIERS: Mapping[str, str] = {
 GATE_STATUS_DISABLED: str = "disabled"
 GATE_STATUS_PASS: str = "pass"
 GATE_STATUS_FAIL: str = "fail"
+GATE_STATUS_ERROR: str = "error"
 
 # ---------------------------------------------------------------------------
 # GATE_WAIVER marker attribution vocabulary (spec 3.6, 4.9; D-6). A

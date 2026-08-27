@@ -4619,6 +4619,7 @@ class TestGatesConfigParsing:
               shared_file_impact:
                 enabled: true
                 auto_derive_registry: true
+                fan_in_threshold: 5
               fixture_consistency:
                 enabled: true
                 canonical_sources:
@@ -4650,6 +4651,7 @@ class TestGatesConfigParsing:
         assert gates.ancestry.enabled is True
         assert gates.shared_file_impact.enabled is True
         assert gates.shared_file_impact.auto_derive_registry is True
+        assert gates.shared_file_impact.fan_in_threshold == 5
         assert gates.fixture_consistency.enabled is True
         assert gates.fixture_consistency.canonical_sources == (
             FixtureCanonicalSource(path="tests/fixtures/catalog.json", identifier_field="sku"),
@@ -4663,6 +4665,98 @@ class TestGatesConfigParsing:
         assert override is not None
         assert override.enabled is True
         assert override.patterns == ("src/app/Shell.tsx",)
+
+    # -- gates.shared_file_impact.fan_in_threshold (spec 4.6, issue #13 AC4) --------
+
+    def test_fan_in_threshold_defaults_to_three(self, tmp_path: Path) -> None:
+        """Absent fan_in_threshold defaults to 3 (spec 4.6)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.shared_file_impact.fan_in_threshold == 3
+
+    def test_fan_in_threshold_explicit_value_parses(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                auto_derive_registry: true
+                fan_in_threshold: 7
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.shared_file_impact.fan_in_threshold == 7
+
+    def test_fan_in_threshold_non_integer_raises_naming_key(self, tmp_path: Path) -> None:
+        """A non-integer fan_in_threshold fails config load naming the offending key (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: "three"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_fan_in_threshold_zero_raises_naming_key(self, tmp_path: Path) -> None:
+        """A fan_in_threshold below 1 fails config load naming the offending key (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: 0
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_fan_in_threshold_negative_raises_naming_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: -1
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_key_inside_shared_file_impact_block_raises_naming_key(self, tmp_path: Path) -> None:
+        """An unrecognised key nested inside gates.shared_file_impact fails load naming it (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*bogus_key"):
+            load_runtime_config(cfg, {})
 
     def test_unknown_gate_name_raises_value_error_naming_key(self, tmp_path: Path) -> None:
         """An unrecognised top-level gates.<name> key fails load naming the offending key (AC-5)."""
@@ -4724,6 +4818,7 @@ class TestGatesConfigParsing:
         assert rt.gates.reachability.enabled is False
         assert rt.gates.ancestry.enabled is False
         assert rt.gates.shared_file_impact.enabled is False
+        assert rt.gates.shared_file_impact.fan_in_threshold == 3
         assert rt.gates.fixture_consistency.enabled is False
         assert rt.gates.write_path_audit.enabled is False
         assert rt.gates.newly_reachable_paths.enabled is False
@@ -4856,6 +4951,29 @@ class TestGatesConfigDefenseInDepthDirectCalls:
         fake_path = tmp_path / "cfg.yaml"
         with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.auto_derive_registry must be a boolean"):
             _parse_shared_file_impact_gate(fake_path, {"auto_derive_registry": "yes"})
+
+    def test_shared_file_impact_fan_in_threshold_bool_raises_direct(self, tmp_path: Path) -> None:
+        """A bool is a Python int subclass but must never satisfy the integer check (defense in depth
+        beyond the schema layer, which already rejects bool for a `type: integer` property)."""
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": True})
+
+    def test_shared_file_impact_fan_in_threshold_non_integer_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": 2.5})
+
+    def test_shared_file_impact_fan_in_threshold_below_one_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": 0})
 
     def test_gate_override_enabled_absent_key_returns_default_direct(self, tmp_path: Path) -> None:
         """An override block present but omitting 'enabled' yields GateEnabledOverride() (enabled=None)."""
@@ -5282,8 +5400,12 @@ class TestResolveGateConfigPrecedence:
         result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
 
         assert result.gate == "shared_file_impact"
-        assert result.values == {"enabled": False, "auto_derive_registry": False}
-        assert result.provenance == {"enabled": "builtin", "auto_derive_registry": "builtin"}
+        assert result.values == {"enabled": False, "auto_derive_registry": False, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "builtin",
+            "auto_derive_registry": "builtin",
+            "fan_in_threshold": "builtin",
+        }
 
     def test_project_level_tunable_is_project_provenance_enabled_stays_builtin(self) -> None:
         """Project sets a tunable away from its built-in default: that
@@ -5301,8 +5423,12 @@ class TestResolveGateConfigPrecedence:
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
         result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
 
-        assert result.values == {"enabled": False, "auto_derive_registry": True}
-        assert result.provenance == {"enabled": "builtin", "auto_derive_registry": "project"}
+        assert result.values == {"enabled": False, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "builtin",
+            "auto_derive_registry": "project",
+            "fan_in_threshold": "builtin",
+        }
 
     def test_repo_override_flips_enabled_and_inherits_project_tunable(self) -> None:
         """A per-repo override that flips 'enabled' inherits the
@@ -5325,8 +5451,12 @@ class TestResolveGateConfigPrecedence:
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
         result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
 
-        assert result.values == {"enabled": True, "auto_derive_registry": True}
-        assert result.provenance == {"enabled": "repo", "auto_derive_registry": "project"}
+        assert result.values == {"enabled": True, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "repo",
+            "auto_derive_registry": "project",
+            "fan_in_threshold": "builtin",
+        }
 
     def test_env_override_wins_regardless_of_lower_layers(self) -> None:
         """The env layer overrides 'enabled' regardless of project/repo
@@ -5350,8 +5480,33 @@ class TestResolveGateConfigPrecedence:
         runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
         result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config, env_enabled_override=False)
 
-        assert result.values == {"enabled": False, "auto_derive_registry": True}
-        assert result.provenance == {"enabled": "env", "auto_derive_registry": "project"}
+        assert result.values == {"enabled": False, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {"enabled": "env", "auto_derive_registry": "project", "fan_in_threshold": "builtin"}
+
+    def test_fan_in_threshold_project_level_override_is_project_provenance(self) -> None:
+        """A project-level fan_in_threshold different from the built-in default (3) resolves
+        with 'project' provenance -- exercises `_merge_shared_file_impact_fan_in_threshold`
+        (spec 4.6) alongside the generic bool merge, the same pattern
+        `test_resolved_reachability_carries_both_enabled_and_entry_points` pins for
+        reachability's `entry_points`."""
+        from devbench.config_loader import (
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(shared_file_impact=GateSharedFileImpactConfig(enabled=True, fan_in_threshold=7))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "auto_derive_registry": False, "fan_in_threshold": 7}
+        assert result.provenance == {
+            "enabled": "project",
+            "auto_derive_registry": "builtin",
+            "fan_in_threshold": "project",
+        }
 
     def test_fixture_consistency_tunable_uses_extract_source_literals_field(self) -> None:
         """A different gate's differently-named tunable (extract_source_literals)
@@ -5447,14 +5602,14 @@ class TestResolveGateConfigPrecedence:
 class TestResolveGateConfigSingleReadPathPin:
     """AC-E2-F1-S1-T2-5 (AC-27): ``resolve_gate_config`` is the ONLY sanctioned
     read path for a gate's resolver-managed fields (``enabled``,
-    ``auto_derive_registry``, ``extract_source_literals``,
+    ``auto_derive_registry``, ``fan_in_threshold``, ``extract_source_literals``,
     ``entry_points``). Fails when a module other than ``config_loader.py``
     reads one of these fields directly off the raw ``GatesConfig`` tree
     instead of calling the resolver, so a later gate epic cannot quietly
     re-introduce a second, potentially divergent interpretation of the
     precedence chain.
 
-    Scoped to the four resolver-managed field names rather than every
+    Scoped to the five resolver-managed field names rather than every
     ``.gates.`` access, because two pre-existing, sanctioned direct reads
     of *structural* (non-resolver) gate fields already exist in
     ``cli.py`` (``gates.repos.<repo>.shared_file_impact.patterns`` and
@@ -5466,7 +5621,8 @@ class TestResolveGateConfigSingleReadPathPin:
     _SRC_ROOT = Path(__file__).parent.parent / "src" / "devbench"
     _EXEMPT_MODULE = _SRC_ROOT / "config_loader.py"
     _RAW_GATE_FIELD_ACCESS_RE = re.compile(
-        r"\.gates\.[\w.\[\]\"' ()]*?\.(enabled|auto_derive_registry|extract_source_literals|entry_points)\b"
+        r"\.gates\.[\w.\[\]\"' ()]*?"
+        r"\.(enabled|auto_derive_registry|fan_in_threshold|extract_source_literals|entry_points)\b"
     )
 
     def _scanned_files(self) -> list[Path]:

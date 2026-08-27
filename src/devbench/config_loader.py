@@ -115,6 +115,19 @@ _BACKLOG_DEFAULT_BULK_UPDATE_AUDIT_PATH: str = "logs/bulk-updates.log"
 _SKILLS_DEFAULT_FAN_OUT_THRESHOLD: int = 10
 _SKILLS_DEFAULT_MAX_ITERATIONS: int = 5
 
+# gates.shared_file_impact.fan_in_threshold built-in default (spec 4.6,
+# issue #13 AC4; E5-F2-S1-T2): a file imported/required by MORE than this
+# many distinct modules is auto-derived into the shared-file registry when
+# `gates.shared_file_impact.auto_derive_registry` is true. Lives here
+# (rather than `constants.GATE_FIELD_DEFAULTS`, which is bool-only) because
+# `resolve_gate_config` merges this field through its own gate-specific
+# step (`_merge_shared_file_impact_fan_in_threshold`), the same pattern
+# `_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT` already uses for
+# `reachability.entry_points` -- not every gate-specific config knob
+# has a matching per-repo override layer or a uniform bool shape, so the
+# generic `GATE_FIELD_DEFAULTS`-driven merge does not fit every field.
+_SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT: int = 3
+
 # Quota wait-and-resume configuration (issue #236, spec S5.2, FR-2.9).
 _QUOTA_HANDLING_VALID_ON_EXHAUSTION: frozenset[str] = frozenset({"wait", "fail", "drain"})
 _QUOTA_HANDLING_VALID_ON_EXHAUSTION_TIMEOUT: frozenset[str] = frozenset({"drain", "fail", "keep_waiting"})
@@ -688,16 +701,23 @@ class GateSharedFileImpactConfig:
     Attributes:
         enabled: Whether this gate is enabled at the project level.
             Default ``constants.GATE_ENABLED_DEFAULT`` (``False``).
-        auto_derive_registry: Reserved for the future auto-derived fan-in
-            registry successor to the hand-maintained per-repo glob list
-            (v1 is hand-maintained only, via ``gates.repos.<org/repo>
-            .shared_file_impact.patterns``). Default
-            ``constants.GATE_AUTO_DERIVE_REGISTRY_DEFAULT`` (``False``);
-            not yet consumed by ``check-shared-file-impact``.
+        auto_derive_registry: When true, `check-shared-file-impact` computes
+            the shared-file set as the files imported/required by more than
+            `fan_in_threshold` distinct modules (spec 4.6, issue #13 AC4),
+            unioned ADDITIVELY with the hand-maintained per-repo glob list
+            (``gates.repos.<org/repo>.shared_file_impact.patterns`` --
+            never replaced by auto-derivation). Default
+            ``constants.GATE_AUTO_DERIVE_REGISTRY_DEFAULT`` (``False``).
+        fan_in_threshold: The fan-in count a file's distinct importer count
+            must exceed (strictly greater than, not "at least") for
+            auto-derivation to include it in the shared-file set. Only
+            consumed when `auto_derive_registry` is true. Default
+            ``_SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT`` (``3``).
     """
 
     enabled: bool = GATE_ENABLED_DEFAULT
     auto_derive_registry: bool = GATE_AUTO_DERIVE_REGISTRY_DEFAULT
+    fan_in_threshold: int = _SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -1490,7 +1510,10 @@ def _parse_shared_file_impact_gate(path: Path, gate_raw: object) -> GateSharedFi
 
     Raises:
         ValueError: If *gate_raw* is present but not a mapping, or
-            ``enabled``/``auto_derive_registry`` is not a boolean.
+            ``enabled``/``auto_derive_registry`` is not a boolean, or
+            ``fan_in_threshold`` is not an integer ``>= 1`` (spec 4.1 AC-5;
+            ``bool`` is rejected even though it is a Python ``int``
+            subclass -- ``true``/``false`` is never a valid threshold).
     """
     defaults = GateSharedFileImpactConfig()
     if gate_raw is None:
@@ -1506,7 +1529,15 @@ def _parse_shared_file_impact_gate(path: Path, gate_raw: object) -> GateSharedFi
             f"Config file '{path}': gates.shared_file_impact.auto_derive_registry must be a boolean "
             f"(true/false), got {type(auto_derive_registry).__name__} ({auto_derive_registry!r})."
         )
-    return GateSharedFileImpactConfig(enabled=enabled, auto_derive_registry=auto_derive_registry)
+    fan_in_threshold = gate_raw.get("fan_in_threshold", defaults.fan_in_threshold)
+    if isinstance(fan_in_threshold, bool) or not isinstance(fan_in_threshold, int) or fan_in_threshold < 1:
+        raise ValueError(
+            f"Config file '{path}': gates.shared_file_impact.fan_in_threshold must be an integer >= 1, "
+            f"got {fan_in_threshold!r}."
+        )
+    return GateSharedFileImpactConfig(
+        enabled=enabled, auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+    )
 
 
 def _parse_gate_override_enabled(path: Path, key: str, raw: dict) -> GateEnabledOverride:
@@ -2981,9 +3012,11 @@ class ResolvedGateConfig:
             *gate* in ``constants.GATE_FIELD_DEFAULTS`` (for example
             ``"auto_derive_registry"`` for ``shared_file_impact``) or merged
             by a gate-specific step in this function (``"entry_points"``
-            for ``reachability``, spec 4.4 bullet 2). Every value is a
-            ``bool`` except ``reachability``'s ``entry_points``, which is a
-            ``tuple[str, ...]``.
+            for ``reachability``, spec 4.4 bullet 2; ``"fan_in_threshold"``
+            for ``shared_file_impact``, spec 4.6). Every value is a
+            ``bool`` except ``reachability``'s ``entry_points`` (a
+            ``tuple[str, ...]``) and ``shared_file_impact``'s
+            ``fan_in_threshold`` (an ``int``).
         provenance: The layer that set each field in ``values`` -- one of
             ``constants.GATE_PROVENANCE_BUILTIN`` / ``_PROJECT`` /
             ``_REPO`` / ``_ENV`` (spec 4.1; rendered as the ``devbench
@@ -2991,13 +3024,13 @@ class ResolvedGateConfig:
     """
 
     gate: str
-    values: Mapping[str, bool | tuple[str, ...]]
+    values: Mapping[str, bool | int | tuple[str, ...]]
     provenance: Mapping[str, str]
 
 
 def _merge_gate_project_layer(
     gate: str, runtime_config: RuntimeConfig
-) -> tuple[dict[str, bool | tuple[str, ...]], dict[str, str]]:
+) -> tuple[dict[str, bool | int | tuple[str, ...]], dict[str, str]]:
     """Merge the built-in and project-level layers for *gate*, field-wise.
 
     Generic over every gate's field set (``constants.GATE_FIELD_DEFAULTS``)
@@ -3016,7 +3049,7 @@ def _merge_gate_project_layer(
         any project-level value that differs from the built-in default.
     """
     defaults = GATE_FIELD_DEFAULTS[gate]
-    values: dict[str, bool | tuple[str, ...]] = dict(defaults)
+    values: dict[str, bool | int | tuple[str, ...]] = dict(defaults)
     provenance: dict[str, str] = dict.fromkeys(defaults, GATE_PROVENANCE_BUILTIN)
 
     project_gate = getattr(runtime_config.gates, gate)
@@ -3032,7 +3065,7 @@ def _merge_gate_repo_layer(
     gate: str,
     repo: str,
     runtime_config: RuntimeConfig,
-    values: dict[str, bool | tuple[str, ...]],
+    values: dict[str, bool | int | tuple[str, ...]],
     provenance: dict[str, str],
 ) -> None:
     """Field-wise merge *repo*'s override for *gate* over *values*/*provenance*, in place.
@@ -3084,7 +3117,7 @@ _REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT: tuple[str, ...] = tuple(sorted(ENTRY
 
 def _merge_reachability_entry_points(
     runtime_config: RuntimeConfig,
-    values: dict[str, bool | tuple[str, ...]],
+    values: dict[str, bool | int | tuple[str, ...]],
     provenance: dict[str, str],
 ) -> None:
     """Merge the project layer for reachability's ``entry_points`` field, in place (spec 4.4 bullet 2).
@@ -3094,10 +3127,12 @@ def _merge_reachability_entry_points(
     are typed (and, per D-17, populated) for boolean tunables only --
     structural, list-valued fields have no built-in default to merge
     against there (see ``constants.GATE_FIELD_DEFAULTS``'s own docstring).
-    ``entry_points`` is the first gate-specific tunable that DOES carry a
-    real built-in default (:data:`_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`,
-    AC-FUNC-006), so it gets its own narrow merge step here rather than
-    widening the generic mechanism for a single field.
+    ``entry_points`` carries a real built-in default
+    (:data:`_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`, AC-FUNC-006) but is
+    not itself a boolean, so it gets its own narrow merge step here rather
+    than widening the generic mechanism for a single field --
+    ``shared_file_impact.fan_in_threshold`` (spec 4.6) gets the same
+    treatment just below, for the same reason (an int, not a bool).
 
     No per-repo override layer is merged: this campaign configures a
     single target repo (spec Section 9) and no acceptance criterion
@@ -3118,6 +3153,47 @@ def _merge_reachability_entry_points(
     else:
         values["entry_points"] = _REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT
         provenance["entry_points"] = GATE_PROVENANCE_BUILTIN
+
+
+def _merge_shared_file_impact_fan_in_threshold(
+    runtime_config: RuntimeConfig,
+    values: dict[str, bool | int | tuple[str, ...]],
+    provenance: dict[str, str],
+) -> None:
+    """Merge the project layer for shared_file_impact's ``fan_in_threshold`` field, in place (spec 4.6).
+
+    Same rationale as :func:`_merge_reachability_entry_points`: the generic
+    ``GATE_FIELD_DEFAULTS``-driven merge in :func:`_merge_gate_project_layer`
+    only models boolean tunables, so a real-valued (``int``) tunable with
+    its own built-in default (:data:`_SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT`)
+    gets its own narrow merge step here. Field-wise equality against the
+    built-in default is the same "was this explicitly set at the project
+    level" test every other project-layer field in this module uses
+    (:func:`_merge_gate_project_layer`); a project value that happens to
+    equal the built-in default is indistinguishable from "not set" and is
+    reported with ``builtin`` provenance, the same accepted simplification
+    documented on every other field this resolver merges.
+
+    No per-repo override layer is merged: no acceptance criterion for this
+    task requires a per-repo ``fan_in_threshold`` override, so
+    ``GateSharedFileImpactOverride`` carries no ``fan_in_threshold`` field
+    at all -- there is no override layer to read (mirrors
+    ``entry_points``'s identical no-override-layer note above).
+
+    Args:
+        runtime_config: Loaded runtime configuration.
+        values: The already project/repo/env-merged ``values`` dict for the
+            ``enabled``/``auto_derive_registry`` fields, updated in place
+            with ``fan_in_threshold``.
+        provenance: Companion provenance dict, updated in place.
+    """
+    project_value = runtime_config.gates.shared_file_impact.fan_in_threshold
+    if project_value != _SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT:
+        values["fan_in_threshold"] = project_value
+        provenance["fan_in_threshold"] = GATE_PROVENANCE_PROJECT
+    else:
+        values["fan_in_threshold"] = _SHARED_FILE_IMPACT_FAN_IN_THRESHOLD_DEFAULT
+        provenance["fan_in_threshold"] = GATE_PROVENANCE_BUILTIN
 
 
 def resolve_gate_config(
@@ -3158,7 +3234,10 @@ def resolve_gate_config(
     layers above: built-in default
     (:data:`_REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`, source_classification-
     derived) or project-level override, with provenance recorded the same
-    way (AC-FUNC-006).
+    way (AC-FUNC-006). ``shared_file_impact``'s ``fan_in_threshold`` field
+    (spec 4.6, issue #13 AC4) is merged by the equivalent gate-specific step
+    (:func:`_merge_shared_file_impact_fan_in_threshold`), also after the
+    four generic layers.
 
     Pure function -- no I/O, no env reads; directly testable with an
     in-memory ``RuntimeConfig`` and a plain ``bool | None``.
@@ -3193,6 +3272,8 @@ def resolve_gate_config(
         provenance["enabled"] = GATE_PROVENANCE_ENV
     if gate == "reachability":
         _merge_reachability_entry_points(runtime_config, values, provenance)
+    if gate == "shared_file_impact":
+        _merge_shared_file_impact_fan_in_threshold(runtime_config, values, provenance)
 
     return ResolvedGateConfig(gate=gate, values=values, provenance=provenance)
 

@@ -1196,11 +1196,21 @@ Current value shown to the operator: the existing config's value for this key if
 
 #### `gates.shared_file_impact.auto_derive_registry` -- Auto-derive fan-in registry
 
-Reserved for the future auto-derived fan-in registry successor to the hand-maintained per-repo glob list. v1 is hand-maintained only via `gates.repos.<org/repo>.shared_file_impact.patterns`.
+When true, computes the shared-file set as the files imported/required by more than `fan_in_threshold` distinct modules (spec 4.6, issue #13 AC4), via language-appropriate import scanning. Unioned ADDITIVELY with the hand-maintained per-repo glob list (`gates.repos.<org/repo>.shared_file_impact.patterns`) -- auto-derivation never replaces the hand list.
 
-- **Recommended:** `false` -- matches the only implemented mode today (hand-maintained glob list); the auto-derive mode has no implementation yet.
-- **Alternatives:** `true` (has no effect yet -- reserved for a future release.)
+- **Recommended:** `false` -- D-17 covers both every gate being disabled at the built-in level (`gates.shared_file_impact.enabled`, above) AND the accepted tunable defaults, naming this exact key with this exact value (`auto_derive_registry=false`); this default is D-17's operator selection, not this feature's own choice.
+- **Alternatives:** `true` (enables auto-derivation for every repo; combine with `fan_in_threshold` below.)
 - **Free-form:** Type `true` or `false` directly; any other value is rejected and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
+#### `gates.shared_file_impact.fan_in_threshold` -- Auto-derive fan-in threshold
+
+The distinct-importer fan-in count a file must exceed (strictly greater than, not "at least") for `auto_derive_registry` to include it in the shared-file set. Only consumed when `auto_derive_registry` is true.
+
+- **Recommended:** `3` -- the built-in default, D-17's accepted `fan_in_threshold=3` operator selection.
+- **Alternatives:** any integer `>= 1` (a lower value derives more files; a higher value derives fewer.)
+- **Free-form:** Type an integer `>= 1` directly; any other value (non-integer, or `< 1`) is rejected by the schema check and re-prompted.
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
 

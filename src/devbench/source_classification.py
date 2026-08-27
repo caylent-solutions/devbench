@@ -58,6 +58,9 @@ substrings. A stem can never collide with an extension and vice versa.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+
 # ---------------------------------------------------------------------------
 # Extension category: which suffixes are source code.
 # ---------------------------------------------------------------------------
@@ -206,3 +209,202 @@ def is_test_path(rel_path: str) -> bool:
         return True
     stem = filename.rsplit(".", 1)[0]
     return stem.startswith("test_") or stem.endswith("_test")
+
+
+# ---------------------------------------------------------------------------
+# Import-target category: language-appropriate import/require scanning
+# (spec `integration-reality-gates-hardening.md` section 4.6, D-9;
+# caylent-solutions/devbench-internal-backlog#13 AC4).
+# ---------------------------------------------------------------------------
+#
+# This is scanning, not parsing: each family's own single-line import/
+# require/using/include grammar, matched with a compiled regex, the same
+# "cheap candidate surfacing, not a real compiler front-end" posture
+# `devbench.cli`'s reachability importer search already documents for its
+# own grep-based heuristic. :func:`extract_import_targets` answers only
+# "what did this file's text say it imports" -- resolving a raw target
+# string (a relative path fragment, a dotted module path, or a bare
+# package name) to an actual on-disk file is the caller's job
+# (`devbench.cli._derive_shared_file_registry`), never this module's.
+
+_JS_IMPORT_TARGET_RE = re.compile(
+    r"""(?:import\s+(?:[^'";]*?\bfrom\s+)?|export\s+[^'";]*?\bfrom\s+|require\s*\(\s*|import\s*\(\s*)['"]([^'"]+)['"]"""
+)
+_PY_FROM_IMPORT_RE = re.compile(r"^\s*from\s+([.\w]+)\s+import\s+(.+)$", re.MULTILINE)
+_PY_IMPORT_RE = re.compile(r"^\s*import\s+([.\w]+(?:\s*,\s*[.\w]+)*)", re.MULTILINE)
+_GO_SINGLE_IMPORT_RE = re.compile(r'^\s*import\s+(?:\w+\s+)?"([^"]+)"', re.MULTILINE)
+_GO_IMPORT_BLOCK_RE = re.compile(r"import\s*\(([^)]*)\)", re.DOTALL)
+_GO_IMPORT_BLOCK_ENTRY_RE = re.compile(r'"([^"]+)"')
+_RUBY_IMPORT_TARGET_RE = re.compile(r"""require(?:_relative)?\s*\(?\s*['"]([^'"]+)['"]""")
+_JVM_IMPORT_TARGET_RE = re.compile(r"^\s*import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;?", re.MULTILINE)
+_SWIFT_IMPORT_TARGET_RE = re.compile(r"^\s*import\s+([\w.]+)", re.MULTILINE)
+_CSHARP_IMPORT_TARGET_RE = re.compile(r"^\s*using\s+(?:static\s+)?([\w.]+)\s*;", re.MULTILINE)
+_PHP_INCLUDE_TARGET_RE = re.compile(r"""(?:require|include)(?:_once)?\s*\(?\s*['"]([^'"]+)['"]""")
+_PHP_USE_TARGET_RE = re.compile(r"^\s*use\s+([\w\\]+)", re.MULTILINE)
+
+
+def _split_python_import_clause(imported_clause: str) -> list[str]:
+    """Split a ``from X import <this clause>`` clause into bare imported names.
+
+    Strips a wrapping ``(...)``, drops ``as <alias>`` aliasing, and skips the
+    ``*`` wildcard form, which names no on-disk file any resolver could ever
+    match. This function itself accepts a multi-line clause fine (it splits on
+    ``,`` after stripping, so embedded newlines are harmless); the actual
+    scanning limitation lives one level up, in the caller's
+    ``_PY_FROM_IMPORT_RE`` (``re.MULTILINE`` without ``re.DOTALL``), whose
+    ``.+$`` group only ever matches up to the FIRST physical line -- nothing is
+    "collapsed"; for a multi-line grouped ``from . import (`` clause the regex
+    simply never sees anything past the opening ``(``, so this function is
+    called with a truncated one-character clause and the real imported names on
+    the following lines are silently missed (a documented scanning limitation,
+    not a parsing one -- no downstream resolver can act on a target this
+    function was never given).
+    """
+    clause = imported_clause.strip()
+    if clause.startswith("(") and clause.endswith(")"):
+        clause = clause[1:-1]
+    names = []
+    for part in clause.split(","):
+        name = part.strip().split(" as ")[0].strip()
+        if name and name != "*":
+            names.append(name)
+    return names
+
+
+def _extract_python_import_targets(text: str) -> list[str]:
+    """Return ``from <target> import ...`` and ``import <target>[, <target> ...]`` targets.
+
+    A ``from`` clause whose module path is dots-only (``from . import x``, ``from
+    .. import x, y``) names no dotted module of its own -- ``x``/``y`` there are
+    the submodule names a real Python resolver looks for directly under that
+    package, the same shape ``from .x import y`` already names explicitly via its
+    own module path. Both spellings are therefore reduced to one target per
+    imported name (``.x``), rather than the dots-only path being emitted alone as
+    a target no on-disk file could ever match (spec 4.6, round-1 A3 finding: ``from
+    . import target`` and ``from .target import x`` must resolve the same way).
+    """
+    targets: list[str] = []
+    for match in _PY_FROM_IMPORT_RE.finditer(text):
+        module_path, imported_clause = match.group(1), match.group(2)
+        if module_path and module_path.strip(".") == "":
+            for imported_name in _split_python_import_clause(imported_clause):
+                targets.append(module_path + imported_name)
+        else:
+            targets.append(module_path)
+    for match in _PY_IMPORT_RE.finditer(text):
+        for part in match.group(1).split(","):
+            name = part.strip().split(" as ")[0].strip()
+            if name:
+                targets.append(name)
+    return targets
+
+
+def _extract_js_import_targets(text: str) -> list[str]:
+    """Return ``import ... from '<target>'``, bare ``import '<target>'`` and ``require('<target>')`` targets."""
+    return [match.group(1) for match in _JS_IMPORT_TARGET_RE.finditer(text)]
+
+
+def _extract_go_import_targets(text: str) -> list[str]:
+    """Return single-line ``import "<target>"`` and every grouped ``import (...)`` block's targets.
+
+    Uses ``finditer`` (round-2 test_review finding), never ``search``: a Go file
+    with more than one grouped import block (legal Go, and not unusual after a
+    tool like ``goimports`` regroups stdlib vs third-party imports separately)
+    has every block's targets extracted, not only the first one a single
+    ``search`` call would find.
+    """
+    targets = [match.group(1) for match in _GO_SINGLE_IMPORT_RE.finditer(text)]
+    for block in _GO_IMPORT_BLOCK_RE.finditer(text):
+        targets.extend(match.group(1) for match in _GO_IMPORT_BLOCK_ENTRY_RE.finditer(block.group(1)))
+    return targets
+
+
+def _extract_ruby_import_targets(text: str) -> list[str]:
+    """Return ``require '<target>'`` / ``require_relative '<target>'`` targets."""
+    return [match.group(1) for match in _RUBY_IMPORT_TARGET_RE.finditer(text)]
+
+
+def _extract_jvm_import_targets(text: str) -> list[str]:
+    """Return Java/Kotlin ``import <target>;`` (including ``import static``) targets."""
+    return [match.group(1) for match in _JVM_IMPORT_TARGET_RE.finditer(text)]
+
+
+def _extract_swift_import_targets(text: str) -> list[str]:
+    """Return Swift ``import <target>`` targets."""
+    return [match.group(1) for match in _SWIFT_IMPORT_TARGET_RE.finditer(text)]
+
+
+def _extract_csharp_import_targets(text: str) -> list[str]:
+    """Return C# ``using <target>;`` (including ``using static``) targets."""
+    return [match.group(1) for match in _CSHARP_IMPORT_TARGET_RE.finditer(text)]
+
+
+def _extract_php_import_targets(text: str) -> list[str]:
+    """Return PHP ``require``/``include`` (with ``_once`` variants) and ``use <target>`` targets."""
+    targets = [match.group(1) for match in _PHP_INCLUDE_TARGET_RE.finditer(text)]
+    targets.extend(match.group(1) for match in _PHP_USE_TARGET_RE.finditer(text))
+    return targets
+
+
+#: The JS/TS family's extensions (spec 4.6, round-2 code_review finding): the
+#: SINGLE place this grouping is declared. ``devbench.cli``'s shared-file
+#: import-target *resolution* step (as opposed to the *scanning* dispatch
+#: below) needs this exact family too, to know which extensions and
+#: directory-entry stem (``index``) a JS/TS-family relative import resolves
+#: against -- it imports this constant rather than redeclaring its own
+#: extension tuple, so adding a new JS/TS extension here (e.g. a future
+#: ``.mts``) can never silently drift between the two call sites with no
+#: failing test (mirrors the existing :data:`WRITE_PATH_AUDIT_SCAN_EXTENSIONS`
+#: precedent: one named scope, every consumer imports it).
+JS_TS_FAMILY_EXTENSIONS: tuple[str, ...] = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+#: Per-extension import-target extractor registry (spec 4.6 AC-5): every key
+#: is a member of :data:`SOURCE_EXTENSIONS` (never a redeclared extension
+#: set of its own -- :func:`extract_import_targets` dispatches on
+#: :func:`is_source_extension` first, this dict only routes an
+#: already-classified suffix to its language family's extractor). ``.vue``
+#: is deliberately absent: its imports live inside an embedded ``<script>``
+#: block this registry does not parse -- :func:`extract_import_targets`
+#: returns ``[]`` for it, the same result an unmapped *known* source
+#: extension gets, not an error.
+_IMPORT_TARGET_EXTRACTORS: dict[str, Callable[[str], list[str]]] = {
+    ".py": _extract_python_import_targets,
+    **dict.fromkeys(JS_TS_FAMILY_EXTENSIONS, _extract_js_import_targets),
+    ".go": _extract_go_import_targets,
+    ".rb": _extract_ruby_import_targets,
+    ".java": _extract_jvm_import_targets,
+    ".kt": _extract_jvm_import_targets,
+    ".swift": _extract_swift_import_targets,
+    ".cs": _extract_csharp_import_targets,
+    ".php": _extract_php_import_targets,
+}
+
+
+def extract_import_targets(suffix: str, text: str) -> list[str]:
+    """Return the raw import/require/using/include target strings *text* contains.
+
+    Dispatches on *suffix* (case-insensitive, via :func:`is_source_extension`) to the
+    language family's extractor in :data:`_IMPORT_TARGET_EXTRACTORS` -- the SINGLE
+    place per family's import grammar lives (spec 4.6 AC-5): no caller declares a
+    second copy of any of these patterns, and this function declares no extension
+    tuple of its own, dispatching purely on :data:`SOURCE_EXTENSIONS` membership via
+    :func:`is_source_extension`.
+
+    Targets are returned exactly as written in the source -- a relative path
+    fragment (``"./shared_module"``), a dotted module/namespace path
+    (``"pkg.shared_module"``, ``"com.example.SharedModule"``), or a bare package
+    name -- in file order, duplicates included (fan-in counting is the caller's
+    job). Resolving a target to an on-disk file is never this function's
+    responsibility.
+
+    Returns ``[]``, never raises, for a *suffix* outside :data:`SOURCE_EXTENSIONS`
+    (not source at all) and for a recognised source extension with no entry in
+    :data:`_IMPORT_TARGET_EXTRACTORS` (currently only ``.vue``) -- a file that
+    contributes no import targets simply casts no fan-in vote; this is not a scan
+    error. A genuinely unreadable file is a filesystem-level concern only the
+    caller can detect (it alone touches disk), never this text-only function's.
+    """
+    if not is_source_extension(suffix):
+        return []
+    extractor = _IMPORT_TARGET_EXTRACTORS.get(suffix.lower())
+    return extractor(text) if extractor is not None else []

@@ -68,7 +68,11 @@ plugin/devbench-orchestrate/
                                    (caylent-solutions/devbench-internal-backlog#13):
                                    blocks when `devbench check-shared-file-impact` reports a diff
                                    touched a `gates.repos.<repo>.shared_file_impact.patterns`
-                                   match AND the full-suite run introduced a failure attributable
+                                   match, OR (when `gates.shared_file_impact.auto_derive_registry`
+                                   is enabled, caylent-solutions/devbench-internal-backlog#13 AC4)
+                                   touched a file the import-fan-in scanner derived -- an empty
+                                   `patterns` list does not by itself mean this gate never fires --
+                                   AND the full-suite run introduced a failure attributable
                                    to the unit's own Changes Manifest scope that is not present in
                                    the stored baseline (a new failure outside that scope is
                                    reported but never blocks). Reads the verdict from a small

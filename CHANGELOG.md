@@ -5,6 +5,63 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-shared-file-impact` gains an auto-derived shared-file registry from
+  import fan-in, with a tunable threshold** (spec
+  `integration-reality-gates-hardening.md` section 4.6, D-9; issue #13 AC4).
+  `gates.shared_file_impact.auto_derive_registry: true` (default `false`)
+  computes the shared-file set as the files imported/required by more than
+  `gates.shared_file_impact.fan_in_threshold` (default `3`, must be an
+  integer `>= 1`) distinct modules, via language-appropriate import scanning
+  (`devbench.source_classification.extract_import_targets`, dispatched on
+  the module's existing extension sets: Python, the JS/TS family (including
+  `export ... from`/`export * from`), Go (every grouped import block, not only
+  the first), Ruby, Java/Kotlin, Swift, C#, and PHP) and
+  `devbench.cli._derive_shared_file_registry`'s fan-in count, resolved
+  language-appropriately: for Python, the JS/TS family, Ruby and PHP, against
+  the importing file's own directory for a leading-`.` target and against the
+  repo root ONLY (never a `src/` fallback) for a leading-`/` target (this
+  leading-`/` bucket does not arise for Python in practice, since Python's own
+  extractor never emits a `/`-prefixed target); for Go, Java/Kotlin, C#, and
+  Swift, ALWAYS against the repo root and a top-level
+  `src/` directory regardless of the target's own leading character (their
+  import grammars have no relative form); and for a bare/absolute Python,
+  PHP, Go, Java/Kotlin, C#, or Swift target with neither prefix, likewise
+  against the repo root and a top-level `src/` directory -- never a bare
+  global basename index, which would credit an
+  unrelated same-named file (e.g. a stdlib `import types` crediting an
+  unrelated `mylib/types.py`); a bare/aliased JS/TS or Ruby target with
+  neither prefix is deliberately never resolved and casts no fan-in vote; a
+  directory-form import (`from mypkg
+  import X`, `import {A} from './lib'`) resolves to that package's entry file
+  (`__init__.py`/`index.<ext>`); a target resolving to more than one candidate is
+  credited to neither, with a `WARNING:` on stderr naming the ambiguity. The
+  derived set is unioned ADDITIVELY with the hand-maintained
+  `gates.repos.<org/repo>.shared_file_impact.patterns` glob list -- never a
+  replacement -- and is printed in the JSON payload on every invocation of an
+  ENABLED gate that reaches a verdict (pass or block), `auto_derive_registry`
+  enabled, matched or not; an invocation that raises before reaching a verdict,
+  and an invocation where `gates.shared_file_impact.enabled` is `false` (which
+  writes its own PASS verdict record and returns before any payload is built),
+  both print no payload at all. It is additionally cached alongside the baseline record, as
+  `<branch-point-sha>.derived-registry.json` (a sibling of the baseline
+  record's own `<branch-point-sha>.json`, never `<baseline_path>` literally
+  suffixed, which would resolve to a nonexistent
+  `<sha>.json.derived-registry.json`), on a MATCHED invocation (once a branch
+  point/baseline is actually resolved) and as soon as that baseline is loaded,
+  before the full-suite command is even resolved -- so a matched invocation
+  that later raises can still leave this cache written with no comparison ever
+  completed. This cache is write-only: no devbench command reads it back; it
+  exists so an operator can recover what registry was in effect for a given
+  verdict by inspecting the file directly on disk. `enabled`, `auto_derive_registry` and
+  `fan_in_threshold` are all read exclusively through
+  `resolve_gate_config("shared_file_impact", repo)` (spec 4.1 AC-27), via the
+  same `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability`
+  use; a non-integer or `< 1` threshold, or an unrecognised key inside the
+  `gates.shared_file_impact` block, fails config load naming the offending
+  key. An unreadable source file (including a dangling symlink) encountered
+  during the scan is a loud `ERROR: import scan failed for <path>: <reason>`
+  (exit 1), never a partial derived set.
+
 - **`check-ancestry` gains a squash-aware second probe, a fatal `git fetch`,
   and a configured tracking remote** (spec `integration-reality-gates-hardening.md`
   section 4.5, 317-D02; AC-17, AC-15; issue #12). A strict

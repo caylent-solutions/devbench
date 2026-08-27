@@ -82,6 +82,7 @@ import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -340,7 +341,14 @@ from devbench.scope import (
     _tokenise,
 )
 from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog, flock_path
-from devbench.source_classification import SOURCE_EXTENSIONS, is_entry_point_stem, is_source_extension, is_test_path
+from devbench.source_classification import (
+    JS_TS_FAMILY_EXTENSIONS,
+    SOURCE_EXTENSIONS,
+    extract_import_targets,
+    is_entry_point_stem,
+    is_source_extension,
+    is_test_path,
+)
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
 from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeResult, resolve_changed_files
@@ -6374,6 +6382,424 @@ def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -
     return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
 
 
+#: Directory names never walked while enumerating shared-file-registry scan
+#: candidates (spec 4.6, round-1 code_review A2 finding): dependency/build/vendor
+#: trees a real import graph never treats as "this repo's own code", pruned the
+#: moment the walk reaches them rather than filtered out of an already-fully
+#: enumerated ``rglob("*")`` result -- round-1 measurement on this very repo found
+#: the overwhelming majority of a naive ``rglob("*")`` scan's derived entries were
+#: ``.venv/`` files a post-hoc filter never needed to walk in the first place.
+#:
+#: This set is CLOSED and finite, not an exhaustive denylist of every vendor/
+#: dependency directory convention (round-2 code_review finding): an unlisted
+#: SUBDIRECTORY the walk descends into (e.g. ``bower_components/``,
+#: ``.direnv/``, ``target/``) still has its own internals scanned and voted
+#: on. This applies only to subdirectories the walk descends into, not to the
+#: repo root itself, which is always scanned regardless of what it is named --
+#: pruning only ever filters ``dirnames`` while walking, and *repo_path* is
+#: never itself a prune candidate. ``vendor/`` and ``third_party/`` are
+#: included below since Go -- a language this scanner explicitly supports --
+#: canonically vendors third-party code under ``vendor/``.
+_SHARED_FILE_SCAN_EXCLUDED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".eggs",
+        "site-packages",
+        "dist",
+        "build",
+        "htmlcov",
+        "vendor",
+        "third_party",
+    }
+)
+
+#: Extensions :func:`_resolve_shared_file_import_target` treats as the JS/TS
+#: family for the *resolution* step (never the scanning grammar itself, which
+#: stays in ``source_classification``, AC-5) -- imported from
+#: :data:`devbench.source_classification.JS_TS_FAMILY_EXTENSIONS`, the single
+#: place this family is declared (round-2 code_review finding: a second,
+#: hand-copied tuple here could drift silently from the scanning dispatch's own
+#: family grouping with no failing test).
+_SHARED_FILE_JS_RESOLVE_EXTS: tuple[str, ...] = JS_TS_FAMILY_EXTENSIONS
+_SHARED_FILE_PY_RESOLVE_EXTS: tuple[str, ...] = (".py",)
+
+#: Directory-entry filename stems (spec 4.6, round-1 A3 finding): a directory-form
+#: import (``from mypkg import X`` naming the package itself, ``import {A} from
+#: './lib'`` naming a barrel directory) resolves to the package/directory's entry
+#: file, mirroring the convention each ecosystem already uses.
+_SHARED_FILE_PY_ENTRY_STEM = "__init__"
+_SHARED_FILE_JS_ENTRY_STEM = "index"
+
+
+def _iter_shared_file_scan_candidates(repo_path: Path) -> dict[str, Path]:
+    """Return ``{repo-relative POSIX path: absolute Path}`` for every classified
+    source file under *repo_path*.
+
+    Prunes :data:`_SHARED_FILE_SCAN_EXCLUDED_DIRS` DURING the walk (spec 4.6,
+    round-1 A2 finding) via in-place ``dirnames`` mutation, so a vendored or
+    dependency tree is never descended into at all -- as opposed to the previous
+    ``rglob("*")`` approach, which enumerated (and, on this very repo, let vote)
+    every file inside a matching directory before a post-hoc filter discarded it.
+    """
+    candidates: dict[str, Path] = {}
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SHARED_FILE_SCAN_EXCLUDED_DIRS)
+        for filename in sorted(filenames):
+            abs_path = Path(dirpath) / filename
+            if not is_source_extension(abs_path.suffix):
+                continue
+            rel = abs_path.relative_to(repo_path).as_posix()
+            candidates[rel] = abs_path
+    return candidates
+
+
+def _shared_file_source_roots(repo_path: Path) -> tuple[str, ...]:
+    """Return the repo-relative directory prefixes an ABSOLUTE import target is
+    resolved against (spec 4.6, round-1 A1 finding).
+
+    Always includes the repo root itself (``""``). Also includes ``"src"`` when a
+    top-level ``src/`` directory exists -- the common Python/JS src-layout
+    convention (PEP 517/518, and this very repo) under which an absolute import
+    (e.g. ``devbench.utils.io``) omits the ``src`` prefix its own file still
+    carries on disk. This is a small, fixed, principled allowlist, never "every
+    directory in the tree" -- the latter degenerates back into crediting any file
+    with a matching basename regardless of where it lives, exactly the round-1 A1
+    defect this function exists to avoid reintroducing.
+    """
+    roots = [""]
+    if (repo_path / "src").is_dir():
+        roots.append("src")
+    return tuple(roots)
+
+
+def _match_shared_file_module_path(
+    prefix: str, candidates: set[str], exts: tuple[str, ...], entry_stem: str | None
+) -> set[str]:
+    """Return every *candidates* member at repo-relative *prefix*: *prefix* ITSELF
+    when the raw target already carried its own extension (PHP/Ruby ``require``
+    paths commonly spell out ``lib/shared.php`` in full, unlike Python/JS's
+    extension-less module specifiers -- no scanned candidate is ever
+    extension-less, since :func:`devbench.source_classification.is_source_extension`
+    never classifies one, so this can only ever match a target that already named
+    a real extension), a plain file (``<prefix><ext>``), or, for a directory-form
+    import (spec 4.6, round-1 A3 finding), that directory's *entry_stem* file
+    (``<prefix>/<entry_stem><ext>``).
+
+    *entry_stem* is ``None`` for languages with no directory-entry convention this
+    scan resolves (Go, Ruby, PHP, JVM, C#, Swift) -- only the directory-entry form
+    is skipped for those; the exact-path and plain-file (``<prefix><ext>``) forms
+    are still tried.
+
+    A *prefix* that normalises to the empty string or ``"."`` (the repo root
+    itself) always returns an empty set below, so a directory-form target
+    naming the repo root's own entry file is never credited -- a conservative
+    under-credit, never a false match.
+    """
+    if prefix in ("", "."):
+        return set()
+    matches = {prefix} if prefix in candidates else set()
+    matches |= {f"{prefix}{ext}" for ext in exts if f"{prefix}{ext}" in candidates}
+    if entry_stem is not None:
+        matches |= {f"{prefix}/{entry_stem}{ext}" for ext in exts if f"{prefix}/{entry_stem}{ext}" in candidates}
+    return matches
+
+
+def _resolve_python_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve one Python :func:`extract_import_targets` target to its on-disk
+    candidate(s) (spec 4.6, round-1 A1/A3 findings).
+
+    A leading-dot target (``.pkg``, ``..pkg``) is a RELATIVE import: each dot
+    beyond the first pops one more directory off the importing file's own
+    directory (Python's own relative-import level semantics), so it is only ever
+    matched against a file reachable from the importer's own package -- never an
+    unrelated same-stem file elsewhere in the tree. A dotted target with no
+    leading dot is resolved as an ABSOLUTE module path against each of
+    *source_roots* in turn -- never against a bare global basename index, which is
+    the round-1 defect that let five stdlib ``import types`` statements credit an
+    unrelated ``mylib/types.py`` with zero real importers.
+    """
+    if target.startswith("."):
+        level = len(target) - len(target.lstrip("."))
+        remainder = target[level:]
+        importer_dir = posixpath.dirname(importer_rel)
+        base_parts = [part for part in importer_dir.split("/") if part] if importer_dir else []
+        pops = level - 1
+        if pops > len(base_parts):
+            return set()
+        base_dir = "/".join(base_parts[: len(base_parts) - pops]) if pops else importer_dir
+        segment = remainder.replace(".", "/") if remainder else ""
+        joined = f"{base_dir}/{segment}" if base_dir and segment else (base_dir or segment)
+        prefix = posixpath.normpath(joined) if joined else ""
+        return _match_shared_file_module_path(
+            prefix, candidates, _SHARED_FILE_PY_RESOLVE_EXTS, _SHARED_FILE_PY_ENTRY_STEM
+        )
+
+    segment = target.replace(".", "/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{segment}") if root else posixpath.normpath(segment)
+        matches |= _match_shared_file_module_path(
+            prefix, candidates, _SHARED_FILE_PY_RESOLVE_EXTS, _SHARED_FILE_PY_ENTRY_STEM
+        )
+    return matches
+
+
+def _resolve_relative_path_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], exts: tuple[str, ...], entry_stem: str | None
+) -> set[str]:
+    """Resolve a ``/``-separated target with a leading ``.`` or ``/`` (spec 4.6,
+    round-1 A1/A3 findings) -- JS/TS, Ruby's ``require_relative``, and a relative
+    PHP ``require``/``include`` all share this shape. A leading-``.`` target
+    resolves against the IMPORTING file's own directory; a leading-``/`` target
+    resolves against the repo ROOT ONLY, never a ``src/`` fallback -- the two
+    prefixes are NOT equivalent.
+
+    A bare (non-relative) target is deliberately never resolved here: for a JS
+    bare specifier or a Ruby ``require`` gem name it is an external package this
+    scan has no business crediting, so treating it as unresolved is what stops a
+    same-named local file from being falsely credited (round-1 A1). Ruby's
+    ``require_relative`` can by language definition never name a gem, but
+    ``extract_import_targets`` does not distinguish it from ``require`` (both
+    share :data:`devbench.source_classification._RUBY_IMPORT_TARGET_RE`), so a
+    canonical ``require_relative 'shared'`` written without a leading ``./`` is
+    also left unresolved here, casting no fan-in vote even though it always
+    names a file relative to the importer.
+    """
+    normalized = target.replace("\\", "/")
+    if not normalized.startswith((".", "/")):
+        return set()
+    importer_dir = posixpath.dirname(importer_rel)
+    if normalized.startswith("/"):
+        prefix = posixpath.normpath(normalized.lstrip("/"))
+    else:
+        joined = f"{importer_dir}/{normalized}" if importer_dir else normalized
+        prefix = posixpath.normpath(joined)
+    return _match_shared_file_module_path(prefix, candidates, exts, entry_stem)
+
+
+def _resolve_absolute_path_shared_file_target(
+    target: str, candidates: set[str], source_roots: tuple[str, ...], exts: tuple[str, ...]
+) -> set[str]:
+    """Resolve a ``/``-separated target with NO relative-import syntax of its own
+    against each of *source_roots* -- Go's ``import "myproj/shared"`` grammar
+    never emits a leading ``.``/``/``; every Go import path is already project- or
+    module-absolute, so it is resolved the same way an absolute Python dotted
+    path is (spec 4.6, round-1 A1 finding), never against a bare basename index.
+    """
+    normalized = target.replace("\\", "/").strip("/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{normalized}") if root else posixpath.normpath(normalized)
+        matches |= _match_shared_file_module_path(prefix, candidates, exts, None)
+    return matches
+
+
+def _resolve_dotted_absolute_shared_file_target(
+    target: str, candidates: set[str], source_roots: tuple[str, ...], exts: tuple[str, ...]
+) -> set[str]:
+    """Resolve a fully-qualified DOTTED namespace target (Java/Kotlin ``import``,
+    C# ``using``, Swift ``import``) against each of *source_roots* -- the
+    non-relative branch of :func:`_resolve_python_shared_file_target`, generalised
+    to languages whose import grammar this scan extracts has no relative form.
+    """
+    segment = target.replace(".", "/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{segment}") if root else posixpath.normpath(segment)
+        matches |= _match_shared_file_module_path(prefix, candidates, exts, None)
+    return matches
+
+
+def _resolve_php_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve a PHP ``require``/``include``/``use`` target (spec 4.6, round-1 A1 finding).
+
+    PHP mixes two grammars ``extract_import_targets`` does not distinguish: a
+    relative-or-bare path (``require``/``include``) and a backslash-separated
+    namespace (``use``). Both are normalised from ``\\`` to ``/`` BEFORE the
+    leading character is tested, so a ``use`` namespace written with a leading
+    backslash (``\\Lib\\Shared``) normalises to a leading ``/`` and is resolved
+    by the leading-``/`` branch below, NOT treated as bare. Once normalised: a
+    leading ``.`` target is resolved against the importing file's own
+    directory, exactly like JS/Ruby; a leading ``/`` target is resolved against
+    the repo ROOT ONLY, never a ``src/`` fallback, exactly like the sibling
+    resolver's leading-``/`` bucket -- the two prefixes are NOT equivalent. A
+    target with neither a leading ``.`` nor a leading ``/`` after normalisation
+    (either grammar -- a bare ``require`` path or a ``use`` namespace with no
+    leading backslash, e.g. ``Lib\\Shared``) is resolved against
+    :func:`_shared_file_source_roots`, exactly like Go's always-absolute import
+    paths -- never a bare global basename index.
+    """
+    normalized_target = target.replace("\\", "/")
+    if normalized_target.startswith((".", "/")):
+        return _resolve_relative_path_shared_file_target(importer_rel, normalized_target, candidates, (".php",), None)
+    return _resolve_absolute_path_shared_file_target(normalized_target, candidates, source_roots, (".php",))
+
+
+#: Per-suffix ``(exts, entry_stem)`` config for :func:`_resolve_relative_path_shared_file_target`
+#: (spec 4.6, round-1 A1/A3 findings): the JS/TS family shares one ext tuple and directory-entry
+#: stem across six suffixes; Ruby's ``.rb`` has no directory-entry convention this scan resolves.
+_SHARED_FILE_RELATIVE_RESOLVE_CONFIG: dict[str, tuple[tuple[str, ...], str | None]] = {
+    **dict.fromkeys(_SHARED_FILE_JS_RESOLVE_EXTS, (_SHARED_FILE_JS_RESOLVE_EXTS, _SHARED_FILE_JS_ENTRY_STEM)),
+    ".rb": ((".rb",), None),
+}
+
+#: Per-suffix ext tuple for :func:`_resolve_dotted_absolute_shared_file_target` (spec 4.6,
+#: round-1 A1 finding): Java and Kotlin each match only their own extension.
+_SHARED_FILE_DOTTED_ABSOLUTE_EXTS: dict[str, tuple[str, ...]] = {
+    ".java": (".java",),
+    ".kt": (".kt",),
+    ".cs": (".cs",),
+    ".swift": (".swift",),
+}
+
+
+def _resolve_shared_file_import_target(
+    importer_rel: str, suffix: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve one raw import *target* (as :func:`extract_import_targets` returned
+    it, from a file with *suffix*) to the set of on-disk repo-relative paths it
+    names (spec 4.6, round-1 A1/A3 findings).
+
+    Dispatches by language family, never by a shared global basename index:
+    Python and JVM/C#/Swift use dotted namespace resolution (Python additionally
+    supports relative ``.``/``..`` targets); JS/TS and Ruby split a leading-``.``
+    target (resolved against the importer's own directory) from a leading-``/``
+    target (resolved against the repo root only, never a ``src/`` fallback) and
+    leave a bare target unresolved (:data:`_SHARED_FILE_RELATIVE_RESOLVE_CONFIG`);
+    PHP mixes those two relative shapes with the absolute fallback
+    (:func:`_resolve_php_shared_file_target`); Go resolves its always-absolute
+    import paths against :func:`_shared_file_source_roots`. An unmapped suffix
+    (today only ``.vue``, whose imports this scanner does not parse, per
+    :data:`devbench.source_classification.SOURCE_EXTENSIONS`) resolves to
+    nothing rather than guessing.
+    """
+    suffix = suffix.lower()
+    if suffix == ".py":
+        return _resolve_python_shared_file_target(importer_rel, target, candidates, source_roots)
+    if suffix in _SHARED_FILE_RELATIVE_RESOLVE_CONFIG:
+        exts, entry_stem = _SHARED_FILE_RELATIVE_RESOLVE_CONFIG[suffix]
+        return _resolve_relative_path_shared_file_target(importer_rel, target, candidates, exts, entry_stem)
+    if suffix == ".go":
+        return _resolve_absolute_path_shared_file_target(target, candidates, source_roots, (".go",))
+    if suffix == ".php":
+        return _resolve_php_shared_file_target(importer_rel, target, candidates, source_roots)
+    if suffix in _SHARED_FILE_DOTTED_ABSOLUTE_EXTS:
+        return _resolve_dotted_absolute_shared_file_target(
+            target, candidates, source_roots, _SHARED_FILE_DOTTED_ABSOLUTE_EXTS[suffix]
+        )
+    return set()
+
+
+def _derive_shared_file_registry(repo_path: Path, threshold: int) -> set[str]:
+    """Compute the auto-derived shared-file registry for *repo_path* (spec 4.6, issue #13 AC4).
+
+    Walks every classified source file under *repo_path*
+    (:func:`_iter_shared_file_scan_candidates`, pruning vendored/dependency trees
+    DURING the walk -- spec 4.6, round-1 A2 finding), extracts each file's
+    import/require targets via
+    :func:`devbench.source_classification.extract_import_targets` (AC-5: the
+    scanning grammar itself lives entirely in ``source_classification`` -- this
+    function only resolves and counts), and resolves each target to the other
+    repo file(s) it actually names via
+    :func:`_resolve_shared_file_import_target` -- never a global bare-basename
+    index, but language-appropriate resolution partitioned by LANGUAGE FAMILY
+    FIRST, not by the target's leading character alone: for Python, the JS/TS
+    family, Ruby and PHP, a leading-``.`` target resolves against the
+    importing file's own directory, and a leading-``/`` target resolves
+    against the repo root ONLY (never a ``src/`` fallback) -- this
+    leading-``/`` bucket does not arise for Python in practice, since
+    Python's own extractor never emits a ``/``-prefixed target; for Go,
+    Java/Kotlin, C# and Swift, resolution is ALWAYS against
+    :func:`_shared_file_source_roots` regardless of the target's own leading
+    character, a leading ``.`` included and a leading ``/`` included, since
+    none of those languages' import grammars has a relative form; a
+    bare/absolute Python or PHP target with neither prefix is likewise always
+    resolved against :func:`_shared_file_source_roots`; a bare/aliased JS/TS
+    or Ruby target with neither prefix is deliberately never resolved and
+    casts no fan-in vote (round-1 A1 finding: the previous basename-only
+    approach credited an unrelated ``mylib/types.py`` from five stdlib ``import
+    types`` statements, and separately derived nothing at all for
+    ``mypkg/__init__.py`` and ``lib/index.js``, both fixed by this resolution
+    step -- round-1 A1/A3).
+
+    A target that resolves to MORE than one on-disk candidate is never credited
+    to any of them (an unresolvable ambiguity, not a guess) -- a
+    ``WARNING: ...`` line naming the target and every candidate it could not
+    choose between is printed to stderr so the refusal is visible rather than
+    silent (round-1 A1 finding). A target that resolves to nothing in the repo
+    (a stdlib/third-party import, or a target this scan's language-appropriate
+    resolution genuinely cannot place) casts no fan-in vote at all -- not an
+    error, exactly like an unmapped source extension already casts no vote.
+
+    A resolved target file's fan-in is the number of DISTINCT importing files that
+    named it -- multiple import statements in the SAME file count once. Returns the
+    set of repo-relative POSIX paths whose fan-in count is strictly greater than
+    *threshold* (AC-1: "more than `fan_in_threshold`", not "at least").
+
+    Args:
+        repo_path: Repo checkout root to scan.
+        threshold: The fan-in count a file's distinct-importer count must exceed to
+            be included (``gates.shared_file_impact.fan_in_threshold``, resolved by
+            the caller through ``resolve_gate_config``, never read here).
+
+    Raises:
+        RuntimeError: ``ERROR: import scan failed for <path>: <reason>`` (AC-7) the
+            moment any classified source file cannot be read (permission error,
+            broken symlink, decode failure) -- raised before any derived set is
+            returned, so a scan that cannot read every candidate file never reports
+            a partial answer as if it were complete. A dangling symlink is included:
+            :func:`_iter_shared_file_scan_candidates` never filters on
+            ``Path.is_file()`` (which silently swallows a broken symlink's OSError),
+            so reading one always reaches this same ``read_text`` call and raises
+            here.
+    """
+    candidates = _iter_shared_file_scan_candidates(repo_path)
+    candidate_paths: set[str] = set(candidates)
+    source_roots = _shared_file_source_roots(repo_path)
+
+    importers_by_target: dict[str, set[str]] = {}
+    ambiguous_refusals: dict[str, set[str]] = {}
+    for rel, path in candidates.items():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"ERROR: import scan failed for {rel}: {exc}") from exc
+        suffix = path.suffix.lower()
+        for raw_target in extract_import_targets(path.suffix, text):
+            resolved = _resolve_shared_file_import_target(rel, suffix, raw_target, candidate_paths, source_roots)
+            resolved.discard(rel)
+            if not resolved:
+                continue
+            if len(resolved) > 1:
+                ambiguous_refusals.setdefault(raw_target, set()).update(resolved)
+                continue
+            (target_rel,) = resolved
+            importers_by_target.setdefault(target_rel, set()).add(rel)
+
+    for target in sorted(ambiguous_refusals):
+        candidates_repr = ", ".join(sorted(ambiguous_refusals[target]))
+        print(
+            f"WARNING: import target '{target}' resolves to more than one file "
+            f"({candidates_repr}); refusing to credit any of them toward fan-in",
+            file=sys.stderr,
+        )
+
+    return {target for target, importers in importers_by_target.items() if len(importers) > threshold}
+
+
 def _extract_node_ids(pattern: re.Pattern[str], output: str) -> set[str]:
     """Return the stripped first capture group of every *pattern* match in *output*.
 
@@ -6759,6 +7185,68 @@ def _write_shared_file_baseline(path: Path, record: Mapping[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(dict(record), indent=2, sort_keys=True) + "\n"
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS):
+        atomic_write_text(path, payload)
+
+
+def _shared_file_derived_registry_cache_path(canonical_repo: str, branch_point: str) -> Path:
+    """Return the auto-derived registry cache path, ALONGSIDE the baseline record (spec 4.6, AC-6).
+
+    A sibling of :func:`_shared_file_baseline_path`'s own
+    ``<branch-point-sha>.json`` in the same per-repo directory --
+    ``<branch-point-sha>.derived-registry.json`` -- so "cached alongside the
+    baseline record" is literal: same directory, same branch-point key, a
+    distinct file rather than a new key merged into the baseline record's
+    own spec 5.4 shape (which stays exactly ``schema_version``,
+    ``captured_at``, ``branch_point``, ``runner``, ``failing``).
+    """
+    baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
+    return baseline_path.with_name(f"{baseline_path.stem}.derived-registry.json")
+
+
+def _write_shared_file_derived_registry_cache(
+    path: Path, *, branch_point: str, fan_in_threshold: int, derived_registry: set[str]
+) -> None:
+    """Persist the auto-derived registry cache at *path*, atomically, under an exclusive lock.
+
+    Same ``atomic_write_text`` + sibling-``flock_path`` composition
+    :func:`_write_shared_file_baseline` uses, on this cache's own path and
+    its own sibling lock file (never contending with the baseline
+    record's lock) -- see that function's docstring for the full
+    lost-update rationale.
+
+    Unlike the baseline record (a pre-change snapshot written ONCE per
+    branch point, then read-only for the rest of that branch point's
+    life), this cache is OVERWRITTEN on every `check-shared-file-impact`
+    run that enters :func:`_evaluate_shared_file_gate` (i.e. a MATCHED
+    invocation) with `auto_derive_registry` enabled -- a no-match run reaches
+    its own PASS verdict without ever calling this function: the derived set
+    reflects the CURRENT tree's import fan-in, so a later matched run's
+    derived set can legitimately differ from an earlier one's, and each
+    matched run's own write is the source of truth for "what registry was in
+    effect when THAT matched run's verdict was reached" (spec 4.6).
+
+    This cache is WRITE-ONLY as of this unit (round-1 test_review F3 finding,
+    intentional): nothing in ``src/`` reads this file back. It exists purely as a
+    forensic artifact an OPERATOR reads directly off disk during an investigation
+    ("what did the derived set look like when this verdict was reached") -- AC-6's
+    "recoverable" is about human recoverability, not a runtime dependency any
+    devbench command re-reads. Because nothing reads it, the corrupt-cache/
+    stale-cache handling `_load_shared_file_baseline` has for the BASELINE record
+    is deliberately not mirrored here: there is no code path for a corrupt or
+    stale derived-registry cache to feed into, so there is nothing for it to
+    corrupt.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "captured_at": datetime.now(tz=UTC).isoformat(),
+        "branch_point": branch_point,
+        "fan_in_threshold": fan_in_threshold,
+        "derived_registry": sorted(derived_registry),
+    }
+    payload = json.dumps(record, indent=2, sort_keys=True) + "\n"
     lock_path = _shared_file_baseline_lock_path(path)
     with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS):
         atomic_write_text(path, payload)
@@ -7210,9 +7698,37 @@ def _shared_file_gate_attributable(node_id: str, scope_files: frozenset[str]) ->
 
 
 def _evaluate_shared_file_gate(
-    *, unit_id: str, canonical_repo: str, repo_path: Path, matched_files: list[str], scope_files: list[str]
+    *,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    matched_files: list[str],
+    scope_files: list[str],
+    auto_derive_registry: bool,
+    fan_in_threshold: int,
+    derived_registry: set[str],
 ) -> tuple[dict[str, Any], int]:
     """Run the full suite and diff it against the pre-change baseline for a matched shared-file impact.
+
+    *auto_derive_registry*/*fan_in_threshold*/*derived_registry* (spec 4.6, issue #13
+    AC4) are the caller's already-resolved (``resolve_gate_config``) auto-derivation
+    settings and already-computed derived set (:func:`_derive_shared_file_registry`).
+    All three are required keyword-only arguments with no defaults (round-1
+    code_review C2 finding): the sole production caller
+    (:func:`cmd_check_shared_file_impact`) always supplies all three, and a default
+    would mask a caller bug rather than surface it -- ``fan_in_threshold=0`` is a
+    value this gate's own config validation explicitly rejects, yet a default would
+    let it be written verbatim into the cache; an ``Optional`` ``derived_registry``
+    defaulting to ``None`` would need an in-body ``... if ... is not None else
+    set()`` fallback that silently caches an EMPTY derived registry as if it were
+    the registry actually in effect. When *auto_derive_registry* is true, the derived set is added to the returned
+    payload (``"derived_registry"``) and cached to disk ALONGSIDE the baseline record
+    (:func:`_write_shared_file_derived_registry_cache`, AC-6) once the branch point is
+    resolved below -- this is the point a verdict is actually being reached, so it is
+    where "what registry was in effect when a verdict was reached" is recoverable
+    from. A no-match invocation (this function's caller, :func:`cmd_check_shared_file_impact`,
+    never entered this function at all) never resolves a branch point and so never
+    writes this cache -- there is no baseline for it to sit "alongside" on that path.
 
     Isolates the "a shared file WAS touched" branch of
     :func:`cmd_check_shared_file_impact` into its own function purely to
@@ -7307,6 +7823,14 @@ def _evaluate_shared_file_gate(
     baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
     baseline = _load_shared_file_baseline(baseline_path, branch_point=branch_point, unit_id=unit_id)
 
+    if auto_derive_registry:
+        _write_shared_file_derived_registry_cache(
+            _shared_file_derived_registry_cache_path(canonical_repo, branch_point),
+            branch_point=branch_point,
+            fan_in_threshold=fan_in_threshold,
+            derived_registry=derived_registry,
+        )
+
     resolved = _resolve_full_suite_command(repo_path)
     _cmd, runner_key, _parser = resolved
 
@@ -7337,6 +7861,8 @@ def _evaluate_shared_file_gate(
         "baseline_path": str(baseline_path),
         "branch_point": branch_point,
     }
+    if auto_derive_registry:
+        base_payload["derived_registry"] = sorted(derived_registry)
 
     if baseline is None:
         captured_failing, captured_runner_key = _capture_shared_file_baseline(repo_path, branch_point, unit_id)
@@ -7382,6 +7908,113 @@ def _evaluate_shared_file_gate(
         "unattributed_new_failures": unattributed_new_failures,
     }
     return payload, 0
+
+
+def _resolve_shared_file_impact_gate_config(
+    canonical_repo: str, *, unit_id: str, invocation_id: str
+) -> "ResolvedGateConfig | int":
+    """Resolve the ``shared_file_impact`` gate's config, or an already-handled exit code.
+
+    Thin wrapper around :func:`_load_gate_config_or_report` -- the SAME helper
+    `check-ancestry`/`check-reachability` both use (spec 4.1, D-15) -- kept as its
+    own function purely so :func:`cmd_check_shared_file_impact` stays within ruff's
+    return/branch-count budget (PLR0911/PLR0912); the wrapping itself previously
+    lived inline in that function. Calling the shared helper instead of a second,
+    hand-rolled ``resolve_gate_config`` call fixes a real bug (round-1 code_review C1
+    finding): the inline version never checked ``enabled`` at all, so an
+    operator-configured ``enabled: false`` could not actually disable this gate.
+
+    An ``int`` result is already fully handled (its own ``ERROR:``/disabled line
+    already printed by the wrapped helper). ``0`` is the disabled-gate clean exit,
+    for which THIS function additionally writes the command's own PASS verdict
+    record so the PostToolUse hook does not stay blocked on ``"pending"`` forever.
+    ``1`` is a genuine config-load error, which leaves the verdict at ``"pending"``
+    on purpose, matching every other error-return path
+    :func:`cmd_check_shared_file_impact` has (see that function's own docstring). A
+    ``ResolvedGateConfig`` result means the gate is enabled and the caller should
+    proceed.
+    """
+    gate_config = _load_gate_config_or_report("shared_file_impact", canonical_repo)
+    if isinstance(gate_config, int) and gate_config == 0:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
+    return gate_config
+
+
+def _resolve_shared_file_impact_target(unit_id: str, parser: BacklogParser) -> tuple[str, Path] | None:
+    """Resolve *unit_id*'s canonical repo and local checkout path, or ``None``.
+
+    Collapses :func:`cmd_check_shared_file_impact`'s two independent "cannot proceed"
+    checks (unknown unit id, no local repo path configured) into a single caller-side
+    ``if target is None: return 1`` -- keeping the cyclomatic/return-statement
+    complexity of that already-dense command function low (PLR0911) without changing
+    either error message or exit behaviour. Prints its own ``ERROR: ...`` line to
+    stderr on either failure; the caller never re-derives the message. Returns only
+    ``(canonical_repo, repo_path)`` -- never the resolved ``WorkUnit`` itself (round-1
+    code_review F2 finding): the unit is resolved solely to validate its existence
+    and derive its repo, and the sole caller has no further use for the object.
+    """
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return None
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return None
+    return canonical_repo, repo_path
+
+
+def _prepare_shared_file_impact_scope_and_registry(
+    unit_id: str,
+    repo_path: Path,
+    *,
+    auto_derive_registry: bool,
+    fan_in_threshold: int,
+) -> "tuple[ScopeResult, set[str]] | int":
+    """Resolve this unit's changed-file scope and, when enabled, the auto-derived registry.
+
+    Extracted out of :func:`cmd_check_shared_file_impact` to keep that function's
+    return-statement count within ruff's threshold (PLR0911); the two early-exit
+    branches this absorbs (scope-resolution failure, import-scan failure) used to
+    live inline in the caller. Both must resolve BEFORE any pattern/derived-file
+    matching decision is made, so they are prepared together here.
+
+    Scope resolution shares the single scope-resolution error path every other
+    scope-resolving gate/verb uses (`_resolve_scope_or_report`, spec 4.3, AC-9)
+    rather than re-implementing the try/except locally: `ValueError` (unknown unit
+    id, bad repo path, or a `ManifestParseError` subclass instance), `RuntimeError`
+    (git plumbing rc>=2) and `FileNotFoundError` (the unit's work-unit file deleted
+    in a same-process race between the backlog parse and the manifest read) are
+    every error type `work_unit_scope.resolve_changed_files` can raise or
+    propagate; each already carries a fully-formed, actionable message, so it is
+    surfaced verbatim rather than re-derived.
+
+    Returns:
+        ``(scope, derived_registry)`` on success. ``1`` (already printed its own
+        ``ERROR:`` message) on either failure.
+    """
+    mode = _resolve_scope_mode()
+    message_prefix = f"cannot resolve scope for unit {unit_id}"
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=message_prefix)
+    if scope is None:
+        return 1
+
+    derived_registry: set[str] = set()
+    if auto_derive_registry:
+        try:
+            derived_registry = _derive_shared_file_registry(repo_path, fan_in_threshold)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    return scope, derived_registry
 
 
 def cmd_check_shared_file_impact(unit_id: str) -> int:
@@ -7507,13 +8140,65 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
        equivalent guard `_capture_shared_file_baseline` has always had on
        the branch-point capture run (spec 3.5).
 
-    Known limitation (v1, documented rather than hidden): the shared-file
-    pattern list itself is a hand-maintained glob registry, not an
-    auto-derived import/mount-graph of actual fan-in
-    (`gates.shared_file_impact.auto_derive_registry` is the reserved config
-    surface for the eventual auto-derivation successor -- see
-    `docs/devbench-yaml-reference.md` for the tradeoff). Separately, the
-    runner-parser registry (item 7) ships with exactly three entries
+    Registry auto-derivation (spec 4.6, issue #13 AC4): the shared-file set is a
+    hand-maintained glob registry by default, but `gates.shared_file_impact
+    .auto_derive_registry: true` ADDITIONALLY computes it from the repo's import
+    graph -- files imported/required by more than `fan_in_threshold` distinct
+    modules, via `source_classification.extract_import_targets`'s
+    language-appropriate scanning and `_derive_shared_file_registry`'s
+    location-relative resolution (for Python, the JS/TS family, Ruby and PHP:
+    against the importing file's own directory for a leading-`.` target, and
+    against the repo root ONLY, never a `src/` fallback, for a leading-`/`
+    target -- this leading-`/` bucket does not arise for Python in practice,
+    since Python's own extractor never emits a `/`-prefixed target; for Go,
+    Java/Kotlin, C#, and Swift: ALWAYS against the repo root
+    and a top-level `src/` directory regardless of the target's own leading
+    character, a leading `.` included, since none of those languages' import
+    grammars has a relative form; for a bare/absolute Python, PHP, Go,
+    Java/Kotlin, C#, or Swift target with neither prefix: likewise against the
+    repo root and a top-level `src/` directory -- never a bare global basename
+    index; a bare/aliased JS/TS or Ruby target with neither prefix is
+    deliberately never resolved and casts no fan-in vote) and fan-in count.
+    This is ADDITIVE, never a replacement: the
+    hand-maintained `patterns` list above still matches even when the scanner did
+    not derive a given file, and a derived file matches even with an empty hand
+    list. Because derivation only ever considers files
+    `source_classification.is_source_extension` classifies as source, a shared
+    file with a non-source extension can never be derived and must stay
+    hand-listed regardless of `auto_derive_registry`. `enabled`,
+    `auto_derive_registry` and `fan_in_threshold` are all read exclusively through
+    `_load_gate_config_or_report`/`resolve_gate_config("shared_file_impact", repo)`
+    (AC-27, spec 4.1) -- the same resolver `check-ancestry`/`check-reachability` use
+    (round-1 code_review C1 finding). The derived set is printed in this command's
+    JSON payload (`"derived_registry"`) on every invocation of an ENABLED gate
+    that reaches a verdict (pass or block) with `auto_derive_registry` enabled,
+    matched or not -- an invocation that raises before a verdict (e.g. an
+    unrecognised full-suite runner), and an invocation where `enabled` is
+    `false` (which writes its own PASS verdict record via
+    `_resolve_shared_file_impact_gate_config` and returns before any payload is
+    built, regardless of `auto_derive_registry`), both print no payload at all.
+    It is additionally cached
+    alongside the baseline record, as `<branch-point-sha>.derived-registry.json`
+    (a sibling of the baseline record's own `<branch-point-sha>.json`, in the
+    same per-repo directory -- never `<baseline_path>.derived-registry.json`
+    literally appended, which would resolve to a nonexistent
+    `<sha>.json.derived-registry.json`), via
+    `_write_shared_file_derived_registry_cache` -- ONLY on the matched path (once
+    a branch point/baseline is actually resolved), and as soon as that baseline
+    is loaded, BEFORE the full-suite command itself is even resolved: a matched
+    invocation that later raises (an unrecognised runner, a baseline/runner
+    mismatch) still leaves this cache written even though it aborts with no
+    comparison and no printed payload. A no-match run never resolves a branch
+    point at all, so there is no baseline for this cache to sit "alongside" on
+    that path (round-1 doc_review D1 finding: this cache is not written
+    unconditionally, and does not need to be, since the printed payload already
+    covers the no-match case). This cache is write-only: no devbench command
+    reads it back; it exists so an operator can recover what registry was in
+    effect for a given verdict by inspecting the file directly on disk -- see
+    `docs/devbench-yaml-reference.md` for the full contract.
+
+    Known limitation (v1, documented rather than hidden): the runner-parser
+    registry (item 7) ships with exactly three entries
     (`pytest`, `go test`, npm/yarn/npx-invoked jest); a repo whose
     configured test command (or, for `make test`, whose recipe) matches
     none of those has no path to a passing gate run until a matching entry
@@ -7572,39 +8257,38 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     )
 
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    units = parser.parse_index()
-    unit = _find_unit(units, unit_id)
-    if unit is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+    target = _resolve_shared_file_impact_target(unit_id, parser)
+    if target is None:
         return 1
+    canonical_repo, repo_path = target
 
-    canonical_repo = resolve_repo(unit.repo)
-    validate_repo(canonical_repo)
-    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
-    if repo_path is None:
-        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
-        return 1
+    gate_config = _resolve_shared_file_impact_gate_config(canonical_repo, unit_id=unit_id, invocation_id=invocation_id)
+    if isinstance(gate_config, int):
+        return gate_config
 
+    # `patterns` has no project/env layer of its own (spec 4.1: it is a per-repo-only
+    # override, never resolved by `resolve_gate_config`'s multi-layer merge), so it is
+    # read directly off `RUNTIME_CONFIG.gates.repos` -- `auto_derive_registry` and
+    # `fan_in_threshold` below come from *gate_config* instead, never a second,
+    # independently-loaded config snapshot.
     gate_repo_override = RUNTIME_CONFIG.gates.repos.get(canonical_repo)
     shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
     patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
 
-    mode = _resolve_scope_mode()
-    # Shares the single scope-resolution error path every other scope-resolving
-    # gate/verb uses (`_resolve_scope_or_report`, spec 4.3, AC-9) rather than
-    # re-implementing the try/except locally: `ValueError` (unknown unit id, bad
-    # repo path, or a `ManifestParseError` subclass instance), `RuntimeError`
-    # (git plumbing rc>=2) and `FileNotFoundError` (the unit's work-unit file
-    # deleted in a same-process race between the backlog parse and the manifest
-    # read) are every error type `work_unit_scope.resolve_changed_files` can
-    # raise or propagate; each already carries a fully-formed, actionable
-    # message, so it is surfaced verbatim rather than re-derived.
-    message_prefix = f"cannot resolve scope for unit {unit_id}"
-    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=message_prefix)
-    if scope is None:
-        return 1
+    auto_derive_registry = bool(gate_config.values["auto_derive_registry"])
+    fan_in_threshold = cast("int", gate_config.values["fan_in_threshold"])
+
+    prepared = _prepare_shared_file_impact_scope_and_registry(
+        unit_id, repo_path, auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+    )
+    if isinstance(prepared, int):
+        return prepared
+    scope, derived_registry = prepared
 
     matched_files = _matched_shared_files(scope.files, patterns) if patterns else []
+    if derived_registry:
+        matched_files = sorted(set(matched_files) | (set(scope.files) & derived_registry))
+
     if not matched_files:
         payload: dict[str, Any] = {
             "unit_id": unit_id,
@@ -7612,8 +8296,10 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
             "shared_file_impact": False,
             "changed_files": scope.files,
         }
-        if not patterns:
+        if not patterns and not auto_derive_registry:
             payload["reason"] = "no gates.repos.<repo>.shared_file_impact.patterns configured for this repo"
+        if auto_derive_registry:
+            payload["derived_registry"] = sorted(derived_registry)
         print(json.dumps(payload, indent=2))
         _write_shared_file_impact_verdict(
             _SHARED_FILE_IMPACT_VERDICT_PASS,
@@ -7630,6 +8316,9 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
             repo_path=repo_path,
             matched_files=matched_files,
             scope_files=scope.files,
+            auto_derive_registry=auto_derive_registry,
+            fan_in_threshold=fan_in_threshold,
+            derived_registry=derived_registry,
         )
     except (RuntimeError, UnknownTestRunnerError, TimeoutError) as exc:
         # RuntimeError and UnknownTestRunnerError already carry a fully-formed `ERROR: ...`

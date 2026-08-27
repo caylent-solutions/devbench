@@ -482,7 +482,20 @@ validate:
 #     enabled: false
 #   shared_file_impact:                 # caylent-solutions/devbench-internal-backlog#13
 #     enabled: false
-#     auto_derive_registry: false       # reserved for a future auto-derived fan-in registry
+#     # When true, computes the shared-file set as the files imported/required
+#     # by more than fan_in_threshold distinct modules (spec 4.6, issue #13
+#     # AC4), via language-appropriate import scanning driven by
+#     # devbench.source_classification. Unioned ADDITIVELY with the
+#     # hand-maintained per-repo glob list below (gates.repos.<org/repo>
+#     # .shared_file_impact.patterns) -- auto-derivation never replaces the
+#     # hand list; an operator can always force a file into the set by
+#     # hand-listing it even when the scanner did not derive it.
+#     auto_derive_registry: false
+#     # The distinct-importer fan-in count a file must exceed (strictly
+#     # greater than, not "at least") for auto-derivation to include it.
+#     # Only consumed when auto_derive_registry is true. Must be an integer
+#     # >= 1, or config load fails naming gates.shared_file_impact.fan_in_threshold.
+#     fan_in_threshold: 3
 #   fixture_consistency:                # caylent-solutions/devbench-internal-backlog#17
 #     enabled: false
 #     canonical_sources:

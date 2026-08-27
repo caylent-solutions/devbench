@@ -74,6 +74,7 @@ gates:
   shared_file_impact:
     enabled: false
     auto_derive_registry: false
+    fan_in_threshold: 3
   fixture_consistency:
     enabled: false
     canonical_sources: []
@@ -120,14 +121,15 @@ the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool
 value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
 `config_loader.py` remains parse/validate-only and never reads environment variables itself. No
 consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
-`auto_derive_registry`, `extract_source_literals`, `entry_points`) directly off `RuntimeConfig.gates`
-(AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one row per declared gate
-with the resolved `enabled` status and per-field provenance for every row, calling
-`resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates` directly. Each per-gate
-check command adopts the resolver as its own hardening epic lands: `check-reachability` already
-reads both `enabled` and `entry_points` exclusively through `resolve_gate_config` (spec 4.4,
-E3-F1-S1-T2); `check-shared-file-impact`, `check-fixture-consistency`, and the ones later gate
-epics add follow in their own tasks.
+`auto_derive_registry`, `fan_in_threshold`, `extract_source_literals`, `entry_points`) directly off
+`RuntimeConfig.gates` (AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one
+row per declared gate with the resolved `enabled` status and per-field provenance for every row,
+calling `resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates` directly. Each
+per-gate check command adopts the resolver as its own hardening epic lands: `check-reachability`
+already reads both `enabled` and `entry_points` exclusively through `resolve_gate_config` (spec 4.4,
+E3-F1-S1-T2); `check-shared-file-impact` reads `enabled`, `auto_derive_registry` and
+`fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2); `check-fixture-consistency` and the ones
+later gate epics add follow in their own tasks.
 
 ### Per-gate tunables
 
@@ -135,7 +137,7 @@ epics add follow in their own tasks.
 |------|------------------------------|------------------------------|
 | `reachability` | `entry_points` (issue #10 AC2) | `enabled` |
 | `ancestry` | none | `enabled` |
-| `shared_file_impact` | `auto_derive_registry` (reserved, unused v1) | `enabled`, `patterns` |
+| `shared_file_impact` | `auto_derive_registry`, `fan_in_threshold` | `enabled`, `patterns` |
 | `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (reserved, unused v1) | `enabled` |
 | `write_path_audit` | none | `enabled` |
 | `newly_reachable_paths` | none | `enabled` |
@@ -197,6 +199,111 @@ target repo's fixture/mock-file layout on its own. When configured, the test-rev
 the check as review evidence and fails the review if a scanned fixture references an identifier
 absent from its canonical source, or a canonical source's coverage falls short of an
 `expected_count`. See `docs/backlog-contract.md`.
+
+### `gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` -- auto-derived shared-file registry (caylent-solutions/devbench-internal-backlog#13 AC4)
+
+The hand-maintained glob list below (`gates.repos.<org/repo>.shared_file_impact.patterns`) decays:
+a module that becomes a composition root after the list was written is never added, so the gate
+stops firing exactly where it matters most. `auto_derive_registry: true` (default `false`) closes
+that gap by ADDITIONALLY computing a shared-file set from the import graph, unioned with the
+hand-authored list below (see "Additive override" below -- this never replaces the hand list, and
+the hand list remains the only way to name a shared file the scanner cannot derive, e.g. any file
+whose extension is not classified as source):
+
+- `check-shared-file-impact` walks every source file classified by
+  `devbench.source_classification.is_source_extension` (pruning vendored/dependency directories
+  during the walk, never scanning or voting from them -- the full, CLOSED set is `.git`, `.venv`,
+  `venv`, `node_modules`, `__pycache__`, `.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`,
+  `.ruff_cache`, `.eggs`, `site-packages`, `dist`, `build`, `htmlcov`, `vendor` and `third_party`;
+  because `dist` and `build` are pruned unconditionally, any first-party source that happens to
+  live under a directory named `dist/` or `build/` is never scanned and never votes, exactly like
+  a vendored file would be -- this is a real limitation, not merely an implication of the pruning
+  behaviour above. This is a finite list, not an exhaustive denylist of every vendor/dependency convention, so an
+  unlisted SUBDIRECTORY anywhere under the repo -- e.g. `bower_components/`, `.direnv/`,
+  `target/` -- still has its own internals scanned and voted on; this applies only to
+  subdirectories the walk descends into, not to the repo root itself, which is always scanned
+  regardless of what it is named), extracts each file's import/require targets via
+  `source_classification.extract_import_targets` (language-appropriate scanning dispatched on the
+  extension the file already carries -- Python `import`/`from ... import`, the JS/TS family's
+  `import`/`require`/dynamic `import()`/`export ... from`/`export * from`, Go's `import` blocks
+  (every grouped block in the file, not only the first), Ruby's `require`/`require_relative`,
+  Java/Kotlin's `import`, Swift's `import`, C#'s `using`, and PHP's `require`/`include`/`use`; a
+  `.vue` file's imports live inside an embedded `<script>` block this scanner does not parse, so a
+  `.vue` file always contributes zero import targets even though it is itself a valid, votable
+  candidate), and RESOLVES each target -- never against a bare global basename index, which would
+  credit an unrelated same-named file (e.g. a stdlib `import types` crediting an unrelated
+  `mylib/types.py`). The resolution splits into three buckets by the target's first character,
+  tested AFTER normalising any backslash separator to `/` -- relevant only to PHP's `use`
+  namespace form (see bucket (ii) below); every other language's target already uses `/` as
+  written. (i) A target starting with `.` resolves against the IMPORTING file's own directory --
+  Python's leading-dot level semantics, or a `./`/`../`-style path for the JS/TS family, Ruby, and
+  a relative PHP `require`/`include`. This bucket applies ONLY to Python, the JS/TS family, Ruby
+  and PHP: Go, Java/Kotlin, C#, and Swift are ALWAYS resolved by bucket (iii) below regardless of
+  the target's first character, a leading `.` included -- this is behaviourally inert for the
+  JVM (Java/Kotlin)/C#/Swift languages, since no valid import in those languages can begin with a
+  dot, but it means the partition below is by LANGUAGE FAMILY first and by leading character only
+  within the families bucket (i) actually applies to. (ii) A target starting with `/` resolves
+  against the repo ROOT ONLY, never a `src/` fallback -- the JS/TS family, Ruby, and PHP (Python's
+  own extractor never emits a `/`-prefixed target, so this bucket does not arise for Python in
+  practice). For PHP specifically, a `use` namespace written with a leading backslash (e.g.
+  `use \Lib\Shared;`) normalises that backslash to `/` before the first-character test and so
+  lands HERE, repo-root-only -- NOT in bucket (iii) below. (iii) Everything else -- a target with
+  neither a leading `.` nor a leading `/` after normalisation -- resolves against the repo root
+  and, when present, a top-level `src/` directory for Go's always-absolute import paths (always
+  this bucket regardless of the target's own leading character, per bucket (i)'s note above),
+  Python's absolute dotted targets, PHP's bare `require`/`include` targets and a `use` namespace
+  with NO leading backslash (e.g. `use Lib\Shared;`), and the JVM (Java/Kotlin)/C#/Swift dotted
+  forms (also always this bucket regardless of the target's own leading character); for the JS/TS
+  family and Ruby, that same neither-`.`-nor-`/` shape (a bare or aliased specifier, e.g. a bare
+  `import 'shared'` or `require 'shared'`) is deliberately never resolved and casts no fan-in
+  vote, even when a same-named file exists elsewhere in the repo. A
+  directory-form import (naming a package/barrel directly,
+  e.g. `from mypkg import X` or `import {A} from './lib'`) resolves to that directory's entry file
+  (`__init__.py` for Python, `index.<ext>` for the JS/TS family). A target resolving to MORE than
+  one on-disk file is credited to NEITHER candidate (a `WARNING:` naming the ambiguity is printed
+  to stderr rather than guessing); a target resolving to nothing in the repo (e.g. a stdlib or
+  third-party import, or one of the JS/TS/Ruby bare targets described above) casts no vote at all.
+  A directory-form target that normalises to the REPO ROOT ITSELF (e.g. `app/importer.js`
+  importing `'..'`) never resolves to the root's own entry file even when one exists: the
+  underlying matcher treats a prefix that normalises to the empty string or `.` (the repo root
+  itself) as always yielding no match, so a directory-form target one level too shallow to name
+  any real subdirectory is refused rather than credited to the root's entry file; this
+  under-credits (never falsely credits) and only arises at that single degenerate depth -- the
+  same import written one directory deeper resolves normally.
+- A file whose resolved DISTINCT importer count is strictly greater than `fan_in_threshold`
+  (default `3`, must be an integer `>= 1`) is included in the derived shared-file set.
+- The derived set is printed in this command's JSON payload (`"derived_registry"`) on every
+  invocation of an ENABLED gate that reaches a verdict (pass or block) with `auto_derive_registry`
+  enabled, matched or not -- an invocation that raises before reaching a verdict (e.g. an
+  unrecognised full-suite runner), and an invocation where `gates.shared_file_impact.enabled` is
+  `false` (which writes its own PASS verdict record and returns before any payload is built,
+  regardless of `auto_derive_registry`), both print no payload at all. It is ADDITIONALLY cached
+  alongside the shared-file baseline
+  record, as
+  `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.derived-registry.json` (a
+  sibling of the baseline record's own `<branch-point-sha>.json`), ONLY on a matched invocation
+  (once a branch point/baseline is resolved) -- and as soon as that baseline is loaded, BEFORE the
+  full-suite command is even resolved, so a matched invocation that later raises (an unrecognised
+  runner, a baseline/runner mismatch) can still leave this cache written even though it aborts with
+  no comparison and no printed payload. A no-match run resolves no branch point/baseline at all, so
+  there is nothing for this cache to sit "alongside" on that path; the printed payload already
+  covers what registry was in effect for a no-match run. This cache is write-only: no devbench
+  command reads it back. It exists so an operator can inspect the file directly on disk during an
+  investigation ("what did the derived set look like when this verdict was reached") -- not as a
+  runtime dependency any command re-reads.
+
+**Additive override, never a replacement (spec 4.6):** the hand-maintained `patterns` list below
+is unioned with the auto-derived set, not superseded by it. A hand-listed file the scanner did not
+derive still matches; a derived file matches even when the hand list is empty -- an operator can
+always force a file into the shared-file set by hand-listing it, regardless of `auto_derive_registry`.
+Because derivation only ever considers files `is_source_extension` classifies as source, a shared
+NON-source file (e.g. a shared YAML/JSON config, a shell script outside that extension set) can
+never be derived and must stay hand-listed regardless of `auto_derive_registry`.
+
+`enabled`, `auto_derive_registry` and `fan_in_threshold` are all read exclusively through
+`resolve_gate_config("shared_file_impact", repo)` (AC-27); a non-integer or `< 1` threshold, or an
+unrecognised key inside the `gates.shared_file_impact` block, fails config load naming the
+offending key (spec 4.1 AC-5).
 
 ### `gates.repos.<org/repo>.shared_file_impact.patterns` -- shared-file full-suite regression gate (caylent-solutions/devbench-internal-backlog#13)
 
@@ -266,15 +373,19 @@ emits Claude Code's `PostToolUseFailure` event rather than `PostToolUse`, and th
 registered on `PostToolUse` only, so a block is observed on the next Bash call whose
 `PostToolUse` event reaches this hook rather than necessarily on the gate's own call.
 
-**Known limitation (v1):** this registry is hand-maintained per repo, not auto-derived from an
-import/mount-graph analysis of actual fan-in. Auto-derivation (which files are imported by
-unusually many otherwise-unrelated features) was judged out of scope for the same change that
-introduced the gate; the manual list is a deliberate, honest starting point rather than a
-promise of completeness. Regenerate/review the list periodically as the codebase evolves --
-nothing here does that automatically yet.
+**Hand-maintained by default, auto-derivable on request (caylent-solutions/devbench-internal-backlog#13
+AC4):** this registry is hand-maintained per repo unless `gates.shared_file_impact.auto_derive_registry`
+is set to `true`, in which case the shared-file set is ADDITIONALLY computed from the repo's actual
+import fan-in and unioned with this hand list, never replacing it (see
+`gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` above). `auto_derive_registry`
+defaults to `false`, so a repo that has not opted in still needs this list reviewed/regenerated by
+hand as the codebase evolves -- nothing does that automatically for such a repo.
 
 Omitting `patterns` entirely (or leaving it empty) makes `check-shared-file-impact` a permanent
-no-op for that repo, identical to today's behavior before this feature existed.
+no-op for that repo UNLESS `gates.shared_file_impact.auto_derive_registry` is also `true`, in which
+case a derived file can still match and the gate can still block even with no hand-authored
+patterns at all. Only when both `patterns` is empty AND `auto_derive_registry` is `false` (or
+unset) is the gate a permanent no-op, identical to today's behavior before this feature existed.
 
 ---
 

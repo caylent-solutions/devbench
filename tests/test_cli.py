@@ -11615,10 +11615,55 @@ def _shared_file_impact_parser(unit: WorkUnit) -> MagicMock:
     return mock_parser
 
 
-def _shared_file_impact_runtime_cfg(patterns: tuple[str, ...] = (), default_branch: str | None = None) -> Any:
+def _write_shared_file_impact_gate_config(
+    workspace_root: Path,
+    *,
+    repo: str = _SHARED_FILE_IMPACT_REPO,
+    enabled: bool = True,
+    auto_derive_registry: bool = False,
+    fan_in_threshold: int = 3,
+) -> Path:
+    """Write a scratch ``devbench.yaml`` at *workspace_root*'s DEFAULT resolved
+    config path (``backlog/config/devbench.yaml``, ``resolve_config_path``'s
+    fallback when ``DEVBENCH_CONFIG_PATH`` is unset) so ``_load_gate_config_or_report``
+    -- the SAME helper ``check-ancestry``/``check-reachability`` use -- resolves the
+    ``shared_file_impact`` gate's ``enabled``/``auto_derive_registry``/
+    ``fan_in_threshold`` fields from a real file, exactly as production does (spec
+    4.1, D-15; round-1 code_review C1 finding: ``cmd_check_shared_file_impact`` no
+    longer reads these off a mocked module-level ``RUNTIME_CONFIG`` snapshot).
+
+    A ``repos:`` block naming *repo* (with no further keys) is always included --
+    the config schema's own ``required: [repos]``/``minProperties: 1`` rejects a
+    ``repos:``-less file outright, and this gate command never reads per-repo
+    ``default_branch``/etc. off this particular file (those come from whatever
+    the test's own ``RUNTIME_CONFIG`` mock or git fixture provides), so an empty
+    per-repo mapping is deliberate, not an oversight.
+    """
+    cfg_path = workspace_root / "backlog" / "config" / "devbench.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "repos:\n"
+        f"  {repo}: {{}}\n"
+        "gates:\n"
+        "  shared_file_impact:\n"
+        f"    enabled: {'true' if enabled else 'false'}\n"
+        f"    auto_derive_registry: {'true' if auto_derive_registry else 'false'}\n"
+        f"    fan_in_threshold: {fan_in_threshold}\n"
+    )
+    return cfg_path
+
+
+def _shared_file_impact_runtime_cfg(
+    patterns: tuple[str, ...] = (),
+    default_branch: str | None = None,
+    *,
+    auto_derive_registry: bool = False,
+    fan_in_threshold: int = 3,
+) -> Any:
     from devbench.config_loader import (
         GateRepoOverrides,
         GatesConfig,
+        GateSharedFileImpactConfig,
         GateSharedFileImpactOverride,
         RepoConfig,
         RuntimeConfig,
@@ -11627,7 +11672,12 @@ def _shared_file_impact_runtime_cfg(patterns: tuple[str, ...] = (), default_bran
     overrides = GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(patterns=patterns))
     return RuntimeConfig(
         repos={_SHARED_FILE_IMPACT_REPO: RepoConfig(default_branch=default_branch)},
-        gates=GatesConfig(repos={_SHARED_FILE_IMPACT_REPO: overrides}),
+        gates=GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(
+                auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+            ),
+            repos={_SHARED_FILE_IMPACT_REPO: overrides},
+        ),
     )
 
 
@@ -11732,6 +11782,21 @@ class TestSharedFileRunnerParsers:
     """
 
     REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
 
     def _make_unit(self) -> WorkUnit:
         return _shared_file_impact_unit()
@@ -12035,6 +12100,937 @@ class TestSharedFileRunnerParsers:
         assert cli._resolve_runner_parser(["make", "test"], "tsr run\n") is _tsr_parser
 
 
+class TestSharedFileAutoDerive:
+    """Auto-derived shared-file registry from import fan-in (spec 4.6, issue #13 AC4;
+    E5-F2-S1-T2). ``_derive_shared_file_registry`` scans a real ``tmp_path`` fixture
+    repo -- these tests drive the real function, never a reimplementation of its
+    counting rule."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    # -- AC-1: derivation at, below, and above the threshold ----------------------
+
+    def _write_fan_in_fixture(self, tmp_path: Path, *, importer_count: int) -> None:
+        (tmp_path / "shared_module.py").write_text("def shared():\n    pass\n")
+        (tmp_path / "lonely_module.py").write_text("def lonely():\n    pass\n")
+        for i in range(importer_count):
+            (tmp_path / f"consumer_{i}.py").write_text("import shared_module\n")
+        (tmp_path / "single_consumer.py").write_text("import lonely_module\n")
+
+    def test_file_imported_by_more_than_threshold_modules_is_derived(self, tmp_path: Path) -> None:
+        """Four importing modules straddle the default threshold (3): shared_module.py's
+        fan-in (4) is strictly greater than 3, so it is derived; lonely_module.py's
+        fan-in (1) is not."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"shared_module.py"}
+
+    def test_threshold_uses_strictly_greater_than_not_at_least(self, tmp_path: Path) -> None:
+        """AC-1: 'more than fan_in_threshold', not 'at least' -- a fan-in of exactly 4
+        against threshold=4 must NOT be derived."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        assert result == set()
+
+    def test_raising_threshold_above_fan_in_yields_empty_set(self, tmp_path: Path) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 10)
+
+        assert result == set()
+
+    def test_module_imported_once_is_never_derived_at_the_minimum_threshold(self, tmp_path: Path) -> None:
+        """Even at the minimum valid threshold (1), a fan-in of exactly 1 (not
+        strictly greater than 1) is never derived, while shared_module.py's
+        fan-in of 4 still is."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 1)
+
+        assert "lonely_module.py" not in result
+        assert "shared_module.py" in result
+
+    def test_git_directory_is_never_scanned(self, tmp_path: Path) -> None:
+        """At the fan-in boundary (threshold=4, exactly 4 real importers -> NOT derived,
+        since 4 is not strictly greater than 4): a fifth importer living under `.git`
+        must never push the count over the boundary -- if it did, shared_module.py
+        would wrongly be derived here."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "hooks.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        assert result == set()
+
+    # -- AC-7: an unreadable source file is a loud scan error, never a partial result --
+
+    def test_unreadable_file_raises_loud_error_naming_the_path(self, tmp_path: Path) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        unreadable = tmp_path / "consumer_0.py"
+        original_mode = unreadable.stat().st_mode
+        unreadable.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for consumer_0\.py"):
+                cli._derive_shared_file_registry(tmp_path, 3)
+        finally:
+            unreadable.chmod(original_mode)
+
+    def test_dangling_symlink_raises_loud_error_naming_the_path(self, tmp_path: Path) -> None:
+        """D4 (round 1 doc_review): a broken symlink is never silently skipped --
+        the scan candidate list is never filtered on ``Path.is_file()`` (which
+        swallows a broken symlink's OSError), so reading one reaches the same
+        loud ``ERROR: import scan failed`` path as any other unreadable file."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        broken = tmp_path / "dangling.py"
+        broken.symlink_to(tmp_path / "does_not_exist.py")
+
+        with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for dangling\.py"):
+            cli._derive_shared_file_registry(tmp_path, 3)
+
+    # -- A1 (round 1 code_review): resolution against the importer's own package/
+    # relative location and the repo-root module path, never a global basename index
+
+    def test_stdlib_name_collision_is_never_derived(self, tmp_path: Path) -> None:
+        """A bare Python import whose name collides with an unrelated file's
+        basename must never credit that file's fan-in -- absolute imports resolve
+        against the repo/source root, never a global basename index."""
+        (tmp_path / "mylib").mkdir()
+        (tmp_path / "mylib" / "types.py").write_text("VALUE = 1\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import types\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    def test_same_basename_files_in_different_packages_are_not_conflated(self, tmp_path: Path) -> None:
+        """``pkg_a/shared.py`` imported by 5 modules must never also derive the
+        unrelated, unimported ``pkg_b/shared.py`` that merely shares a basename."""
+        (tmp_path / "pkg_a").mkdir()
+        (tmp_path / "pkg_a" / "__init__.py").write_text("")
+        (tmp_path / "pkg_a" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "pkg_b").mkdir()
+        (tmp_path / "pkg_b" / "__init__.py").write_text("")
+        (tmp_path / "pkg_b" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import pkg_a.shared\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg_a/shared.py"}
+
+    def test_ambiguous_resolution_refuses_to_credit_any_candidate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A target resolvable against more than one source root is credited to
+        NEITHER candidate, and the refusal is printed to stderr rather than
+        silently dropped."""
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "pkg" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "pkg").mkdir()
+        (tmp_path / "src" / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "src" / "pkg" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import pkg.shared\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+        stderr = capsys.readouterr().err
+        assert "pkg.shared" in stderr
+        assert "pkg/shared.py" in stderr
+        assert "src/pkg/shared.py" in stderr
+
+    def test_bare_js_specifier_is_never_resolved_locally(self, tmp_path: Path) -> None:
+        """A bare (non-relative) JS import target is an external package specifier
+        -- it must never be credited to a same-named local file."""
+        (tmp_path / "utils.js").write_text("module.exports = {};\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.js").write_text("import utils from 'utils';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    # -- A2 (round 1 code_review): vendored/dependency trees are pruned DURING
+    # the walk, never enumerated and then filtered out
+
+    def test_vendored_directory_is_never_scanned(self, tmp_path: Path) -> None:
+        """A file living under a vendored dependency directory (`.venv`) must
+        never be scanned as a candidate, and must never vote for a real file's
+        fan-in either."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        vendored = tmp_path / ".venv" / "lib" / "site-packages"
+        vendored.mkdir(parents=True)
+        (vendored / "extra_consumer.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        # A 5th (vendored) importer would push fan-in from 4 to 5, crossing the
+        # threshold=4 boundary -- if the vendored file were scanned, this would
+        # wrongly derive shared_module.py.
+        assert result == set()
+
+    # -- A3 (round 1 code_review/test_review): directory-form composition roots
+    # resolve to their entry file, and idiomatic import spellings agree
+
+    def test_python_package_init_directory_form_is_derived(self, tmp_path: Path) -> None:
+        """``from mypkg import SHARED`` naming the package itself must resolve to
+        ``mypkg/__init__.py``."""
+        (tmp_path / "mypkg").mkdir()
+        (tmp_path / "mypkg" / "__init__.py").write_text("SHARED = 1\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.py").write_text("from mypkg import SHARED\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"mypkg/__init__.py"}
+
+    def test_js_directory_barrel_form_is_derived(self, tmp_path: Path) -> None:
+        """``import {A} from './lib'`` naming a barrel directory must resolve to
+        ``lib/index.js``."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "index.js").write_text("export const A = 1;\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.js").write_text("import {A} from './lib';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/index.js"}
+
+    def test_js_import_with_explicit_extension_is_derived(self, tmp_path: Path) -> None:
+        """``import Foo from './utils.js'`` spells out its own extension -- the
+        resolved prefix already carries it, so it must match the literal
+        candidate rather than being appended a second (nonexistent) `.js.js`."""
+        (tmp_path / "utils.js").write_text("export const Foo = 1;\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.js").write_text("import Foo from './utils.js';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"utils.js"}
+
+    def test_dots_only_and_explicit_relative_import_spellings_agree(self, tmp_path: Path) -> None:
+        """``from . import target`` and ``from .target import x`` are two
+        idiomatic spellings of the same import and must derive the same file."""
+        (tmp_path / "target.py").write_text("VALUE = 1\n")
+        (tmp_path / "other_target.py").write_text("VALUE = 2\n")
+        for i in range(4):
+            (tmp_path / f"consumer_dots_{i}.py").write_text("from . import target\n")
+        for i in range(4):
+            (tmp_path / f"consumer_explicit_{i}.py").write_text("from .other_target import x\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"target.py", "other_target.py"}
+
+    def test_relative_import_resolves_against_importers_own_package(self, tmp_path: Path) -> None:
+        """A relative import resolves against the IMPORTING file's own directory,
+        never a same-named file living in an unrelated directory."""
+        (tmp_path / "pkg_a").mkdir()
+        (tmp_path / "pkg_a" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "pkg_b").mkdir()
+        (tmp_path / "pkg_b" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(4):
+            (tmp_path / "pkg_a" / f"consumer_{i}.py").write_text("from .shared import VALUE\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg_a/shared.py"}
+
+    # -- Non-Python language resolution (spec 4.6, round-1 A1 finding) -------------
+
+    def test_go_absolute_import_path_is_derived(self, tmp_path: Path) -> None:
+        """Go import paths are always project-absolute -- resolved against the repo
+        root, never a bare basename index."""
+        (tmp_path / "myproj").mkdir()
+        (tmp_path / "myproj" / "shared.go").write_text("package myproj\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.go").write_text('import "myproj/shared"\n')
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"myproj/shared.go"}
+
+    def test_php_relative_require_is_derived(self, tmp_path: Path) -> None:
+        """A PHP `require`/`include` with a leading `./` resolves relative to the
+        importing file's own directory."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nrequire('./lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+
+    def test_php_bare_require_resolves_against_source_root(self, tmp_path: Path) -> None:
+        """A PHP `require`/`include` with no leading `./` resolves against the repo
+        root, exactly like Go's always-absolute import paths."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nrequire('lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+
+    def test_php_use_namespace_is_derived(self, tmp_path: Path) -> None:
+        """A PHP `use` namespace (backslash-separated) is normalised to a path and
+        resolved against the repo root."""
+        (tmp_path / "App").mkdir()
+        (tmp_path / "App" / "Shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nuse App\\Shared;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"App/Shared.php"}
+
+    def test_jvm_dotted_import_is_derived(self, tmp_path: Path) -> None:
+        """A Java `import` of a fully-qualified dotted namespace resolves against
+        the repo root, joined on `.`."""
+        (tmp_path / "com" / "example").mkdir(parents=True)
+        (tmp_path / "com" / "example" / "SharedModule.java").write_text("package com.example;\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.java").write_text("import com.example.SharedModule;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"com/example/SharedModule.java"}
+
+    def test_csharp_using_namespace_is_derived(self, tmp_path: Path) -> None:
+        """A C# `using` of a dotted namespace resolves against the repo root."""
+        (tmp_path / "MyProject").mkdir()
+        (tmp_path / "MyProject" / "Shared.cs").write_text("namespace MyProject;\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.cs").write_text("using MyProject.Shared;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"MyProject/Shared.cs"}
+
+    def test_swift_import_is_derived(self, tmp_path: Path) -> None:
+        """A Swift `import` of a module name resolves against the repo root when a
+        matching top-level file exists."""
+        (tmp_path / "SharedModule.swift").write_text("public let value = 1\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.swift").write_text("import SharedModule\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"SharedModule.swift"}
+
+    def test_ruby_bare_require_is_never_resolved_locally(self, tmp_path: Path) -> None:
+        """A bare `require 'shared_module'` (no leading `./`) is an external gem
+        specifier -- it must never be credited to a same-named local file."""
+        (tmp_path / "shared_module.rb").write_text("")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.rb").write_text("require 'shared_module'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    def test_ruby_relative_require_is_derived(self, tmp_path: Path) -> None:
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.rb").write_text("")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.rb").write_text("require_relative './lib/shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.rb"}
+
+    # -- Round-2 test_review finding: every JS/TS/Ruby/relative-PHP fixture above
+    # writes its importers to `tmp_path`'s own ROOT, so `importer_dir` is always
+    # empty and `_resolve_relative_path_shared_file_target`'s
+    # `f"{importer_dir}/{normalized}"` join is never exercised -- only the
+    # dedicated Python subdirectory test above
+    # (`test_relative_import_resolves_against_importers_own_package`) exercises
+    # that shape, and it drives the SEPARATE `_resolve_python_shared_file_target`.
+    # These tests place the importer in a subdirectory with a same-named decoy
+    # at the repo root, so a join that dropped `importer_dir` (crediting the
+    # decoy instead of the real file) would be caught here.
+
+    @pytest.mark.parametrize(
+        ("suffix", "consumer_text"),
+        [
+            (".js", "import {x} from './shared';\n"),
+            (".jsx", "import {x} from './shared';\n"),
+            (".ts", "import {x} from './shared';\n"),
+            (".tsx", "import {x} from './shared';\n"),
+            (".mjs", "import {x} from './shared';\n"),
+            (".cjs", "const {x} = require('./shared');\n"),
+        ],
+    )
+    def test_js_family_relative_import_credits_importer_directory_not_repo_root_decoy(
+        self, tmp_path: Path, suffix: str, consumer_text: str
+    ) -> None:
+        """A relative `./shared` import from an importer living in `pkg/` must
+        resolve to `pkg/shared<suffix>` -- never a same-named decoy file sitting
+        at the repo root -- for every extension in the JS/TS resolve family."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / f"shared{suffix}").write_text("export const x = 1;\n")
+        (tmp_path / f"shared{suffix}").write_text("export const x = 999;\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}{suffix}").write_text(consumer_text)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {f"pkg/shared{suffix}"}
+
+    def test_ruby_relative_require_credits_importer_directory_not_repo_root_decoy(self, tmp_path: Path) -> None:
+        """A relative `require_relative './shared'` from an importer living in
+        `pkg/` must resolve to `pkg/shared.rb` -- never a same-named decoy file
+        sitting at the repo root."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "shared.rb").write_text("")
+        (tmp_path / "shared.rb").write_text("")
+        for i in range(4):
+            (pkg / f"consumer_{i}.rb").write_text("require_relative './shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg/shared.rb"}
+
+    def test_php_relative_require_credits_importer_directory_not_repo_root_decoy(self, tmp_path: Path) -> None:
+        """A relative PHP `require('./shared.php')` from an importer living in
+        `pkg/` must resolve to `pkg/shared.php` -- never a same-named decoy file
+        sitting at the repo root."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "shared.php").write_text("<?php\n")
+        (tmp_path / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}.php").write_text("<?php\nrequire('./shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg/shared.php"}
+
+    # -- Round-5 test_review finding (BLOCKING 5): the leading-`/` branch of
+    # `_resolve_relative_path_shared_file_target`
+    # (`prefix = posixpath.normpath(normalized.lstrip("/"))`) was NOT-EXECUTED
+    # under the full suite despite being documented, in this round's own
+    # docstrings and in docs/devbench-yaml-reference.md, as repo-root-anchored
+    # and NEVER falling back to `src/`. Each importer below lives in a
+    # subdirectory (`pkg/`) and names a leading-`/` target, with a same-named
+    # decoy at the importer-relative path AND a same-named decoy under a
+    # top-level `src/` directory, so a regression toward either the
+    # importer-relative join or a `src/` fallback is caught.
+
+    @pytest.mark.parametrize(
+        ("suffix", "consumer_text"),
+        [
+            (".js", "import {x} from '/lib/shared';\n"),
+            (".jsx", "import {x} from '/lib/shared';\n"),
+            (".ts", "import {x} from '/lib/shared';\n"),
+            (".tsx", "import {x} from '/lib/shared';\n"),
+            (".mjs", "import {x} from '/lib/shared';\n"),
+            (".cjs", "const {x} = require('/lib/shared');\n"),
+        ],
+    )
+    def test_js_family_leading_slash_import_anchors_to_repo_root_only(
+        self, tmp_path: Path, suffix: str, consumer_text: str
+    ) -> None:
+        """A leading-`/` JS/TS import from an importer living in `pkg/` must
+        resolve to the repo-root `lib/shared<suffix>` ONLY -- never the
+        importer-relative decoy at `pkg/lib/shared<suffix>` and never a
+        `src/`-anchored decoy at `src/lib/shared<suffix>` -- for every
+        extension in the JS/TS resolve family."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / f"shared{suffix}").write_text("export const x = 1;\n")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / f"shared{suffix}").write_text("export const x = 2;\n")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / f"shared{suffix}").write_text("export const x = 3;\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}{suffix}").write_text(consumer_text)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {f"lib/shared{suffix}"}
+        assert f"pkg/lib/shared{suffix}" not in result
+        assert f"src/lib/shared{suffix}" not in result
+
+    def test_ruby_leading_slash_require_anchors_to_repo_root_only(self, tmp_path: Path) -> None:
+        """A leading-`/` Ruby `require '/lib/shared'` from an importer living in
+        `pkg/` must resolve to the repo-root `lib/shared.rb` ONLY -- never the
+        importer-relative decoy at `pkg/lib/shared.rb` and never a
+        `src/`-anchored decoy at `src/lib/shared.rb`."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / "shared.rb").write_text("")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / "shared.rb").write_text("")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / "shared.rb").write_text("")
+        for i in range(4):
+            (pkg / f"consumer_{i}.rb").write_text("require '/lib/shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.rb"}
+        assert "pkg/lib/shared.rb" not in result
+        assert "src/lib/shared.rb" not in result
+
+    def test_php_leading_slash_require_anchors_to_repo_root_only(self, tmp_path: Path) -> None:
+        """A leading-`/` PHP `require('/lib/shared.php')` from an importer
+        living in `pkg/` must resolve to the repo-root `lib/shared.php` ONLY --
+        never the importer-relative decoy at `pkg/lib/shared.php` and never a
+        `src/`-anchored decoy at `src/lib/shared.php`."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / "shared.php").write_text("<?php\n")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / "shared.php").write_text("<?php\n")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}.php").write_text("<?php\nrequire('/lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+        assert "pkg/lib/shared.php" not in result
+        assert "src/lib/shared.php" not in result
+
+    # -- Round-6 test_review finding: `_resolve_python_shared_file_target`'s
+    # over-pop guard (`if pops > len(base_parts): return set()`) was
+    # NOT-EXECUTED under the full suite and survived mutation. Without the
+    # guard, a relative import popping more directories than the importer
+    # actually has silently anchors at the repo root via a negative slice that
+    # wraps to `[]`, casting a spurious fan-in vote for an unrelated
+    # same-stem file elsewhere in the tree -- the round-1 A1 defect class.
+
+    def test_over_popping_relative_import_never_anchors_to_repo_root(self, tmp_path: Path) -> None:
+        """Four importers at `src/consumer_0..3.py` each write
+        `from ...shared import VALUE` -- a relative import with level 3
+        (three leading dots), so `pops = level - 1 = 2`. The importer's own
+        directory is `src` (`base_parts = ["src"]`, length 1), so `pops (2) >
+        len(base_parts) (1)`: the level pops past the repo root itself, which
+        is not a real location any file can be resolved against. This must
+        derive `set()`, never the unrelated repo-root decoy `shared.py`,
+        even though the decoy exists and four importers exceed the
+        threshold."""
+        (tmp_path / "shared.py").write_text("VALUE = 1\n")
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(4):
+            (src / f"consumer_{i}.py").write_text("from ...shared import VALUE\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+        assert "shared.py" not in result
+
+    # -- Round-2 test_review finding: 11 of 14 (now 16) _SHARED_FILE_SCAN_EXCLUDED_DIRS
+    # entries could previously be removed individually with zero test failures
+    # (only `.git` was pinned; `.venv`/`site-packages` were pinned only as a
+    # conjunction via the `.venv/lib/site-packages` fixture path). This
+    # parametrized test pins every entry individually: a file living under it
+    # must never cast a fan-in vote, even a vote that would otherwise push a
+    # target over threshold.
+
+    # Hard-coded (never read from `cli._SHARED_FILE_SCAN_EXCLUDED_DIRS` itself):
+    # parametrizing over the production constant would make a removed entry
+    # silently vanish from this test's own case list rather than fail it. The
+    # companion equality-pin test below independently pins the constant's exact
+    # membership, so an addition or removal on either side is caught.
+    _EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS = frozenset(
+        {
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".tox",
+            ".nox",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".eggs",
+            "site-packages",
+            "dist",
+            "build",
+            "htmlcov",
+            "vendor",
+            "third_party",
+        }
+    )
+
+    def test_excluded_dirs_constant_membership_is_pinned(self) -> None:
+        assert cli._SHARED_FILE_SCAN_EXCLUDED_DIRS == self._EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS
+
+    @pytest.mark.parametrize("excluded_dir", sorted(_EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS))
+    def test_each_excluded_directory_entry_prunes_a_would_be_extra_voter(
+        self, tmp_path: Path, excluded_dir: str
+    ) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        pruned = tmp_path / excluded_dir / "nested"
+        pruned.mkdir(parents=True)
+        (pruned / "extra_consumer.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        # A 5th (excluded-dir) importer would push fan-in from 4 to 5, crossing
+        # the threshold=4 boundary -- if this directory were not pruned, this
+        # would wrongly derive shared_module.py.
+        assert result == set()
+
+    # -- Derived-registry cache alongside the baseline record (AC-6) ---------------
+
+    def test_derived_registry_cache_path_is_a_sibling_of_the_baseline(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            baseline_path = cli._shared_file_baseline_path(self.REPO, "deadbeef")
+            cache_path = cli._shared_file_derived_registry_cache_path(self.REPO, "deadbeef")
+        assert cache_path.parent == baseline_path.parent
+        assert cache_path.name == "deadbeef.derived-registry.json"
+
+    def test_write_derived_registry_cache_persists_expected_shape(self, tmp_path: Path) -> None:
+        path = tmp_path / "deadbeef.derived-registry.json"
+        cli._write_shared_file_derived_registry_cache(
+            path, branch_point="deadbeef", fan_in_threshold=3, derived_registry={"src/shared.py", "src/other.py"}
+        )
+        record = json.loads(path.read_text())
+        assert record["branch_point"] == "deadbeef"
+        assert record["fan_in_threshold"] == 3
+        assert record["derived_registry"] == ["src/other.py", "src/shared.py"]
+        datetime.fromisoformat(record["captured_at"])
+
+    def test_derived_registry_cache_and_payload_key_written_on_a_reached_verdict(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-6 (round 1 test_review): the derived-registry cache file and the
+        payload's own ``derived_registry`` key are both real side effects of
+        reaching a verdict through ``_evaluate_shared_file_gate`` over a real
+        full-suite run -- not merely properties of the writer helper tested in
+        isolation, or of the no-match payload branch. Kills two independent
+        mutations: deleting the ``_write_shared_file_derived_registry_cache`` call
+        site, and deleting ``base_payload["derived_registry"] = sorted(...)``."""
+        unit = _shared_file_impact_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        cfg_path = _write_shared_file_impact_gate_config(workspace, auto_derive_registry=True, fan_in_threshold=3)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("tests/test_suite.py",),
+                    default_branch="main",
+                    auto_derive_registry=True,
+                    fan_in_threshold=3,
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"tests/test_suite.py"}),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["derived_registry"] == ["tests/test_suite.py"]
+
+        cache_path = (
+            workspace
+            / ".devbench"
+            / "test-baselines"
+            / self.REPO.replace("/", "__")
+            / f"{base_sha}.derived-registry.json"
+        )
+        assert cache_path.exists(), "the derived-registry cache must be written when a verdict is actually reached"
+        cache_record = json.loads(cache_path.read_text())
+        assert cache_record["derived_registry"] == ["tests/test_suite.py"]
+        assert cache_record["fan_in_threshold"] == 3
+
+    # -- cmd_check_shared_file_impact wiring: additive union + resolver reads ------
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    def test_hand_pattern_not_derived_still_matches(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-2: a hand-listed pattern the scanner did not derive still matches, even
+        with auto_derive_registry enabled."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/hand_listed.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("src/hand_listed.py",), auto_derive_registry=True, fan_in_threshold=3
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value=set()) as mock_derive,
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_derive.assert_called_once_with(tmp_path, 3)
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/hand_listed.py"]
+        assert mock_evaluate.call_args.kwargs["auto_derive_registry"] is True
+        assert mock_evaluate.call_args.kwargs["fan_in_threshold"] == 3
+        assert mock_evaluate.call_args.kwargs["derived_registry"] == set()
+
+    def test_derived_file_matches_with_empty_hand_list(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-2: a derived file matches even when the hand list is empty."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/derived_only.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/derived_only.py"]
+
+    def test_hand_pattern_and_derived_file_both_survive_the_union(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-2 (round 1 test_review): with BOTH a hand-listed match and a derived
+        match present simultaneously, the union must be ADDITIVE -- neither side
+        may be dropped in favour of the other. Kills the mutation that replaces
+        the union with `set(scope.files) & derived_registry` (discarding every
+        hand-listed match): under that mutation `matched_files` would be
+        `["src/derived_only.py"]` alone, missing `src/hand_listed.py`."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/hand_listed.py", "src/derived_only.py"))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("src/hand_listed.py",), auto_derive_registry=True, fan_in_threshold=3
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/derived_only.py", "src/hand_listed.py"]
+
+    def test_derived_file_outside_scope_never_matches(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A derived file NOT in this unit's own scope must never be unioned in --
+        the union is `scope.files & derived_registry`, not `derived_registry` alone."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_run.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+
+    def test_derived_registry_printed_on_no_match_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-6: the derived set is printed on the run even on a no-match invocation."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_run.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        assert payload["derived_registry"] == ["src/some_other_derived_file.py"]
+
+    def test_import_scan_failure_exits_one_and_leaves_verdict_pending(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-7 surfaced through cmd_check_shared_file_impact: a loud scan error exits 1
+        and never reaches a clean verdict (fail-closed for the hook)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(workspace, auto_derive_registry=True, fan_in_threshold=3)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.cli._derive_shared_file_registry",
+                side_effect=RuntimeError("ERROR: import scan failed for src/broken.py: [Errno 13] Permission denied"),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "ERROR: import scan failed for src/broken.py" in captured.err
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending"
+
+    def test_auto_derive_registry_and_fan_in_threshold_read_through_resolver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both new keys are read exclusively through resolve_gate_config (spec 4.1 AC-27),
+        proven by a recording wrapper around the real resolver."""
+        from devbench.config_loader import resolve_gate_config as real_resolve_gate_config
+
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=9
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        calls: list[str] = []
+
+        def recording_resolve(gate: str, *args: Any, **kwargs: Any) -> Any:
+            calls.append(gate)
+            return real_resolve_gate_config(gate, *args, **kwargs)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=9),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config_loader.resolve_gate_config", side_effect=recording_resolve),
+            patch("devbench.cli._derive_shared_file_registry", return_value=set()) as mock_derive,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert calls == ["shared_file_impact"]
+        mock_derive.assert_called_once_with(tmp_path, 9)
+
+
 class TestCmdCheckSharedFileImpact:
     """Test cmd_check_shared_file_impact -- caylent-solutions/devbench-internal-backlog#13
 
@@ -12042,6 +13038,21 @@ class TestCmdCheckSharedFileImpact:
     """
 
     REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
 
     def _make_unit(self) -> WorkUnit:
         return _shared_file_impact_unit()
@@ -12110,6 +13121,101 @@ class TestCmdCheckSharedFileImpact:
         mock_run.assert_not_called()
         verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
         assert verdict_record.splitlines()[0] == "pass", "a no-patterns-configured no-op must record 'pass'"
+
+    def test_auto_derive_registry_disabled_never_calls_derivation(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-3 (round 1 test_review): with `auto_derive_registry` resolving to its
+        default of False, `_derive_shared_file_registry` must never be called and
+        `derived_registry` must never appear in the payload -- kills the mutation
+        that hardcodes `auto_derive_registry = True` at the consumption site."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry") as mock_derive,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_derive.assert_not_called()
+        payload = json.loads(capsys.readouterr().out)
+        assert "derived_registry" not in payload
+
+    def test_gate_disabled_prints_status_line_and_writes_pass_verdict(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """C1/D3 (round 1 code_review): `enabled` is now read through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability`
+        use, closing the previous gap where this command never checked `enabled`
+        at all. A `false` config disables the gate before any scope/derivation/
+        full-suite work runs, and the PostToolUse hook's verdict record is still
+        overwritten with `pass` (never left at `pending`) so the hook does not
+        stay blocked on a disabled gate forever."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        cfg_path = _write_shared_file_impact_gate_config(workspace, enabled=False)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "shared_file_impact", "status": "disabled"}'
+        mock_run.assert_not_called()
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            "a disabled gate must still write 'pass' so the PostToolUse hook is never left blocked"
+        )
+
+    def test_config_load_error_reports_and_leaves_verdict_pending(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuine config-load error (malformed YAML) via `_load_gate_config_or_report`
+        must exit 1 with the loader's own `ERROR:` message and leave the verdict record
+        at `pending` -- never the disabled path's `pass` write, since no gate config was
+        actually resolved."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        cfg_path = workspace / "backlog" / "config" / "devbench.yaml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text("gates: [this is not a mapping\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        mock_run.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("ERROR:")
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pending", (
+            "a genuine config-load error must leave the verdict at 'pending', not write 'pass'"
+        )
 
     def test_changed_files_do_not_match_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """Patterns configured, but this task's diff doesn't touch any of them -- no-op."""
@@ -12191,6 +13297,21 @@ class TestCheckSharedFileImpactScope:
     raw working-tree scan (finding 318-D7)."""
 
     REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
 
     def _make_unit(self) -> WorkUnit:
         return _shared_file_impact_unit()
@@ -12644,6 +13765,21 @@ class TestCheckSharedFileImpactBaseline:
     """
 
     REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
 
     def _make_unit(self) -> WorkUnit:
         return _shared_file_impact_unit()

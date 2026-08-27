@@ -494,3 +494,183 @@ class TestIsTestPath:
         from devbench.source_classification import is_test_path
 
         assert is_test_path("src\\__tests__\\Button.tsx") is True
+
+
+# ---------------------------------------------------------------------------
+# extract_import_targets (spec 4.6, issue #13 AC4; E5-F2-S1-T2 AC-5)
+# ---------------------------------------------------------------------------
+
+
+class TestJsTsFamilyExtensions:
+    """`JS_TS_FAMILY_EXTENSIONS` is the single declared source for the JS/TS
+    grouping (round-2 code_review finding) -- `devbench.cli`'s shared-file
+    import-*resolution* step imports this same constant rather than
+    redeclaring it, so this pin protects both consumers from silent drift."""
+
+    def test_membership_is_pinned(self) -> None:
+        from devbench.source_classification import JS_TS_FAMILY_EXTENSIONS
+
+        assert JS_TS_FAMILY_EXTENSIONS == (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+    def test_every_family_extension_dispatches_to_the_js_extractor(self) -> None:
+        """Every extension `JS_TS_FAMILY_EXTENSIONS` names must actually route
+        through the JS/TS extractor in `extract_import_targets` -- pins the two
+        constants against drifting apart from each other."""
+        from devbench.source_classification import JS_TS_FAMILY_EXTENSIONS, extract_import_targets
+
+        for suffix in JS_TS_FAMILY_EXTENSIONS:
+            assert extract_import_targets(suffix, "import Foo from './shared';\n") == ["./shared"]
+
+
+class TestExtractImportTargets:
+    """Language-appropriate import/require scanning dispatched on the extension
+    the caller's file already carries -- every branch below is killed by a
+    distinct test (extractor dispatch table AND the guard/absent-entry paths)."""
+
+    def test_python_from_import_and_bare_import(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "import shared_module\nfrom pkg.other import Thing\nfrom . import local_mod\n"
+        assert extract_import_targets(".py", text) == ["pkg.other", ".local_mod", "shared_module"]
+
+    def test_python_dots_only_from_import_expands_per_imported_name(self) -> None:
+        """``from . import a, b as c`` names no dotted module of its own -- each
+        imported name becomes its own ``.``-prefixed target (spec 4.6, round-1 A3
+        finding), the same shape ``from .a import x`` / ``from .b import x`` already
+        produce explicitly."""
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".py", "from . import a, b as c\n") == [".a", ".b"]
+
+    def test_python_dots_only_from_import_matches_explicit_module_path_spelling(self) -> None:
+        """Two idiomatic spellings of the same import must resolve identically
+        (spec 4.6, round-1 A3 finding)."""
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".py", "from . import target\n") == extract_import_targets(
+            ".py", "from .target import x\n"
+        )
+
+    def test_python_dots_only_from_import_strips_parenthesized_clause(self) -> None:
+        """The single-line parenthesized form (``from . import (a, b)``) strips the
+        wrapping parens before splitting on commas, rather than treating ``(a``/
+        ``b)`` as literal (and wrong) names."""
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".py", "from . import (a, b)\n") == [".a", ".b"]
+
+    def test_python_comma_separated_import_splits_and_strips_aliases(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".py", "import os, sys as _sys\n") == ["os", "sys"]
+
+    @pytest.mark.parametrize("suffix", [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"])
+    def test_js_family_import_export_and_require(self, suffix: str) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "import Foo from './shared_module';\nimport './other';\nconst x = require('./bar');\n"
+        assert extract_import_targets(suffix, text) == ["./shared_module", "./other", "./bar"]
+
+    def test_js_export_from_form(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".ts", "export { Foo } from './shared_module';\n") == ["./shared_module"]
+
+    def test_js_dynamic_import_call_form(self) -> None:
+        """F1 (round 1 test_review): the ``import(...)`` dynamic-call form (e.g.
+        ``const mod = await import('./foo')``) is a distinct grammar shape from
+        both the static ``import ... from`` form and ``require(...)`` -- both the
+        no-space (``import('./foo')``) and spaced (``import ('./foo')``) call
+        spellings must extract a target rather than silently returning nothing."""
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".js", "const mod = await import('./dynamic_module');\n") == ["./dynamic_module"]
+        assert extract_import_targets(".js", "await import ('./spaced_module');\n") == ["./spaced_module"]
+
+    def test_go_single_line_and_grouped_import_block(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = 'import "fmt"\nimport (\n\t"os"\n\t"myproj/shared"\n)\n'
+        assert extract_import_targets(".go", text) == ["fmt", "os", "myproj/shared"]
+
+    def test_go_multiple_grouped_import_blocks_are_all_read(self) -> None:
+        """3b (round-2 test_review): a Go file with TWO grouped import blocks
+        (e.g. one for stdlib, one for third-party imports, a shape
+        `goimports` commonly produces) must have both blocks' targets
+        extracted -- a `.search()`-only implementation stops at the first."""
+        from devbench.source_classification import extract_import_targets
+
+        text = 'import (\n\t"fmt"\n\t"os"\n)\n\nimport (\n\t"myproj/shared"\n\t"myproj/other"\n)\n'
+        assert extract_import_targets(".go", text) == ["fmt", "os", "myproj/shared", "myproj/other"]
+
+    def test_ruby_require_and_require_relative(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "require 'shared_module'\nrequire_relative './lib/other'\n"
+        assert extract_import_targets(".rb", text) == ["shared_module", "./lib/other"]
+
+    @pytest.mark.parametrize("suffix", [".java", ".kt"])
+    def test_jvm_import_including_static(self, suffix: str) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "import com.example.SharedModule;\nimport static com.example.Utils.foo;\n"
+        assert extract_import_targets(suffix, text) == ["com.example.SharedModule", "com.example.Utils.foo"]
+
+    def test_swift_import(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".swift", "import SharedModule\n") == ["SharedModule"]
+
+    def test_csharp_using_including_static(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "using MyProject.Shared;\nusing static MyProject.Utils;\n"
+        assert extract_import_targets(".cs", text) == ["MyProject.Shared", "MyProject.Utils"]
+
+    def test_php_require_include_and_use(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        text = "require_once 'lib/shared.php';\ninclude 'lib/other.php';\nuse App\\Shared;\n"
+        assert extract_import_targets(".php", text) == ["lib/shared.php", "lib/other.php", "App\\Shared"]
+
+    def test_vue_extension_has_no_extractor_and_returns_empty(self) -> None:
+        """`.vue` is a known SOURCE_EXTENSIONS member with no registered extractor
+        (imports live inside an embedded <script> block this module does not
+        parse) -- distinct from a wholly unrecognised extension."""
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".vue", "import Foo from './shared_module'\n") == []
+
+    def test_non_source_extension_returns_empty_without_scanning(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".md", "import Foo from './shared_module'\n") == []
+
+    def test_is_source_extension_guard_is_checked_even_if_extractor_table_drifted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Defense in depth: `extract_import_targets` gates on `is_source_extension`
+        BEFORE the `_IMPORT_TARGET_EXTRACTORS` lookup, not merely relying on that
+        table only ever containing SOURCE_EXTENSIONS members. Proven by patching in
+        a non-source-extension entry and confirming it is still never consulted."""
+        import devbench.source_classification as source_classification_module
+        from devbench.source_classification import extract_import_targets
+
+        def _should_never_run(_text: str) -> list[str]:
+            raise AssertionError("a non-source extension's extractor must never be invoked")
+
+        drifted = dict(source_classification_module._IMPORT_TARGET_EXTRACTORS)
+        drifted[".md"] = _should_never_run
+        monkeypatch.setattr(source_classification_module, "_IMPORT_TARGET_EXTRACTORS", drifted)
+
+        assert extract_import_targets(".md", "import Foo from './shared_module'\n") == []
+
+    def test_no_import_statements_returns_empty(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".py", "x = 1\n") == []
+
+    def test_suffix_matching_is_case_insensitive(self) -> None:
+        from devbench.source_classification import extract_import_targets
+
+        assert extract_import_targets(".PY", "import shared_module\n") == ["shared_module"]

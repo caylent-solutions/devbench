@@ -4480,10 +4480,12 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
 def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | None:
     """Return ``(unit, canonical_repo, repo_path)`` for ``unit_id``, or ``None`` on failure.
 
-    Shared by :func:`cmd_get_diff` and :func:`cmd_check_manifest_scope` so both
-    verbs report "unit not found" / "no local path configured" identically.
-    Prints the ERROR itself; the caller's job is only to propagate a non-zero
-    exit code.
+    Shared by :func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`,
+    :func:`cmd_check_reachability`, :func:`_prepare_shared_file_impact_run`
+    (on behalf of :func:`cmd_check_shared_file_impact`) and
+    :func:`cmd_request_amendment` so all five verbs report "unit not found" /
+    "no local path configured" identically. Prints the ERROR itself; the
+    caller's job is only to propagate a non-zero exit code.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -7448,6 +7450,12 @@ def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: s
 # adopt the slot (and thereby make its own later terminal `"pending"`/`"pass"`
 # write look "same-invocation") before that terminal write is even
 # attempted.
+# Canonical name of the shared-file-impact gate (spec 4.6; constants.GATE_TIERS key).
+# Declared once here, mirroring `_REACHABILITY_GATE_NAME`'s role for the reachability
+# gate, so every gate-name comparison/lookup/marker-write this command makes shares the
+# SAME symbol instead of a hand-typed literal that could drift.
+_SHARED_FILE_IMPACT_GATE_NAME: str = "shared_file_impact"
+
 _SHARED_FILE_IMPACT_VERDICT_FILENAME: str = "shared-file-impact-verdict"
 _SHARED_FILE_IMPACT_VERDICT_PENDING: str = "pending"
 _SHARED_FILE_IMPACT_VERDICT_PASS: str = "pass"
@@ -7581,9 +7589,13 @@ def _write_shared_file_impact_verdict(status: str, *, workspace_root: Path, unit
     invocation: the opening ``"pending"`` write always runs first, followed by
     exactly one of the three ``"pass"``/``"block"`` clean-exit writes -- never
     both, and never on an error path (unit not found, no local repo path
-    configured, a scope-resolution error, or `_evaluate_shared_file_gate`
-    raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, or an
-    uncaught exception), so a run that started but could not reach a clean
+    configured, the config file failed to load, a scope-resolution error,
+    the import-fan-in scan failed, `_evaluate_shared_file_gate`
+    raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, an
+    uncaught exception, or the due `[GATE_PASS shared_file_impact]` record
+    write failing -- the work-unit file cannot be located on disk, or the
+    audit-marker append itself raises `OSError`), so
+    a run that started but could not reach a clean
     verdict leaves the record at ``"pending"`` -- `assert-shared-file-impact.sh`
     fails CLOSED on that value, exactly the "started but the verdict cannot be
     determined" case spec 3.5 requires not to fail open. `cmd_check_shared_file_impact`
@@ -7934,7 +7946,7 @@ def _resolve_shared_file_impact_gate_config(
     ``ResolvedGateConfig`` result means the gate is enabled and the caller should
     proceed.
     """
-    gate_config = _load_gate_config_or_report("shared_file_impact", canonical_repo)
+    gate_config = _load_gate_config_or_report(_SHARED_FILE_IMPACT_GATE_NAME, canonical_repo)
     if isinstance(gate_config, int) and gate_config == 0:
         _write_shared_file_impact_verdict(
             _SHARED_FILE_IMPACT_VERDICT_PASS,
@@ -7945,31 +7957,83 @@ def _resolve_shared_file_impact_gate_config(
     return gate_config
 
 
-def _resolve_shared_file_impact_target(unit_id: str, parser: BacklogParser) -> tuple[str, Path] | None:
-    """Resolve *unit_id*'s canonical repo and local checkout path, or ``None``.
+def _write_shared_file_impact_gate_pass_record(unit: WorkUnit, unit_id: str, scope: "ScopeResult") -> int | None:
+    """Persist ``[GATE_PASS shared_file_impact]`` for a passing enabled run (spec 4.2, 5.3).
 
-    Collapses :func:`cmd_check_shared_file_impact`'s two independent "cannot proceed"
-    checks (unknown unit id, no local repo path configured) into a single caller-side
-    ``if target is None: return 1`` -- keeping the cyclomatic/return-statement
-    complexity of that already-dense command function low (PLR0911) without changing
-    either error message or exit behaviour. Prints its own ``ERROR: ...`` line to
-    stderr on either failure; the caller never re-derives the message. Returns only
-    ``(canonical_repo, repo_path)`` -- never the resolved ``WorkUnit`` itself (round-1
-    code_review F2 finding): the unit is resolved solely to validate its existence
-    and derive its repo, and the sole caller has no further use for the object.
+    Mirrors :func:`cmd_check_reachability`'s inline gate-pass write: this is the ONE call
+    site :func:`_emit_shared_file_impact_status` uses on either of its two passing exits
+    (the no-match no-op, and a matched run with zero attributable new failures), so the
+    wu-file resolution and write steps have a single implementation instead of being
+    duplicated per branch (DRY). `compose_gate_pass_record` (`devbench.gate_records`) is
+    the sole authorized builder of the marker text (AC-E2-F2-S1-T1-6); this command never
+    hand-formats it. `BacklogManager._append_audit_marker_before_comments` is the sole
+    writer of the work-unit file itself -- the record is written by the command, never
+    by agent prose.
+
+    An empty Changes Manifest (``scope.files`` empty, ``scope.scope_hash == ""``) has no
+    scope to persist a hash for, so the caller must skip calling this at all in that case
+    (mirroring `compute_scope_hash`'s own refusal to hash an empty change set) --
+    this function does not re-check that condition itself.
+
+    Returns:
+        ``None`` on a successful write. ``1`` (already printed its own ``ERROR: ...``
+        message to stderr, and nothing to stdout yet) when the work-unit file cannot be
+        located on disk, or when the audit-marker append itself raises ``OSError``
+        (e.g. a permission error or a full disk) -- mirroring
+        :func:`_write_ancestry_gate_pass_record`'s own ``OSError`` guard, this never
+        surfaces as a raw traceback.
     """
-    units = parser.parse_index()
-    unit = _find_unit(units, unit_id)
-    if unit is None:
-        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
-        return None
-    canonical_repo = resolve_repo(unit.repo)
-    validate_repo(canonical_repo)
-    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
-    if repo_path is None:
-        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
-        return None
-    return canonical_repo, repo_path
+    from devbench.backlog.manager import BacklogManager
+    from devbench.gate_records import compose_gate_pass_record
+
+    wu_file = _resolve_work_unit_file(unit)
+    if not wu_file.is_file():
+        print(
+            f"ERROR: Cannot write [GATE_PASS {_SHARED_FILE_IMPACT_GATE_NAME}] record for {unit_id}: "
+            f"work unit file not found at {wu_file}",
+            file=sys.stderr,
+        )
+        return 1
+
+    marker = compose_gate_pass_record(_SHARED_FILE_IMPACT_GATE_NAME, scope.scope_hash)
+    try:
+        BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+    except OSError as exc:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {_SHARED_FILE_IMPACT_GATE_NAME}] record for {unit_id}: {wu_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _emit_shared_file_impact_status(
+    unit: WorkUnit, unit_id: str, scope: "ScopeResult", status: str, findings: int, payload: dict[str, Any]
+) -> int | None:
+    """Write the ``[GATE_PASS shared_file_impact]`` record (spec 4.2, 5.3) on a passing
+    status with a non-empty scope, then print the spec 5.2 status line followed by the
+    findings payload.
+
+    The single call site :func:`cmd_check_shared_file_impact` uses for all three of its
+    reached-a-verdict exits (the no-match no-op, a matched run with zero attributable new
+    failures, and a matched run that blocks) -- collapsing the write-then-print sequence
+    here rather than repeating it per branch keeps the caller's own return/branch count
+    within ruff's thresholds (PLR0911/PLR0912) and means the record-write-before-any-print
+    ordering (mirroring `cmd_check_reachability`'s own ordering: a write failure must never
+    leave partial stdout behind) can never drift between call sites.
+
+    Returns:
+        ``None`` when the caller should continue normally (either no record was due, or
+        the write succeeded). ``1`` (already printed its own ``ERROR: ...``; nothing else
+        printed) when a due record could not be written.
+    """
+    if status == GATE_STATUS_PASS and scope.files:
+        write_result = _write_shared_file_impact_gate_pass_record(unit, unit_id, scope)
+        if write_result is not None:
+            return write_result
+    print(_gate_status_line(_SHARED_FILE_IMPACT_GATE_NAME, status, findings, scope_hash=scope.scope_hash))
+    print(json.dumps(payload, indent=2))
+    return None
 
 
 def _prepare_shared_file_impact_scope_and_registry(
@@ -8017,6 +8081,87 @@ def _prepare_shared_file_impact_scope_and_registry(
     return scope, derived_registry
 
 
+@dataclass(frozen=True)
+class _SharedFileImpactRun:
+    """Everything :func:`cmd_check_shared_file_impact` needs before it can decide
+    match/no-match, resolved by :func:`_prepare_shared_file_impact_run`.
+
+    A named, frozen dataclass rather than a positional tuple (E5-F3-S1-T1 round-1
+    code_review idiomatic-code finding): an 8-element positional tuple unpacked
+    immediately into 8 locals is the exact shape that invites a silent
+    reordering bug at the single call site, one `mypy` only partially protects
+    against (adjacent `bool`/`int`/`str`-ish slots); a named-attribute dataclass
+    cannot be misordered, and `frozen=True` additionally makes each field
+    immutable after construction.
+    """
+
+    unit: WorkUnit
+    canonical_repo: str
+    repo_path: Path
+    patterns: tuple[str, ...]
+    auto_derive_registry: bool
+    fan_in_threshold: int
+    scope: ScopeResult
+    derived_registry: set[str]
+
+
+def _prepare_shared_file_impact_run(unit_id: str, invocation_id: str) -> "_SharedFileImpactRun | int":
+    """Resolve everything :func:`cmd_check_shared_file_impact` needs before it can
+    decide match/no-match: the unit/repo/local-path, the resolved gate config, the
+    per-repo ``patterns`` override, and the Manifest scope plus (when enabled) the
+    auto-derived registry.
+
+    Collapses three independent early-exit checks
+    (:func:`_resolve_unit_repo_and_path`, :func:`_resolve_shared_file_impact_gate_config`,
+    :func:`_prepare_shared_file_impact_scope_and_registry`) into ONE caller-side
+    ``isinstance`` check, keeping :func:`cmd_check_shared_file_impact`'s own
+    return/branch count within ruff's PLR0911/PLR0912 thresholds -- each of the three
+    used to be checked inline in that function.
+
+    Returns:
+        A :class:`_SharedFileImpactRun` on success. An ``int`` when any step already
+        fully handled its own exit (its own ``ERROR:``/disabled line already printed).
+    """
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    unit, canonical_repo, repo_path = resolved
+
+    gate_config = _resolve_shared_file_impact_gate_config(canonical_repo, unit_id=unit_id, invocation_id=invocation_id)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    # `patterns` has no project/env layer of its own (spec 4.1: it is a per-repo-only
+    # override, never resolved by `resolve_gate_config`'s multi-layer merge), so it is
+    # read directly off `RUNTIME_CONFIG.gates.repos` -- `auto_derive_registry` and
+    # `fan_in_threshold` below come from *gate_config* instead, never a second,
+    # independently-loaded config snapshot.
+    gate_repo_override = RUNTIME_CONFIG.gates.repos.get(canonical_repo)
+    shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
+    patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
+
+    auto_derive_registry = bool(gate_config.values["auto_derive_registry"])
+    fan_in_threshold = cast("int", gate_config.values["fan_in_threshold"])
+
+    prepared = _prepare_shared_file_impact_scope_and_registry(
+        unit_id, repo_path, auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+    )
+    if isinstance(prepared, int):
+        return prepared
+    scope, derived_registry = prepared
+
+    return _SharedFileImpactRun(
+        unit=unit,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        patterns=patterns,
+        auto_derive_registry=auto_derive_registry,
+        fan_in_threshold=fan_in_threshold,
+        scope=scope,
+        derived_registry=derived_registry,
+    )
+
+
 def cmd_check_shared_file_impact(unit_id: str) -> int:
     """Gate a work unit's diff against the shared-file full-suite regression policy.
 
@@ -8031,6 +8176,29 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     that gap for repos with `gates.repos.<repo>.shared_file_impact.patterns`
     configured in devbench.yaml:
 
+    0. Prints the spec 5.2 gate status line as the FIRST stdout line:
+       `{"gate": "shared_file_impact", "status": "disabled"}` (the exact bytes
+       `json.dumps` with its default separators emits) and exits 0 (spec 4.1,
+       AC-4) when the gate is disabled or unconfigured for the unit's repo -- via
+       the same shared `_load_gate_config_or_report` helper `check-ancestry`/
+       `check-reachability` use; otherwise
+       `{"gate": "shared_file_impact", "tier": "machine-blocking", "status": "pass"|"fail",
+       "findings": <int>, "scope_hash": "<sha256>"}` followed by the JSON findings
+       payload (items 1-3 below). `findings` is `0` on every passing exit (the
+       no-match no-op, and a matched run with zero attributable new failures) and
+       the count of `new_failures` on a blocking exit. A passing run with a
+       non-empty Changes Manifest additionally persists
+       `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` to the unit's audit
+       trail (spec 4.2, 5.3) through `devbench.gate_records.compose_gate_pass_record`
+       -- the sole authorized builder of that marker text -- so the record is
+       always written by this command, never by agent prose; a blocking run writes
+       no record. `BacklogManager._check_gate_pass_done_invariant` (already
+       generic across every `constants.GATE_TIERS` machine-blocking gate) is what
+       `mark-done` consults for this record: an enabled gate with no fresh record
+       and no operator `[GATE_WAIVER shared_file_impact]` refuses naming the exact
+       remediation command, and a Changes-Manifest edit after the record was
+       written changes the recomputed scope hash and makes the record read as
+       stale.
     1. Resolves the work unit's changed-file set through
        `work_unit_scope.resolve_changed_files(unit_id, repo_path, mode)`
        (spec 4.3, AC-9) -- the unit's own ADR-12 mode-aware Changes Manifest
@@ -8240,9 +8408,13 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
     ``"block"``. The record is overwritten with a clean ``"pass"``/``"block"``
     verdict only on the two clean-exit paths below (a no-match no-op, or
     `_evaluate_shared_file_gate` returning a result); every error-return
-    path (unit not found, no local repo path, a scope-resolution error, or
-    `_evaluate_shared_file_gate` raising) leaves the record at ``"pending"``
-    on purpose, so the hook never has to re-derive this command's own
+    path (unit not found, no local repo path, the config file failed to
+    load, a scope-resolution error, the import-fan-in scan failed,
+    `_evaluate_shared_file_gate` raising, or the due
+    `[GATE_PASS shared_file_impact]` record write failing -- the
+    work-unit file cannot be located on disk, or the audit-marker append
+    itself raises `OSError`) leaves the record at
+    ``"pending"`` on purpose, so the hook never has to re-derive this command's own
     outcome by re-parsing `tool_input.command` or `tool_response.stdout`.
     Every write this invocation makes -- the opening ``"pending"`` and
     whichever clean-exit write follows it -- carries the SAME
@@ -8256,34 +8428,17 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         _SHARED_FILE_IMPACT_VERDICT_PENDING, workspace_root=WORKSPACE_ROOT, unit_id=unit_id, invocation_id=invocation_id
     )
 
-    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
-    target = _resolve_shared_file_impact_target(unit_id, parser)
-    if target is None:
-        return 1
-    canonical_repo, repo_path = target
-
-    gate_config = _resolve_shared_file_impact_gate_config(canonical_repo, unit_id=unit_id, invocation_id=invocation_id)
-    if isinstance(gate_config, int):
-        return gate_config
-
-    # `patterns` has no project/env layer of its own (spec 4.1: it is a per-repo-only
-    # override, never resolved by `resolve_gate_config`'s multi-layer merge), so it is
-    # read directly off `RUNTIME_CONFIG.gates.repos` -- `auto_derive_registry` and
-    # `fan_in_threshold` below come from *gate_config* instead, never a second,
-    # independently-loaded config snapshot.
-    gate_repo_override = RUNTIME_CONFIG.gates.repos.get(canonical_repo)
-    shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
-    patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
-
-    auto_derive_registry = bool(gate_config.values["auto_derive_registry"])
-    fan_in_threshold = cast("int", gate_config.values["fan_in_threshold"])
-
-    prepared = _prepare_shared_file_impact_scope_and_registry(
-        unit_id, repo_path, auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
-    )
+    prepared = _prepare_shared_file_impact_run(unit_id, invocation_id)
     if isinstance(prepared, int):
         return prepared
-    scope, derived_registry = prepared
+    unit = prepared.unit
+    canonical_repo = prepared.canonical_repo
+    repo_path = prepared.repo_path
+    patterns = prepared.patterns
+    auto_derive_registry = prepared.auto_derive_registry
+    fan_in_threshold = prepared.fan_in_threshold
+    scope = prepared.scope
+    derived_registry = prepared.derived_registry
 
     matched_files = _matched_shared_files(scope.files, patterns) if patterns else []
     if derived_registry:
@@ -8300,7 +8455,9 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
             payload["reason"] = "no gates.repos.<repo>.shared_file_impact.patterns configured for this repo"
         if auto_derive_registry:
             payload["derived_registry"] = sorted(derived_registry)
-        print(json.dumps(payload, indent=2))
+        emit_result = _emit_shared_file_impact_status(unit, unit_id, scope, GATE_STATUS_PASS, 0, payload)
+        if emit_result is not None:
+            return emit_result
         _write_shared_file_impact_verdict(
             _SHARED_FILE_IMPACT_VERDICT_PASS,
             workspace_root=WORKSPACE_ROOT,
@@ -8338,7 +8495,13 @@ def cmd_check_shared_file_impact(unit_id: str) -> int:
         )
         print(message, file=sys.stderr)
         return 1
-    print(json.dumps(result_payload, indent=2))
+
+    status = GATE_STATUS_PASS if rc == 0 else GATE_STATUS_FAIL
+    findings = 0 if rc == 0 else len(result_payload.get("new_failures", []))
+    emit_result = _emit_shared_file_impact_status(unit, unit_id, scope, status, findings, result_payload)
+    if emit_result is not None:
+        return emit_result
+
     if rc != 0:
         _write_shared_file_impact_verdict(
             _SHARED_FILE_IMPACT_VERDICT_BLOCK,

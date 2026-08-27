@@ -1454,6 +1454,45 @@ uv run devbench run-tests <id>
 
 Run the test suite in the work unit's target repo. Uses the repo's `make test` target when present; falls back to bare `pytest`. Used by `test_review`. Returns the test runner's exit code.
 
+### `check-shared-file-impact`
+
+```
+uv run devbench check-shared-file-impact <id>
+```
+
+Full-suite regression gate for shared/high-fan-in files (spec `integration-reality-gates-hardening.md` section 4.6; `caylent-solutions/devbench-internal-backlog#13`; machine-blocking per `constants.GATE_TIERS`). Runs no test suite unless the unit's resolved Changes Manifest scope (`devbench.work_unit_scope.resolve_changed_files`, spec 4.3, AC-9 -- never a raw working-tree scan) touches a configured `gates.repos.<repo>.shared_file_impact.patterns` glob, or (when `gates.shared_file_impact.auto_derive_registry` is `true`) a file the import-fan-in scanner derives as shared -- a no-match run still writes a `[GATE_PASS shared_file_impact]` record when the gate is enabled (see below), so it is not a full no-op. On a match, runs the repo's FULL test suite against the current tree and diffs its failures against a pre-change baseline captured at the unit's branch point; blocks (exit 1) only on new failures attributable to the unit's own scope. See [devbench-yaml-reference.md](devbench-yaml-reference.md) for the full algorithm (baseline capture and caching, runner-parser registry, auto-derive-registry fan-in scan) and the `gates.repos.<repo>.shared_file_impact` / `gates.shared_file_impact` config fields.
+
+Prints the spec 5.2 gate status line as the FIRST stdout line. When the gate is disabled (or unconfigured) for the unit's repo: `{"gate": "shared_file_impact", "status": "disabled"}`, exit 0 (spec 4.1, AC-4). When enabled: `{"gate": "shared_file_impact", "tier": "machine-blocking", "status": "pass"|"fail", "findings": <int>, "scope_hash": "<sha256>"}`, followed by the JSON findings payload. `findings` is `0` on every passing exit (a no-match no-op, or a matched run introducing zero attributable new failures) and the count of `new_failures` on a blocking exit. The payload's field set differs by shape (verified against `_evaluate_shared_file_gate` (`src/devbench/cli.py:7711-7920`), which builds both matched shapes, `cmd_check_shared_file_impact`'s no-match branch (`src/devbench/cli.py:8446-8456`), and measured against the real command):
+
+- **No-match** (scope touches no configured/derived shared file): `unit_id`, `repo`, `shared_file_impact` (`false`), `changed_files` -- plus `derived_registry` when `auto_derive_registry` is enabled, and `reason` when no `patterns`/derived registry are configured for the repo at all.
+- **Matched, passing** (`verdict: "pass"`): `unit_id`, `repo`, `shared_file_impact` (`true`), `matched_files`, `full_suite_command`, `full_suite_exit_code`, `baseline_path`, `branch_point`, `verdict`, `failing_tests`, `unattributed_new_failures` -- plus `derived_registry` when `auto_derive_registry` is enabled. There is no `changed_files` key on a matched run and no `new_failures` key on a passing run; `failing_tests` (the repo-wide current-tree failure set) takes its place.
+- **Matched, blocking** (`verdict: "block"`): the same base fields as a matched pass (`unit_id`, `repo`, `shared_file_impact`, `matched_files`, `full_suite_command`, `full_suite_exit_code`, `baseline_path`, `branch_point`) -- plus `derived_registry` when `auto_derive_registry` is enabled -- plus `verdict`, `new_failures`, `pre_existing_failures`, `unattributed_new_failures` in place of `failing_tests`.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Gate disabled for the unit's repo, the unit's scope matches no configured/derived shared file, or a matched run introduced zero attributable new failures. |
+| 1 | Work unit not found, no local path configured for its repo, the config file failed to load, `work_unit_scope.resolve_changed_files` raised, the import-fan-in scan failed, the configured test command could not be resolved to a registered runner parser, a stored baseline is corrupt or was captured under a different runner, a stored baseline's `branch_point` disagrees with the resolved merge-base, a current-tree or branch-point-capture suite run exits non-zero yet its parser attributes zero failing node ids (spec 3.5's zero-attributed-failures guard), a branch-point worktree could not be checked out, a branch-point capture worktree could not be removed, the branch point could not be resolved, a stuck baseline lock timed out, the work-unit file could not be located to persist a passing record or the audit-marker append raised an `OSError`, or a matched run introduced at least one attributable new failure. |
+
+**Persisted machine record (spec 4.2, 4.6).** A passing run (`findings: 0`) with at least one file in the unit's Changes Manifest appends exactly one `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` line to the unit's audit section -- the `<scope-hash>` is identical to the status line's `scope_hash`, computed by `devbench.gate_records.compute_scope_hash` over the sorted Changes Manifest file list plus each file's current git blob hash, so any later edit to an in-scope file invalidates the record. `devbench.gate_records.compose_gate_pass_record` is the sole authorized builder of that marker text -- `check-shared-file-impact` never hand-formats it. A blocking run, or a disabled gate, writes no record of THIS kind -- see below for the two OTHER on-disk artifacts this command persists regardless.
+
+This command also writes two OTHER on-disk artifacts distinct from the `[GATE_PASS]` marker above: a four-line shared-file-impact **verdict record** (`<workspace>/.devbench/shared-file-impact-verdict`, or a per-session subdirectory) that `plugin/devbench-orchestrate/scripts/assert-shared-file-impact.sh` reads back fail-closed on the next Bash `PostToolUse` event -- unlike the `[GATE_PASS]` marker, EVERY invocation writes this record, including a disabled gate (`pass`) and a blocking run (`block`), never only a passing/matched-enabled one; and a write-only `<branch-point-sha>.derived-registry.json` cache alongside the test baseline, written only on a matched invocation with `auto_derive_registry` enabled. See [devbench-yaml-reference.md](devbench-yaml-reference.md#gatesshared_file_impactauto_derive_registry--fan_in_threshold----auto-derived-shared-file-registry-caylent-solutionsdevbench-internal-backlog13-ac4) for the derived-registry cache and [devbench-yaml-reference.md](devbench-yaml-reference.md#gatesreposorgreposhared_file_impactpatterns----shared-file-full-suite-regression-gate-caylent-solutionsdevbench-internal-backlog13) for the verdict record's full contract.
+
+**`mark-done` requirement.** When `gates.shared_file_impact.enabled` is `true` for the unit's repo, `mark-done` refuses (exit 1, writes no status) unless the unit carries a fresh `[GATE_PASS shared_file_impact]` record or an operator-attributed `[GATE_WAIVER shared_file_impact]` marker:
+
+```
+$ uv run devbench mark-done E9-F1-S1-T1
+ERROR: done-gate: gate 'shared_file_impact' is enabled for repo 'caylent-solutions/devbench' but has no
+[GATE_PASS shared_file_impact] record for E9-F1-S1-T1. Run: uv run devbench check-shared-file-impact E9-F1-S1-T1
+```
+
+Editing any Manifest file after the record was written re-derives a different scope hash, so the stale record no longer satisfies the gate:
+
+```
+ERROR: gate 'shared_file_impact' record is stale (scope changed since it ran). Run: uv run devbench check-shared-file-impact E9-F1-S1-T1 to produce a fresh record.
+```
+
+An operator-attributed `[GATE_WAIVER shared_file_impact]` marker (see [`log-waiver`](#log-waiver)) satisfies the requirement in place of a record, and does so even when an existing record has gone stale (spec Section 3.6: the operator is the only waiver authority for a machine-blocking gate); an executor-attributed waiver alone is never sufficient. Unlike `check-reachability`, `check-shared-file-impact` itself does not read `[GATE_WAIVER shared_file_impact]` markers to clear individual findings -- the whole-gate `mark-done` bypass above is the only waiver interaction this gate has.
+
 ### `check-fixture-consistency`
 
 ```

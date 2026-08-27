@@ -5,6 +5,61 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-shared-file-impact` is wired into the done path and persists a
+  `[GATE_PASS shared_file_impact]` machine record, making an already-enabled
+  gate satisfiable for the first time** (spec
+  `integration-reality-gates-hardening.md` sections 4.1, 4.2, 4.6, 5.2, 5.3;
+  finding 318-D15). At HEAD, `constants.GATE_TIERS` already declared
+  `shared_file_impact` machine-blocking and
+  `BacklogManager._check_gate_pass_done_invariant` already required a fresh
+  `[GATE_PASS shared_file_impact]` record for any repo with the gate enabled,
+  but no code path could ever write that record (`compose_gate_pass_record`
+  had exactly two call sites: ancestry and reachability). A repo that enabled
+  the gate therefore had `mark-done` permanently deadlocked, satisfiable only
+  by an operator `[GATE_WAIVER shared_file_impact]`. This change closes that
+  deadlock by making `check-shared-file-impact` the command that produces the
+  record the invariant already demanded. The command now prints the spec 5.2
+  gate status line as the FIRST stdout line:
+  `{"gate": "shared_file_impact", "status": "disabled"}` (the exact bytes
+  `json.dumps`'s default separators emit) and exits 0 when the gate is
+  disabled or unconfigured for the repo (spec 4.1, AC-4); otherwise
+  `{"gate": "shared_file_impact", "tier": "machine-blocking",
+  "status": "pass"|"fail", "findings": <int>, "scope_hash": "<sha256>"}` followed by
+  the JSON findings payload, with `findings` counting the attributed
+  `new_failures` on a blocking run and `0` on either passing shape (a no-match
+  no-op, or a matched run with zero attributable new failures). A passing run
+  with a non-empty Changes Manifest additionally appends
+  `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` to the unit's audit
+  trail through `devbench.gate_records.compose_gate_pass_record` -- the sole
+  authorized builder of that marker text, so the record is always written by
+  the command, never by agent prose; a blocking run writes no `[GATE_PASS]`
+  record. `mark-done`'s already-generic
+  `BacklogManager._check_gate_pass_done_invariant` (spanning every
+  `constants.GATE_TIERS` machine-blocking gate since E2-F2-S1-T2) is what
+  enforces this: an enabled gate with no fresh record and no
+  operator-attributed `[GATE_WAIVER shared_file_impact]` marker refuses
+  naming the exact `uv run devbench check-shared-file-impact <unit-id>`
+  remediation, and editing a Changes-Manifest file after the record was
+  written re-derives a different scope hash and reads the record as stale.
+  Unlike `check-reachability`, `check-shared-file-impact` itself never reads
+  `[GATE_WAIVER shared_file_impact]` markers to clear individual findings --
+  the whole-gate `mark-done` bypass is its only waiver interaction.
+  `docs/cli-reference.md` gains a `check-shared-file-impact` entry (under
+  [Orchestrator helpers](docs/cli-reference.md#orchestrator-helpers-invoked-by-agents),
+  alongside `check-reachability` and `check-fixture-consistency`, per the
+  [`## Gates`](docs/cli-reference.md#gates) section's own intro note that the
+  per-gate check verbs continue to live under Orchestrator helpers until a
+  follow-up unit relocates them -- `check-ancestry` itself in fact lives under
+  `## Git operations`, not Orchestrator helpers) pinned by
+  `tests/test_docs/test_cli_reference_shared_file_impact.py`, and
+  `tests/test_integration/test_gate_shared_file_e2e.py` proves the wiring end
+  to end over real, hermetic git fixture repos: block, pass, disabled, waiver,
+  stale-record and attribution journeys, plus a pre-existing-vs-introduced
+  failure pair, a corrupt-baseline loud failure, and an auto-derived registry
+  that yields the expected shared set. The `docs/cli-reference.md` entry that
+  spec Section 8 calls for (`#318`'s missing-entry gap) also lands in this
+  change; 318-D15 itself is only the done-path requirement above.
+
 - **`check-shared-file-impact` gains an auto-derived shared-file registry from
   import fan-in, with a tunable threshold** (spec
   `integration-reality-gates-hardening.md` section 4.6, D-9; issue #13 AC4).

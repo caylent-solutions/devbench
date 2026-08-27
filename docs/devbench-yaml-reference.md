@@ -360,8 +360,12 @@ protects, so nothing is lost by letting the escalation land -- refusing it would
 discard the escalating invocation's own genuine failing verdict. A `"block"` record blocks (exit 2); a
 `"pass"` record allows; a record still reading `"pending"` (every error path
 `check-shared-file-impact` can exit through AFTER its initial write without reaching a clean
-verdict -- an unrecognised unit id, no local repo path configured, a scope-resolution error, or
-the process crashing or being killed mid-run) fails CLOSED (blocks, exit 2). No record at all
+verdict -- an unrecognised unit id, no local repo path configured, the config file failed to
+load, a scope-resolution error, the import-fan-in scan failed, `_evaluate_shared_file_gate`
+raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, the
+due `[GATE_PASS shared_file_impact]` record write failing (the work-unit file cannot be
+located, or the audit-marker append itself raises an `OSError`), or the process crashing or
+being killed mid-run) fails CLOSED (blocks, exit 2). No record at all
 allows, and is reached three ways, only two of which are the intended "nothing unresolved" case:
 the gate was never invoked in this session; its prior record was already consumed; or (not
 closable from inside this hook) `cmd_check_shared_file_impact` never reached its own first line

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
@@ -3995,17 +3996,26 @@ def _seed_scope_backlog(
     return backlog_root, backlog_index
 
 
-def _seed_reachability_done_path_backlog(
-    tmp_path: Path, unit_id: str, repo_name: str, manifest_file: str
+def _seed_gate_done_path_backlog(
+    tmp_path: Path, unit_id: str, repo_name: str, manifest_files: tuple[str, ...], title: str
 ) -> tuple[Path, Path, Path]:
-    """Write a scratch ``BACKLOG.md`` + work-unit ``.md`` carrying everything the
-    reachability done-path end-to-end cycle needs at once: a ``## Target
+    """Write a scratch ``BACKLOG.md`` + work-unit ``.md`` carrying everything a
+    gate's done-path end-to-end cycle needs at once: a ``## Target
     Repository`` section and ``## Changes Manifest`` (`work_unit_scope`
     resolution and `_check_gate_pass_done_invariant`'s repo extraction), an
     exempt ``## Task Type`` (so `mark_done`'s RED_OBSERVED invariant never
     blocks these tests -- that invariant is exercised elsewhere), and an
     all-five-judges-pass ``## Comments`` block (`mark_done`'s judge-round
     invariant).
+
+    Shared by every gate's done-path journey suite (reachability,
+    shared-file-impact, and any that follow): ``manifest_files`` is a TUPLE
+    because some journeys (e.g. shared-file-impact's
+    pre-existing-vs-introduced and attribution cases) need more than one
+    Changes Manifest row at once (e.g. both ``tests/test_suite.py`` and
+    ``tests/test_feature.py``), while a single-file caller passes a
+    one-element tuple; ``title`` is the work unit's display title so callers
+    across gates do not collide on a shared literal.
 
     Returns ``(backlog_root, backlog_index, wu_file)``.
     """
@@ -4017,14 +4027,15 @@ def _seed_reachability_done_path_backlog(
     all_pass = "".join(
         f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
     )
+    manifest_rows = "".join(f"| `{f}` | modify |\n" for f in manifest_files)
     wu_file.write_text(
-        f"# {unit_id}: End to end reachability cycle test\n\n"
+        f"# {unit_id}: {title}\n\n"
         "## Status: in-review\n\n"
         "## Task Type: test-only\n\n"
         f"## Target Repository\n\n- **Repo:** `{repo_name}`\n\n"
         "## Changes Manifest\n\n"
         "| File | Change |\n|------|--------|\n"
-        f"| `{manifest_file}` | modify |\n\n"
+        f"{manifest_rows}\n"
         f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
         encoding="utf-8",
     )
@@ -4033,11 +4044,28 @@ def _seed_reachability_done_path_backlog(
         "## Full Work Unit Index\n\n"
         "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
         "|-----|-------|------|--------|-------------|------|----------|\n"
-        f"| {unit_id} | End to end reachability cycle test | Task | in-review | None | "
+        f"| {unit_id} | {title} | Task | in-review | None | "
         f"{repo_name} | `backlog/{unit_id}.md` |\n",
         encoding="utf-8",
     )
     return backlog_root, backlog_index, wu_file
+
+
+def _seed_reachability_done_path_backlog(
+    tmp_path: Path, unit_id: str, repo_name: str, manifest_file: str
+) -> tuple[Path, Path, Path]:
+    """Thin, single-file-Manifest wrapper over :func:`_seed_gate_done_path_backlog`.
+
+    Kept as its own name (rather than inlining the call at every reachability
+    call site) purely so `tests/test_integration/test_gate_reachability_e2e.py`
+    -- a sibling journey module outside this work unit's own Changes Manifest --
+    keeps importing a stable name; the actual seeding logic lives in exactly one
+    place, :func:`_seed_gate_done_path_backlog`, so there is nothing left to
+    drift between the reachability and shared-file-impact done-path fixtures.
+    """
+    return _seed_gate_done_path_backlog(
+        tmp_path, unit_id, repo_name, (manifest_file,), "End to end reachability cycle test"
+    )
 
 
 def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
@@ -10278,8 +10306,8 @@ class TestReachabilityDonePathEndToEnd(_ReachabilityCmdFixtures):
         )
         subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "wire Wired.tsx"], cwd=repo, check=True, capture_output=True)
-        backlog_root, backlog_index, wu_file = _seed_reachability_done_path_backlog(
-            tmp_path, unit_id, self._REPO, "src/Wired.tsx"
+        backlog_root, backlog_index, wu_file = _seed_gate_done_path_backlog(
+            tmp_path, unit_id, self._REPO, ("src/Wired.tsx",), "End to end reachability cycle test"
         )
         return repo, backlog_root, backlog_index, wu_file
 
@@ -11729,6 +11757,20 @@ def _shared_file_impact_git_fixture(
     return checkout, base_sha
 
 
+def _shared_file_impact_status_and_payload(out: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split ``cmd_check_shared_file_impact``'s captured stdout into ``(status_line, payload)``.
+
+    An enabled run's stdout is always the spec 5.2 gate status line (a single-line JSON
+    object) followed by the multi-line, ``indent=2`` findings payload (E5-F3-S1-T1, AC-2).
+    Splitting on the first newline rather than assuming both are single-line lets this
+    helper parse either shape of payload (the no-match ``shared_file_impact: False`` object
+    or the matched ``verdict``/``new_failures`` object) without re-deriving the split logic
+    at every call site.
+    """
+    first_line, _, rest = out.partition("\n")
+    return json.loads(first_line), json.loads(rest)
+
+
 # Real-shaped sample output per registered runner (AC-2), keyed off the registry itself so
 # this map cannot silently drift out of sync with `_SHARED_FILE_RUNNER_PARSERS` in either
 # direction: REMOVING a registered runner surfaces as a `KeyError` in the parametrized tests
@@ -12762,6 +12804,7 @@ class TestSharedFileAutoDerive:
                 ),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value={"tests/test_suite.py"}),
@@ -12769,7 +12812,7 @@ class TestSharedFileAutoDerive:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["derived_registry"] == ["tests/test_suite.py"]
 
         cache_path = (
@@ -12813,6 +12856,7 @@ class TestSharedFileAutoDerive:
                 ),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value=set()) as mock_derive,
@@ -12845,6 +12889,7 @@ class TestSharedFileAutoDerive:
                 _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
@@ -12882,6 +12927,7 @@ class TestSharedFileAutoDerive:
                 ),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
@@ -12912,6 +12958,7 @@ class TestSharedFileAutoDerive:
                 _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
@@ -12921,7 +12968,7 @@ class TestSharedFileAutoDerive:
 
         assert result == 0
         mock_run.assert_not_called()
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
 
     def test_derived_registry_printed_on_no_match_run(
@@ -12943,6 +12990,7 @@ class TestSharedFileAutoDerive:
                 _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
@@ -12952,7 +13000,7 @@ class TestSharedFileAutoDerive:
 
         assert result == 0
         mock_run.assert_not_called()
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         assert payload["derived_registry"] == ["src/some_other_derived_file.py"]
 
@@ -13019,6 +13067,7 @@ class TestSharedFileAutoDerive:
                 _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=9),
             ),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.config_loader.resolve_gate_config", side_effect=recording_resolve),
@@ -13109,6 +13158,7 @@ class TestCmdCheckSharedFileImpact:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command") as mock_run,
@@ -13116,7 +13166,7 @@ class TestCmdCheckSharedFileImpact:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         mock_run.assert_not_called()
         verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
@@ -13137,6 +13187,7 @@ class TestCmdCheckSharedFileImpact:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli._derive_shared_file_registry") as mock_derive,
@@ -13145,7 +13196,7 @@ class TestCmdCheckSharedFileImpact:
 
         assert result == 0
         mock_derive.assert_not_called()
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert "derived_registry" not in payload
 
     def test_gate_disabled_prints_status_line_and_writes_pass_verdict(
@@ -13227,6 +13278,7 @@ class TestCmdCheckSharedFileImpact:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.run_command") as mock_run,
@@ -13234,7 +13286,7 @@ class TestCmdCheckSharedFileImpact:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         mock_run.assert_not_called()
         verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
@@ -13289,6 +13341,262 @@ class TestCmdCheckSharedFileImpact:
             "a scope-resolution error must leave the verdict record at 'pending' (fail-closed for the hook), "
             f"got: {record!r}"
         )
+
+
+class TestCmdCheckSharedFileImpactWritesGatePass:
+    """check-shared-file-impact persists the spec-4.2 machine record (E5-F3-S1-T1,
+    AC-3): a passing enabled run -- either of its two shapes, a no-match no-op or a
+    matched run with zero attributable new failures -- writes exactly one
+    `[GATE_PASS shared_file_impact]` line whose scope hash matches the status line's
+    (AC-FUNC-shared-file-1); a work-unit file that cannot be located at write time is
+    a loud `ERROR: ...` and exit 1 with no stdout, never a silent skip
+    (AC-FUNC-shared-file-2)."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    def test_no_match_pass_writes_exactly_one_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS shared_file_impact]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "shared_file_impact")
+        assert record is not None
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert record.scope_hash == status_line["scope_hash"]
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_no_match_pass_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            # Neither candidate _resolve_work_unit_file tries resolves to the real,
+            # `_seed_scope_backlog`-written file: this makes the write step itself
+            # (never the scope resolution, which reads through the independently
+            # patched `work_unit_scope.BACKLOG_ROOT`/`BACKLOG_INDEX` below) fail.
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+
+    def test_no_match_pass_write_failure_on_append_os_error_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The work-unit file resolves, but the audit-marker append itself raises
+        `OSError` (e.g. a permission error or a full disk) -- this must surface as
+        the standard `ERROR: ...` shape and exit 1, never a raw traceback, mirroring
+        `_write_ancestry_gate_pass_record`'s own `OSError` handling."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+                side_effect=OSError(28, "No space left on device"),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+        assert "Traceback" not in captured.err, "an OSError during the append must never surface as a raw traceback"
+
+    def test_matched_pass_writes_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        cfg_path = _write_shared_file_impact_gate_config(workspace)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=("tests/test_suite.py",), default_branch="main"),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS shared_file_impact]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert status_line["status"] == "pass"
+        assert status_line["findings"] == 0, "a matched but non-blocking run must report zero findings"
+
+    def test_matched_pass_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace-does-not-exist")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=("tests/test_suite.py",), default_branch="main"),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+
+    def test_empty_manifest_pass_never_attempts_a_write(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verification-only unit (empty Changes Manifest, `scope.files == []`) reaching
+        a passing status must never attempt a `[GATE_PASS shared_file_impact]` write --
+        there is no scope to hash (mirrors `compute_scope_hash`'s own refusal on an empty
+        change set). Isolates the `scope.files` operand of `_emit_shared_file_impact_status`'s
+        `status == GATE_STATUS_PASS and scope.files` guard from the `status` operand
+        the blocking-run tests already exercise."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, manifest_body="| File | Change |\n|------|--------|\n| (none) | none |\n"
+        )
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        wu_file_mtime_before = wu_file.stat().st_mtime_ns
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            # Deliberately NOT patched: devbench.cli.BACKLOG_ROOT. If the empty-scope
+            # guard were ever bypassed, the write attempt would try to resolve the
+            # work-unit file through the unpatched default and fail loudly (exit 1) --
+            # this test would then fail on `result == 0` below, proving the guard is
+            # what keeps this test passing, not an accidentally-successful write.
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert status_line["scope_hash"] == ""
+        assert wu_file.stat().st_mtime_ns == wu_file_mtime_before, "an empty-scope pass must never touch the wu file"
+        assert "[GATE_PASS shared_file_impact]" not in wu_file.read_text(encoding="utf-8")
+
+
+class TestPrepareSharedFileImpactRun:
+    """`_prepare_shared_file_impact_run` returns a frozen dataclass, not an
+    8-element positional tuple (E5-F3-S1-T1 round-1 code_review idiomatic-code
+    finding): a positional tuple this wide invites a silent reordering bug that
+    only `mypy`'s partial protection (adjacent `bool`/`int`/`str` slots) would
+    catch, where a named-attribute dataclass cannot be misordered at all."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def test_returns_named_dataclass_not_positional_tuple(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = _shared_file_impact_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            prepared = cli._prepare_shared_file_impact_run("E0-F1-S1-T1", "test-invocation")
+
+        assert not isinstance(prepared, int)
+        assert prepared.__class__.__name__ == "_SharedFileImpactRun"
+        assert prepared.unit is unit
+        assert prepared.canonical_repo == self.REPO
+        assert prepared.repo_path == tmp_path
+        assert prepared.patterns == ("src/app/Shell.tsx",)
+        assert prepared.auto_derive_registry is False
+        assert prepared.fan_in_threshold >= 1
+        assert prepared.scope.files == ["src/unrelated.py"]
+        assert prepared.derived_registry == set()
+        mutable_field_name = "canonical_repo"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(prepared, mutable_field_name, "mutated")
 
 
 class TestCheckSharedFileImpactScope:
@@ -13368,6 +13676,7 @@ class TestCheckSharedFileImpactScope:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/other_leftover.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
             patch("devbench.cli.resolve_changed_files", side_effect=recording_resolve),
@@ -13375,7 +13684,7 @@ class TestCheckSharedFileImpactScope:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["shared_file_impact"] is False
         assert payload["changed_files"] == ["tests/test_suite.py"]
         assert "src/other_leftover.py" not in payload["changed_files"]
@@ -13408,13 +13717,14 @@ class TestCheckSharedFileImpactScope:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/shared_module.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["verdict"] == "pass"
         assert payload["matched_files"] == ["src/shared_module.py"]
         assert payload["full_suite_exit_code"] != 0, "the repo-wide RESULT must still show the real suite exit"
@@ -14058,13 +14368,14 @@ class TestCheckSharedFileImpactBaseline:
             patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
             patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
             patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
             patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
             patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 0
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert payload["verdict"] == "pass"
         assert payload["branch_point"] == base_sha
 
@@ -14104,7 +14415,9 @@ class TestCheckSharedFileImpactBaseline:
 
         assert result == 1
         captured = capsys.readouterr()
-        payload = json.loads(captured.out)
+        status_line, payload = _shared_file_impact_status_and_payload(captured.out)
+        assert status_line["status"] == "fail"
+        assert status_line["findings"] == 1, "findings must count the one attributed new failure"
         assert payload["verdict"] == "block"
         assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
         assert payload["branch_point"] == base_sha
@@ -14164,7 +14477,7 @@ class TestCheckSharedFileImpactBaseline:
 
         captured = capsys.readouterr()
         assert result == 1, f"gate must run to completion and block, not error: {captured.err}"
-        payload = json.loads(captured.out)
+        _status_line, payload = _shared_file_impact_status_and_payload(captured.out)
         assert payload["verdict"] == "block"
         assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
         assert payload["full_suite_command"] == ["make", "test"]
@@ -14473,7 +14786,7 @@ class TestCheckSharedFileImpactBaseline:
             result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
 
         assert result == 1
-        payload = json.loads(capsys.readouterr().out)
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
         assert "degraded" not in payload
 
     # -- _resolve_branch_point_sha error paths -------------------------------

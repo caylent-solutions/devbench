@@ -384,12 +384,20 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
   ```bash
   uv run devbench check-shared-file-impact $ARGUMENTS
   ```
-  This is a no-op (exit 0, `shared_file_impact: false`) for most tasks -- it only does
-  anything when the target repo has `gates.repos.<repo>.shared_file_impact.patterns`
-  configured in `backlog/config/devbench.yaml` AND this task's diff (resolved through the
-  same ADR-12 mode-aware scope helper `get-diff` uses, never a raw working-tree scan)
-  touches one of those patterns (an app-level composition root, a shared shell/container
-  component, a widely-consumed shared hook). When it matches, the command runs the FULL
+  This runs no test suite for most tasks: when the gate is disabled or unconfigured for the
+  target repo, exit 0 and print only `{"gate": "shared_file_impact", "status": "disabled"}`
+  (no payload, no `shared_file_impact` key at all); when the gate is enabled but this task's
+  diff (resolved through the same ADR-12 mode-aware scope helper `get-diff` uses, never a raw
+  working-tree scan) touches none of the target repo's configured
+  `gates.repos.<repo>.shared_file_impact.patterns` (an app-level composition root, a shared
+  shell/container component, a widely-consumed shared hook) or auto-derived shared files,
+  exit 0 and print the payload with `shared_file_impact: false`. It is NOT a full no-op even
+  on this enabled no-match path, though: when `gates.shared_file_impact.enabled` is `true` for
+  the repo AND this task's Changes Manifest is non-empty, a no-match run still appends a
+  `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` record to this
+  task's audit trail -- `mark-done` requires a fresh one of these (or an operator
+  `[GATE_WAIVER shared_file_impact]`) before it will proceed, refusing otherwise with the
+  exact `uv run devbench check-shared-file-impact <unit-id>` remediation command. When it matches, the command runs the FULL
   test suite (not just the files this task touched) and reports that repo-wide RESULT, but
   BLOCKS (non-zero exit) only on a new failure vs. the stored baseline whose failing node id
   is attributable to THIS task's own Changes Manifest scope -- a regression this task caused
@@ -409,7 +417,11 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
   actually consumes it; the hook also fails CLOSED (blocks) when the record still reads
   `"pending"` -- covering every error path `check-shared-file-impact` can exit through, after its
   initial write, without reaching a clean verdict (an unrecognised unit id, no local repo path
-  configured, a scope-resolution error, or the process crashing or being killed mid-run). A
+  configured, the config file failed to load, a scope-resolution error, the import-fan-in scan
+  failed, `_evaluate_shared_file_gate` raising `RuntimeError`/`UnknownTestRunnerError`/
+  `TimeoutError`, the due `[GATE_PASS shared_file_impact]` record write
+  failing -- the work-unit file cannot be located, or the audit-marker append itself raises an
+  `OSError` -- or the process crashing or being killed mid-run). A
   `"pending"` left by an invocation that crashed mid-run is protected almost the same way as a
   `"block"`: it is never silently overwritten by a DIFFERENT invocation's own `"pending"` or
   `"pass"` write, only by that same crashed invocation's own follow-up write (which never comes),

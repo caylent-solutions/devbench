@@ -19,7 +19,9 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import inspect
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -1870,8 +1872,10 @@ class TestDevbenchYamlReferenceDocumentsAccuracyBounds:
 class TestCliReferenceDocumentsExtractSourceLiteralsCause:
     """W-d (round-3 test_review): a drift pin for ``docs/cli-reference.md``'s
     ``check-fixture-consistency`` exit-code-1 table row, whose ``extract_source_literals``
-    zero-classified-source-files clause and 'all four of the latter' count have no other
-    anti-drift pin in this suite -- deleting either killed no test."""
+    zero-classified-source-files clause and 'all four of the config-error causes in that
+    parenthetical' count have no other anti-drift pin in this suite -- deleting either
+    killed no test. The older 'all four of the latter' wording is barred by this pin
+    (test_exit_code_one_row_claims_all_four_causes_not_three asserts its absence)."""
 
     _DOC_PATH = Path(__file__).parent.parent / "docs" / "cli-reference.md"
 
@@ -1884,8 +1888,77 @@ class TestCliReferenceDocumentsExtractSourceLiteralsCause:
 
     def test_exit_code_one_row_claims_all_four_causes_not_three(self) -> None:
         text = self._doc_text()
-        assert "all four of the latter" in text
-        assert "all three of the latter" not in text
+        assert "all four of the config-error causes in that parenthetical" in text
+        assert "all three of the config-error causes in that parenthetical" not in text
+        assert "all four of the latter" not in text
+
+
+@pytest.mark.unit
+class TestReviewerPromptPinsFixtureAttributionGuidance:
+    """test_review (E6-F2-S1-T2 blocking): a drift pin for
+    ``plugin/devbench-orchestrate/agents/review_team/test-reviewer.md``'s TWO
+    attribution-related additions -- the ``Fixture-catalog cross-reference check``
+    evidence-header sentence about the persisted ``[GATE_PASS fixture_consistency]``
+    record, and rubric item 54's extended ``OK:``-banner cross-check instruction --
+    neither of which had any drift pin before this test. Deleting either killed no
+    test: the full behavioural suite (8911 passed / 8 skipped) stayed green with the
+    rubric-54 sentence removed entirely, and stayed green again with the evidence-
+    header sentence reverted, because
+    ``tests/test_plugin/test_rubric_numbering.py``'s own
+    ``test_test_reviewer_insertions_occupy_54_to_56`` only pins item 54's PRE-EXISTING
+    phrases (``FIXTURE_CATALOG_MISMATCH``, ``extract_source_literals``, ``zero
+    classified source files``), every one of which survives deletion of the new
+    sentence untouched. Both assertions below are HAND-TYPED literals (never text
+    derived from the file itself) and SECTION-SCOPED to the one physical line each
+    addition lives on, via `_line_starting_with`, so neither can be satisfied by the
+    same phrase appearing elsewhere in the (large, densely cross-referenced) prompt
+    file. Mutation-proven: deleting the rubric-54 sentence or reverting the evidence-
+    header sentence kills the corresponding test below; restoring either brings the
+    corresponding test back to green.
+    """
+
+    _TEST_REVIEWER_PATH = (
+        Path(__file__).parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "review_team" / "test-reviewer.md"
+    )
+
+    def _text(self) -> str:
+        return self._TEST_REVIEWER_PATH.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _line_starting_with(text: str, prefix: str) -> str:
+        """Return the single physical line in *text* that starts with *prefix*, raising
+        `AssertionError` naming the prefix if none (or more than one) is found -- this is
+        the section-scoping mechanism: every assertion below runs against ONLY this one
+        line, never the whole file, so a phrase appearing elsewhere in the prompt cannot
+        satisfy it by coincidence."""
+        matches = [line for line in text.splitlines() if line.startswith(prefix)]
+        if len(matches) != 1:
+            raise AssertionError(f"expected exactly one line starting with {prefix!r}, found {len(matches)}")
+        return matches[0]
+
+    def test_evidence_header_documents_the_persisted_gate_pass_record(self) -> None:
+        line = self._line_starting_with(self._text(), "Fixture-catalog cross-reference check (opt-in;")
+        assert (
+            "a passing run with a non-empty resolved Changes-Manifest scope also persists "
+            "a [GATE_PASS fixture_consistency] record into the work-unit file" in line
+        )
+        assert "a passing run with an empty resolved scope persists no record" in line
+        assert "see rubric item 54 below for how to judge" in line
+
+    def test_rubric_item_54_cross_checks_missing_key_finding_under_ok_banner(self) -> None:
+        line = self._line_starting_with(self._text(), "54. If the `check-fixture-consistency`")
+        assert (
+            "a `[missing_key]` finding line printed under it is fail-worthy ONLY if the "
+            "file path it names does NOT actually fall outside the calling unit's own "
+            "declared Changes Manifest" in line
+        )
+        assert "cross-check the finding's quoted path against the Manifest table in the evidence above" in line
+        assert "an omitted-from-Manifest fixture reaches `OK:` the same way a genuinely out-of-scope one does" in line
+        assert (
+            "a `[coverage_shortfall]` or `[load_error]` finding line can never appear under "
+            "the `OK:` banner, since those two kinds are never scope-filtered and always "
+            "force `FAIL:` instead" in line
+        )
 
 
 @pytest.mark.unit
@@ -1944,3 +2017,237 @@ class TestFormatFixtureLocation:
     def test_line_appends_colon_line_number(self) -> None:
         fc = _fixture_consistency()
         assert fc._format_fixture_location("app/routes.py", 3) == "app/routes.py:3"
+
+
+@pytest.mark.unit
+class TestMissingKeyFindingLocationField:
+    """security_review round 5 HIGH (E6-F2-S1-T2): ``FixtureFinding.location`` is a
+    structured field populated directly by the two ``missing_key`` producer sites,
+    ``_check_scan_targets`` and ``_check_source_literals``, rather than being recovered
+    by re-parsing ``message`` -- so a scan target or source file whose repo-relative
+    path legally contains an apostrophe, a colon, or a newline is attributed correctly
+    instead of truncating a free-text parse at the first special character. Every case
+    here drives the real producer end to end (through ``check_fixture_consistency``,
+    never a hand-built ``FixtureFinding``), so the wiring between the producer and the
+    field is proven, not merely the field's shape.
+
+    RE-ANCHORED (E6-F2-S1-T2, second attribution bypass closed on orchestrator
+    direction): the ``dot-dot-component-via-config-path`` case used to assert
+    ``location`` equalled the configured ``sub/../mock_lookup.json`` scan path VERBATIM
+    -- proof-of-direct-assignment was conflated with proof-of-no-canonicalisation, and
+    the latter was itself the second bypass (a `..`-traversal spelling of an in-Manifest
+    file compared unequal to that file's canonical Manifest spelling and silently
+    stopped blocking). This case now asserts the LEXICALLY NORMALISED result
+    (``fixture_consistency.normalize_repo_relative_path``, ``mock_lookup.json``)
+    instead, which still proves direct assignment (a re-parse of ``message`` could never
+    recover a `..`-free path this cleanly) while also proving the fix. The apostrophe/
+    colon/newline cases are UNCHANGED and still assert verbatim equality, since none of
+    those three characters is a path separator or a ``.``/``..`` component --
+    ``posixpath.normpath`` is a no-op for all three, so they continue to pin the
+    original round-5 HIGH property untouched by this fix."""
+
+    @pytest.mark.parametrize(
+        "scan_filename,scan_path,expected_location",
+        [
+            pytest.param("o'brien.json", "o'brien.json", "o'brien.json", id="apostrophe"),
+            pytest.param("weird:name.json", "weird:name.json", "weird:name.json", id="colon"),
+            pytest.param("weird\nname.json", "weird\nname.json", "weird\nname.json", id="newline"),
+            pytest.param(
+                "mock_lookup.json",
+                "sub/../mock_lookup.json",
+                "mock_lookup.json",
+                id="dot-dot-component-via-config-path",
+            ),
+        ],
+    )
+    def test_scan_target_producer_sets_location_to_the_normalized_scan_path(
+        self, tmp_path: Path, scan_filename: str, scan_path: str, expected_location: str
+    ) -> None:
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(tmp_path / scan_filename, [{"sku": "GHOST-SKU"}])
+        if scan_path != scan_filename:
+            # The dot-dot-component case configures a scan path that resolves to the
+            # SAME file via a `..` traversal (`sub/../mock_lookup.json`), rather than a
+            # filename literally containing `..` (an OS-legal but confusing choice); the
+            # walk still requires the `sub` directory to exist to resolve the `..`
+            # component.
+            (tmp_path / "sub").mkdir()
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path=scan_path, identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        missing_key_findings = [f for f in findings if f.kind == "missing_key"]
+        assert len(missing_key_findings) == 1
+        assert missing_key_findings[0].location == expected_location
+
+    @pytest.mark.parametrize(
+        "source_filename",
+        [
+            pytest.param("o'brien.py", id="apostrophe"),
+            pytest.param("weird:name.py", id="colon"),
+            pytest.param("weird\nname.py", id="newline"),
+            pytest.param("app/routes.py", id="nested-directory"),
+        ],
+    )
+    def test_source_literal_producer_sets_location_to_the_bare_path_no_line_suffix(
+        self, tmp_path: Path, source_filename: str
+    ) -> None:
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": "A1"}])
+        _write_json_fixture(tmp_path / "mock_lookup.json", [{"sku": "A1"}])
+        # Unlike the scan-target producer above (a hand-configured `scan[].path` string
+        # that can spell a literal `..` traversal), the source-literal producer's
+        # location always comes from `iter_classified_source_files` walking `tmp_path`
+        # plus `Path.relative_to`, which never reintroduces a `..` segment -- so this
+        # parametrization proves the nested-directory shape (a real subdirectory
+        # component, not a `..` traversal) is handled identically to a flat one.
+        source_path = tmp_path / source_filename
+        _write_fixture(source_path, 'ROUTE_TABLE = {\n    "sku": "SKU-DOES-NOT-EXIST",\n}\n')
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+            extract_source_literals=True,
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        rel_path = source_path.relative_to(tmp_path).as_posix()
+        source_literal_findings = [f for f in findings if f.kind == "missing_key" and rel_path in f.message]
+        assert len(source_literal_findings) == 1
+        finding = source_literal_findings[0]
+        assert finding.location == rel_path
+        assert not finding.location.endswith(":2"), "location must be the bare path, never path:line"
+        assert f"{rel_path}:2" in finding.message, "message still embeds path:line for a human reader"
+
+    def test_coverage_shortfall_and_load_error_findings_leave_location_unset(self, tmp_path: Path) -> None:
+        """The two kinds spec 4.3 never scope-filters (``coverage_shortfall``,
+        ``load_error``) leave ``location`` at its default ``None`` -- explicit contract,
+        not an accident of construction (see ``FixtureFinding.location``'s own
+        docstring)."""
+        cl = _config_loader()
+        fc = _fixture_consistency()
+        _write_json_fixture(tmp_path / "catalog.json", [{"sku": f"A{i}"} for i in range(3)])
+        _write_json_fixture(tmp_path / "mock_lookup.json", [{"sku": "A0"}])
+
+        config = cl.FixtureConsistencyConfig(
+            canonical_sources=(
+                cl.FixtureCanonicalSource(path="catalog.json", identifier_field="sku", expected_count=99),
+                cl.FixtureCanonicalSource(path="missing.json", identifier_field="sku"),
+            ),
+            scan=(cl.FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        findings = fc.check_fixture_consistency(tmp_path, config)
+        kinds = {f.kind for f in findings}
+        assert kinds == {"coverage_shortfall", "load_error"}
+        assert all(f.location is None for f in findings)
+
+
+@pytest.mark.unit
+class TestFindingKindMissingKeyConstant:
+    """changes_manifest round-1 (E6-F2-S1-T2 Blocking 3) and code_review round-1 (W4):
+    ``BLOCKING_FINDING_KINDS``'s membership comment claimed unqualified that its kinds
+    "make the gate status fail", which this task's attribution rule
+    (``cli._fixture_finding_is_attributable``) made false for an out-of-scope
+    ``missing_key`` finding -- it is now qualified as necessary-but-not-sufficient,
+    matching the qualifier already added to ``cli.cmd_check_fixture_consistency``'s own
+    docstring, which the comment explicitly says to keep in sync with. Also pins W4: a
+    declared ``FINDING_KIND_MISSING_KEY`` constant is the single source of truth for the
+    ``"missing_key"`` literal, consumed by both this module's two producer sites and by
+    ``cli.py``'s comparison site, so the literal can never drift between the two
+    modules."""
+
+    def test_constant_value_is_missing_key(self) -> None:
+        fc = _fixture_consistency()
+        assert fc.FINDING_KIND_MISSING_KEY == "missing_key"
+
+    def test_constant_is_exported(self) -> None:
+        fc = _fixture_consistency()
+        assert "FINDING_KIND_MISSING_KEY" in fc.__all__
+
+    def test_constant_is_a_member_of_blocking_finding_kinds(self) -> None:
+        fc = _fixture_consistency()
+        assert fc.FINDING_KIND_MISSING_KEY in fc.BLOCKING_FINDING_KINDS
+
+    @staticmethod
+    def _blocking_finding_kinds_comment_block(source: str) -> str:
+        """Return ONLY the comment block immediately above ``BLOCKING_FINDING_KINDS``'s
+        own declaration -- test_review (E6-F2-S1-T2 round 5 W1): the prior slice used
+        ``source.split("BLOCKING_FINDING_KINDS: frozenset[str] =")[0]``, which also
+        includes the ENTIRE module docstring and every constant declared above it, so
+        planting the pinned phrases in the module docstring instead of the actual
+        comment left both tests passing (proven permeable by mutation). Anchoring the
+        START of the slice on ``FINDING_KIND_MISSING_KEY``'s own declaration line --
+        the line immediately BEFORE the comment block this test targets -- excludes the
+        module docstring and every earlier constant, so only the real comment block
+        remains in scope."""
+        after_declaration = source.split('FINDING_KIND_MISSING_KEY: str = "missing_key"')[1]
+        return after_declaration.split("BLOCKING_FINDING_KINDS: frozenset[str] =")[0]
+
+    def test_module_comment_qualifies_membership_as_necessary_not_sufficient(self) -> None:
+        fc = _fixture_consistency()
+        source = inspect.getsource(fc)
+        comment_block = self._blocking_finding_kinds_comment_block(source)
+        assert "NECESSARY but not SUFFICIENT" in comment_block
+        assert "attribution rule" in comment_block
+        assert "out-of-scope file is a member of this set" in comment_block
+
+    def test_module_comment_no_longer_makes_the_unqualified_claim(self) -> None:
+        fc = _fixture_consistency()
+        source = inspect.getsource(fc)
+        comment_block = self._blocking_finding_kinds_comment_block(source)
+        assert "values that make" not in comment_block
+
+    def test_two_producer_sites_use_the_constant_not_a_bare_literal(self) -> None:
+        fc = _fixture_consistency()
+        scan_targets_source = inspect.getsource(fc._check_scan_targets)
+        source_literals_source = inspect.getsource(fc._check_source_literals)
+        assert '"missing_key"' not in scan_targets_source
+        assert '"missing_key"' not in source_literals_source
+        assert "FINDING_KIND_MISSING_KEY" in scan_targets_source
+        assert "FINDING_KIND_MISSING_KEY" in source_literals_source
+
+    def test_bare_literal_occurs_exactly_once_module_wide_at_declaration(self) -> None:
+        """changes_manifest round-3 (E6-F2-S1-T2): the two-producer-site check above
+        only inspects ``_check_scan_targets``/``_check_source_literals`` by name, so a
+        bare ``"missing_key"`` literal introduced at a future THIRD producer function
+        would not be caught. This is the module-wide form: walk the AST for every
+        string constant whose value is ``"missing_key"`` and assert there is exactly
+        one, at ``FINDING_KIND_MISSING_KEY``'s own declaration line -- a literal
+        anywhere else in the module (a new producer, a re-typed comparison) fails
+        this regardless of which function it lives in."""
+        fc = _fixture_consistency()
+        source = inspect.getsource(fc)
+        tree = ast.parse(source)
+        literal_lines = [
+            node.lineno for node in ast.walk(tree) if isinstance(node, ast.Constant) and node.value == "missing_key"
+        ]
+        declaration_lineno = next(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "FINDING_KIND_MISSING_KEY"
+        )
+        assert literal_lines == [declaration_lineno]
+
+    def test_cli_comparison_site_consumes_the_constant(self) -> None:
+        """E6-F2-S1-T2 round 5 (security_review HIGH fix): the comparison site that
+        consumed the constant moved from the now-deleted ``_fixture_finding_location_path``
+        (which re-parsed ``message`` free text) to ``_fixture_finding_is_attributable``
+        itself, which reads the structured ``FixtureFinding.location`` field directly."""
+        from devbench import cli
+
+        assert not hasattr(cli, "_fixture_finding_location_path"), (
+            "the free-text location-recovery helper must be fully deleted, not left as a fallback"
+        )
+        source = inspect.getsource(cli._fixture_finding_is_attributable)
+        assert "from devbench.fixture_consistency import FINDING_KIND_MISSING_KEY" in source
+        assert "finding.kind != FINDING_KIND_MISSING_KEY" in source
+        assert 'finding.kind != "missing_key"' not in source

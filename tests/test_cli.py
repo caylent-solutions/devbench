@@ -13498,6 +13498,98 @@ class TestCmdCheckSharedFileImpact:
         )
 
 
+class TestWriteGatePassRecordSharedHelper:
+    """code_review round-1 (E6-F2-S1-T2 Blocking 2): ``_write_shared_file_impact_gate_pass_record``
+    and ``_write_fixture_consistency_gate_pass_record`` were a 22-line verbatim copy of
+    each other, differing only by the gate-name constant substituted in three places
+    (an AST-level body diff with docstrings stripped showed zero other differences).
+    Extracted into one ``_write_gate_pass_record(gate_name, unit, unit_id, scope)`` that
+    both gates now call, so this generic behaviour -- successful write, missing-file
+    error, and append ``OSError`` -- is pinned exactly once here, parameterized over an
+    arbitrary gate name, rather than duplicated per gate."""
+
+    def _make_unit(self, unit_id: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def _scope(self):
+        from devbench.work_unit_scope import ScopeResult
+
+        return ScopeResult(
+            files=["src/foo.py"],
+            mode="per_task_branch",
+            commit_shas=[],
+            scope_hash="a" * 64,
+        )
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency", "write_path_audit"])
+    def test_successful_write_appends_a_marker_naming_the_given_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        backlog_root = tmp_path / "backlog-root"
+        wu_file = backlog_root / "backlog" / f"{unit_id}.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+
+        result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result is None
+        content = wu_file.read_text(encoding="utf-8")
+        assert f"[GATE_PASS {gate_name}]" in content
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency"])
+    def test_missing_work_unit_file_reports_the_given_gate_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", tmp_path / "backlog-does-not-exist")
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist")
+
+        result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: work unit file not found" in (
+            captured.err
+        )
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency"])
+    def test_append_os_error_reports_the_given_gate_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        backlog_root = tmp_path / "backlog-root"
+        wu_file = backlog_root / "backlog" / f"{unit_id}.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+
+        with patch(
+            "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: {wu_file}" in captured.err
+        assert "Traceback" not in captured.err
+
+
 class TestCmdCheckSharedFileImpactWritesGatePass:
     """check-shared-file-impact persists the spec-4.2 machine record (E5-F3-S1-T1,
     AC-3): a passing enabled run -- either of its two shapes, a no-match no-op or a
@@ -15111,6 +15203,53 @@ def _make_fixture_consistency_test_unit() -> WorkUnit:
     )
 
 
+def _init_fixture_consistency_git_repo(tmp_path: Path) -> None:
+    """Turn *tmp_path* into a real git work tree in place (no commit needed).
+
+    ``cmd_check_fixture_consistency``'s scope resolution
+    (``work_unit_scope.resolve_changed_files``, E6-F2-S1-T2) requires
+    *repo_path* to be a git work tree once the calling unit's Changes
+    Manifest is non-empty (``work_unit_scope._require_git_work_tree``), and
+    computes each Manifest file's scope hash via ``git hash-object`` -- a
+    plumbing command that needs no commit history, so ``git init`` alone
+    (no ``git add``/``git commit``) is sufficient. Every
+    ``TestCmdCheckFixtureConsistency``/``...LoudModes``/
+    ``...ReadsExtractSourceLiteralsThroughResolver`` test that reaches a
+    passing or blocking (not config-error/disabled) verdict writes its
+    canonical/scan fixture files directly under *tmp_path* and points
+    ``REPO_LOCAL_PATHS`` at *tmp_path* itself (not a ``checkout``
+    subdirectory), so this helper git-inits *tmp_path* in place rather than
+    creating a fresh subdirectory the way ``test_tdd_gate.init_scratch_repo``
+    does.
+    """
+    for args in (
+        ["init"],
+        ["config", "user.email", "fixture-consistency-test@example.com"],
+        ["config", "user.name", "Fixture Consistency Test"],
+    ):
+        _run_scratch_git(args, tmp_path)
+
+
+def _seed_fixture_consistency_scope(tmp_path: Path, files: tuple[str, ...]) -> tuple[Path, Path]:
+    """Git-init *tmp_path* and seed a scratch backlog whose Changes Manifest is *files*.
+
+    Returns ``(backlog_root, backlog_index)`` for patching
+    ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` -- the
+    independent ``BacklogParser`` lookup
+    ``work_unit_scope.resolve_changed_files`` performs, separate from
+    ``devbench.cli.BacklogParser`` (see ``_seed_scope_backlog``'s own
+    docstring) -- so ``cmd_check_fixture_consistency``'s scope resolution can
+    find a real, on-disk Changes Manifest for ``E0-F1-S1-T1``
+    (``_make_fixture_consistency_test_unit``'s id) naming *files*. Callers
+    must additionally patch ``devbench.cli.BACKLOG_ROOT`` to
+    ``backlog_root.parent`` so ``_resolve_work_unit_file`` resolves to the
+    SAME on-disk work-unit file a passing run's
+    ``[GATE_PASS fixture_consistency]`` record is appended to.
+    """
+    _init_fixture_consistency_git_repo(tmp_path)
+    return _seed_scope_backlog(tmp_path, unit_id="E0-F1-S1-T1", files=files)
+
+
 class TestCmdCheckFixtureConsistency:
     """Test cmd_check_fixture_consistency command (caylent-solutions/devbench-internal-backlog#17)."""
 
@@ -15160,13 +15299,18 @@ class TestCmdCheckFixtureConsistency:
         assert json.loads(capsys.readouterr().out.strip()) == {"gate": "fixture_consistency", "status": "disabled"}
 
     def test_passes_when_fixtures_are_consistent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """A configured check with no cross-reference issues returns 0 and prints OK."""
+        """A configured check with no cross-reference issues returns 0, prints OK, and persists
+        a `[GATE_PASS fixture_consistency]` record (E6-F2-S1-T2, spec 4.2)."""
         unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
 
         (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
 
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.gates.repos = {}
@@ -15179,6 +15323,9 @@ class TestCmdCheckFixtureConsistency:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
@@ -15187,10 +15334,12 @@ class TestCmdCheckFixtureConsistency:
         assert result == 0
         # Exactly four keys, deliberately with no `scope_hash` (unlike
         # check-reachability/check-shared-file-impact's status lines): this
-        # gate cross-references a workspace-wide configured file set, not
-        # the calling unit's own Changes Manifest, so there is no per-unit
-        # scope for a hash to be computed over (see
-        # cmd_check_fixture_consistency's docstring).
+        # gate's own SCAN stays workspace-wide, not the calling unit's own
+        # Changes Manifest, so there is no meaningful "scope this run
+        # covered" hash to render on the line a human reads -- the
+        # persisted `[GATE_PASS fixture_consistency]` record below carries
+        # its own scope hash instead (see cmd_check_fixture_consistency's
+        # docstring).
         assert json.loads(first_line) == {
             "gate": "fixture_consistency",
             "tier": "machine-blocking",
@@ -15198,6 +15347,7 @@ class TestCmdCheckFixtureConsistency:
             "findings": 0,
         }
         assert "OK" in rest
+        assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
 
     def test_fails_and_prints_findings_when_key_is_missing(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -15209,6 +15359,9 @@ class TestCmdCheckFixtureConsistency:
 
         (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "GHOST-SKU"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
 
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.gates.repos = {}
@@ -15221,6 +15374,9 @@ class TestCmdCheckFixtureConsistency:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
@@ -15261,6 +15417,9 @@ class TestCmdCheckFixtureConsistency:
             json.dumps([{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}]),
             encoding="utf-8",
         )
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_not_found.json")
+        )
 
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.gates.repos = {}
@@ -15273,6 +15432,9 @@ class TestCmdCheckFixtureConsistency:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
@@ -15317,6 +15479,9 @@ class TestCmdCheckFixtureConsistency:
             ),
             encoding="utf-8",
         )
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
 
         mock_runtime_cfg = MagicMock()
         mock_runtime_cfg.gates.repos = {}
@@ -15329,6 +15494,9 @@ class TestCmdCheckFixtureConsistency:
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
@@ -15353,7 +15521,22 @@ class TestCmdCheckFixtureConsistencyLoudModes:
     """spec 4.7 bullets 1-3 (322-D02/D03/D05): the three degenerate configurations that must exit 1
     with a one-line stderr diagnostic instead of a passing/misleading result (AC-19)."""
 
-    def _run(self, tmp_path: Path, fixture_config: FixtureConsistencyConfig) -> tuple[int, str, str]:
+    def _run(
+        self, tmp_path: Path, fixture_config: FixtureConsistencyConfig, *, manifest_files: tuple[str, ...] | None = None
+    ) -> tuple[int, str, str]:
+        """Run ``cmd_check_fixture_consistency`` against *fixture_config*.
+
+        *manifest_files*, when supplied, seeds a real scratch backlog and git
+        work tree (:func:`_seed_fixture_consistency_scope`) and patches
+        ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` and
+        ``devbench.cli.BACKLOG_ROOT`` so ``cmd_check_fixture_consistency``'s
+        scope resolution (E6-F2-S1-T2) can resolve ``E0-F1-S1-T1``'s
+        Changes-Manifest scope -- required for any case that reaches a
+        blocking-findings determination (any status other than
+        ``"error"``/``"disabled"``). ``None`` (the default) preserves this
+        class's original config-error-path behaviour, where scope resolution
+        is never reached at all.
+        """
         unit = _make_fixture_consistency_test_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
@@ -15361,11 +15544,24 @@ class TestCmdCheckFixtureConsistencyLoudModes:
         mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = fixture_config
 
-        with (
+        patches: list[AbstractContextManager[Any]] = [
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
-        ):
+        ]
+        if manifest_files is not None:
+            backlog_root, backlog_index = _seed_fixture_consistency_scope(tmp_path, files=manifest_files)
+            patches.extend(
+                (
+                    patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+                    patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+                    patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+                )
+            )
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
         captured = self._capsys.readouterr()
@@ -15422,7 +15618,7 @@ class TestCmdCheckFixtureConsistencyLoudModes:
             scan=(FixtureScanTarget(path="mock_lookup.txt", identifier_field="sku"),),
         )
 
-        result, out, err = self._run(tmp_path, config)
+        result, out, err = self._run(tmp_path, config, manifest_files=("catalog.json", "mock_lookup.txt"))
 
         first_line, _, rest = out.partition("\n")
         assert result == 1
@@ -15520,6 +15716,9 @@ class TestCmdCheckFixtureConsistencyReadsExtractSourceLiteralsThroughResolver:
         mock_parser.parse_index.return_value = [unit]
         (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
 
         # The project-level config's own `extract_source_literals` is left at
         # its dataclass default (False) -- if the command read it directly
@@ -15540,6 +15739,9 @@ class TestCmdCheckFixtureConsistencyReadsExtractSourceLiteralsThroughResolver:
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
             patch("devbench.config_loader.resolve_gate_config", return_value=mock_resolved) as mock_resolve,
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
 
@@ -15629,6 +15831,812 @@ class TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync:
         comment_block = source.split('"""', 2)[2]
         assert "the authoritative five-path enumeration) config" in comment_block
         assert "the authoritative four-path enumeration) config" not in comment_block
+
+
+class TestCmdCheckFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
+    """code_review/doc_review round-1 (E6-F2-S1-T2): the done-path wiring this task adds
+    creates two more zero-stdout terminals -- scope resolution for the calling unit
+    failing, and a due ``[GATE_PASS fixture_consistency]`` record failing to be written
+    -- on top of the three ``_resolve_fixture_consistency_repo_path`` already enumerated,
+    for a total of six. ``cmd_check_fixture_consistency``'s own docstring must both drop
+    the false 'for every run that reaches gate resolution' universal quantifier and name
+    all six, or a future change can silently falsify the enumeration again exactly as
+    happened here (mirrors ``TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync``
+    above, added by E6-F2-S1-T1 for the same defect class against the config-error
+    enumeration).
+
+    Every assertion below is checked against a HAND-TYPED literal of the expected
+    wording, never against a production constant or against the other prose copy. The
+    docstring is whitespace-normalized (collapsed to single spaces) before matching so a
+    pin does not depend on exactly where the source wraps a line."""
+
+    def _source(self) -> str:
+        import inspect
+
+        return " ".join(inspect.getsource(cli.cmd_check_fixture_consistency).split())
+
+    def test_docstring_drops_the_false_universal_quantifier(self) -> None:
+        source = self._source()
+        assert "for every run that reaches a findings-based or config-error verdict" in source
+        assert "for every run that reaches gate resolution:" not in source
+
+    def test_docstring_claims_six_terminals_not_three(self) -> None:
+        source = self._source()
+        assert "SIX terminals never reach that verdict at all and" in source
+        assert "The three terminals that" not in source
+
+    def test_docstring_names_the_scope_resolution_failure_terminal(self) -> None:
+        source = self._source()
+        assert "scope resolution for the calling unit failing (exit 1," in source
+        assert "_resolve_scope_or_report`` call, E6-F2-S1-T2)" in source
+
+    def test_docstring_names_the_gate_pass_record_write_failure_terminal(self) -> None:
+        source = self._source()
+        assert "a due ``[GATE_PASS fixture_consistency]`` record failing to be written" in source
+        assert "_write_gate_pass_record`, E6-F2-S1-T2)" in source
+
+
+class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
+    """Same defect class as the class above, pinned against the ``docs/cli-reference.md``
+    prose this unit's diff rewrites (code_review/doc_review round-1, E6-F2-S1-T2): the
+    doc's own opening sentence must carry the corrected 'findings-based or config-error
+    verdict' phrasing and the six-terminal count, matching ``cmd_check_fixture_consistency``'s
+    docstring exactly, or the two prose copies can drift independently again."""
+
+    _DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "cli-reference.md"
+    _HEADING_RE = re.compile(r"^#{2,3} ", re.MULTILINE)
+
+    def _doc_text(self) -> str:
+        return self._DOC_PATH.read_text(encoding="utf-8")
+
+    def _section(self) -> str:
+        """Return only the ``check-fixture-consistency`` section, bounded at the
+        NEXT ``##``/``###`` heading. Unlike a whole-document ``text.split(...)[1]``
+        (which runs to end of file), this stops the slice at the section's own
+        end so an assertion cannot be satisfied by prose relocated into a later
+        command's section."""
+        text = self._doc_text()
+        start = text.index("### `check-fixture-consistency`")
+        after_heading = start + len("### `check-fixture-consistency`")
+        match = self._HEADING_RE.search(text, after_heading)
+        end = match.start() if match is not None else len(text)
+        return text[start:end]
+
+    def test_doc_drops_the_false_universal_quantifier(self) -> None:
+        section = self._section()
+        assert "for every run that reaches a findings-based or config-error verdict" in section
+        assert "for every run that reaches gate resolution (spec 4.1" not in section
+
+    def test_doc_claims_six_terminals_not_three(self) -> None:
+        section = self._section()
+        assert "Six terminals never reach that verdict at all and write ZERO bytes to stdout" in section
+
+    def test_doc_names_both_new_write_failure_causes(self) -> None:
+        section = self._section()
+        assert "the unit's own work-unit file cannot be located on disk" in section
+        assert "the audit-marker append itself raises `OSError`" in section
+
+
+class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
+    """doc_review round-2 (E6-F2-S1-T2 Blocking 3): ``_resolve_scope_mode`` and
+    ``_resolve_scope_or_report`` each carry an exhaustive parenthetical caller
+    enumeration. This task adds a fifth caller
+    (:func:`cli._finalize_fixture_consistency_result`) to both helpers, so both
+    enumerations must name it -- pinned here so a future new caller of either
+    helper cannot land without this list being swept too."""
+
+    def test_resolve_scope_mode_names_the_fixture_consistency_gate(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "fixture-consistency gate" in source
+
+    def test_resolve_scope_or_report_names_the_fixture_consistency_gate(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "fixture-consistency gate" in source
+
+
+class _FixtureGateCmdFixtures:
+    """Shared git-fixture / config-fixture helpers for the fixture-consistency
+    done-path test classes below (E6-F2-S1-T2). Mirrors
+    ``_ReachabilityCmdFixtures``'s role for the reachability gate: a real,
+    on-disk git checkout plus a real, on-disk scratch backlog, rather than a
+    working-tree-free mock, since ``work_unit_scope.resolve_changed_files``
+    (spec 4.3, AC-9) needs both to resolve a real scope.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    def _make_unit(self, unit_id: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _seed(
+        self, tmp_path: Path, unit_id: str, *, scan_value: str = "A1", extra_manifest_files: tuple[str, ...] = ()
+    ) -> tuple[Path, Path, Path, Path]:
+        """Seed a real git checkout (catalog/scan fixtures) and a done-path scratch backlog.
+
+        *scan_value* is the scan target's single record's ``sku`` value:
+        ``"A1"`` (the default) matches the canonical source, so the check
+        passes; any other value produces a ``missing_key`` finding naming
+        the scan target, which is IN the seeded Changes Manifest (both
+        fixture files are declared there), so it is attributable and
+        blocks (spec 4.3, E6-F2-S1-T2 AC-6).
+
+        *extra_manifest_files* adds further paths to the seeded Changes
+        Manifest beyond ``catalog.json``/``mock_lookup.json`` -- e.g. a
+        seeded source-literal file a caller wants to declare in scope so a
+        ``missing_key`` finding naming it is attributable (spec 4.3).
+        """
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (["init"], ["config", "user.email", "t@ex.com"], ["config", "user.name", "Test"]):
+            _run_scratch_git(args, repo)
+        (repo / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (repo / "mock_lookup.json").write_text(json.dumps([{"sku": scan_value}]), encoding="utf-8")
+        backlog_root, backlog_index, wu_file = _seed_gate_done_path_backlog(
+            tmp_path,
+            unit_id,
+            self._REPO,
+            ("catalog.json", "mock_lookup.json", *extra_manifest_files),
+            "Fixture consistency gate cycle test",
+        )
+        return repo, backlog_root, backlog_index, wu_file
+
+    def _runtime_config(
+        self,
+        repo: Path,
+        *,
+        enabled: bool = True,
+        canonical_identifier_field: str = "sku",
+        canonical_source_paths: tuple[str, ...] | None = None,
+        scan_target_paths: tuple[str, ...] = ("mock_lookup.json",),
+        extract_source_literals: bool = False,
+    ) -> Any:
+        """Build a `RuntimeConfig` with a single `fixture_consistency` gate configured.
+
+        Parameterized (test_review, E6-F2-S1-T2 round 5 W4) so every journey-suite
+        variant shares this one builder instead of hand-rolling its own inline
+        `RuntimeConfig(...)` plus a local `config_loader` import block:
+
+        - `canonical_source_paths=None` (the default) configures the single
+          `catalog.json` canonical source every journey but the disabled/empty ones
+          uses; `canonical_source_paths=()` configures NONE at all, matching
+          `FixtureConsistencyConfig()`'s own unconfigured default (the disabled-gate
+          journey).
+        - `canonical_identifier_field` overrides the canonical source's
+          `identifier_field` (the typo'd-field adversarial journey passes `"skuu"`).
+        - `scan_target_paths` accepts more than one path (the attribution journey
+          configures a second, out-of-Manifest scan target alongside the default
+          `mock_lookup.json`); every scan target shares `identifier_field="sku"`,
+          matching every journey's actual usage.
+        - `extract_source_literals` is forwarded verbatim (the two seeded-source-
+          literal journeys set it `True`).
+        """
+        from devbench.config_loader import (
+            FixtureCanonicalSource,
+            FixtureConsistencyConfig,
+            FixtureScanTarget,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+        )
+
+        resolved_canonical_paths = ("catalog.json",) if canonical_source_paths is None else canonical_source_paths
+        fixture_cfg = FixtureConsistencyConfig(
+            enabled=enabled,
+            canonical_sources=tuple(
+                FixtureCanonicalSource(path=path, identifier_field=canonical_identifier_field)
+                for path in resolved_canonical_paths
+            ),
+            scan=tuple(FixtureScanTarget(path=path, identifier_field="sku") for path in scan_target_paths),
+            extract_source_literals=extract_source_literals,
+        )
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(fixture_consistency=fixture_cfg),
+        )
+
+    def _patches(
+        self, unit_id: str, repo: Path, backlog_root: Path, backlog_index: Path, *, runtime_config: Any = None
+    ) -> tuple[Any, ...]:
+        """Every patch both ``cmd_check_fixture_consistency`` and ``cmd_mark_done`` need.
+
+        A single shared ``RuntimeConfig`` is patched at BOTH
+        ``devbench.cli.RUNTIME_CONFIG`` (``cmd_check_fixture_consistency``
+        reads ``RUNTIME_CONFIG.gates.fixture_consistency`` directly, never
+        re-loaded from a config file) and ``devbench.config.RUNTIME_CONFIG``
+        (``BacklogManager._check_gate_pass_done_invariant`` resolves
+        ``gates.fixture_consistency.enabled`` through
+        ``config_loader.resolve_gate_config`` against THAT import location)
+        -- the two gates' config surfaces genuinely differ (see
+        ``cmd_check_fixture_consistency``'s own docstring), but this test
+        module always wants them to agree, so one ``RuntimeConfig`` object
+        backs both patches.
+        """
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        resolved_runtime_config = runtime_config if runtime_config is not None else self._runtime_config(repo)
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", resolved_runtime_config),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", resolved_runtime_config),
+        )
+
+
+class TestFixtureGateWritesGatePassRecord(_FixtureGateCmdFixtures):
+    """AC-E6-F2-S1-T2-1 (spec 4.2; 4.7 done-path sentence): a passing
+    ``check-fixture-consistency`` run writes ``[GATE_PASS
+    fixture_consistency] <iso-utc> <scope-hash>`` to the unit's audit trail
+    from the command itself; a failing run writes no record."""
+
+    def test_passing_run_writes_gate_pass_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        capsys.readouterr()
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert content.count("[GATE_PASS fixture_consistency]") == 1
+        import devbench.gate_records as gate_records_module
+
+        record = gate_records_module.latest_gate_pass_record(content, "fixture_consistency")
+        assert record is not None
+        assert record.timestamp.tzinfo is not None
+
+    def test_failing_run_writes_no_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="GHOST-SKU")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        capsys.readouterr()
+        assert result == 1
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_scope_resolution_failure_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """`work_unit_scope.resolve_changed_files` performs its OWN independent
+        `BacklogParser` lookup against `work_unit_scope.BACKLOG_ROOT`/`BACKLOG_INDEX` --
+        separate from `devbench.cli.BacklogParser`, which only serves this command's
+        earlier unit/repo resolution (`_resolve_fixture_consistency_repo_path`). Pointing
+        the former at a backlog that does not declare the unit (while the latter still
+        resolves it fine) makes scope resolution itself fail, which must exit 1 with an
+        `ERROR: ...` message rather than propagate an uncaught exception."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        empty_backlog_root = tmp_path / "empty-backlog"
+        empty_backlog_root.mkdir()
+        empty_backlog_index = tmp_path / "EmptyBACKLOG.md"
+        empty_backlog_index.write_text(
+            "## Full Work Unit Index\n\n| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n",
+            encoding="utf-8",
+        )
+        patches = [
+            *self._patches(unit_id, repo, backlog_root, backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", empty_backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", empty_backlog_index),
+        ]
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        assert result == 1
+        assert f"cannot resolve scope for unit {unit_id}" in capsys.readouterr().err
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The work-unit file cannot be located on disk at write time (`BACKLOG_ROOT`/
+        `WORKSPACE_ROOT` point elsewhere) -- mirrors
+        `TestCheckSharedFileImpactBaseline`'s equivalent shared_file_impact test."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        runtime_config = self._runtime_config(repo)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_config),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert f"ERROR: Cannot write [GATE_PASS fixture_consistency] record for {unit_id}" in captured.err
+        assert "work unit file not found" in captured.err
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_write_failure_on_append_os_error_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The work-unit file resolves, but the audit-marker append itself raises
+        `OSError` (e.g. a permission error or a full disk) -- must surface as the
+        standard `ERROR: ...` shape and exit 1, never a raw traceback (mirrors
+        `_write_ancestry_gate_pass_record`'s own `OSError` handling)."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = [
+            *self._patches(unit_id, repo, backlog_root, backlog_index),
+            patch(
+                "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+                side_effect=OSError(28, "No space left on device"),
+            ),
+        ]
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert f"ERROR: Cannot write [GATE_PASS fixture_consistency] record for {unit_id}" in captured.err
+        assert "Traceback" not in captured.err, "an OSError during the append must never surface as a raw traceback"
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestFixtureFindingIsAttributable:
+    """`_fixture_finding_is_attributable` (spec 4.3, E6-F2-S1-T2 AC-6): the attribution rule
+    that limits a `missing_key` finding to blocking only the calling unit whose scope
+    contains the file it names.
+
+    SECURITY (security_review, round 5 HIGH): `FixtureFinding.location` is a structured
+    field set directly by the producing call site (`_check_scan_targets`/
+    `_check_source_literals`), never recovered by re-parsing `message`. The deleted
+    `_fixture_finding_location_path` helper re-parsed a free-text, single-quoted
+    `'{location}'` message slot with a regex, which truncated at the first apostrophe a
+    repo-relative path can legally contain (`o'brien.json`), silently misattributing an
+    IN-SCOPE finding as out-of-scope and letting it stop blocking. The parametrized cases
+    below prove the structured field is immune to that whole class of defect for every
+    character that broke (or could plausibly break) a free-text parse."""
+
+    def test_non_missing_key_finding_is_always_attributable(self) -> None:
+        """code_review (E6-F2-S1-T2): `location` is set to a non-`None`, OUT-OF-SCOPE
+        path so the leading `if finding.kind != FINDING_KIND_MISSING_KEY: return True`
+        guard is the ONLY reason this assertion can pass -- deleting that guard entirely
+        used to leave this test green too, since the default `location=None` fell
+        through to the *separate* `finding.location is None: return True` fail-closed
+        branch below it and still returned `True` by coincidence, never actually
+        exercising the kind check this test claims to pin."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="load_error", message="Failed to parse fixture 'x.json': boom", location="other.json"
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock.json"})) is True
+
+    def test_missing_key_finding_with_no_location_is_attributable_fail_closed(self) -> None:
+        """A `missing_key` finding whose `location` was never populated (a hypothetical
+        future third producer that forgets to set the field) must never be silently
+        excluded from attribution. This is fail-CLOSED, not fail-fast: nothing here
+        aborts early -- the run continues to completion and the finding with no provable
+        location is simply retained as blocking rather than excused, exactly the
+        semantics `cli.py` already names "fail-closed" elsewhere (e.g. the ancestry
+        probe's "a node whose outcome could not be determined at all" branch). Today
+        both `missing_key` producers populate `location` unconditionally, so this test
+        exercises the defensive branch directly via a hand-built finding, not the parse
+        failure the old helper used to guard against -- there is no parse step left."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(kind="missing_key", message="a message with no structured location", location=None)
+
+        assert finding.location is None
+        assert cli._fixture_finding_is_attributable(finding, frozenset()) is True
+
+    def test_missing_key_finding_in_scope_is_attributable(self) -> None:
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'mock_lookup.json' field 'sku' references...",
+            location="mock_lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock_lookup.json"})) is True
+
+    def test_missing_key_finding_out_of_scope_is_not_attributable(self) -> None:
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'other.json' field 'sku' references...",
+            location="other.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock_lookup.json"})) is False
+
+    def test_source_literal_finding_location_carries_no_line_suffix(self) -> None:
+        """A source-literal `missing_key` finding's `message` embeds `path:line` for a
+        human reader, but `location` is always the bare path -- attribution compares
+        `location` verbatim against `ScopeResult.files`, which never carries a line
+        suffix either."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Source file 'app/routes.py:3' assigns 'sku'...",
+            location="app/routes.py",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"app/routes.py"})) is True
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"app/routes.py:3"})) is False
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            pytest.param("o'brien.json", id="apostrophe"),
+            pytest.param("weird:name.json", id="colon"),
+            pytest.param("weird\nname.json", id="newline"),
+            pytest.param("a/../b/catalog.json", id="dot-dot-component"),
+        ],
+    )
+    def test_scan_target_shaped_finding_with_special_path_blocks_when_in_scope(self, path: str) -> None:
+        """A repo-relative path containing an apostrophe, a colon, a newline, or a `..`
+        component is unusual but legal on this filesystem -- the structured `location`
+        field compares it verbatim against `scope_files`, with no free-text parsing step
+        that could truncate or otherwise mis-split on any of those characters."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=(
+                f"Fixture '{path}' field 'sku' references 1 key(s) absent from canonical "
+                "source 'catalog.json': GHOST-SKU."
+            ),
+            location=path,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({path})) is True
+
+    @pytest.mark.parametrize(
+        "path,line",
+        [
+            pytest.param("o'brien.py", 3, id="apostrophe"),
+            pytest.param("weird:name.py", 5, id="colon"),
+            pytest.param("weird\nname.py", 7, id="newline"),
+            pytest.param("a/../b/routes.py", 9, id="dot-dot-component"),
+        ],
+    )
+    def test_source_literal_shaped_finding_with_special_path_blocks_when_in_scope(self, path: str, line: int) -> None:
+        """Same as above for the source-literal producer's `path:line` message shape --
+        `location` still carries only the bare path (no line suffix) and still compares
+        verbatim, with no parsing step to mis-split on the special character."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=(
+                f"Source file '{path}:{line}' assigns 'sku' the literal value "
+                "'<redacted, 3 chars total; see file:line above to inspect it directly>', "
+                "which is absent from canonical source 'catalog.json' ..."
+            ),
+            location=path,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({path})) is True
+
+    def test_location_that_is_a_string_prefix_of_an_in_scope_path_is_not_attributable(self) -> None:
+        """`location` must be compared for EXACT membership in `scope_files`, never a
+        prefix/substring match -- a finding naming `tests/fixtures/o` must not be treated
+        as in-scope merely because `tests/fixtures/o'brien.json` (a distinct, longer
+        path) happens to be a member of `scope_files`."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'tests/fixtures/o' field 'sku' references...",
+            location="tests/fixtures/o",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"tests/fixtures/o'brien.json"})) is False
+
+
+@pytest.mark.unit
+class TestFixtureFindingLocationNormalization:
+    """`_fixture_finding_is_attributable` (spec 4.3, E6-F2-S1-T2 -- orchestrator-directed
+    closure of a second attribution bypass reproduced independently by security_review,
+    code_review and test_review): before this fix, `location` was compared against
+    `scope_files` with NO canonicalisation on either side. `config_loader._parse_...`
+    stores a scan target's configured `path` string verbatim, and `_check_scan_targets`
+    copies it verbatim into `FixtureFinding.location` -- so a scan target declared as
+    `./mock_lookup.json` or `sub/../mock_lookup.json` compared unequal to the SAME file's
+    canonical Manifest spelling (`mock_lookup.json`), the finding was misattributed
+    out-of-scope, and the gate silently passed on an inconsistent catalog -- reaching the
+    identical end state as the round-5 HIGH this fix's sibling (`TestFixtureFindingIsAttributable`)
+    closed. The source-literal producer (`_check_source_literals`) already emits a canonical
+    `abs_path.relative_to(repo_path).as_posix()` location and needed no change.
+
+    Normalisation is lexical only (`fixture_consistency.normalize_repo_relative_path`,
+    built on `posixpath.normpath`) -- it never touches the filesystem, so it cannot resolve
+    a symlink and change which unit a finding is attributed to, and it never case-folds, so
+    two paths differing only in case remain distinct. An escaping `..` or a bare absolute
+    path is left exactly as normalised (still carrying the leading `..`/`/`), which can
+    never equal a genuine repo-relative Manifest entry -- for those two shapes specifically,
+    normalisation never turns a genuinely out-of-scope path into an in-scope one. That
+    guarantee does not extend to every path this function accepts: a symlinked-parent `..`
+    merge can turn a genuinely out-of-scope path into an in-scope one (fail-closed, block
+    direction only, never the reverse -- see `normalize_repo_relative_path`'s own
+    docstring)."""
+
+    @pytest.mark.parametrize(
+        "location,scope_files",
+        [
+            pytest.param("norm_lookup.json", frozenset({"norm_lookup.json"}), id="control-already-canonical"),
+            pytest.param("./norm_lookup.json", frozenset({"norm_lookup.json"}), id="leading-dot-slash"),
+            pytest.param("sub/../norm_lookup.json", frozenset({"norm_lookup.json"}), id="dot-dot-collapse"),
+            pytest.param("./app/norm.json", frozenset({"app/norm.json"}), id="nested-leading-dot-slash"),
+            pytest.param("norm_lookup.json/", frozenset({"norm_lookup.json"}), id="trailing-slash"),
+            pytest.param("a//norm_lookup.json", frozenset({"a/norm_lookup.json"}), id="duplicate-separator"),
+            pytest.param("a/./norm_lookup.json", frozenset({"a/norm_lookup.json"}), id="internal-dot-slash"),
+        ],
+    )
+    def test_differently_spelled_in_scope_path_is_attributable(
+        self, location: str, scope_files: frozenset[str]
+    ) -> None:
+        """test_review's four-row reproduction table, plus the control row, a trailing-
+        slash variant, and a duplicate-separator/internal-dot-slash pair pinning the two
+        collapse shapes `normalize_repo_relative_path`'s docstring names alongside the
+        original three: every spelling of the SAME repo-relative file blocks identically."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=f"Fixture '{location}' field 'sku' references 1 key(s) absent from catalog.json: GHOST-SKU.",
+            location=location,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, scope_files) is True
+
+    def test_dot_dot_escaping_the_root_does_not_match_a_same_named_in_scope_file(self) -> None:
+        """A scan target spelled `../outside.json` names a file one level ABOVE the repo
+        root -- a genuinely different file from an in-scope `outside.json` at the repo
+        root. Normalisation must never collapse the two together."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture '../outside.json' field 'sku' references...",
+            location="../outside.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"outside.json"})) is False
+
+    def test_absolute_path_does_not_match_a_same_named_in_scope_file(self) -> None:
+        """An absolute-path location must never be treated as equivalent to a bare
+        repo-relative Manifest entry of the same basename."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture '/norm_lookup.json' field 'sku' references...",
+            location="/norm_lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"norm_lookup.json"})) is False
+
+    def test_case_difference_does_not_match(self) -> None:
+        """Normalisation must never case-fold -- a path differing only in case is left
+        exactly as distinct as it was before normalisation."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'Norm_Lookup.json' field 'sku' references...",
+            location="Norm_Lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"norm_lookup.json"})) is False
+
+    def test_normalized_string_prefix_still_does_not_match(self) -> None:
+        """Normalisation is applied before the EXACT-membership check, never before a
+        substring/prefix check -- a leading `./` on a path that is a string prefix of an
+        in-scope path must still not match (mirrors
+        `TestFixtureFindingIsAttributable.test_location_that_is_a_string_prefix_of_an_in_scope_path_is_not_attributable`,
+        with normalisation now in the comparison path)."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture './tests/fixtures/o' field 'sku' references...",
+            location="./tests/fixtures/o",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"tests/fixtures/o'brien.json"})) is False
+
+
+class TestMarkDoneRequiresFixtureGatePass(_FixtureGateCmdFixtures):
+    """AC-E6-F2-S1-T2-2/3/4/5 (spec 4.2, 4.3; AC-16, AC-7, AC-9): the fixture
+    gate's done-path cycle observed end to end against a real git fixture
+    repo -- ``mark-done`` is blocked with no record, ``check-fixture-consistency``
+    writes the record and ``mark-done`` then consumes it, an in-scope edit
+    stales an existing record, a non-operator waiver does not unblock while an
+    operator one does, and a disabled gate imposes nothing at all."""
+
+    def test_blocked_then_record_written_then_done(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            before = wu_file.read_text(encoding="utf-8")
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1, "mark-done must refuse before any [GATE_PASS fixture_consistency] record exists"
+            assert wu_file.read_text(encoding="utf-8") == before
+
+            checked = cli.cmd_check_fixture_consistency(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
+
+            done = cli.cmd_mark_done(unit_id)
+            assert done == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_mark_done_refusal_names_the_exact_remediation_command(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            blocked = cli.cmd_mark_done(unit_id)
+
+        assert blocked == 1
+        assert f"uv run devbench check-fixture-consistency {unit_id}" in capsys.readouterr().err
+
+    def test_stale_record_blocks_and_operator_waiver_unblocks(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            checked = cli.cmd_check_fixture_consistency(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
+
+            # Edit an in-scope file AFTER the record was captured (AC-3): the
+            # persisted scope hash no longer matches the recomputed one.
+            (repo / "mock_lookup.json").write_text(json.dumps([{"sku": "A1", "extra": "changed"}]), encoding="utf-8")
+
+            capsys.readouterr()  # discard the check-fixture-consistency output above
+            stale = cli.cmd_mark_done(unit_id)
+            assert stale == 1
+            assert (
+                "ERROR: gate 'fixture_consistency' record is stale (scope changed since it ran)"
+                in capsys.readouterr().err
+            )
+            content_before_waiver = wu_file.read_text(encoding="utf-8")
+            assert "## Status: done" not in content_before_waiver
+
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "fixture_consistency",
+                "--target",
+                "mock_lookup.json",
+                "--reason",
+                "reviewed manually after the stale edit",
+                "--operator",
+            )
+            assert waiver_result == 0
+
+            unblocked = cli.cmd_mark_done(unit_id)
+            assert unblocked == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_non_operator_waiver_does_not_unblock(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Two independent halves of AC-4 (spec Section 3.6: only an operator may waive a
+        machine-blocking gate): (1) ``log-waiver`` itself REFUSES to write a non-operator
+        waiver for ``fixture_consistency`` at all (the CLI-level enforcement every caller
+        goes through); (2) even if an executor-attributed ``[GATE_WAIVER fixture_consistency]``
+        marker existed anyway (e.g. hand-authored), ``mark-done``'s own
+        ``_check_gate_pass_done_invariant`` still refuses it -- defense in depth, proven by
+        appending the marker directly rather than through ``log-waiver``."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "fixture_consistency",
+                "--target",
+                "mock_lookup.json",
+                "--reason",
+                "executor self-review, not an operator decision",
+            )
+            assert waiver_result == 2
+            assert "--operator is required" in capsys.readouterr().err
+            assert "[GATE_WAIVER fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+            # Defense in depth: even an executor-attributed marker that exists on disk
+            # (never through log-waiver) must not unblock mark-done for this gate.
+            content = wu_file.read_text(encoding="utf-8")
+            hand_authored_waiver = (
+                "[2026-01-01 00:00 UTC] [agent/code_review] [GATE_WAIVER fixture_consistency] "
+                "2026-01-01T00:00:00+00:00 mock_lookup.json executor reviewed manually\n"
+            )
+            updated_content = content.replace("## Comments\n\n", f"## Comments\n\n{hand_authored_waiver}", 1)
+            wu_file.write_text(updated_content, encoding="utf-8")
+
+            capsys.readouterr()
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1
+            assert "executor-attributed" in capsys.readouterr().err
+            assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        from devbench.config_loader import FixtureConsistencyConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        disabled_runtime_config = RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(fixture_consistency=FixtureConsistencyConfig(enabled=False)),
+        )
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, runtime_config=disabled_runtime_config)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            done = cli.cmd_mark_done(unit_id)
+
+        assert done == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
 
 
 class TestCmdLogVerdict:

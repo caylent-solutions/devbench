@@ -104,6 +104,7 @@ silent ``continue``.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -123,23 +124,46 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCKING_FINDING_KINDS",
+    "FINDING_KIND_MISSING_KEY",
     "FixtureConsistencyConfigError",
     "FixtureFinding",
     "check_fixture_consistency",
     "collect_identifiers",
+    "normalize_repo_relative_path",
 ]
 
-# The `FixtureFinding.kind` values that make `cli.cmd_check_fixture_consistency`'s
-# gate status "fail" (spec 4.7; `cmd_check_fixture_consistency`'s own docstring
-# repeats this list, so keep both in sync). `"waiver_applied"` (spec 4.7 bullet
-# 5, E6-F1-S1-T2) is deliberately excluded: it documents that a mismatch was
-# suppressed by a validated in-fixture marker, not that one was found -- a
-# fixture whose only findings are `waiver_applied` waivers has nothing left
-# to fail the gate on (AC-E6-F1-S1-T2-1). This is the single source of truth
-# for the blocking/informational split; `cli.py` imports this constant rather
-# than re-declaring the three kind literals at its own comparison site, so the
-# two modules can never drift on which kinds block the gate.
-BLOCKING_FINDING_KINDS: frozenset[str] = frozenset({"missing_key", "coverage_shortfall", "load_error"})
+# `cli.py`'s `_fixture_finding_is_attributable` (the only production consumer
+# outside this module) used to re-type the bare `"missing_key"` literal at
+# its own comparison site (code_review round-1 WARN, E6-F2-S1-T2); declaring
+# it here and importing it there means the two modules can never drift on
+# the literal's spelling.
+FINDING_KIND_MISSING_KEY: str = "missing_key"
+
+# The `FixtureFinding.kind` values that are ELIGIBLE to make
+# `cli.cmd_check_fixture_consistency`'s gate status "fail" (spec 4.7;
+# `cmd_check_fixture_consistency`'s own docstring repeats this list, so keep
+# both in sync). Membership here is NECESSARY but not SUFFICIENT for a given
+# finding to actually block a run: spec 4.3's attribution rule
+# (`cli._fixture_finding_is_attributable`, E6-F2-S1-T2 AC-6) additionally
+# requires a `missing_key` finding to name a file inside the CALLING unit's
+# own resolved Changes-Manifest scope, or whose `FixtureFinding.location`
+# field was never populated by its producer (fail-closed, not fail-fast --
+# see `cli._fixture_finding_is_attributable`'s own docstring for why that is
+# the accurate term), before it can block that unit's run -- a `missing_key` finding
+# naming an out-of-scope file is a member of this set but does NOT make the
+# gate status "fail" for that run. `coverage_shortfall`
+# and `load_error` are NOT scope-filtered and always block regardless of
+# which unit's run observes them (see `_fixture_finding_is_attributable`'s
+# own docstring for why). `"waiver_applied"` (spec 4.7 bullet 5, E6-F1-S1-T2)
+# is deliberately excluded from this set entirely: it documents that a
+# mismatch was suppressed by a validated in-fixture marker, not that one was
+# found -- a fixture whose only findings are `waiver_applied` waivers has
+# nothing left to fail the gate on (AC-E6-F1-S1-T2-1). This is the single
+# source of truth for the blocking-eligible/informational split; `cli.py`
+# imports this constant rather than re-declaring the three kind literals at
+# its own comparison site, so the two modules can never drift on which kinds
+# are even eligible to block the gate.
+BLOCKING_FINDING_KINDS: frozenset[str] = frozenset({FINDING_KIND_MISSING_KEY, "coverage_shortfall", "load_error"})
 
 # Dotted YAML key prefix for every operator-facing config-key reference in
 # this module's finding messages. Centralised so the spec 4.1 gates
@@ -288,6 +312,66 @@ _MSG_SOURCE_LITERAL_MISSING_KEY: str = (
 _MSG_SOURCE_LITERAL_VALUE_REDACTED: str = "<redacted, {length} chars total; see file:line above to inspect it directly>"
 
 
+def normalize_repo_relative_path(raw_path: str) -> str:
+    """Return *raw_path*'s canonical lexical form for repo-relative path comparison.
+
+    SECURITY (security_review AND code_review, E6-F2-S1-T2, orchestrator-directed closure of
+    a second attribution bypass reaching the SAME end state as the round-5 HIGH the sibling
+    `FixtureFinding.location` fix closed): a configured scan target's ``path`` is stored and
+    compared VERBATIM against the calling unit's resolved Changes-Manifest scope
+    (``work_unit_scope.ScopeResult.files``) with no canonicalisation on either side, so two
+    independently-authored spellings of the SAME repo-relative file (``./mock.json`` vs
+    ``mock.json``, or ``sub/../mock.json`` vs ``mock.json``) compared unequal -- an IN-SCOPE
+    ``missing_key`` finding was silently misattributed as out-of-scope, stopped blocking, and
+    a ``[GATE_PASS fixture_consistency]`` record was persisted on an inconsistent catalog.
+
+    This function is deliberately LEXICAL ONLY, built on the stdlib ``posixpath.normpath``,
+    which never touches the filesystem: it collapses a leading ``./``, an internal ``a/../``
+    component pair, and a trailing ``/``, entirely by string manipulation. It never calls
+    ``Path.resolve()`` or performs any ``stat``/``readlink`` -- resolving a symlink here would
+    let a path's ACTUAL on-disk target silently change which unit a finding is attributed to,
+    which is exactly the kind of non-deterministic, filesystem-state-dependent attribution this
+    module's `FixtureFinding.location` field was introduced to eliminate (see its own
+    docstring). It never case-folds either: a path differing from an in-scope path only in
+    case is left exactly as distinct as it was before normalisation, since two paths differing
+    only in case may or may not name the same file depending on the host filesystem's own
+    case-sensitivity, which this function has no way to know and must never guess at.
+
+    A path that escapes the repo root (e.g. ``../outside.json``) or that is already absolute
+    (e.g. ``/outside.json``) is returned with its leading ``..``/``/`` intact -- ``posixpath
+    .normpath`` never fabricates a root-relative interpretation for either shape, so the
+    normalised result can never equal a genuine repo-relative Manifest entry (which never
+    starts with ``..`` or ``/``).
+
+    This function collapses a leading ``./``, an internal ``a/../`` component pair, and a trailing
+    ``/`` among other purely lexical collapses, confirmed directly: ``./mock_lookup.json``,
+    ``a/../mock_lookup.json``, and ``mock_lookup.json/`` each normalise to ``mock_lookup.json``. It
+    does NOT canonicalise a path that leaves and re-enters the repo root:
+    ``../checkout/mock_lookup.json`` normalises to itself, and against a Manifest row
+    ``mock_lookup.json`` naming the identical on-disk file (confirmed via
+    ``os.path.realpath``), the two spellings still compare unequal and the finding is judged out of
+    scope -- a known and accepted residual. It likewise does not canonicalise a path routed through
+    a committed symlink: with a symlink ``link -> .``, ``link/mock_lookup.json`` also normalises to
+    itself and, against the same Manifest row for the identical on-disk file, is judged out of scope
+    too -- a second known and accepted residual reaching the same end state.
+
+    Because the ``..`` collapsing performed here is purely lexical, it can also run the other way:
+    with a symlink ``sub/s -> ../elsewhere``, ``sub/s/../mock_lookup.json`` normalises to
+    ``sub/mock_lookup.json`` and compares equal to a Manifest row ``sub/mock_lookup.json``, even
+    though the two spellings resolve via ``os.path.realpath`` to two DIFFERENT files. That merge is
+    fail-closed: it can only cause an out-of-scope finding to be treated as in-scope and block,
+    never the reverse, so it is safe even though it is not correct.
+
+    Used both by :func:`_check_scan_targets` (the exposed producer this fix targets -- the
+    sibling :func:`_check_source_literals` already emits a canonical
+    ``abs_path.relative_to(repo_path).as_posix()`` location and needs no change) and by
+    ``cli._fixture_finding_is_attributable`` (normalises BOTH the finding's own ``location``
+    and every member of the calling unit's ``scope_files``, so a Manifest-typed path carrying
+    its own incidental ``./``/trailing-slash spelling still compares correctly too).
+    """
+    return posixpath.normpath(raw_path)
+
+
 def _format_fixture_location(path: str, line: int | None = None) -> str:
     """Build the ``path`` or ``path:line`` location fragment plugged into a finding message.
 
@@ -431,10 +515,37 @@ class FixtureFinding:
         message: Human-readable, actionable description including the
             offending file path(s) (``file:line`` for a source-literal
             finding) and identifier value(s).
+        location: The bare repo-relative path this finding names, set
+            directly by the producing call site -- never recovered by
+            re-parsing *message* (security_review, E6-F2-S1-T2 round 5
+            HIGH: a free-text re-parse of a single-quoted ``'{location}'``
+            message slot truncates at the first apostrophe a path can
+            legally contain, e.g. ``o'brien.json``, silently misattributing
+            an in-scope finding as out-of-scope). Populated for every
+            ``"missing_key"`` finding -- the only kind spec 4.3 attribution
+            (``cli._fixture_finding_is_attributable``) scope-filters -- by
+            both producers of that kind, :func:`_check_scan_targets` and
+            :func:`_check_source_literals`. For a source-literal finding
+            (spec 4.7 bullet 4) this is the bare file path with NO
+            ``:<line>`` suffix even though *message* embeds ``path:line``
+            for a human reader, because attribution compares this field --
+            LEXICALLY NORMALISED via :func:`normalize_repo_relative_path`
+            on both sides (E6-F2-S1-T2, second attribution bypass closed on
+            orchestrator direction: a scan target spelled ``./mock.json``
+            or ``sub/../mock.json`` used to compare unequal to the SAME
+            file's canonical ``mock.json`` Manifest spelling) -- against
+            ``work_unit_scope.ScopeResult.files``, which never carries a
+            line suffix either. ``None`` for
+            ``"coverage_shortfall"``, ``"load_error"`` and
+            ``"waiver_applied"`` findings -- those three kinds are never
+            scope-filtered regardless of this field's value (see
+            ``cli._fixture_finding_is_attributable``'s own docstring for
+            why), so their producers leave it at the default.
     """
 
     kind: str
     message: str
+    location: str | None = None
 
 
 def _load_parsed(path: Path) -> Any:
@@ -819,7 +930,7 @@ def _check_scan_targets(
         if missing:
             findings.append(
                 FixtureFinding(
-                    "missing_key",
+                    FINDING_KIND_MISSING_KEY,
                     _MSG_MISSING_KEY.format(
                         location=_format_fixture_location(scan.path),
                         field=scan.identifier_field,
@@ -827,6 +938,7 @@ def _check_scan_targets(
                         canonical_path=canonical_path,
                         keys=", ".join(missing),
                     ),
+                    location=normalize_repo_relative_path(scan.path),
                 )
             )
 
@@ -1040,7 +1152,7 @@ def _check_source_literals(
                     continue
                 findings.append(
                     FixtureFinding(
-                        "missing_key",
+                        FINDING_KIND_MISSING_KEY,
                         _MSG_SOURCE_LITERAL_MISSING_KEY.format(
                             location=_format_fixture_location(rel_path, line_no),
                             field=field_name,
@@ -1048,6 +1160,7 @@ def _check_source_literals(
                             canonical_path=", ".join(sorted(source.path for source in group)),
                             prefix=_CONFIG_KEY_PREFIX,
                         ),
+                        location=rel_path,
                     )
                 )
 

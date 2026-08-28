@@ -357,7 +357,7 @@ from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeR
 
 if TYPE_CHECKING:
     from devbench.backlog.manifest import ManifestRow
-    from devbench.config_loader import ResolvedGateConfig, RuntimeConfig
+    from devbench.config_loader import FixtureConsistencyConfig, ResolvedGateConfig, RuntimeConfig
     from devbench.fixture_consistency import FixtureFinding
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
@@ -4434,10 +4434,10 @@ def _resolve_scope_mode() -> str:
     ``MODE_DEFER_PR`` when ``DEVBENCH_DEFER_PR`` resolves true, else
     ``MODE_PER_TASK_BRANCH``. Every scope-resolving gate/verb
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
-    reachability gate, :func:`cmd_check_shared_file_impact`) calls this
-    single helper instead of re-deriving the same two-branch ternary, so
-    the mode-selection rule can never drift between call sites (spec 4.3,
-    ADR-12).
+    reachability gate, :func:`cmd_check_shared_file_impact`, the
+    fixture-consistency gate) calls this single helper instead of
+    re-deriving the same two-branch ternary, so the mode-selection rule
+    can never drift between call sites (spec 4.3, ADR-12).
     """
     from devbench.config import DEFER_PR
 
@@ -4449,14 +4449,14 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
 
     Shared by every gate/verb that needs the unit's ADR-12 mode-aware scope
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
-    reachability gate, and :func:`cmd_check_shared_file_impact`; spec 4.3,
-    AC-9) so every consumer resolves scope through the single mode-aware
-    implementation and reports a resolution failure through one shared
-    error path, never a divergent per-caller try/except copy. Each caller
-    passes its own operator-facing ``message_prefix`` (e.g. ``"Cannot scope
-    diff for '<unit>'"`` or ``"cannot resolve scope for unit <unit>"``) so
-    existing callers' wording is preserved exactly while a new caller can
-    state its own verb.
+    reachability gate, :func:`cmd_check_shared_file_impact`, and the
+    fixture-consistency gate; spec 4.3, AC-9) so every consumer resolves
+    scope through the single mode-aware implementation and reports a
+    resolution failure through one shared error path, never a divergent
+    per-caller try/except copy. Each caller passes its own operator-facing
+    ``message_prefix`` (e.g. ``"Cannot scope diff for '<unit>'"`` or
+    ``"cannot resolve scope for unit <unit>"``) so existing callers'
+    wording is preserved exactly while a new caller can state its own verb.
 
     ``FileNotFoundError`` is caught alongside ``ValueError``/``RuntimeError``:
     :func:`resolve_changed_files` can propagate it (via
@@ -4478,6 +4478,14 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
     except (ValueError, RuntimeError, FileNotFoundError) as exc:
         print(f"ERROR: {message_prefix}: {exc}", file=sys.stderr)
         return None
+
+
+# Shared ``message_prefix`` template for the two :func:`_resolve_scope_or_report`
+# callers (:func:`_prepare_shared_file_impact_scope_and_registry`,
+# :func:`_finalize_fixture_consistency_result`) that have no gate-specific wording
+# of their own to preserve, so the identical prefix text can never drift between
+# the two call sites (doc_review round-2 W4, E6-F2-S1-T2).
+_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str = "cannot resolve scope for unit {unit_id}"
 
 
 def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | None:
@@ -7984,23 +7992,38 @@ def _resolve_shared_file_impact_gate_config(
     return gate_config
 
 
-def _write_shared_file_impact_gate_pass_record(unit: WorkUnit, unit_id: str, scope: "ScopeResult") -> int | None:
-    """Persist ``[GATE_PASS shared_file_impact]`` for a passing enabled run (spec 4.2, 5.3).
+def _write_gate_pass_record(gate_name: str, unit: WorkUnit, unit_id: str, scope: "ScopeResult") -> int | None:
+    """Persist ``[GATE_PASS <gate_name>]`` for a passing enabled run (spec 4.2, 5.3).
 
-    Mirrors :func:`cmd_check_reachability`'s inline gate-pass write: this is the ONE call
-    site :func:`_emit_shared_file_impact_status` uses on either of its two passing exits
-    (the no-match no-op, and a matched run with zero attributable new failures), so the
-    wu-file resolution and write steps have a single implementation instead of being
-    duplicated per branch (DRY). `compose_gate_pass_record` (`devbench.gate_records`) is
-    the sole authorized builder of the marker text (AC-E2-F2-S1-T1-6); this command never
-    hand-formats it. `BacklogManager._append_audit_marker_before_comments` is the sole
-    writer of the work-unit file itself -- the record is written by the command, never
-    by agent prose.
+    Shared by every machine-blocking gate whose command resolves a ``ScopeResult`` and
+    persists a passing record through it: ``shared_file_impact``
+    (:func:`_emit_shared_file_impact_status`'s ONE call site, covering both of its
+    passing exits -- the no-match no-op and a matched run with zero attributable new
+    failures) and ``fixture_consistency``
+    (:func:`_finalize_fixture_consistency_result`). Extracted (code_review round-1,
+    E6-F2-S1-T2 Blocking 2) because the two gates' write logic was a verbatim 22-line
+    duplicate differing only by which gate-name constant got substituted in -- exactly
+    the shape this DRY extraction now shares in one place. `compose_gate_pass_record`
+    (`devbench.gate_records`) is the sole authorized builder of the marker text
+    (AC-E2-F2-S1-T1-6); no caller of this function hand-formats it.
+    `BacklogManager._append_audit_marker_before_comments` is the sole writer of the
+    work-unit file itself -- the record is written by the command, never by agent prose.
 
     An empty Changes Manifest (``scope.files`` empty, ``scope.scope_hash == ""``) has no
     scope to persist a hash for, so the caller must skip calling this at all in that case
     (mirroring `compute_scope_hash`'s own refusal to hash an empty change set) --
     this function does not re-check that condition itself.
+
+    Args:
+        gate_name: The gate whose record is being persisted, e.g.
+            ``_SHARED_FILE_IMPACT_GATE_NAME`` or ``_FIXTURE_CONSISTENCY_GATE_NAME`` --
+            embedded verbatim in both the marker text and any ``ERROR: ...`` message
+            this function prints.
+        unit: The calling unit's resolved :class:`WorkUnit`, used to locate its
+            work-unit file (:func:`_resolve_work_unit_file`).
+        unit_id: The calling unit's id, used only for the ``ERROR: ...`` message text.
+        scope: The calling unit's resolved :class:`ScopeResult` (non-empty by the
+            caller-side precondition above); its ``scope_hash`` is what gets persisted.
 
     Returns:
         ``None`` on a successful write. ``1`` (already printed its own ``ERROR: ...``
@@ -8016,18 +8039,17 @@ def _write_shared_file_impact_gate_pass_record(unit: WorkUnit, unit_id: str, sco
     wu_file = _resolve_work_unit_file(unit)
     if not wu_file.is_file():
         print(
-            f"ERROR: Cannot write [GATE_PASS {_SHARED_FILE_IMPACT_GATE_NAME}] record for {unit_id}: "
-            f"work unit file not found at {wu_file}",
+            f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: work unit file not found at {wu_file}",
             file=sys.stderr,
         )
         return 1
 
-    marker = compose_gate_pass_record(_SHARED_FILE_IMPACT_GATE_NAME, scope.scope_hash)
+    marker = compose_gate_pass_record(gate_name, scope.scope_hash)
     try:
         BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
     except OSError as exc:
         print(
-            f"ERROR: Cannot write [GATE_PASS {_SHARED_FILE_IMPACT_GATE_NAME}] record for {unit_id}: {wu_file}: {exc}",
+            f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: {wu_file}: {exc}",
             file=sys.stderr,
         )
         return 1
@@ -8055,7 +8077,7 @@ def _emit_shared_file_impact_status(
         printed) when a due record could not be written.
     """
     if status == GATE_STATUS_PASS and scope.files:
-        write_result = _write_shared_file_impact_gate_pass_record(unit, unit_id, scope)
+        write_result = _write_gate_pass_record(_SHARED_FILE_IMPACT_GATE_NAME, unit, unit_id, scope)
         if write_result is not None:
             return write_result
     print(_gate_status_line(_SHARED_FILE_IMPACT_GATE_NAME, status, findings, scope_hash=scope.scope_hash))
@@ -8093,7 +8115,7 @@ def _prepare_shared_file_impact_scope_and_registry(
         ``ERROR:`` message) on either failure.
     """
     mode = _resolve_scope_mode()
-    message_prefix = f"cannot resolve scope for unit {unit_id}"
+    message_prefix = _GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
     scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=message_prefix)
     if scope is None:
         return 1
@@ -8571,7 +8593,7 @@ _FIXTURE_CONSISTENCY_GATE_NAME: str = "fixture_consistency"
 # through `_gate_status_line`/`_gate_disabled_line`.
 
 
-def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[str, Path] | int:
+def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[WorkUnit, str, Path] | int:
     """Resolve everything :func:`cmd_check_fixture_consistency` needs before running the check.
 
     Split out purely to keep that function's return-count within the
@@ -8584,13 +8606,16 @@ def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[str, Path] | i
     into one caller-side ``isinstance(..., int)`` check.
 
     Returns:
-        A ``(canonical_repo, repo_path)`` pair when every resolution step
-        succeeds -- *canonical_repo* is the ``resolve_gate_config`` repo
-        argument the caller needs to resolve ``extract_source_literals``
-        (spec 4.1, AC-27; E6-F2-S1-T1 doc_review round-1 D4), *repo_path*
-        the resolved local checkout ``Path``; otherwise the ``int`` exit
-        code the caller should return as-is (the offending step has
-        already printed its own diagnostic).
+        A ``(unit, canonical_repo, repo_path)`` triple when every resolution
+        step succeeds -- *unit* is the resolved :class:`WorkUnit` itself,
+        needed by the caller (E6-F2-S1-T2) to locate the work-unit file a
+        passing run persists its ``[GATE_PASS fixture_consistency]`` record
+        to (:func:`_resolve_work_unit_file`); *canonical_repo* is the
+        ``resolve_gate_config`` repo argument the caller needs to resolve
+        ``extract_source_literals`` (spec 4.1, AC-27; E6-F2-S1-T1 doc_review
+        round-1 D4); *repo_path* the resolved local checkout ``Path``;
+        otherwise the ``int`` exit code the caller should return as-is (the
+        offending step has already printed its own diagnostic).
     """
     if not unit_id.strip():
         print("ERROR: check-fixture-consistency requires a non-empty <unit-id>", file=sys.stderr)
@@ -8610,7 +8635,7 @@ def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[str, Path] | i
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    return canonical_repo, Path(repo_path)
+    return unit, canonical_repo, Path(repo_path)
 
 
 def cmd_check_fixture_consistency(unit_id: str) -> int:
@@ -8633,16 +8658,25 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
     ``expected_count`` (backfill coverage).
 
     Prints the spec 5.2 gate status line as the FIRST stdout line for every
-    run that reaches gate resolution: ``{"gate":"fixture_consistency",
-    "status":"disabled"}`` and exits 0 when no ``canonical_sources`` are
-    configured (spec 4.1); otherwise ``{"gate":"fixture_consistency",
-    "tier":"machine-blocking","status":"pass"|"fail"|"error",
-    "findings":<int>}`` followed by the human-readable findings (spec 4.7
-    hardening, register findings 322-D02/D03/D05). The three terminals that
-    precede gate resolution -- an empty-or-whitespace *unit_id* (exit 2), an
-    unresolvable *unit_id* (exit 1), and a repo with no configured local
-    path (exit 1) -- print ``ERROR: ...`` to stderr only and write ZERO
-    bytes to stdout; there is no status line to be "first" on those three
+    run that reaches a findings-based or config-error verdict:
+    ``{"gate":"fixture_consistency", "status":"disabled"}`` and exits 0
+    when no ``canonical_sources`` are configured (spec 4.1); otherwise
+    ``{"gate":"fixture_consistency", "tier":"machine-blocking",
+    "status":"pass"|"fail"|"error", "findings":<int>}`` followed by the
+    human-readable findings (spec 4.7 hardening, register findings
+    322-D02/D03/D05). SIX terminals never reach that verdict at all and
+    write ZERO bytes to stdout, printing only ``ERROR: ...`` to stderr: an
+    empty-or-whitespace *unit_id* (exit 2), an unresolvable *unit_id*
+    (exit 1), a repo with no configured local path (exit 1) (all three
+    from :func:`_resolve_fixture_consistency_repo_path`), scope resolution
+    for the calling unit failing (exit 1,
+    :func:`_finalize_fixture_consistency_result`'s own
+    ``_resolve_scope_or_report`` call, E6-F2-S1-T2), and a due
+    ``[GATE_PASS fixture_consistency]`` record failing to be written
+    (exit 1, :func:`_write_gate_pass_record`,
+    E6-F2-S1-T2) -- either because the unit's own work-unit file cannot be
+    located on disk, or because the audit-marker append itself raises
+    ``OSError``. There is no status line to be "first" on any of those six
     paths.
 
     - ``status`` is ``"error"`` -- never a passing status line -- when the
@@ -8672,73 +8706,117 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
       on an earlier source) are discarded, not reported, since the run as
       a whole never reached a meaningful findings-based verdict.
     - ``status`` is ``"fail"`` when the check ran to completion and found at
-      least one BLOCKING finding -- a ``kind`` in
+      least one ATTRIBUTABLE blocking finding -- a ``kind`` in
       ``fixture_consistency.BLOCKING_FINDING_KINDS`` (``missing_key``,
-      ``coverage_shortfall``, ``load_error``) -- ``load_error`` now also
-      covers a canonical/scan file configured with an extension other than
+      ``coverage_shortfall``, ``load_error``) that
+      :func:`_fixture_finding_is_attributable` does not exclude (see the
+      Attribution paragraph below) -- ``load_error`` now also covers a
+      canonical/scan file configured with an extension other than
       ``.json``/``.yaml``/``.yml`` (spec 4.7 bullet 3; no implicit
       JSON-parse fallback is attempted for any other extension), exit 1.
     - ``status`` is ``"pass"`` when the check ran to completion with zero
-      BLOCKING findings, exit 0 -- a run whose only findings are
+      ATTRIBUTABLE blocking findings, exit 0 -- a run whose only findings are
       informational ``waiver_applied`` entries (spec 4.7 bullet 5,
       E6-F1-S1-T2: a record's in-fixture ``allow_missing`` marker
       suppressed what would otherwise have been a ``missing_key`` finding)
       still passes, because a validly waived record is not an unresolved
-      cross-reference problem (AC-E6-F1-S1-T2-1). The ``"findings"`` count
+      cross-reference problem (AC-E6-F1-S1-T2-1); so does a run whose only
+      blocking finding(s) are ``missing_key`` findings this command excludes
+      from attribution (spec 4.3; E6-F2-S1-T2 AC-6). The ``"findings"`` count
       on the status line is the TOTAL finding count (blocking and
       informational together, i.e. ``len(findings)``), not just the
-      blocking count -- it tells the reader how many ``[<kind>] ...`` lines
-      to expect below, and every finding (including every applied waiver)
-      is printed on BOTH the pass and the fail path, so the suppression
-      stays visible in the report even when it does not block the gate
-      (AC-E6-F1-S1-T2-2).
+      attributable-blocking count -- it tells the reader how many
+      ``[<kind>] ...`` lines to expect below, and every finding (including
+      every applied waiver and every non-attributable blocking finding) is
+      printed on BOTH the pass and the fail path, so nothing this command
+      found is ever silently hidden from the report even when it does not
+      block the gate (AC-E6-F1-S1-T2-2, E6-F2-S1-T2 AC-6).
 
-    No ``scope_hash`` field (spec 5.2; unlike ``check-reachability`` and
-    ``check-shared-file-impact``, which both compute one via
-    ``gate_records.compute_scope_hash`` over the calling unit's own Changes
-    Manifest). This check is deliberately NOT scoped to the calling unit's
-    Changes Manifest at all -- it cross-references the workspace-wide
-    configured ``gates.fixture_consistency.canonical_sources``/``scan``
-    file set against each other, independent of which unit happens to
-    invoke it, so there is no per-unit scope for a hash to be computed
-    over.
+    Attribution (spec 4.3, D-7; E6-F2-S1-T2 AC-6): this check's SCAN itself
+    stays exactly as described above -- entirely repo-wide, over the
+    workspace-wide configured ``gates.fixture_consistency.canonical_sources``/
+    ``scan`` file set, independent of which unit happens to invoke it, and
+    every finding that scan produces is always printed (see the previous
+    paragraph). Which of those findings can actually BLOCK this run --
+    and, transitively, whether a ``[GATE_PASS fixture_consistency]`` record
+    gets persisted below -- is narrower: a ``missing_key`` finding
+    (:func:`_fixture_finding_is_attributable`) blocks only when the fixture
+    or source file it names is a member of the CALLING unit's own resolved
+    Changes-Manifest scope (``work_unit_scope.resolve_changed_files``, the
+    same shared helper ``check-reachability``/``check-shared-file-impact``
+    use, spec 4.3, AC-9); a ``missing_key`` finding naming a file outside
+    that scope is reported (as above) but never counted toward ``status``,
+    matching spec 4.3's "repo-wide RESULTS, blame only within scope" rule.
+    ``coverage_shortfall`` and ``load_error`` are NOT filtered by scope --
+    both describe a canonical dataset or fixture-file problem that is not
+    naturally "in" any one unit's own changed-file set (a coverage
+    shortfall is a property of the whole canonical source; a load error
+    means the file could not be read AT ALL, so there is no reliable
+    identifier value to attribute it by), so either always blocks whichever
+    unit's run happens to observe it, exactly as before this attribution
+    rule existed.
 
-    This command does not currently persist a ``[GATE_PASS
-    fixture_consistency]`` record at all. That is a SEPARATE fact from the
-    ``scope_hash`` omission above -- ``mark-done`` DOES require a fresh
-    ``[GATE_PASS fixture_consistency]`` record (or operator ``[GATE_WAIVER
-    fixture_consistency]``) whenever ``gates.fixture_consistency`` resolves
-    enabled for the unit's repo: ``constants.GATE_TIERS`` marks
-    ``fixture_consistency`` machine-blocking, and
-    ``BacklogManager._check_gate_pass_done_invariant`` iterates every
+    Scope hash (spec 4.2, 5.2; design decision, E6-F2-S1-T2): the JSON
+    status line above still carries no ``scope_hash`` field, unlike
+    ``check-reachability``/``check-shared-file-impact`` -- this check's own
+    SCAN remains genuinely repo-wide, not scoped to the calling unit's
+    Changes Manifest, so there is still no meaningful "the scope this run
+    covered" hash to report on the line a human reads. But the
+    ``[GATE_PASS fixture_consistency]`` record persisted below (see the next
+    paragraph) DOES carry a ``scope_hash`` -- computed via the same
+    ``work_unit_scope.resolve_changed_files``/``ScopeResult.scope_hash``
+    the attribution rule above already resolves -- because
+    ``mark-done``'s existing, fully generic
+    ``BacklogManager._check_gate_pass_done_invariant`` recomputes every
+    non-``ancestry`` machine-blocking gate's scope hash the SAME way (over
+    the calling unit's current Changes Manifest file-blob-hashes,
+    ``BacklogManager._recompute_gate_scope_hash``), regardless of which
+    gate wrote the record. A record with no scope hash to compare against
+    could never be validated for freshness by that shared invariant, so a
+    later edit to an in-scope file would never invalidate it (AC-3 would be
+    unsatisfiable) -- the persisted record's scope hash is therefore over
+    the calling unit's own Changes Manifest specifically so
+    ``mark-done``'s existing, ungated recompute logic can validate it,
+    exactly like every other non-``ancestry`` gate, even though the CHECK
+    that earned the record is not itself scoped by that Manifest. A run
+    with an empty resolved scope (``ScopeResult.files`` empty, e.g. a unit
+    whose Changes Manifest is empty) has no scope to persist a hash for, so
+    a passing run in that case persists no record at all (mirrors
+    ``_emit_shared_file_impact_status``'s identical empty-scope
+    skip) -- such a unit can only satisfy ``mark-done``'s requirement for
+    this gate via an operator ``[GATE_WAIVER fixture_consistency]``.
+
+    This command persists a ``[GATE_PASS fixture_consistency]`` record
+    (composed by ``gate_records.compose_gate_pass_record``, the sole
+    authorized builder of that marker text, and appended to the unit's
+    audit trail by ``BacklogManager._append_audit_marker_before_comments``)
+    on every passing run whose resolved scope is non-empty -- closing the
+    gap this docstring used to describe (no command wrote this record at
+    all, leaving an operator waiver as the only route through ``mark-done``
+    for a unit whose repo resolves this gate enabled). ``mark-done`` DOES
+    require a fresh ``[GATE_PASS fixture_consistency]`` record (or operator
+    ``[GATE_WAIVER fixture_consistency]``) whenever
+    ``gates.fixture_consistency`` resolves enabled for the unit's repo:
+    ``constants.GATE_TIERS`` marks ``fixture_consistency`` machine-blocking,
+    and ``BacklogManager._check_gate_pass_done_invariant`` iterates every
     machine-blocking gate and refuses ``mark-done`` on the missing-record
-    case, matching ``docs/cli-reference.md``'s done-gate section. Because
-    this command writes no such record today, there is no way to satisfy
-    that invariant via a ``[GATE_PASS fixture_consistency]`` record until
-    this command persists one; the only route through ``mark-done`` today
-    for a unit whose repo resolves this gate enabled is an
-    operator-attributed ``[GATE_WAIVER fixture_consistency]`` marker
-    (``_check_gate_pass_done_invariant`` checks the waiver before it ever
-    looks for a record), written with ``uv run devbench log-waiver <judge>
-    <unit-id> --gate fixture_consistency --target <t> --reason <r>
-    --operator``. Closing the missing-record gap itself is tracked outside
-    this docstring's scope.
+    case, matching ``docs/cli-reference.md``'s done-gate section -- this is
+    ALREADY fully generic across every machine-blocking gate (E6-F2-S1-T2
+    adds no gate-specific branch to that invariant at all; it only makes
+    this command a genuine writer for the ``fixture_consistency`` case that
+    invariant already covered).
 
     Used as review evidence by the test-reviewer agent.
     """
     from dataclasses import replace as _replace
 
     from devbench.config_loader import resolve_gate_config
-    from devbench.fixture_consistency import (
-        BLOCKING_FINDING_KINDS,
-        FixtureConsistencyConfigError,
-        check_fixture_consistency,
-    )
+    from devbench.fixture_consistency import FixtureConsistencyConfigError, check_fixture_consistency
 
     resolved = _resolve_fixture_consistency_repo_path(unit_id)
     if isinstance(resolved, int):
         return resolved
-    canonical_repo, repo_path = resolved
+    unit, canonical_repo, repo_path = resolved
 
     fixture_config = RUNTIME_CONFIG.gates.fixture_consistency
     if not fixture_config.canonical_sources:
@@ -8782,10 +8860,51 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    blocking_findings = [finding for finding in findings if finding.kind in BLOCKING_FINDING_KINDS]
+    return _finalize_fixture_consistency_result(unit, unit_id, repo_path, fixture_config, findings)
+
+
+def _finalize_fixture_consistency_result(
+    unit: WorkUnit,
+    unit_id: str,
+    repo_path: Path,
+    fixture_config: "FixtureConsistencyConfig",
+    findings: "list[FixtureFinding]",
+) -> int:
+    """Resolve scope, apply attribution, persist a passing record, and print the verdict.
+
+    Split out of :func:`cmd_check_fixture_consistency` purely to keep that function's
+    return-count within the project's complexity lint budget (mirrors the existing
+    ``_prepare_ancestry_probe_context``-style helpers this module already uses for the
+    same reason) -- resolves ``unit_id``'s scope (spec 4.3, AC-9), applies the
+    attribution rule to *findings* (:func:`_fixture_finding_is_attributable`), persists
+    ``[GATE_PASS fixture_consistency]`` on a passing run with non-empty scope
+    (:func:`_write_gate_pass_record`), and prints the spec 5.2 status
+    line followed by the human-readable findings.
+    """
+    from devbench.fixture_consistency import BLOCKING_FINDING_KINDS
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+    scope_files = frozenset(scope.files)
+
+    blocking_findings = [
+        finding
+        for finding in findings
+        if finding.kind in BLOCKING_FINDING_KINDS and _fixture_finding_is_attributable(finding, scope_files)
+    ]
     status = GATE_STATUS_FAIL if blocking_findings else GATE_STATUS_PASS
+
+    if status == GATE_STATUS_PASS and scope.files:
+        write_result = _write_gate_pass_record(_FIXTURE_CONSISTENCY_GATE_NAME, unit, unit_id, scope)
+        if write_result is not None:
+            return write_result
+
     print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, status, len(findings)))
-    if not blocking_findings:
+    if status == GATE_STATUS_PASS:
         sources = ", ".join(source.path for source in fixture_config.canonical_sources)
         print(f"OK: fixture-catalog cross-reference check passed against canonical source(s): {sources}")
         _print_fixture_findings(findings)
@@ -8807,6 +8926,69 @@ def _print_fixture_findings(findings: "list[FixtureFinding]") -> None:
     """
     for finding in findings:
         print(f"  [{finding.kind}] {finding.message}")
+
+
+def _fixture_finding_is_attributable(finding: "FixtureFinding", scope_files: frozenset[str]) -> bool:
+    """Return whether *finding* can block the CALLING unit's own gate run (spec 4.3, AC-6).
+
+    Mirrors `_shared_file_gate_attributable`'s role for the shared-file-impact gate:
+    this check's own scan is repo-wide (every configured canonical source/scan target,
+    independent of any one unit), but spec 4.3's attribution rule limits which of those
+    repo-wide findings may actually BLOCK a given unit's run to findings that name a
+    file in that unit's own resolved Changes-Manifest scope
+    (`work_unit_scope.ScopeResult.files`).
+
+    SECURITY (security_review, E6-F2-S1-T2 round 5 HIGH): this function used to recover
+    the offending path by re-parsing `finding.message` with a regex anchored on
+    `fixture_consistency._MSG_MISSING_KEY`/`_MSG_SOURCE_LITERAL_MISSING_KEY`'s leading
+    `Fixture '<location>'`/`Source file '<location>'` fragment. That message is free text
+    interpolated into a single-quoted slot with no escaping, so a fixture whose own file
+    name legally contains an apostrophe (`o'brien.json`) truncated the regex capture at
+    the first `'`, producing a path (`tests/fixtures/o`) that is never a member of
+    *scope_files* even when the real file is -- an IN-SCOPE finding was silently
+    misattributed as out-of-scope, which stopped it blocking. `FixtureFinding.location`
+    (see its own docstring) removes that entire re-parsing surface: it is set directly by
+    the producing call site, `_check_scan_targets`/`_check_source_literals`, so there is
+    no free text to mis-split on any character a path may legally contain (apostrophe,
+    colon, newline, `..`, or any other value).
+
+    SECURITY (security_review AND code_review, E6-F2-S1-T2, orchestrator-directed closure
+    of a second bypass reaching the SAME end state as the round-5 HIGH above): `location`
+    and every member of *scope_files* used to be compared with NO canonicalisation --
+    `config_loader` stores a scan target's configured `path` verbatim, so a scan target
+    declared as `./mock.json` or `sub/../mock.json` compared unequal to the SAME file's
+    canonical `mock.json` Manifest spelling, again silently misattributing an in-scope
+    finding as out-of-scope. Both operands are now run through
+    `fixture_consistency.normalize_repo_relative_path` before comparison -- a purely
+    lexical operation (built on `posixpath.normpath`) that never touches the filesystem
+    (so it cannot resolve a symlink and change which unit a finding is attributed to) and
+    never case-folds (so a path differing only in case stays distinct). See that
+    function's own docstring for why an escaping `..` or an absolute path can never be
+    normalised into matching a genuine repo-relative Manifest entry.
+
+    Only `missing_key` findings are scope-filtered at all -- a `coverage_shortfall`
+    describes a whole canonical source's aggregate count, and a `load_error` means the
+    offending file could not even be read, so neither has a single reliable file to
+    attribute by; both remain unconditionally attributable (`True`) regardless of
+    `finding.location`'s value, exactly as before this attribution rule existed. A
+    `missing_key` finding whose `location` is `None` is also treated as attributable
+    (fail-closed, not fail-fast: nothing here aborts early, the run continues and the
+    unparseable finding is simply retained as blocking rather than excused) -- this
+    function must never silently narrow away a finding it cannot actually prove is out
+    of scope (mirrors `_shared_file_gate_attributable`'s identical "cannot attribute
+    away" rule). Today both `missing_key` producers populate `location` unconditionally,
+    so this branch is defensive: it protects against a future third `missing_key`
+    producer that forgets to set the field, not against a parse failure (there is no
+    parse step left to fail).
+    """
+    from devbench.fixture_consistency import FINDING_KIND_MISSING_KEY, normalize_repo_relative_path
+
+    if finding.kind != FINDING_KIND_MISSING_KEY:
+        return True
+    if finding.location is None:
+        return True
+    normalized_scope_files = {normalize_repo_relative_path(path) for path in scope_files}
+    return normalize_repo_relative_path(finding.location) in normalized_scope_files
 
 
 def _reject_em_dash(field_name: str, text: str) -> int | None:

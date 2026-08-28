@@ -226,9 +226,14 @@ silent no-op. Every applied waiver is itself surfaced as a `waiver_applied`
 finding in the check's own report, so the suppression is visible there too, not only in the
 fixture's diff -- printed on both the `pass` and `fail` output, since a validly waived record is
 informational, not a blocking problem: `check-fixture-consistency`'s `status` is computed from
-the BLOCKING finding kinds only (`missing_key`, `coverage_shortfall`, `load_error`), so a run
-whose only finding is an applied waiver still reports `status: "pass"` and exits 0. See
-`docs/cli-reference.md`'s `check-fixture-consistency` entry for the exact status/exit-code rule.
+the ATTRIBUTABLE BLOCKING finding kinds (`missing_key`, `coverage_shortfall`, `load_error`) --
+per spec 4.3, a `missing_key` finding is ATTRIBUTABLE only when the file it names, compared after
+lexical path normalisation, is a member of the calling unit's own resolved Changes-Manifest
+scope, while `coverage_shortfall` and `load_error` are never scope-filtered and always block
+regardless of scope -- so a run whose only
+finding is an applied waiver, or a `missing_key` finding naming a file outside that scope, still
+reports `status: "pass"` and exits 0. See `docs/cli-reference.md`'s `check-fixture-consistency`
+entry for the exact status/exit-code rule.
 
 **`gates.fixture_consistency.scan[].allow_missing` (the pre-E6-F1-S1-T2 workspace-config
 allowlist) is a REMOVED key** -- a complete replacement, not an addition. It shipped only in an

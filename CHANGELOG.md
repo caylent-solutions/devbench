@@ -5,6 +5,85 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-fixture-consistency` is wired into the `mark-done` done-path gate and proven
+  end to end by a journey suite** (spec `integration-reality-gates-hardening.md` section
+  4.2, 4.7 done-path sentence, 4.3 attribution rule; issue #17; E6-F2-S1-T2). A passing
+  run now persists `[GATE_PASS fixture_consistency] <iso-utc> <scope-hash>` to the
+  calling unit's audit trail from the command itself (never agent prose), closing the
+  deadlock where `mark-done` already required a fresh `[GATE_PASS fixture_consistency]`
+  record that no command could write, leaving an operator waiver as the only route to
+  `done` for a unit whose repo resolves this gate enabled (a unit whose repo resolves it
+  disabled reaches `done` without either); a failing or erroring run persists no record.
+  `mark-done` already
+  enforced this for every `constants.GATE_TIERS` machine-blocking gate generically
+  (`BacklogManager._check_gate_pass_done_invariant`) -- `fixture_consistency` was
+  declared machine-blocking since E2-F2 but had no writer until now, so this closes the
+  invariant's last real gap without adding a gate-specific branch anywhere in that
+  method. The persisted record's scope hash is computed over the calling unit's own
+  Changes Manifest via the shared `work_unit_scope.resolve_changed_files` helper (the
+  same one `check-reachability`/`check-shared-file-impact` use) so `mark-done`'s
+  existing stale-record recompute (spec 4.2 AC-7) can validate it identically to every
+  other non-`ancestry` gate, even though this gate's own catalog SCAN remains genuinely
+  repo-wide and the JSON status line still carries no `scope_hash` field. Attribution
+  (spec 4.3): a `missing_key` finding only blocks when the fixture/source file it names
+  is a member of the calling unit's own scope -- a mismatch outside that scope is still
+  reported (repo-wide, exactly as before) but never counted toward `status` or
+  persisted-record eligibility; `coverage_shortfall`/`load_error` findings are unaffected
+  by scope and always block, since neither describes a problem attributable to one
+  particular file. The new hermetic journey suite,
+  `tests/test_integration/test_gate_fixture_e2e.py`, drives the real CLI over scratch git
+  fixture repos for the full AC-14 matrix (block, pass, disabled, waiver, stale-record,
+  attribution) plus the four adversarial fixture shapes spec Section 10 names for this
+  gate: a typo'd `identifier_field`, an empty canonical catalog, an in-fixture waiver
+  visible in `git diff`, and a seeded source literal reported with `file:line`.
+
+- **Fixed: an apostrophe (or any other special character) in a fixture's filename could
+  defeat spec 4.3 attribution and let an inconsistent fixture reach `done`** (security
+  fix; E6-F2-S1-T2). Attribution used to recover a `missing_key` finding's offending file
+  path by re-parsing the finding's free-text `message` with a regex anchored on the
+  message template's leading `Fixture '<location>'`/`Source file '<location>'` fragment.
+  That message interpolates the path into a single-quoted slot with no escaping, so a
+  scan target or classified source file legitimately named with an apostrophe (e.g.
+  `o'brien.json`) truncated the regex capture at the first `'`, producing a path that was
+  never a member of the calling unit's own resolved scope even when the real file was --
+  silently misattributing an IN-SCOPE finding as out-of-scope, so it stopped blocking, a
+  `[GATE_PASS fixture_consistency]` record was persisted, and `mark-done` reached `done`
+  on an inconsistent fixture catalog. `fixture_consistency.FixtureFinding` now carries a
+  structured `location` field, populated directly by the two `missing_key` producers
+  (`_check_scan_targets`/`_check_source_literals`) at construction time -- there is no
+  longer any free text for the attribution rule to parse, so no path shape (apostrophe,
+  colon, newline, a `..` component, or any other legal character) can mis-split it. The
+  two prior regex helpers (`cli._FIXTURE_MISSING_KEY_LOCATION_RE`,
+  `_FIXTURE_LOCATION_LINE_SUFFIX_RE`) and the free-text parser they backed
+  (`_fixture_finding_location_path`) are deleted outright, not kept as a fallback.
+  `plugin/devbench-orchestrate/agents/review_team/test-reviewer.md` rubric item 54's
+  fixture-catalog guidance is also tightened: a `[missing_key]` finding printed under the
+  `OK:` banner is no longer dismissed unconditionally -- the reviewer must first cross-
+  check the finding's quoted path against the unit's own Changes Manifest, since
+  attribution is only as trustworthy as that self-attested Manifest and `mark-done` does
+  not independently verify it against the real diff. The evidence header presented to
+  that reviewer for this check now also documents that a passing run with a non-empty
+  scope persists a `[GATE_PASS fixture_consistency]` record.
+
+- **Fixed: an independently-spelled repo-relative path (a leading `./`, an internal
+  `a/../` component, or a trailing `/`) could also defeat spec 4.3 attribution, reaching
+  the same end state as the apostrophe bug above** (security fix; E6-F2-S1-T2). Attribution
+  compared a scan target's configured `path` against the calling unit's resolved
+  Changes-Manifest scope with NO canonicalisation on either side, so a scan target
+  declared `./mock.json` or `sub/../mock.json` compared unequal to that SAME file's
+  canonical `mock.json` Manifest spelling -- an IN-SCOPE finding was silently
+  misattributed as out-of-scope, a `[GATE_PASS fixture_consistency]` record was
+  persisted, and `mark-done` reached `done` on an inconsistent catalog. Both the
+  finding's `location` and every Manifest scope path are now run through the new
+  `fixture_consistency.normalize_repo_relative_path` helper before comparison -- a
+  purely lexical operation (`posixpath.normpath`) that never touches the filesystem
+  (so it cannot resolve a symlink and change which unit a finding is attributed to) and
+  never case-folds (so a path differing only in case is never treated as equivalent to
+  a genuine repo-relative Manifest entry). An absolute path or a path that escapes the
+  repo root via `..` is likewise never treated as equivalent to a genuine repo-relative
+  Manifest entry, because `posixpath.normpath` never fabricates a root-relative
+  interpretation for either shape, not because of the case-folding behaviour above.
+
 - **`check-fixture-consistency` gains a config-gated source-literal extraction mode**
   (spec `integration-reality-gates-hardening.md` section 4.7 bullet 4; issue #17
   AC-19; E6-F2-S1-T1). `gates.fixture_consistency.extract_source_literals`

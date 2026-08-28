@@ -22,6 +22,25 @@ input (spec 4.5, internal issue #12 AC3: the ancestry gate's resolved target
 ref commit sha, folded into the digest alongside the file mapping) -- so the
 whole module is testable without a live repo (spec Section 3.6).
 
+All four of `constants.GATE_TIERS`'s machine-blocking gates now write their
+`[GATE_PASS]` record through this module's `[GATE_PASS]` primitives (the
+`[GATE_WAIVER]` marker is composed on the operator's behalf by
+`devbench.backlog.manager.compose_gate_waiver_record`, not by this module --
+this module exposes only `[GATE_WAIVER]` readers, e.g.
+:func:`gate_waiver_records`/:func:`gate_waiver_targets`): `cli._write_ancestry_gate_pass_record`
+(ancestry, its own dedicated writer since it also persists a companion
+`[GATE_ANCESTRY_TARGET_REF]` marker atomically), the inline write in
+`cli.cmd_check_reachability` (reachability), and the shared
+`cli._write_gate_pass_record(gate_name, ...)` (shared_file_impact and, as of
+E6-F2-S1-T2, fixture_consistency -- extracted from what was previously two
+verbatim-duplicate per-gate writer functions, code_review round-1). No
+gate-specific branch was added anywhere in this module to support the fourth
+caller: `"fixture_consistency"` was already a fully valid `gate` argument to
+every function here (it has been declared in `GATE_TIERS` since E2-F2), so
+this module's part of closing the "no command persists this gate's record"
+gap was already done before E6-F2-S1-T2 started -- only a real production
+caller was missing.
+
 The marker is additive to the audit-comment contract (spec Section 5.3): a
 gate command may embed it as the message body of a normal audit comment
 (mirroring `[BLOCKED]`/`[QUOTA_WAITING]`-style bracketed tags -- see

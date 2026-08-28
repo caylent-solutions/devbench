@@ -241,6 +241,53 @@ class TestLatestGatePassRecord:
 
 
 @pytest.mark.unit
+class TestFixtureConsistencyGateParticipatesInTheSharedMarkerGrammar:
+    """E6-F2-S1-T2: `cli.cmd_check_fixture_consistency` becomes this module's first genuine
+    production caller for the ``"fixture_consistency"`` gate name (every function under test
+    here already accepted it structurally, since `constants.GATE_TIERS` already declared it
+    machine-blocking -- but nothing in production actually composed or read a
+    ``[GATE_PASS fixture_consistency]``/``[GATE_WAIVER fixture_consistency]`` record before this
+    task). Pins that the existing generic grammar needs no gate-specific branch to support it:
+    compose/parse/latest-lookup round-trip for ``"fixture_consistency"`` exactly like every other
+    declared gate."""
+
+    def test_compose_and_latest_round_trip_for_fixture_consistency(self) -> None:
+        from devbench.gate_records import compose_gate_pass_record, latest_gate_pass_record
+
+        marker = compose_gate_pass_record("fixture_consistency", "f" * 64, timestamp=datetime(2026, 3, 1, tzinfo=UTC))
+        content = f"## Comments\n\n[2026-08-14 02:58 UTC] [agent/check-fixture-consistency] {marker}\n"
+
+        latest = latest_gate_pass_record(content, "fixture_consistency")
+
+        assert latest is not None
+        assert latest.gate == "fixture_consistency"
+        assert latest.scope_hash == "f" * 64
+
+    def test_fixture_consistency_is_declared_machine_blocking(self) -> None:
+        """The done-path invariant (`BacklogManager._check_gate_pass_done_invariant`) only
+        requires a `[GATE_PASS <gate>]` record for gates whose tier is machine-blocking
+        (`constants.GATE_TIERS`) -- this is the fact E6-F2-S1-T2's whole done-path wiring
+        depends on, so it is pinned here alongside the marker grammar it is composed with."""
+        from devbench.constants import GATE_TIER_MACHINE_BLOCKING, GATE_TIERS
+
+        assert GATE_TIERS["fixture_consistency"] == GATE_TIER_MACHINE_BLOCKING
+
+    def test_fixture_consistency_gate_waiver_round_trips(self) -> None:
+        from devbench.gate_records import gate_waiver_targets
+
+        content = (
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER fixture_consistency] "
+            "2026-01-01T00:00:00+00:00 mock_lookup.json operator reviewed manually\n"
+        )
+
+        result = gate_waiver_targets(content, "fixture_consistency")
+
+        assert set(result) == {"mock_lookup.json"}
+        assert result["mock_lookup.json"].attribution == "operator"
+
+
+@pytest.mark.unit
 class TestAncestryTargetRefMarker:
     """`[GATE_ANCESTRY_TARGET_REF] <target-ref>` (spec 4.5, internal issue
     #12 AC3): the companion marker persisting the EXACT ref

@@ -544,10 +544,24 @@ class FixtureConsistencyConfig:
         canonical_sources: Designated canonical fixture/dataset file(s).
         scan: Mock/fixture files to cross-reference against a canonical
             source.
-        extract_source_literals: Reserved for a future literal-extraction
-            scanning mode (spec 4.7 hardening). Default
-            ``constants.GATE_EXTRACT_SOURCE_LITERALS_DEFAULT`` (``False``);
-            not yet consumed by ``check_fixture_consistency``.
+        extract_source_literals: Enables the config-gated source-literal
+            extraction scan mode (spec 4.7 bullet 4; caylent-solutions/
+            devbench-internal-backlog#17 AC-19; E6-F2-S1-T1): when
+            ``True``, ``check_fixture_consistency`` additionally scans the
+            classified source files in the repo checkout (pruning a fixed
+            set of dependency/build/vendor directories -- see
+            ``source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS``
+            -- and also excluding any file symlink whose resolved real
+            path falls outside the repo checkout root; a symlinked
+            directory is never descended into) for identifier literals
+            matching a configured ``identifier_field`` and flags one
+            absent from its canonical source's value set, redacted
+            unconditionally regardless of length. Heuristic, so
+            config-gated; default
+            ``constants.GATE_EXTRACT_SOURCE_LITERALS_DEFAULT`` (``False``)
+            -- see ``docs/devbench-yaml-reference.md``'s
+            ``gates.fixture_consistency.extract_source_literals`` section
+            for the documented accuracy bounds.
     """
 
     enabled: bool = GATE_ENABLED_DEFAULT

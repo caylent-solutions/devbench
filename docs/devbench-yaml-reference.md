@@ -128,8 +128,11 @@ calling `resolve_gate_config` once per gate rather than reading `RuntimeConfig.g
 per-gate check command adopts the resolver as its own hardening epic lands: `check-reachability`
 already reads both `enabled` and `entry_points` exclusively through `resolve_gate_config` (spec 4.4,
 E3-F1-S1-T2); `check-shared-file-impact` reads `enabled`, `auto_derive_registry` and
-`fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2); `check-fixture-consistency` and the ones
-later gate epics add follow in their own tasks.
+`fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2); `check-fixture-consistency` reads
+`extract_source_literals` the same way (spec 4.7 bullet 4, E6-F2-S1-T1) -- it still reads
+`canonical_sources`/`scan` directly off `RuntimeConfig.gates.fixture_consistency`, since those are
+project/per-repo-only structural fields `resolve_gate_config` does not manage at all (no built-in
+default to merge against); later gate epics adopt the resolver in their own tasks.
 
 ### Per-gate tunables
 
@@ -138,7 +141,7 @@ later gate epics add follow in their own tasks.
 | `reachability` | `entry_points` (issue #10 AC2) | `enabled` |
 | `ancestry` | none | `enabled` |
 | `shared_file_impact` | `auto_derive_registry`, `fan_in_threshold` | `enabled`, `patterns` |
-| `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (reserved, unused v1) | `enabled` |
+| `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (heuristic, default false; spec 4.7 bullet 4) | `enabled` |
 | `write_path_audit` | none | `enabled` |
 | `newly_reachable_paths` | none | `enabled` |
 | `composition_root` | none | `enabled` |
@@ -235,6 +238,141 @@ in-fixture marker above that replaced it, checked before JSON Schema validation 
 message can name the replacement (the schema's own `additionalProperties: false` rejection
 cannot).
 
+### `gates.fixture_consistency.extract_source_literals` -- source-literal extraction (spec `integration-reality-gates-hardening.md` 4.7 bullet 4; caylent-solutions/devbench-internal-backlog#17 AC-19; E6-F2-S1-T1)
+
+`extract_source_literals: true` (default `false`) adds a second, heuristic scan mode on top of
+the structured JSON/YAML cross-reference above: `check-fixture-consistency` additionally
+enumerates the classified source files in the repo checkout via
+`devbench.source_classification.iter_classified_source_files` (PM-3: the single owner of
+extension classification -- `fixture_consistency.py` declares no extension tuple of its own) and
+scans each file's text, line by line, for an assignment whose key matches a configured
+`identifier_field`. A matched literal is resolved against the UNION of every canonical source
+sharing that `identifier_field` name (never cross-producted against an unrelated canonical
+source): canonical sources that declare the same `identifier_field` are treated as one combined
+identifier namespace, so a literal present in ANY member of that group passes, and a literal
+absent from all of them produces a `missing_key` finding naming the whole group (the finding's
+canonical-source path is a comma-joined list when the group has more than one member) and
+carrying `file:line` (a 1-based line number), so a reviewer can jump straight to the offending
+assignment. "The classified source files" is a scanning BOUNDARY,
+not literally every file: `iter_classified_source_files` prunes a fixed set of dependency/build/
+vendor directory names (`.git`, `.venv`, `venv`, `node_modules`, `dist`, `build`, `vendor`,
+`third_party`, and others -- see `source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS` for
+the full, closed list) DURING the walk, so a literal that lives only under one of those pruned
+directories is never scanned at all. The same boundary also excludes a class of individual
+files, independent of the pruned-directory names above: a FILE symlink whose resolved real path
+(via `os.path.realpath`) falls OUTSIDE the resolved scope root is excluded from the scan --
+whether the symlink is live or dangling. A FILE symlink whose resolved real path falls INSIDE the
+resolved scope root is still included, exactly like an ordinary file. A symlinked DIRECTORY is
+never descended into at all (`os.walk`'s own default `followlinks=False`), so nothing under a
+symlinked directory is ever scanned regardless of where that directory's target resolves -- this
+applies even when the target resolves inside the scope root. A repo checkout whose only
+classified source files happen to live entirely under a pruned directory, OR whose only
+classified source file is an out-of-root symlink, resolves to ZERO classified source files in
+scope, which hits the loud pre-scan error described below exactly the same way a repo with no
+classified source files anywhere would.
+
+**The identifier_field grammar.** A candidate assignment is `<field>` (optionally
+single/double-quoted, matching a JSON/JS/TS object key or a quoted dict key), followed by a `:`
+or `=` separator (optional surrounding whitespace), followed by either a single/double-quoted
+string literal or a bare integer/float literal -- e.g. `"sku": "SKU-DOES-NOT-EXIST"`,
+`sku = "SKU-DOES-NOT-EXIST"`, or `sku: "SKU-DOES-NOT-EXIST"` all match an `identifier_field` of
+`sku`. Matching happens per PHYSICAL LINE, never across a multi-line span -- this is what makes
+the reported line number meaningful, at the cost of the bounds below.
+
+**Documented accuracy bounds (why this mode defaults off).** This is a regex-based heuristic
+scan, not a parser, for any of the languages `source_classification.SOURCE_EXTENSIONS` covers:
+
+- It has no notion of comments: a literal inside a `#`/`//`/`/* */` comment, or inside a string
+  that merely *looks* like an assignment, is matched and flagged exactly like reachable code.
+- It has no notion of reachability or dead code: an assignment inside a function that is never
+  called, or behind a permanently-false conditional, is still scanned.
+- The grammar's quoted-content match requires a BARE quote character (`'` or `"`) to appear
+  IMMEDIATELY after the `:`/`=` separator (only whitespace may sit between them). When that bare
+  chunk is itself the first operand of a plain string concatenation (`"PRE" + suffix`,
+  `"GHOST-A" + "GHOST-B"`), it is matched on its FIRST quoted chunk only: `"PRE" + suffix` is
+  reported as the literal value `PRE` (a partial-literal false positive, since `PRE` alone was
+  never the intended complete value). The same first-chunk partial match happens when the
+  concatenation's continuation is on a SECOND physical line (`"GHOST-A" +` followed by
+  `"GHOST-B"` on the next line, or a backslash-continued Python assignment): the assignment's own
+  line is still scanned in isolation and still matches its first quoted chunk, so this is not a
+  "never matched" case either. Anything that puts a non-quote character between the separator and
+  the opening quote is simply UNMATCHED, never a partial match: an f-string/r-string/b-string/
+  u-string prefix (`f"{prefix}-SKU"`, `r"RAW-GHOST"`, `b"BYTES-GHOST"`) puts its prefix letter
+  there regardless of whether a leading literal chunk exists before any placeholder; a backtick
+  template literal (`` `GHOST-BT` ``) is never matched at all, since a backtick is not in the
+  grammar's quote-character class; and a parenthesised expression (`("GHOST-A" + "GHOST-B")`)
+  puts the opening `(` there. All three are simply never detected, not misreported.
+- A value spread across more than one physical line via a triple-quoted string (Python
+  `"""..."""`/`'''...'''`) is never matched -- the grammar explicitly rejects an opening quote
+  immediately followed by another instance of the same quote character (the start of a
+  triple-quote run), so this includes a triple-quoted value that happens to fit entirely on ONE
+  line (`sku = """GHOST-TQ"""`), which is also never matched, and a genuinely empty single/double
+  quoted string (`sku = ""`), which is likewise never matched -- rather than misreporting either
+  shape with a spurious empty literal value.
+- It does not decode escape sequences: `sku = "A\"B-GHOST"` is reported with the literal value
+  containing the raw, undecoded `\"` rather than a decoded `"`.
+- A value containing the OPPOSITE quote character from its own delimiter (`sku = "it's-GHOST"`) is
+  never matched at all -- the grammar's quoted-content character class excludes both quote
+  characters unless backslash-escaped, so an UNESCAPED embedded quote of either kind terminates
+  the match attempt with no closing delimiter found. A backslash-escaped embedded quote does not
+  terminate the match (it is consumed by the same undecoded-escape handling described above):
+  `sku = "A\"B-GHOST"` matches, with the raw undecoded `\"` included in the reported value.
+- It matches ANY assignment shape satisfying the grammar, regardless of which class, dict, or
+  data structure the key belongs to -- a coincidental variable name collision with a configured
+  `identifier_field` (e.g. a wholly unrelated `sku` local variable) can produce a false positive.
+
+Because of these bounds, a workspace enabling this mode should expect occasional false positives
+and should expect a handful of genuinely drifted literals to go undetected -- it is a
+drift-detection aid for catching stale hard-coded literals a reviewer would otherwise have to
+notice by eye, not a sound analysis. **There is no waiver mechanism for a source-literal
+finding**: the in-fixture `allow_missing` marker documented above is consulted only for the
+structured scan-target cross-reference (`_check_scan_targets`), never for `_check_source_literals`
+-- a source file is never parsed as a structured fixture record, so it has no record to attach a
+marker to in the first place. The only remedies for a source-literal `missing_key` finding (spec
+4.7 bullet 4; matching `fixture_consistency._MSG_SOURCE_LITERAL_MISSING_KEY`'s own wording
+verbatim) are: fix the literal to reference a real canonical key, correct the canonical source if
+it is the one that is incomplete, or disable `gates.fixture_consistency.extract_source_literals`
+entirely if the finding is a false positive of one of the bounds documented above. **Enabling the
+mode when the repo checkout resolves ZERO classified source files** is a loud, pre-scan
+`FixtureConsistencyConfigError` naming the resolved scope and the
+`gates.fixture_consistency.extract_source_literals` key (spec Section 7: an enabled mode that
+silently inspected nothing must never look identical to a genuine, clean pass, mirroring the
+empty-`scan`-list and zero-match-`identifier_field` shapes) -- this includes both the
+pruned-directory case described above AND a checkout whose only classified source file is an
+out-of-root symlink (excluded by the symlink boundary described above), a second route to this
+same zero-classified-source-files error. **A directory under the resolved scope that cannot be
+listed** (e.g.
+permission denied) aborts the walk with exactly one `load_error` finding naming the unreadable
+directory, rather than silently skipping that subtree and reporting a clean pass having inspected
+only part of the resolved scope (spec Section 7). **A source file that raises `UnicodeDecodeError`
+or `OSError`** while being read produces exactly one `load_error` finding naming the file; every
+other classified source file is still scanned
+(never a silent `except (...): continue`).
+
+**What a `missing_key` finding prints, and the redaction posture on the extracted value
+(SECURITY, security_review AND code_review round-4, convergent findings).** This mode's own
+selection logic reports exactly the literals ABSENT from the canonical catalog -- a hard-coded
+credential assigned to a matching `identifier_field` key via a grammar-matched assignment shape
+(see "The identifier_field grammar" above) is reported here, since it can never appear in a
+legitimate canonical catalog; a credential assigned via a shape the grammar does not match (e.g.
+an f-string/r-string/b-string prefix, a backtick template literal, a parenthesised expression, or
+a value containing an unescaped opposite quote character -- see the accuracy bounds above) is not
+scanned at all, exactly like any other literal in an unmatched shape. Because gate stdout flows
+into CI job logs and review comments, the finding NEVER reproduces any part of the extracted
+value, regardless of its length: there is no length threshold below which a value is echoed in
+full. A prior length threshold of 32 characters (below which a value was shown unredacted) and a
+disclosed 4-character prefix on longer values were both found indefensible -- a Stripe live
+secret key and a session identifier of exactly 32 characters sat precisely on the old threshold,
+and a 4-character prefix is exactly the length of common credential-type prefixes (`ghp_`,
+`AKIA`, `AIza`, `eyJh`), disclosing credential type and issuer for no review benefit `file:line`
+does not already provide. The finding instead prints the placeholder
+`<redacted, N chars total; see file:line above to inspect it directly>`, naming only the value's
+original length, never any of its content -- this is a UNIFORM policy applied to every value
+regardless of its shape, never a credential-shape heuristic (matching a `ghp_`/`sk-`/`eyJ`
+prefix, for example) that could fail open on a format it does not recognise. The finding still
+carries `file:line` and the matched field name, sufficient for a reviewer to open the file and
+inspect the value directly.
+
 ### `gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` -- auto-derived shared-file registry (caylent-solutions/devbench-internal-backlog#13 AC4)
 
 The hand-maintained glob list below (`gates.repos.<org/repo>.shared_file_impact.patterns`) decays:
@@ -257,7 +395,15 @@ whose extension is not classified as source):
   unlisted SUBDIRECTORY anywhere under the repo -- e.g. `bower_components/`, `.direnv/`,
   `target/` -- still has its own internals scanned and voted on; this applies only to
   subdirectories the walk descends into, not to the repo root itself, which is always scanned
-  regardless of what it is named), extracts each file's import/require targets via
+  regardless of what it is named. This same walk also excludes a class of individual files,
+  independent of the pruned-directory names above: a FILE symlink whose resolved real path (via
+  `os.path.realpath`) falls OUTSIDE the resolved repo root is excluded from both scanning AND
+  fan-in voting, whether the symlink is live or dangling; one resolving INSIDE the repo root is
+  still included, exactly like an ordinary file. A symlinked DIRECTORY is never descended into at
+  all (`os.walk`'s own default `followlinks=False`), so a `.py` file living only under a
+  symlinked directory neither votes nor is scanned -- see `iter_classified_source_files` for the
+  shared implementation both this gate and `extract_source_literals` above delegate to), extracts
+  each file's import/require targets via
   `source_classification.extract_import_targets` (language-appropriate scanning dispatched on the
   extension the file already carries -- Python `import`/`from ... import`, the JS/TS family's
   `import`/`require`/dynamic `import()`/`export ... from`/`export * from`, Go's `import` blocks

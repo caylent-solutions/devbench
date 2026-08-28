@@ -674,3 +674,250 @@ class TestExtractImportTargets:
         from devbench.source_classification import extract_import_targets
 
         assert extract_import_targets(".PY", "import shared_module\n") == ["shared_module"]
+
+
+class TestClassifiedSourceWalkExcludedDirs:
+    """`CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS` (spec 4.7 bullet 4, source-literal extraction,
+    E6-F2-S1-T1) -- the directories `iter_classified_source_files` prunes during its walk."""
+
+    def test_membership_is_pinned(self) -> None:
+        from devbench.source_classification import CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS
+
+        expected = frozenset(
+            {
+                ".git",
+                ".venv",
+                "venv",
+                "node_modules",
+                "__pycache__",
+                ".tox",
+                ".nox",
+                ".mypy_cache",
+                ".pytest_cache",
+                ".ruff_cache",
+                ".eggs",
+                "site-packages",
+                "dist",
+                "build",
+                "htmlcov",
+                "vendor",
+                "third_party",
+            }
+        )
+        assert expected == CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS
+
+
+class TestIterClassifiedSourceFiles:
+    """`iter_classified_source_files` (spec 4.7 bullet 4; caylent-solutions/devbench-internal-backlog#17
+    AC-19; E6-F2-S1-T1) -- the enumeration entry point `fixture_consistency`'s config-gated
+    `extract_source_literals` scan mode uses to discover candidate source files, dispatching
+    purely on `is_source_extension` (PM-3: no second extension tuple)."""
+
+    def test_finds_classified_source_files_and_skips_others(self, tmp_path: Path) -> None:
+        from devbench.source_classification import iter_classified_source_files
+
+        (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "notes.md").write_text("# not source\n", encoding="utf-8")
+        (tmp_path / "data.json").write_text("{}", encoding="utf-8")
+
+        results = iter_classified_source_files(tmp_path)
+
+        assert results == [tmp_path / "app.py"]
+
+    def test_prunes_excluded_directories(self, tmp_path: Path) -> None:
+        from devbench.source_classification import iter_classified_source_files
+
+        (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+        vendored = tmp_path / "node_modules" / "pkg"
+        vendored.mkdir(parents=True)
+        (vendored / "index.js").write_text("module.exports = {};\n", encoding="utf-8")
+
+        results = iter_classified_source_files(tmp_path)
+
+        assert results == [tmp_path / "app.py"]
+
+    def test_unlisted_subdirectory_is_still_scanned(self, tmp_path: Path) -> None:
+        """A subdirectory not in `CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS` (e.g. an app-defined
+        `services/` tree) still has its own internals scanned and returned."""
+        from devbench.source_classification import iter_classified_source_files
+
+        nested = tmp_path / "services" / "billing"
+        nested.mkdir(parents=True)
+        (nested / "invoice.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(tmp_path)
+
+        assert results == [nested / "invoice.py"]
+
+    def test_empty_directory_returns_empty_list(self, tmp_path: Path) -> None:
+        from devbench.source_classification import iter_classified_source_files
+
+        assert iter_classified_source_files(tmp_path) == []
+
+    def test_results_are_sorted_deterministically(self, tmp_path: Path) -> None:
+        from devbench.source_classification import iter_classified_source_files
+
+        (tmp_path / "zeta.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_path / "alpha.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(tmp_path)
+
+        assert results == [tmp_path / "alpha.py", tmp_path / "zeta.py"]
+
+
+class TestIterClassifiedSourceFilesSymlinkBoundary:
+    """SECURITY (security_review round-3 MEDIUM finding): the classified-source-file NAME (its
+    path under *root*) previously determined whether a candidate was enumerated, while a later
+    `Path.read_text` call on that candidate follows a symlink to whatever it actually points at
+    -- so a symlink committed inside the repo whose target resolves OUTSIDE the walked root was a
+    read primitive for arbitrary filesystem content under a path that looked like it belonged to
+    the scanned repo. Combined with `fixture_consistency`'s source-literal extraction mode (which
+    echoes matched file content into gate output), this was a read-and-echo primitive. The fix:
+    skip a candidate whose resolved real path falls outside the resolved *root*, comparing both
+    sides resolved so a *root* itself reached through a symlink (common for `/tmp` on macOS, or a
+    bind mount) is not spuriously treated as "everything is outside root"."""
+
+    def test_symlink_resolving_outside_root_is_excluded(self, tmp_path: Path) -> None:
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text("SECRET_TOKEN = 'do-not-scan-me'\n", encoding="utf-8")
+        (root / "linked.py").symlink_to(outside / "secret.py")
+        (root / "normal.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "normal.py"], (
+            f"a symlink whose resolved target lies outside the walked root must never be enumerated, got: {results}"
+        )
+
+    def test_symlink_resolving_inside_root_is_included(self, tmp_path: Path) -> None:
+        """DECISION: a symlink whose target also resolves inside *root* discloses nothing
+        outside the repo -- it is included, exactly like an ordinary file, even though this can
+        enumerate the same on-disk content twice under two different repo-relative paths (once
+        directly, once via the symlink). Excluding every symlink unconditionally would silently
+        drop legitimate scan coverage for a real, in-repo authoring pattern (e.g. a compatibility
+        shim re-exporting a moved module) with no security benefit, since nothing crosses the
+        repo boundary."""
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "real.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (root / "shim.py").symlink_to(root / "real.py")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "real.py", root / "shim.py"]
+
+    def test_dangling_symlink_resolving_inside_root_is_still_included(self, tmp_path: Path) -> None:
+        """A dangling symlink whose (nonexistent) target still names a location inside *root* is
+        included, unchanged from pre-fix behaviour -- it is not filtered on `Path.is_file()` (the
+        shared-file gate's own documented non-regression, `cli._derive_shared_file_registry`'s
+        `Raises:` block), so attempting to read it still surfaces as a loud `OSError`/`load_error`
+        downstream rather than a silent skip."""
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        (root / "dangling.py").symlink_to(root / "does_not_exist.py")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "dangling.py"]
+
+    def test_dangling_symlink_resolving_outside_root_is_excluded(self, tmp_path: Path) -> None:
+        """A dangling symlink whose target string names a location OUTSIDE *root* is excluded
+        the same way a live out-of-root symlink is -- the boundary check is based on the
+        resolved target path, not on whether that target actually exists."""
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        (root / "dangling_outside.py").symlink_to(outside / "does_not_exist_either.py")
+        (root / "normal.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "normal.py"]
+
+    def test_root_itself_reached_through_a_symlink_still_scans_normally(self, tmp_path: Path) -> None:
+        """The boundary check must resolve BOTH the candidate and *root* before comparing --
+        resolving only the candidate while leaving *root* as the unresolved symlinked path passed
+        in would make every real file under *root* look like it resolves "outside" that
+        unresolved root, silently excluding everything."""
+        from devbench.source_classification import iter_classified_source_files
+
+        real_root = tmp_path / "real_repo"
+        real_root.mkdir()
+        (real_root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        symlinked_root = tmp_path / "symlinked_repo"
+        symlinked_root.symlink_to(real_root)
+
+        results = iter_classified_source_files(symlinked_root)
+
+        assert results == [symlinked_root / "app.py"]
+
+    def test_symlink_resolving_into_a_prefix_sharing_sibling_directory_is_excluded(self, tmp_path: Path) -> None:
+        """SECURITY (WARN 2, test_review round-4): the boundary comparison in
+        :func:`_resolves_outside_root` must be a true path-component containment check, never a
+        naive string-prefix comparison. A root of ``tmp_path / "repo"`` and an out-of-root target
+        of ``tmp_path / "repo-evil"`` share the string prefix ``"repo"`` even though
+        ``repo-evil`` is a distinct SIBLING directory, not a subdirectory, of ``repo`` -- a
+        rewrite of the comparison to
+        ``not str(resolved_candidate).startswith(str(resolved_root))`` would wrongly treat
+        ``repo-evil/secret.py`` as being "inside" ``repo`` (since the string ``".../repo-evil/..."``
+        starts with the string ``".../repo"``) and include it, disclosing sibling-directory
+        content the boundary check exists to keep out. The six other cases in this class all use
+        ``tmp_path / "outside"`` as their out-of-root target, whose name shares no prefix with
+        ``tmp_path / "repo"`` at all, so none of them can catch this particular escape."""
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        evil_sibling = tmp_path / "repo-evil"
+        evil_sibling.mkdir()
+        (evil_sibling / "secret.py").write_text("SECRET_TOKEN = 'do-not-scan-me'\n", encoding="utf-8")
+        (root / "linked.py").symlink_to(evil_sibling / "secret.py")
+        (root / "normal.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "normal.py"], (
+            f"a symlink resolving into a prefix-sharing SIBLING directory must be excluded "
+            f"exactly like one resolving into any other out-of-root directory, got: {results}"
+        )
+
+    def test_symlinked_directory_is_never_descended_into(self, tmp_path: Path) -> None:
+        """W4 (round-4 code_review): the "symlinked DIRECTORY is never descended into" claim in
+        :func:`iter_classified_source_files`'s own docstring previously rested entirely on
+        ``os.walk``'s unpinned default ``followlinks=False`` -- a future edit passing
+        ``followlinks=True`` (e.g. to "fix" a coverage gap elsewhere) would silently flip this
+        behaviour with no test catching it. A file living ONLY under a symlinked directory
+        (whose target resolves INSIDE *root*, so the file-level boundary check in
+        :func:`_resolves_outside_root` would not itself exclude it) must never appear in the
+        result -- proving the exclusion is genuinely about not descending into the directory at
+        all, not about the file-level symlink boundary check."""
+        from devbench.source_classification import iter_classified_source_files
+
+        root = tmp_path / "repo"
+        root.mkdir()
+        real_dir = root / "real_dir"
+        real_dir.mkdir()
+        (real_dir / "inner.py").write_text("x = 1\n", encoding="utf-8")
+        (root / "linked_dir").symlink_to(real_dir)
+        (root / "normal.py").write_text("x = 1\n", encoding="utf-8")
+
+        results = iter_classified_source_files(root)
+
+        assert results == [root / "normal.py", real_dir / "inner.py"], (
+            f"a symlinked directory must never be descended into -- its contents must never be "
+            f"reached via the symlinked path, got: {results}"
+        )
+        assert (root / "linked_dir" / "inner.py") not in results, (
+            f"the file must never be reachable through the symlinked directory path, got: {results}"
+        )

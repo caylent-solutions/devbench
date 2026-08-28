@@ -47,6 +47,7 @@ from devbench.constants import (
     TDD_PHASE_RED_OBSERVED,
 )
 from devbench.github.git_ops import CIResult
+from devbench.source_classification import CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS
 
 
 @pytest.fixture
@@ -12238,6 +12239,96 @@ class TestSharedFileAutoDerive:
         finally:
             unreadable.chmod(original_mode)
 
+    def test_unreadable_directory_raises_loud_error_instead_of_a_silent_partial_registry(self, tmp_path: Path) -> None:
+        """E6-F2-S1-T1 round-2 code_review/test_review/changes_manifest finding: the
+        round-1 Blocking 6 DRY delegation to
+        :func:`devbench.source_classification.iter_classified_source_files` also
+        imports that walk's ``onerror=_reraise_walk_error`` policy into the
+        shared-file-impact gate. An unreadable subdirectory must surface as this
+        gate's own documented ``ERROR: import scan failed`` ``RuntimeError`` shape
+        (the same shape :func:`_derive_shared_file_registry`'s ``Raises:`` block
+        already promises and :func:`_prepare_shared_file_impact_run` already
+        catches) -- never an uncaught ``PermissionError`` escaping past that
+        ``except RuntimeError`` guard, and never a silent partial registry that
+        looks identical to a clean pass having genuinely inspected the whole
+        scope."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        locked_dir = tmp_path / "locked"
+        locked_dir.mkdir()
+        (locked_dir / "consumer_locked.py").write_text("import shared_module\n")
+        original_mode = locked_dir.stat().st_mode
+        locked_dir.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+                cli._derive_shared_file_registry(tmp_path, 3)
+            assert "locked" in str(exc_info.value), (
+                f"expected the RuntimeError to name the unreadable 'locked' directory, got: {exc_info.value}"
+            )
+            # W-a (E6-F2-S1-T1 round-3 code_review): the reported directory is repo-RELATIVE,
+            # matching this same gate's sibling file-level message
+            # (``ERROR: import scan failed for {rel}: {exc}``) and
+            # ``fixture_consistency._MSG_SOURCE_SCAN_DIRECTORY_FAILED``'s own ``directory`` slot,
+            # never an absolute tmp_path-prefixed form.
+            assert "directory locked:" in str(exc_info.value), (
+                f"expected the directory slot to be repo-relative 'locked', got: {exc_info.value}"
+            )
+            assert f"directory {tmp_path}" not in str(exc_info.value), (
+                f"expected the directory slot to be repo-relative, not absolute-path-prefixed, got: {exc_info.value}"
+            )
+        finally:
+            locked_dir.chmod(original_mode)
+
+    def test_repo_root_itself_unreadable_names_the_root_not_a_bare_dot(self, tmp_path: Path) -> None:
+        """W3 (round-4 doc_review + code_review): CHANGELOG.md claims this gate's
+        directory-not-found message 'names the unreadable directory repo-relatively (matching
+        the file-level message next to it)'. When the unreadable directory IS the repo root
+        itself, ``raw_directory.relative_to(repo_path)`` collapses to ``Path('.')``, whose
+        ``.as_posix()`` is the bare, unhelpful string ``'.'`` -- exactly the shape
+        ``fixture_consistency._check_source_literals`` already special-cases (W-b, round-3
+        code_review). ``_iter_shared_file_scan_candidates`` must apply the SAME special case so
+        the two siblings genuinely match, rather than one emitting a useless bare dot."""
+        original_mode = tmp_path.stat().st_mode
+        tmp_path.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+                cli._derive_shared_file_registry(tmp_path, 3)
+            assert "directory .:" not in str(exc_info.value), (
+                f"expected the repo root's own directory slot to name the root path, not a bare "
+                f"'.', got: {exc_info.value}"
+            )
+            assert f"directory {tmp_path}:" in str(exc_info.value), (
+                f"expected the directory slot to name the repo root path '{tmp_path}', got: {exc_info.value}"
+            )
+        finally:
+            tmp_path.chmod(original_mode)
+
+    def test_unreadable_directory_outside_repo_path_falls_back_to_the_raw_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """W-a's repo-relative conversion (``raw_directory.relative_to(repo_path)``) cannot
+        succeed for every possible ``OSError.filename`` -- mirrors
+        ``fixture_consistency``'s own identical guard
+        (``TestSourceLiteralExtractionUnreadableDirectory
+        ::test_unreadable_directory_outside_repo_path_falls_back_to_the_raw_path``).
+        Monkeypatches ``iter_classified_source_files`` to raise an ``OSError`` naming a path that
+        is not a descendant of *repo_path* at all -- the code must not assume a real
+        ``os.walk`` under *repo_path* could never itself produce this shape."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        outside_dir = tmp_path.parent / "definitely-outside-the-repo"
+
+        def _raise_outside_oserror(root: Path) -> list[Path]:
+            raise OSError(13, "Permission denied", str(outside_dir))
+
+        monkeypatch.setattr(cli, "iter_classified_source_files", _raise_outside_oserror)
+
+        with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+            cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert str(outside_dir) in str(exc_info.value), (
+            f"expected the raw absolute path fallback since '{outside_dir}' is not under "
+            f"'{tmp_path}', got: {exc_info.value}"
+        )
+
     def test_dangling_symlink_raises_loud_error_naming_the_path(self, tmp_path: Path) -> None:
         """D4 (round 1 doc_review): a broken symlink is never silently skipped --
         the scan candidate list is never filtered on ``Path.is_file()`` (which
@@ -12249,6 +12340,63 @@ class TestSharedFileAutoDerive:
 
         with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for dangling\.py"):
             cli._derive_shared_file_registry(tmp_path, 3)
+
+    def test_symlink_resolving_outside_repo_path_is_silently_excluded_never_read(self, tmp_path: Path) -> None:
+        """SECURITY (security_review round-3 MEDIUM finding, E6-F2-S1-T1): a symlink whose
+        target resolves OUTSIDE *repo_path* is excluded at enumeration time by
+        ``source_classification.iter_classified_source_files``'s own boundary check -- it never
+        reaches this gate's ``read_text`` call at all, so it neither raises (unlike the dangling
+        in-repo case above) nor contributes any content to the derived registry.
+
+        test_review round-4 WARN: this test previously seeded ``shared_module.py`` with a
+        fan-in of 4 against the default threshold of 3, so ``"shared_module.py" in result``
+        stayed true regardless of whether the out-of-root symlink exclusion ran at all, and
+        ``linked_outside.py`` can never be counted in the first place because the registry is
+        keyed by IMPORTED module name, never by an importer's own filename -- so neither
+        assertion could ever fail. Seeding EXACTLY the threshold (3) instead means
+        ``shared_module.py`` is only excluded from the result if the out-of-root symlink is
+        never read as a fourth, silently-crediting importer; removing the exclusion in
+        ``_resolves_outside_root`` makes ``linked_outside.py`` a real (if unreachable-by-name)
+        fourth importer and flips this assertion from pass to fail."""
+        self._write_fan_in_fixture(tmp_path, importer_count=3)
+        outside = tmp_path.parent / "outside-the-repo"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.py").write_text("import shared_module\n" * 10, encoding="utf-8")
+        (tmp_path / "linked_outside.py").symlink_to(outside / "secret.py")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert "shared_module.py" not in result, (
+            "the out-of-root symlink must never be read as a fan-in vote: at exactly the "
+            "threshold (3 real importers), a fourth (silent) vote from the excluded symlink "
+            "would wrongly push shared_module.py's fan-in strictly above threshold"
+        )
+
+    def test_scan_candidates_delegates_to_the_shared_classified_source_enumeration(self) -> None:
+        """W6 (round-2 test_review advisory): a structural regression guard, mirroring
+        this repo's own ``inspect.getsource`` precedent (e.g.
+        ``TestCheckSourceLiteralsUsesSharedClassifiedSourceEnumeration`` in
+        ``tests/test_fixture_consistency.py``, and
+        ``TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync`` in this file). Without
+        this pin, reverting round-1 Blocking 6's DRY fix -- restoring a hand-copied
+        ``os.walk`` body inside ``_iter_shared_file_scan_candidates`` instead of delegating to
+        ``source_classification.iter_classified_source_files`` -- kills zero tests: a hand-rolled
+        walk that prunes the same directory names and filters on the same extensions produces
+        byte-identical results for every OTHER test in this class."""
+        import inspect
+
+        source = inspect.getsource(cli._iter_shared_file_scan_candidates)
+        assert "iter_classified_source_files" in source, (
+            "_iter_shared_file_scan_candidates must enumerate candidate files via "
+            "source_classification.iter_classified_source_files (spec 4.3 PM-3 / E6-F2-S1-T1 "
+            "round-1 Blocking 6), not a hand-copied os.walk body"
+        )
+        # Stronger than a bare substring check: requires the actual CALL expression (not
+        # merely a docstring/comment mention of the name, which could survive a real
+        # call-site substitution unchanged), and rejects a hand-copied walk reappearing in
+        # the same function body.
+        assert "iter_classified_source_files(repo_path)" in source
+        assert "os.walk(" not in source
 
     # -- A1 (round 1 code_review): resolution against the importer's own package/
     # relative location and the repo-root module path, never a global basename index
@@ -12700,7 +12848,7 @@ class TestSharedFileAutoDerive:
         assert result == set()
         assert "shared.py" not in result
 
-    # -- Round-2 test_review finding: 11 of 14 (now 16) _SHARED_FILE_SCAN_EXCLUDED_DIRS
+    # -- Round-2 test_review finding: 11 of 14 (now 16) excluded-directory
     # entries could previously be removed individually with zero test failures
     # (only `.git` was pinned; `.venv`/`site-packages` were pinned only as a
     # conjunction via the `.venv/lib/site-packages` fixture path). This
@@ -12708,11 +12856,17 @@ class TestSharedFileAutoDerive:
     # must never cast a fan-in vote, even a vote that would otherwise push a
     # target over threshold.
 
-    # Hard-coded (never read from `cli._SHARED_FILE_SCAN_EXCLUDED_DIRS` itself):
-    # parametrizing over the production constant would make a removed entry
-    # silently vanish from this test's own case list rather than fail it. The
-    # companion equality-pin test below independently pins the constant's exact
-    # membership, so an addition or removal on either side is caught.
+    # Hard-coded (never read from `source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS`
+    # itself): parametrizing over the production constant would make a removed
+    # entry silently vanish from this test's own case list rather than fail it.
+    # The companion equality-pin test below independently pins the constant's
+    # exact membership, so an addition or removal on either side is caught.
+    #
+    # Round-2 code_review finding W3: this used to pin `cli._SHARED_FILE_SCAN_
+    # EXCLUDED_DIRS`, a module-level alias of the same constant that Blocking 6's
+    # walk delegation left with zero production consumers. Pinning the shared
+    # `source_classification` constant directly is the same regression coverage
+    # with no dead re-export required to carry it.
     _EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS = frozenset(
         {
             ".git",
@@ -12736,7 +12890,7 @@ class TestSharedFileAutoDerive:
     )
 
     def test_excluded_dirs_constant_membership_is_pinned(self) -> None:
-        assert cli._SHARED_FILE_SCAN_EXCLUDED_DIRS == self._EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS
+        assert CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS == self._EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS
 
     @pytest.mark.parametrize("excluded_dir", sorted(_EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS))
     def test_each_excluded_directory_entry_prunes_a_would_be_extra_voter(
@@ -14992,6 +15146,7 @@ class TestCmdCheckFixtureConsistency:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig()
 
         with (
@@ -15014,6 +15169,7 @@ class TestCmdCheckFixtureConsistency:
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
 
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
@@ -15055,6 +15211,7 @@ class TestCmdCheckFixtureConsistency:
         (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "GHOST-SKU"}]), encoding="utf-8")
 
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
@@ -15106,6 +15263,7 @@ class TestCmdCheckFixtureConsistency:
         )
 
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_not_found.json", identifier_field="sku"),),
@@ -15161,6 +15319,7 @@ class TestCmdCheckFixtureConsistency:
         )
 
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
@@ -15199,6 +15358,7 @@ class TestCmdCheckFixtureConsistencyLoudModes:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = fixture_config
 
         with (
@@ -15322,6 +15482,7 @@ class TestCmdCheckFixtureConsistencyLoudModes:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
         mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
             canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
             scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
@@ -15338,6 +15499,136 @@ class TestCmdCheckFixtureConsistencyLoudModes:
             pytest.raises(ValueError, match="unrelated parse failure"),
         ):
             cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+
+class TestCmdCheckFixtureConsistencyReadsExtractSourceLiteralsThroughResolver:
+    """E6-F2-S1-T1 doc_review round-1 D4 (spec 4.1, AC-27): ``extract_source_literals`` is a
+    resolver-managed field (``constants.GATE_FIELD_DEFAULTS["fixture_consistency"]``) -- the
+    command must read it exclusively through ``config_loader.resolve_gate_config``, never off
+    ``RUNTIME_CONFIG.gates.fixture_consistency`` directly. Behavioral proof (not merely a static
+    grep pin, which cannot see a read routed through an intermediate local variable): mocks
+    ``resolve_gate_config`` itself and asserts both that it is called with the resolved unit's
+    canonical repo and the ``fixture_consistency`` gate name, and that its returned value -- not
+    ``RUNTIME_CONFIG.gates.fixture_consistency.extract_source_literals`` -- is what actually
+    controls whether the source-literal scan mode runs."""
+
+    def test_resolve_gate_config_is_called_with_the_units_canonical_repo(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+
+        # The project-level config's own `extract_source_literals` is left at
+        # its dataclass default (False) -- if the command read it directly
+        # instead of through the (mocked) resolver below, the resolver
+        # mock's return value would never be consulted at all and this
+        # test could not distinguish the two read paths.
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+        mock_resolved = MagicMock()
+        mock_resolved.values = {"enabled": False, "extract_source_literals": False}
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.config_loader.resolve_gate_config", return_value=mock_resolved) as mock_resolve,
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_resolve.assert_called_once_with("fixture_consistency", "caylent-solutions/git-repo", mock_runtime_cfg)
+
+    def test_resolver_true_enables_the_scan_mode_even_though_project_config_says_false(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The resolver's answer -- not the raw project-level dataclass field -- decides whether
+        the source-literal scan mode runs: with the raw field False but the (mocked) resolver
+        returning True, the zero-classified-source-files loud error (a real, only-reachable-when-
+        the-mode-is-actually-on behaviour) fires, proving the resolved value was actually used."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        # Only unclassified-extension files exist under tmp_path besides the
+        # two fixtures above -- zero classified source files in scope.
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+            extract_source_literals=False,
+        )
+        mock_resolved = MagicMock()
+        mock_resolved.values = {"enabled": False, "extract_source_literals": True}
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.config_loader.resolve_gate_config", return_value=mock_resolved),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "extract_source_literals" in err
+        assert "zero classified source files" in err
+
+
+class TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync:
+    """AC-E6-F2-S1-T1-4 / spec Section 8 (docs land in the same commit as the behaviour):
+    ``cmd_check_fixture_consistency``'s docstring and its ``FixtureConsistencyConfigError``
+    exception-handler comment each carry a hand-maintained enumeration of every
+    ``status: "error"`` loud-error cause. Adding the fifth cause (``extract_source_literals``
+    enabled with zero classified source files, E6-F2-S1-T1) without updating BOTH of those two
+    prose spots leaves them silently claiming an authoritative FOUR-path enumeration that is no
+    longer true.
+
+    Every assertion below is checked against a HAND-TYPED literal of the expected wording, never
+    against a production constant or against the other prose copy -- deriving both sides of an
+    assertion from the same source text can never fail, which is exactly the stub-test shape this
+    pin exists to rule out."""
+
+    def _source(self) -> str:
+        import inspect
+
+        return inspect.getsource(cli.cmd_check_fixture_consistency)
+
+    def test_docstring_enumerates_the_extract_source_literals_cause(self) -> None:
+        source = self._source()
+        assert "``extract_source_literals`` enabled with zero" in source
+        assert "classified source files in scope (spec 4.7 bullet 4, E6-F2-S1-T1" in source
+
+    def test_docstring_claims_five_paths_not_four(self) -> None:
+        source = self._source()
+        assert "the authoritative five-path enumeration" in source
+        assert "All five" in source
+        assert "the authoritative four-path enumeration" not in source
+        assert "All four\n      raise a ``fixture_consistency.FixtureConsistencyConfigError``" not in source
+
+    def test_exception_handler_comment_enumerates_the_extract_source_literals_cause(self) -> None:
+        source = self._source()
+        assert "zero-classified-source-files-with-" in source
+        assert "`extract_source_literals`-enabled (spec 4.7 bullet 4," in source
+
+    def test_exception_handler_comment_claims_five_paths_not_four(self) -> None:
+        """Distinct assertion from the docstring's own five-path claim above: the comment is a
+        SEPARATE piece of hand-maintained prose (a Python comment, not part of the docstring
+        object at runtime) that drifts independently, so it needs its own pin."""
+        source = self._source()
+        comment_block = source.split('"""', 2)[2]
+        assert "the authoritative five-path enumeration) config" in comment_block
+        assert "the authoritative four-path enumeration) config" not in comment_block
 
 
 class TestCmdLogVerdict:

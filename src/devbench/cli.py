@@ -349,6 +349,7 @@ from devbench.source_classification import (
     is_entry_point_stem,
     is_source_extension,
     is_test_path,
+    iter_classified_source_files,
 )
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
@@ -6386,46 +6387,6 @@ def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -
     return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
 
 
-#: Directory names never walked while enumerating shared-file-registry scan
-#: candidates (spec 4.6, round-1 code_review A2 finding): dependency/build/vendor
-#: trees a real import graph never treats as "this repo's own code", pruned the
-#: moment the walk reaches them rather than filtered out of an already-fully
-#: enumerated ``rglob("*")`` result -- round-1 measurement on this very repo found
-#: the overwhelming majority of a naive ``rglob("*")`` scan's derived entries were
-#: ``.venv/`` files a post-hoc filter never needed to walk in the first place.
-#:
-#: This set is CLOSED and finite, not an exhaustive denylist of every vendor/
-#: dependency directory convention (round-2 code_review finding): an unlisted
-#: SUBDIRECTORY the walk descends into (e.g. ``bower_components/``,
-#: ``.direnv/``, ``target/``) still has its own internals scanned and voted
-#: on. This applies only to subdirectories the walk descends into, not to the
-#: repo root itself, which is always scanned regardless of what it is named --
-#: pruning only ever filters ``dirnames`` while walking, and *repo_path* is
-#: never itself a prune candidate. ``vendor/`` and ``third_party/`` are
-#: included below since Go -- a language this scanner explicitly supports --
-#: canonically vendors third-party code under ``vendor/``.
-_SHARED_FILE_SCAN_EXCLUDED_DIRS: frozenset[str] = frozenset(
-    {
-        ".git",
-        ".venv",
-        "venv",
-        "node_modules",
-        "__pycache__",
-        ".tox",
-        ".nox",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".eggs",
-        "site-packages",
-        "dist",
-        "build",
-        "htmlcov",
-        "vendor",
-        "third_party",
-    }
-)
-
 #: Extensions :func:`_resolve_shared_file_import_target` treats as the JS/TS
 #: family for the *resolution* step (never the scanning grammar itself, which
 #: stays in ``source_classification``, AC-5) -- imported from
@@ -6448,21 +6409,70 @@ def _iter_shared_file_scan_candidates(repo_path: Path) -> dict[str, Path]:
     """Return ``{repo-relative POSIX path: absolute Path}`` for every classified
     source file under *repo_path*.
 
-    Prunes :data:`_SHARED_FILE_SCAN_EXCLUDED_DIRS` DURING the walk (spec 4.6,
-    round-1 A2 finding) via in-place ``dirnames`` mutation, so a vendored or
-    dependency tree is never descended into at all -- as opposed to the previous
-    ``rglob("*")`` approach, which enumerated (and, on this very repo, let vote)
-    every file inside a matching directory before a post-hoc filter discarded it.
+    Delegates enumeration and pruning entirely to
+    :func:`devbench.source_classification.iter_classified_source_files` (spec
+    4.6 round-1 A2 finding's pruning-during-the-walk behaviour; E6-F2-S1-T1
+    round-1 code_review Blocking 6 DRY fix -- this module previously
+    hand-copied that walk's body verbatim). This function's own job is only
+    to key the shared walk's absolute-path results by their repo-relative
+    POSIX path, the shape :func:`_derive_shared_file_registry` and its
+    callers need; the walk itself (including
+    :data:`devbench.source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS`
+    pruning and the :func:`is_source_extension` dispatch) lives in exactly
+    one place now -- round-2 code_review finding W3: this module no longer
+    keeps its own ``_SHARED_FILE_SCAN_EXCLUDED_DIRS`` alias for that
+    constant, since delegating the walk left it with zero production
+    consumers.
+
+    Raises:
+        RuntimeError: ``ERROR: import scan failed for directory <path>: <reason>``
+            the moment the shared walk cannot list a directory under
+            *repo_path* (permission denied or similar) -- E6-F2-S1-T1 round-2
+            code_review/test_review/changes_manifest finding: delegating to
+            :func:`iter_classified_source_files` also imports that function's
+            ``onerror=_reraise_walk_error`` policy, which raises the
+            directory-listing ``OSError`` instead of silently skipping the
+            subtree; that ``OSError`` is converted here into this gate's own
+            documented error shape (spec Section 7) so it is caught by
+            :func:`_derive_shared_file_registry`'s only caller
+            (:func:`_prepare_shared_file_impact_run`, which catches
+            ``RuntimeError``) rather than escaping as an unhandled
+            traceback. ``<path>`` is repo-RELATIVE (W-a, round-3 code_review
+            finding), falling back to the raw absolute path only when the
+            reported directory is not actually a descendant of *repo_path*
+            (mirroring ``fixture_consistency``'s identical fallback) --
+            matching this same error shape's sibling file-level message
+            below, rather than one being absolute-path-prefixed while the
+            other is repo-relative.
     """
     candidates: dict[str, Path] = {}
-    for dirpath, dirnames, filenames in os.walk(repo_path):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SHARED_FILE_SCAN_EXCLUDED_DIRS)
-        for filename in sorted(filenames):
-            abs_path = Path(dirpath) / filename
-            if not is_source_extension(abs_path.suffix):
-                continue
-            rel = abs_path.relative_to(repo_path).as_posix()
-            candidates[rel] = abs_path
+    try:
+        classified_source_files = iter_classified_source_files(repo_path)
+    except OSError as exc:
+        raw_directory = Path(getattr(exc, "filename", None) or repo_path)
+        if raw_directory == repo_path:
+            # W3 (E6-F2-S1-T1 round-4 doc_review + code_review): the unreadable directory IS
+            # the repo root itself -- ``raw_directory.relative_to(repo_path)`` collapses to
+            # ``Path('.')``, whose ``.as_posix()`` is the bare, unhelpful string ``'.'``. Name
+            # the repo root path itself instead, exactly mirroring
+            # ``fixture_consistency._check_source_literals``'s own identical W-b special case
+            # (round-3 code_review), so the two documented-as-matching sibling messages
+            # genuinely match rather than one emitting a bare dot.
+            directory = str(repo_path)
+        else:
+            try:
+                # Repo-relative (W-a, E6-F2-S1-T1 round-3 code_review finding): matches this
+                # function's own sibling file-level message below (``import scan failed for
+                # {rel}: {exc}``) and fixture_consistency._MSG_SOURCE_SCAN_DIRECTORY_FAILED's
+                # ``directory`` slot, rather than one of the three being absolute-path-prefixed
+                # while the other two are repo-relative.
+                directory = raw_directory.relative_to(repo_path).as_posix()
+            except ValueError:
+                directory = str(raw_directory)
+        raise RuntimeError(f"ERROR: import scan failed for directory {directory}: {exc}") from exc
+    for abs_path in classified_source_files:
+        rel = abs_path.relative_to(repo_path).as_posix()
+        candidates[rel] = abs_path
     return candidates
 
 
@@ -6764,11 +6774,26 @@ def _derive_shared_file_registry(repo_path: Path, threshold: int) -> set[str]:
             moment any classified source file cannot be read (permission error,
             broken symlink, decode failure) -- raised before any derived set is
             returned, so a scan that cannot read every candidate file never reports
-            a partial answer as if it were complete. A dangling symlink is included:
-            :func:`_iter_shared_file_scan_candidates` never filters on
-            ``Path.is_file()`` (which silently swallows a broken symlink's OSError),
-            so reading one always reaches this same ``read_text`` call and raises
-            here.
+            a partial answer as if it were complete. A dangling symlink whose target
+            resolves INSIDE *repo_path* is included: neither
+            :func:`_iter_shared_file_scan_candidates` nor the
+            :func:`devbench.source_classification.iter_classified_source_files` it
+            delegates to filters on ``Path.is_file()`` (which would silently swallow
+            a broken symlink's ``OSError``), so reading one reaches this same
+            ``read_text`` call and raises here. A symlink (dangling or not) whose
+            TARGET resolves OUTSIDE *repo_path* is a separate case (SECURITY,
+            security_review round-3 MEDIUM finding, E6-F2-S1-T1): it is excluded from
+            the candidate list entirely by
+            :func:`devbench.source_classification.iter_classified_source_files`'s own
+            resolved-real-path boundary check, so it never reaches ``read_text`` and
+            never raises here at all -- a symlink pointing outside the checkout is
+            never a read (or read-error) primitive for this scan.
+            An unreadable DIRECTORY under *repo_path* is a separate case that
+            never reaches ``read_text`` at all: ``ERROR: import scan failed for
+            directory <path>: <reason>`` (E6-F2-S1-T1 round-2 finding) is raised
+            by :func:`_iter_shared_file_scan_candidates` itself the moment the
+            underlying walk cannot list that directory, before any candidate
+            file is even enumerated.
     """
     candidates = _iter_shared_file_scan_candidates(repo_path)
     candidate_paths: set[str] = set(candidates)
@@ -8546,7 +8571,7 @@ _FIXTURE_CONSISTENCY_GATE_NAME: str = "fixture_consistency"
 # through `_gate_status_line`/`_gate_disabled_line`.
 
 
-def _resolve_fixture_consistency_repo_path(unit_id: str) -> Path | int:
+def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[str, Path] | int:
     """Resolve everything :func:`cmd_check_fixture_consistency` needs before running the check.
 
     Split out purely to keep that function's return-count within the
@@ -8559,9 +8584,13 @@ def _resolve_fixture_consistency_repo_path(unit_id: str) -> Path | int:
     into one caller-side ``isinstance(..., int)`` check.
 
     Returns:
-        The resolved local checkout ``Path`` when every resolution step
-        succeeds; otherwise the ``int`` exit code the caller should return
-        as-is (the offending step has already printed its own diagnostic).
+        A ``(canonical_repo, repo_path)`` pair when every resolution step
+        succeeds -- *canonical_repo* is the ``resolve_gate_config`` repo
+        argument the caller needs to resolve ``extract_source_literals``
+        (spec 4.1, AC-27; E6-F2-S1-T1 doc_review round-1 D4), *repo_path*
+        the resolved local checkout ``Path``; otherwise the ``int`` exit
+        code the caller should return as-is (the offending step has
+        already printed its own diagnostic).
     """
     if not unit_id.strip():
         print("ERROR: check-fixture-consistency requires a non-empty <unit-id>", file=sys.stderr)
@@ -8581,7 +8610,7 @@ def _resolve_fixture_consistency_repo_path(unit_id: str) -> Path | int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    return Path(repo_path)
+    return canonical_repo, Path(repo_path)
 
 
 def cmd_check_fixture_consistency(unit_id: str) -> int:
@@ -8623,11 +8652,13 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
       reason); the gate configured with a non-empty ``canonical_sources``
       and an empty resolved ``scan`` list; a fixture (canonical source or
       scan target) carrying a malformed in-fixture ``allow_missing``
-      marker (wrong shape, or a missing/empty ``reason``); or an
+      marker (wrong shape, or a missing/empty ``reason``); an
       ``allow_missing`` marker attached to a record whose configured
       ``identifier_field`` resolves no value (spec 4.7 bullet 5,
-      E6-F1-S1-T2 -- see ``fixture_consistency.FixtureConsistencyConfigError``'s
-      own docstring for the authoritative four-path enumeration). All four
+      E6-F1-S1-T2); or ``extract_source_literals`` enabled with zero
+      classified source files in scope (spec 4.7 bullet 4, E6-F2-S1-T1 --
+      see ``fixture_consistency.FixtureConsistencyConfigError``'s own
+      docstring for the authoritative five-path enumeration). All five
       raise a ``fixture_consistency.FixtureConsistencyConfigError``
       (checked before any file is read for the empty-scan case; discovered
       mid-parse of the offending fixture for the two marker cases) and are
@@ -8695,6 +8726,9 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
 
     Used as review evidence by the test-reviewer agent.
     """
+    from dataclasses import replace as _replace
+
+    from devbench.config_loader import resolve_gate_config
     from devbench.fixture_consistency import (
         BLOCKING_FINDING_KINDS,
         FixtureConsistencyConfigError,
@@ -8704,21 +8738,36 @@ def cmd_check_fixture_consistency(unit_id: str) -> int:
     resolved = _resolve_fixture_consistency_repo_path(unit_id)
     if isinstance(resolved, int):
         return resolved
-    repo_path = resolved
+    canonical_repo, repo_path = resolved
 
     fixture_config = RUNTIME_CONFIG.gates.fixture_consistency
     if not fixture_config.canonical_sources:
         print(_gate_disabled_line(_FIXTURE_CONSISTENCY_GATE_NAME))
         return 0
 
+    # `extract_source_literals` is a resolver-managed field (AC-27;
+    # `constants.GATE_FIELD_DEFAULTS["fixture_consistency"]`) -- read it
+    # exclusively through `resolve_gate_config`, never off
+    # `RUNTIME_CONFIG.gates.fixture_consistency` directly (E6-F2-S1-T1
+    # doc_review round-1 D4). `canonical_sources`/`scan` stay read directly
+    # above: they are project/per-repo-only structural config with no
+    # built-in default to resolve against (`constants.py`'s own
+    # `GATE_FIELD_DEFAULTS` docstring), so they are outside AC-27's scope.
+    resolved_gate_config = resolve_gate_config(_FIXTURE_CONSISTENCY_GATE_NAME, canonical_repo, RUNTIME_CONFIG)
+    resolved_extract_source_literals = bool(resolved_gate_config.values["extract_source_literals"])
+    if resolved_extract_source_literals != fixture_config.extract_source_literals:
+        fixture_config = _replace(fixture_config, extract_source_literals=resolved_extract_source_literals)
+
     try:
         findings = check_fixture_consistency(repo_path, fixture_config)
     except FixtureConsistencyConfigError as exc:
         # The empty-scan-list (322-D05), zero-match-identifier-field
-        # (322-D02/D03), malformed-in-fixture-`allow_missing`-marker, and
+        # (322-D02/D03), malformed-in-fixture-`allow_missing`-marker,
         # unmatchable-`allow_missing`-marker (spec 4.7 bullet 5,
-        # E6-F1-S1-T2; see `fixture_consistency.FixtureConsistencyConfigError`'s
-        # own docstring for the authoritative four-path enumeration) config
+        # E6-F1-S1-T2), and zero-classified-source-files-with-
+        # `extract_source_literals`-enabled (spec 4.7 bullet 4,
+        # E6-F2-S1-T1; see `fixture_consistency.FixtureConsistencyConfigError`'s
+        # own docstring for the authoritative five-path enumeration) config
         # errors are the ONLY exceptions of this specific type that ever
         # escape `check_fixture_consistency` -- every parse-time
         # `ValueError` (malformed JSON/YAML, an unrecognized extension) is

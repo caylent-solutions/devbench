@@ -58,8 +58,10 @@ substrings. A stem can never collide with an extension and vice versa.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Extension category: which suffixes are source code.
@@ -408,3 +410,169 @@ def extract_import_targets(suffix: str, text: str) -> list[str]:
         return []
     extractor = _IMPORT_TARGET_EXTRACTORS.get(suffix.lower())
     return extractor(text) if extractor is not None else []
+
+
+# ---------------------------------------------------------------------------
+# Classified-source-file enumeration (spec `integration-reality-gates-hardening.md`
+# section 4.7 bullet 4; caylent-solutions/devbench-internal-backlog#17 AC-19,
+# E6-F2-S1-T1): the repo-wide walk `fixture_consistency`'s config-gated
+# `extract_source_literals` scan mode uses to discover candidate source files.
+# ---------------------------------------------------------------------------
+
+#: Directories pruned during :func:`iter_classified_source_files`'s walk --
+#: dependency/build/vendor trees no source-literal scan should ever descend
+#: into. This is now the SINGLE declaration of this exclusion set (E6-F2-S1-T1
+#: code_review Blocking 6, DRY/PM-3-adjacent single-ownership rule): a
+#: vendored or build directory is exactly as irrelevant to "does this literal
+#: drift from the canonical catalog" as it is to "does this file participate
+#: in the import graph" -- the sibling `shared_file_impact` gate's own walk
+#: (spec 4.6, `devbench.cli._iter_shared_file_scan_candidates`) delegates
+#: enumeration entirely to :func:`iter_classified_source_files`, which reads
+#: this same constant, so the two walks' pruning can never silently drift
+#: with no failing test. `vendor/` and `third_party/`
+#: are included because Go -- a language both walks explicitly support --
+#: canonically vendors third-party code under `vendor/`; excluding `.venv/`
+#: matters in practice too, not just in principle: an unfiltered walk of this
+#: very repo checkout spends the overwhelming majority of its enumerated
+#: entries inside `.venv/` alone. This set is CLOSED and finite, not an
+#: exhaustive denylist: an unlisted SUBDIRECTORY the walk descends into
+#: (e.g. `bower_components/`, `.direnv/`, `target/`) still has its own
+#: internals scanned, for both walks.
+CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".eggs",
+        "site-packages",
+        "dist",
+        "build",
+        "htmlcov",
+        "vendor",
+        "third_party",
+    }
+)
+
+
+def _reraise_walk_error(error: OSError) -> None:
+    """``os.walk`` ``onerror`` callback that propagates a directory-listing failure.
+
+    ``os.walk``'s default policy (``onerror=None``) SWALLOWS an ``OSError``
+    raised while listing a directory (e.g. permission denied) and simply
+    omits that subtree from the walk with no signal to the caller at all --
+    a degraded-but-passing shape spec Section 7 bans (E6-F2-S1-T1 code_review
+    Blocking 1): a caller enumerating "every classified source file" that
+    silently inspects only part of the requested scope must never look
+    identical to a caller that inspected the whole thing and found nothing
+    of interest. Passing this function as ``os.walk``'s ``onerror`` callback
+    makes an unreadable directory abort the walk with the original
+    ``OSError`` instead, so :func:`iter_classified_source_files` itself
+    never returns a silently-incomplete result; a caller that wants a softer
+    outcome (e.g. a ``load_error`` finding naming the unreadable directory,
+    as `fixture_consistency`'s `extract_source_literals` mode does) catches
+    ``OSError`` around its own call to :func:`iter_classified_source_files`.
+    """
+    raise error
+
+
+def _resolves_outside_root(candidate: Path, resolved_root: Path) -> bool:
+    """Return ``True`` when *candidate*'s resolved real location does not lie under *resolved_root*.
+
+    SECURITY (security_review round-3 MEDIUM finding): a candidate's repo-relative NAME (its
+    path under the walked root) previously determined whether :func:`iter_classified_source_files`
+    enumerated it, while a caller reading its content (``Path.read_text``) follows any symlink in
+    the path to whatever it actually resolves to -- so a symlink committed inside the repo whose
+    TARGET resolves outside the repo checkout was a read primitive for arbitrary filesystem
+    content under a path that looked like it belonged to the scanned repo.
+
+    Uses ``os.path.realpath`` (never ``Path.is_file()``/``Path.exists()``, both of which would
+    silently treat a dangling symlink as "not found" rather than resolving its target for the
+    boundary check): the boundary is evaluated against the resolved TARGET path, whether or not
+    that target actually exists on disk, so a dangling symlink is classified the same way a live
+    one pointing at the same location would be (see :func:`iter_classified_source_files`'s own
+    docstring for why a dangling symlink resolving OUTSIDE the root must still be excluded, and
+    one resolving inside it must not be).
+
+    *resolved_root* must already be resolved by the caller (once, outside the per-candidate loop)
+    -- comparing an unresolved *candidate* against an unresolved *root* would spuriously treat a
+    *root* itself reached through a symlink (a common shape for ``/tmp`` on macOS, or a bind
+    mount) as if every real file under it resolved "outside" that unresolved root.
+    """
+    resolved_candidate = Path(os.path.realpath(candidate))
+    return resolved_candidate != resolved_root and resolved_root not in resolved_candidate.parents
+
+
+def iter_classified_source_files(root: Path) -> list[Path]:
+    """Return every file under *root* whose extension :func:`is_source_extension` classifies as source.
+
+    Prunes :data:`CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS` DURING the walk (via
+    in-place ``dirnames`` mutation), so a vendored/dependency/build tree is
+    never descended into at all. Dispatches purely on
+    :func:`is_source_extension` -- this function declares no extension
+    tuple of its own (PM-3, spec 4.3): the single place the "is this
+    extension source" answer lives is :data:`SOURCE_EXTENSIONS`.
+
+    SECURITY (security_review round-3 MEDIUM finding): a candidate whose resolved real path
+    (:func:`_resolves_outside_root`, via ``os.path.realpath``) falls OUTSIDE the resolved *root*
+    is silently excluded from the result -- never read, never even named in the returned list.
+    This affects only FILE symlinks; a symlinked DIRECTORY is never descended into at all
+    (``os.walk``'s own default ``followlinks=False``, unchanged by this function), so a symlinked
+    directory pointing outside *root* was never a concern in the first place. Two shapes are
+    DELIBERATELY still included, both pre-existing behaviour this fix does not change:
+
+    - A symlink whose target ALSO resolves inside *root* -- it discloses nothing outside the
+      repo checkout, so excluding it would only cost real scan coverage (e.g. an in-repo
+      compatibility shim re-exporting a moved module) for no security benefit. This can result in
+      the same on-disk content being scanned twice, under two different repo-relative paths; that
+      is a scanning-boundary characteristic documented here, never a correctness defect.
+    - A DANGLING symlink whose target names a location inside *root* -- unchanged from
+      pre-fix behaviour (it is never filtered on ``Path.is_file()``/``Path.exists()``, which
+      would silently swallow a broken symlink instead of surfacing it), so attempting to read one
+      still reaches the caller's own read call and raises there (mirrors
+      ``cli._derive_shared_file_registry``'s documented dangling-symlink non-regression). A
+      dangling symlink whose target names a location OUTSIDE *root* is excluded the same way a
+      live out-of-root symlink is: the boundary check is evaluated against the resolved target
+      path regardless of whether that target exists.
+
+    Results are returned as absolute ``Path`` objects, sorted deterministically
+    (directories and filenames are each sorted before being walked/collected),
+    so a caller iterating the result gets a stable, reproducible order run to
+    run on an unchanged checkout.
+
+    Args:
+        root: Absolute path to walk (a repo checkout root, or any
+            subdirectory of one).
+
+    Returns:
+        A list of absolute ``Path``s to every classified source file found,
+        possibly empty when *root* contains no classified source files at
+        all (an empty result is not an error at this layer -- a caller that
+        needs "zero classified source files" to be a loud, actionable error,
+        such as `fixture_consistency`'s `extract_source_literals` mode,
+        raises on that condition itself).
+
+    Raises:
+        OSError: If a directory under *root* cannot be listed (e.g.
+            permission denied) -- see :func:`_reraise_walk_error`. This
+            walk never silently skips an unreadable subtree the way
+            ``os.walk``'s own default ``onerror`` policy would.
+    """
+    resolved_root = Path(os.path.realpath(root))
+    results: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_reraise_walk_error):
+        dirnames[:] = sorted(d for d in dirnames if d not in CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS)
+        for filename in sorted(filenames):
+            candidate = Path(dirpath) / filename
+            if not is_source_extension(candidate.suffix):
+                continue
+            if _resolves_outside_root(candidate, resolved_root):
+                continue
+            results.append(candidate)
+    return results

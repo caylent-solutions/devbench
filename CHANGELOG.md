@@ -5,6 +5,95 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-fixture-consistency` gains a config-gated source-literal extraction mode**
+  (spec `integration-reality-gates-hardening.md` section 4.7 bullet 4; issue #17
+  AC-19; E6-F2-S1-T1). `gates.fixture_consistency.extract_source_literals`
+  (default `false`) additionally scans the classified source files in the
+  repo checkout -- enumerated via
+  `devbench.source_classification.iter_classified_source_files`, the single
+  owner of extension classification (PM-3), which prunes a fixed set of
+  dependency/build/vendor directories during the walk -- for identifier
+  literals whose key matches a configured `identifier_field`. A literal is
+  resolved against the union of every canonical source sharing that
+  `identifier_field` name (never cross-producted against an unrelated
+  canonical source), flagging one absent from all of them with a
+  `missing_key` finding carrying `file:line` (a 1-based line number). This
+  catches catalog drift hiding in a hard-coded route table, enum-like
+  constant list, or seed script that a reviewer would otherwise have to
+  notice by eye. The mode is heuristic (a regex-based per-line scan, not a
+  real parser) and defaults off for exactly that reason -- see
+  `docs/devbench-yaml-reference.md`'s
+  `gates.fixture_consistency.extract_source_literals` section for the full
+  documented accuracy bounds, including that a single-line triple-quoted or
+  genuinely empty string value is never matched rather than misreported with
+  an empty literal value. Enabling the mode when the repo checkout resolves
+  zero classified source files is a loud, pre-scan error naming the resolved
+  scope and the config key (mirroring the existing empty-`scan`-list and
+  zero-match-`identifier_field` loud-error shapes; this includes a repo whose
+  only classified sources live entirely under a pruned directory); a
+  directory that cannot be listed produces exactly one `load_error` finding
+  naming the unreadable directory rather than silently skipping that subtree;
+  a source file that raises `UnicodeDecodeError` or `OSError` while being
+  read produces exactly one `load_error` finding naming the file, and every
+  other classified source file is still scanned. There is no waiver
+  mechanism for a source-literal finding -- the in-fixture `allow_missing`
+  marker applies only to the structured scan-target cross-reference below.
+
+- **`check-shared-file-impact`'s auto-derived-registry scan now shares its file
+  enumeration with `check-fixture-consistency`'s new source-literal mode**
+  (E6-F2-S1-T1 round-2 code_review Blocking 6 DRY finding). `cli.py`'s
+  `_iter_shared_file_scan_candidates` delegates to
+  `devbench.source_classification.iter_classified_source_files` instead of
+  hand-copying that walk's body, so the two gates' pruned-directory set can
+  never silently drift apart. That delegation also means an unreadable
+  directory under the scanned repo -- previously silently skipped, returning
+  a partial derived registry that looked identical to a clean, complete scan
+  -- now raises `ERROR: import scan failed for directory <path>: <reason>`,
+  the same loud error shape `_derive_shared_file_registry` already uses for
+  an unreadable file, caught by `check-shared-file-impact`'s existing
+  import-scan-failure handling rather than escaping as an unhandled
+  traceback. Its own directory-not-found error message now names the
+  unreadable directory repo-relatively (matching the file-level message
+  next to it), rather than an absolute, tmp-path-prefixed form.
+
+- **SECURITY: `iter_classified_source_files` no longer follows a symlink
+  whose target resolves outside the walked root** (security_review round-3
+  MEDIUM finding, E6-F2-S1-T1). A candidate file's repo-relative NAME
+  previously determined whether it was enumerated, while a caller reading
+  its content follows any symlink in the path to whatever it actually
+  points at -- so a symlink committed inside a repo checkout, pointing
+  outside it, was a read primitive for arbitrary filesystem content under a
+  path that looked like it belonged to the scanned repo, shared by both
+  `check-fixture-consistency`'s `extract_source_literals` mode and
+  `check-shared-file-impact`'s auto-derived-registry scan. The boundary is
+  now checked against the resolved real path (`os.path.realpath`), with
+  both the candidate and the walked root resolved before comparing (so a
+  root itself reached through a symlink, e.g. `/tmp` on macOS, is not
+  spuriously treated as excluding everything under it). A symlink whose
+  target ALSO resolves inside the root -- including a DANGLING one -- is
+  still included, unchanged from prior behaviour; only a target resolving
+  outside the root, live or dangling, is now excluded.
+
+- **SECURITY: a `check-fixture-consistency` source-literal `missing_key`
+  finding never echoes any part of an extracted value, regardless of
+  length** (security_review AND code_review round-4, convergent findings;
+  CLAUDE.md "Sensitive Data Handling"; E6-F2-S1-T1). A prior length
+  threshold of 32 characters, below which a value was shown in full, plus a
+  disclosed 4-character prefix on longer values, both leaked real
+  credential shapes: a Stripe live secret key and a 32-character session
+  identifier sat exactly on the old threshold and were echoed in full, and
+  a 4-character prefix is exactly the length of common credential-type
+  prefixes (`ghp_`, `AKIA`, `AIza`, `eyJh`), disclosing credential type and
+  issuer with no review value `file:line` did not already provide.
+  Redaction is now unconditional: the finding prints
+  `<redacted, N chars total; see file:line above to inspect it directly>`
+  naming only the value's original length, never any of its content,
+  applied uniformly regardless of the value's shape or length. The finding
+  still carries `file:line` and the matched field name. Documented
+  alongside the mode's other accuracy bounds in
+  `docs/devbench-yaml-reference.md` and mirrored in the `configure-devbench`
+  skill's wizard entry.
+
 - **The `allow_missing` fixture-catalog waiver moves into the fixture artifact**
   (spec `integration-reality-gates-hardening.md` section 4.7 bullet 5, PM-5's
   in-diff exception; issue #17, E6-F1-S1-T2). A waiver that scopes an

@@ -742,7 +742,7 @@
             },
             "extract_source_literals": {
               "type": "boolean",
-              "description": "Reserved for a future literal-extraction scanning mode (spec 4.7 hardening). Default false."
+              "description": "Config-gated source-literal extraction scan mode (spec 4.7 bullet 4, issue #17 AC-19). When true, check-fixture-consistency additionally scans the classified source files in the repo (pruning a fixed set of dependency/build/vendor directories, and excluding any file symlink resolving outside the repo root; a symlinked directory is never descended into) for identifier literals matching a configured identifier_field and flags one absent from its canonical source; findings carry file:line, redacted unconditionally regardless of length. Heuristic, so off by default -- see docs/devbench-yaml-reference.md for the documented accuracy bounds, including the pruned-directory and symlink scanning boundaries. Default false."
             }
           }
         },

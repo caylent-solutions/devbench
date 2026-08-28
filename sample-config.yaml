@@ -519,7 +519,18 @@ validate:
 #         # {"allow_missing": {"reason": "<non-empty reason>"}} marker directly to the waived
 #         # record in the scanned fixture file itself, so the waiver is visible in the same
 #         # diff a reviewer is already looking at, instead of hidden here.
-#     extract_source_literals: false    # reserved for a future literal-extraction scan mode
+#     # Heuristic scan mode (spec 4.7 bullet 4, issue #17 AC-19): when true,
+#     # additionally scans the classified source files in the repo (pruning a
+#     # fixed set of dependency/build/vendor directories during the walk --
+#     # see source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS for the
+#     # closed list -- and also excluding any file symlink resolving outside
+#     # the repo root; a symlinked directory is never descended into) for
+#     # identifier literals matching a configured identifier_field, flagging
+#     # one absent from its canonical source (findings carry file:line,
+#     # redacted unconditionally regardless of length). Off by default -- see
+#     # docs/devbench-yaml-reference.md for the documented accuracy bounds and
+#     # the default-false rationale.
+#     extract_source_literals: false
 #   write_path_audit:                   # caylent-solutions/devbench-internal-backlog#16
 #     enabled: false
 #   newly_reachable_paths:              # caylent-solutions/devbench-internal-backlog#15

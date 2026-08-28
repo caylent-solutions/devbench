@@ -1216,10 +1216,36 @@ Current value shown to the operator: the existing config's value for this key if
 
 #### `gates.fixture_consistency.extract_source_literals` -- Literal-extraction scan mode
 
-Reserved for a future literal-extraction scanning mode (spec 4.7 hardening) for the fixture-consistency gate.
+A second, heuristic scan mode for the fixture-consistency gate (spec 4.7 bullet 4; issue #17
+AC-19): when true, `check-fixture-consistency` additionally scans the classified source files
+in the repo checkout (enumerated via `source_classification.iter_classified_source_files`, which
+prunes a fixed set of dependency/build/vendor directories during the walk, and also excludes any
+FILE symlink whose resolved real path falls outside the walked root -- live or dangling; a
+symlinked DIRECTORY is never descended into at all) for
+an assignment whose key matches a configured `identifier_field`, and resolves a matched literal
+against the UNION of every canonical source sharing that `identifier_field` name (canonical
+sources declaring the same `identifier_field` are one combined identifier namespace, never
+cross-producted against each other): a literal present in ANY member of that group passes, and
+one absent from all of them is a `missing_key` finding naming the whole group with a
+comma-joined path list and carrying `file:line`. Every extracted value is redacted
+UNCONDITIONALLY, regardless of length: the finding prints
+`<redacted, N chars total; see file:line above to inspect it directly>` rather than any part of
+the value (SECURITY: gate output flows into CI logs and review comments), applied uniformly
+regardless of the value's shape. It is a regex-based heuristic, not a parser --
+it has no notion of comments
+or reachability, does not resolve string interpolation/concatenation (a concatenated or
+cross-line-continued value can be flagged on its first quoted chunk, a partial-literal false
+positive), and never matches a value spread across more than one physical line via a
+triple-quoted string (including a triple-quoted value that fits on one line, and a genuinely
+empty string, both of which are simply unmatched rather than misreported) -- so a workspace
+enabling it should expect occasional false positives, and has no waiver mechanism available for
+a source-literal finding (the in-fixture `allow_missing` marker applies only to the structured
+scan-target cross-reference); see `docs/devbench-yaml-reference.md`'s
+`gates.fixture_consistency.extract_source_literals` section for the full documented accuracy
+bounds.
 
-- **Recommended:** `false` -- matches the only implemented mode today; literal-extraction has no implementation yet.
-- **Alternatives:** `true` (has no effect yet -- reserved for a future release.)
+- **Recommended:** `false` -- matches the shipped default (`constants.GATE_EXTRACT_SOURCE_LITERALS_DEFAULT`); the heuristic can produce false positives, so it stays opt-in.
+- **Alternatives:** `true` (enables the source-literal scan mode in addition to the structured JSON/YAML cross-reference mode above.)
 - **Free-form:** Type `true` or `false` directly; any other value is rejected and re-prompted.
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.

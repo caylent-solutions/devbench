@@ -5271,6 +5271,86 @@ class TestFixtureConsistencyAllowMissingKeyRemoved:
         )
 
 
+class TestFixtureConsistencyExtractSourceLiteralsSchemaAndSampleDrift:
+    """spec 4.1 8-step toggle checklist; AC-E6-F2-S1-T1-7: ``extract_source_literals`` must be
+    declared in ``config-schema.json``'s ``gates.fixture_consistency.properties`` AND present in
+    the commented ``gates:`` block in ``sample-config.yaml``. ``gates.fixture_consistency`` is
+    ``additionalProperties: false``, so an operator who sets the key without the schema entry
+    fails config load outright the moment the schema declaration is missing -- these two
+    assertions are provably load-bearing (each dies if its respective file's key is removed, not
+    merely a documentation nicety)."""
+
+    _SCHEMA_PATH = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+    _SAMPLE_CONFIG_PATH = Path(__file__).parent.parent / "sample-config.yaml"
+
+    def test_schema_declares_extract_source_literals_under_fixture_consistency(self) -> None:
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        fixture_consistency_properties = schema["properties"]["gates"]["properties"]["fixture_consistency"][
+            "properties"
+        ]
+        assert "extract_source_literals" in fixture_consistency_properties, (
+            f"{self._SCHEMA_PATH} does not declare gates.fixture_consistency.extract_source_literals; "
+            "gates.fixture_consistency's additionalProperties: false rejects the key at config-load "
+            "time until this schema entry is (re)added (spec 4.1 8-step toggle checklist)."
+        )
+        assert fixture_consistency_properties["extract_source_literals"]["type"] == "boolean"
+
+    def test_sample_config_documents_extract_source_literals_under_gates_fixture_consistency(self) -> None:
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        matches = re.findall(r"^#?\s*extract_source_literals:\s*(true|false)\s*$", text, re.MULTILINE)
+        assert matches, (
+            f"{self._SAMPLE_CONFIG_PATH} does not document gates.fixture_consistency."
+            "extract_source_literals in its commented gates: block (spec 4.1 8-step toggle checklist)."
+        )
+
+    def test_schema_description_documents_symlink_exclusion_and_redaction(self) -> None:
+        """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+        prose mirrored into ``config-schema.json``'s ``extract_source_literals`` description had
+        no drift pin at all -- stripping it killed no test. Scoped to this property's own
+        ``description`` string (not the whole schema file), so this dies only if THIS mirrored
+        copy drifts, independent of the canonical prose in
+        ``docs/devbench-yaml-reference.md``."""
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        description = schema["properties"]["gates"]["properties"]["fixture_consistency"]["properties"][
+            "extract_source_literals"
+        ]["description"]
+        assert "excluding any file symlink resolving outside the repo root" in description
+        assert "symlinked directory is never descended into" in description
+        assert "redacted unconditionally regardless of length" in description
+
+    def test_sample_config_comment_documents_symlink_exclusion_and_redaction(self) -> None:
+        """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+        prose mirrored into ``sample-config.yaml``'s commented ``extract_source_literals`` entry
+        had no drift pin at all -- stripping it killed no test. Scoped between the entry's own
+        ``# Heuristic scan mode`` comment lead-in and the ``extract_source_literals: false`` key
+        line, so this dies only if THIS mirrored copy drifts."""
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        section = text.split("# Heuristic scan mode (spec 4.7 bullet 4")[1].split("extract_source_literals: false")[0]
+        assert "excluding any file symlink resolving outside" in section
+        assert "symlinked directory is never descended into" in section
+        assert "redacted unconditionally regardless of length" in section
+
+
+@pytest.mark.unit
+class TestFixtureConsistencyConfigDocstringDocumentsSymlinkExclusionAndRedaction:
+    """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+    prose mirrored into ``FixtureConsistencyConfig``'s ``extract_source_literals`` attribute
+    docstring (``src/devbench/config_loader.py``) had no drift pin at all -- stripping it killed
+    no test. Scoped to just the ``extract_source_literals`` attribute's own paragraph within the
+    dataclass docstring (not the whole module), so this dies only if THIS mirrored copy drifts."""
+
+    def test_attribute_docstring_documents_symlink_exclusion_and_redaction(self) -> None:
+        import inspect
+
+        doc = inspect.getdoc(FixtureConsistencyConfig)
+        assert doc is not None
+        section = doc.split("extract_source_literals: Enables")[1]
+        assert "and also excluding any file symlink whose resolved real" in section
+        assert "directory is never descended into) for identifier literals" in section
+        assert "redacted" in section
+        assert "unconditionally regardless of length" in section
+
+
 # ---------------------------------------------------------------------------
 # gates.reachability.entry_points (spec 4.1, 4.4 bullet 2; issue #10 AC2)
 # ---------------------------------------------------------------------------

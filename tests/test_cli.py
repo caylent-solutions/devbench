@@ -15917,6 +15917,312 @@ class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
         assert "the audit-marker append itself raises `OSError`" in section
 
 
+class _WritePathCmdFixtures:
+    """Shared fixture helpers for ``cmd_check_write_path`` test classes
+    (E7-F1-S1-T1, spec `integration-reality-gates-hardening.md` section 4.8).
+
+    Unlike the other gate commands' fixtures, ``check-write-path`` never
+    shells out to git/`gh` (:func:`devbench.plugin_helpers.permission_flag_writepath.audit_write_path`
+    scans the repo checkout's files directly), so no ``run_command`` stub
+    or real git init is needed -- only a plain directory tree of fixture
+    source files under ``repo_path``.
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Write-path audit gate task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _write_gate_config(self, tmp_path: Path, *, enabled: bool) -> Path:
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(
+            f"repos:\n  {self._REPO}:\n    default_branch: main\n"
+            f"gates:\n  write_path_audit:\n    enabled: {'true' if enabled else 'false'}\n"
+        )
+        return cfg_path
+
+    def _enable_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+        """Point ``DEVBENCH_CONFIG_PATH`` at a scratch config resolving
+        ``gates.write_path_audit.enabled``, clearing the workspace-wide env
+        override so an ambient ``DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED``
+        left set by the host shell can never leak in (env is the
+        highest-precedence layer, spec 4.1/D-15)."""
+        cfg_path = self._write_gate_config(tmp_path, enabled=enabled)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+    @contextlib.contextmanager
+    def _patch_common(self, unit: WorkUnit, repo_path: Path) -> Iterator[None]:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+        ):
+            yield
+
+
+@pytest.mark.unit
+class TestCheckWritePathVariadicDispatch:
+    """`check-write-path` is registered in `_VARIADIC_COMMANDS` (spec 4.8):
+    a fixed-arity dispatch would slice ``sys.argv`` to ``[<id>]`` only,
+    dropping ``--flag <name>`` entirely before it ever reaches the handler.
+    This test drives the REAL ``main()`` dispatcher end to end (not a
+    direct call to ``cmd_check_write_path``, which bypasses the slice
+    entirely and so cannot catch this class of registration bug)."""
+
+    def test_flag_and_value_both_reach_the_handler_through_main(self) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "check-write-path", "E1-F1-S1-T1", "--flag", "isPremiumEligible"]),
+            patch.dict(
+                cli._COMMANDS,
+                {"check-write-path": (mock_fn, 0, "Write-path audit: check-write-path <id> --flag <name>")},
+            ),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathUsageErrors(_WritePathCmdFixtures):
+    """AC-WP-007: usage failures exit 2 with the offending argument named on stderr."""
+
+    def test_missing_flag_exits_two_naming_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1")
+
+        assert result == 2
+        assert "--flag" in capsys.readouterr().err
+
+    def test_flag_with_no_value_exits_two(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag")
+
+        assert result == 2
+        assert "--flag" in capsys.readouterr().err
+
+    def test_missing_unit_id_exits_two(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_check_write_path("--flag", "isPremiumEligible")
+
+        assert result == 2
+        assert "unit id" in capsys.readouterr().err
+
+    def test_unknown_flag_exits_two(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible", "--bogus")
+
+        assert result == 2
+        assert "--bogus" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathUnknownUnit(_WritePathCmdFixtures):
+    """AC-WP-007: an unknown unit id exits 1 with one actionable sentence, no stack trace."""
+
+    def test_unknown_unit_id_exits_one(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_write_path("E9-F9-S9-T9", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "E9-F9-S9-T9" in captured.err
+        assert "Traceback" not in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathDisabled(_WritePathCmdFixtures):
+    """AC-WP-006 (spec 4.1): a disabled/unconfigured gate prints exactly the
+    status line and exits 0 before ``--flag`` is ever audited."""
+
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+    def test_unconfigured_gate_defaults_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {self._REPO}:\n    default_branch: main\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+    def test_empty_positional_argument_is_silently_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`_parse_check_write_path_argv`'s `if not arg: i += 1; continue`
+        (cli.py) treats an empty-string argv entry as a no-op: it is
+        neither counted toward the required single positional unit id nor
+        rejected as an unknown/invalid token. This is a DELIBERATE
+        decision for this round, matching the empty-value tolerance an
+        argv-splitting caller (e.g. a shell wrapper that leaves a stray
+        empty token from a doubled separator) would otherwise trip on --
+        it is not a usage error a human or CI caller is likely to type by
+        hand, unlike a genuinely missing/duplicated unit id or an unknown
+        flag, which DO still exit 2 (see the sibling tests above). Proven
+        here by placing the empty string BEFORE the real unit id: if it
+        were counted as a second positional, this would exit 2 with
+        "requires exactly one unit id"; instead the parse succeeds exactly
+        as it would with the empty token absent."""
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("", "E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
+    """AC-WP-005, AC-WP-006: an enabled run prints the spec 5.2 status line
+    (judge-evidence tier, first line) then human-readable findings, and
+    never blocks on an `indeterminate` verdict."""
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def test_live_verdict_prints_pass_status_and_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line == {
+            "gate": "write_path_audit",
+            "tier": "judge-evidence",
+            "status": "pass",
+            "findings": 0,
+            "flag": "isPremiumEligible",
+            "verdict": "live",
+        }
+        assert "[PERMISSION_FLAG_WRITE_PATH_AUDIT]" in captured.out
+        assert "src/reducers/permissionReducer.ts:1" in captured.out
+
+    def test_default_verdict_prints_fail_status_and_exits_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        self._write(
+            repo_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "const initialState = {\n  isPremiumEligible: false,\n};\n",
+        )
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line["status"] == "fail"
+        assert first_line["verdict"] == "default"
+        assert first_line["findings"] == 1
+
+    def test_indeterminate_verdict_never_blocks_and_shows_evidence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        self._write(
+            repo_path / "src" / "misc" / "assign.py",
+            "isPremiumEligible = someUnknownVar\n",
+        )
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line["status"] == "pass"
+        assert first_line["verdict"] == "indeterminate"
+        assert "src/misc/assign.py:1" in captured.out
+
+    def test_config_load_failure_exits_one_before_any_audit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "does-not-exist" / "devbench.yaml"))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+
 class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
     """doc_review round-2 (E6-F2-S1-T2 Blocking 3): ``_resolve_scope_mode`` and
     ``_resolve_scope_or_report`` each carry an exhaustive parenthetical caller
@@ -15936,6 +16242,60 @@ class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
 
         source = inspect.getsource(cli._resolve_scope_or_report)
         assert "fixture-consistency gate" in source
+
+
+@pytest.mark.unit
+class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
+    """code_review + changes_manifest round 1 (E7-F1-S1-T1 Blocking 5): four
+    shared helpers this unit adds a new caller to each carry an exhaustive
+    caller/count enumeration that was accurate before this unit's change and
+    false after it (a stale "all five verbs" / "exactly one definition
+    across both verbs" / "the two verbs' usage errors" claim, and an
+    `**extra_fields` example list that never named `write_path_audit`'s own
+    fields). Pinned here, following the same pattern as
+    ``TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate`` above,
+    so a future new caller of any of these four helpers cannot land without
+    this list being swept too."""
+
+    def test_resolve_unit_repo_and_path_names_check_write_path_as_a_sixth_caller(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_unit_repo_and_path)
+        assert "cmd_check_write_path" in source
+        # W3 (test_review): bare "six" is a substring of "sixth" and would
+        # pass even if the docstring's claim drifted to name a different
+        # count; "six callers" pins the exact claim the docstring makes.
+        assert "six callers" in source
+
+    def test_consume_gate_verb_flag_value_names_parse_check_write_path_argv(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._consume_gate_verb_flag_value)
+        assert "_parse_check_write_path_argv" in source
+        # W3 (test_review): tightened from bare "three" (its sibling test
+        # below was already tightened to "three verbs"); this docstring's
+        # own wording is "three callers", not "three verbs".
+        assert "three callers" in source
+
+    def test_gate_verb_usage_error_names_check_write_path_and_its_scope_correctly(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_verb_usage_error)
+        assert "check-write-path" in source
+        assert "is a gate CHECK verb" in source
+        assert "gate-MARKER verbs" in source
+        assert "three verbs" in source
+
+    def test_gate_status_line_extra_fields_names_write_path_audit_fields(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_status_line)
+        assert "write_path_audit" in source
+        # W3 (test_review): bare "flag" and "verdict" are loose substrings;
+        # the backtick-wrapped, docstring-literal spellings pin the exact
+        # field names the docstring documents for write_path_audit.
+        assert "``flag``" in source
+        assert "``verdict``" in source
 
 
 class _FixtureGateCmdFixtures:

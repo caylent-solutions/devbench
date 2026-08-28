@@ -4493,10 +4493,11 @@ def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | No
 
     Shared by :func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`,
     :func:`cmd_check_reachability`, :func:`_prepare_shared_file_impact_run`
-    (on behalf of :func:`cmd_check_shared_file_impact`) and
-    :func:`cmd_request_amendment` so all five verbs report "unit not found" /
-    "no local path configured" identically. Prints the ERROR itself; the
-    caller's job is only to propagate a non-zero exit code.
+    (on behalf of :func:`cmd_check_shared_file_impact`),
+    :func:`cmd_check_write_path` and :func:`cmd_request_amendment` so all
+    six callers report "unit not found" / "no local path configured"
+    identically. Prints the ERROR itself; the caller's job is only to
+    propagate a non-zero exit code.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -4644,7 +4645,7 @@ def _resolve_ancestry_repo_context(unit_id: str) -> tuple[str, Path] | None:
 
 
 def _gate_disabled_line(gate_name: str) -> str:
-    """Render the spec 4.1 ``{"gate":"<gate_name>","status":"disabled"}`` line.
+    """Render the spec 4.1 ``{"gate": "<gate_name>", "status": "disabled"}`` line.
 
     Single formatter shared by every gate command so the disabled-line
     shape can never drift between gates; the status value comes from
@@ -4660,8 +4661,9 @@ def _gate_status_line(gate_name: str, status: str, findings: int, **extra_fields
     set/order (``gate``, ``tier``, ``status``, ``findings``) can never
     drift between gates. ``**extra_fields`` carries each gate's own
     additional fields (ancestry's ``mode``/``dependency_ref``/
-    ``target_ref``/``scope_hash``; reachability's ``scope_hash``),
-    appended in the order passed.
+    ``target_ref``/``scope_hash``; reachability's ``scope_hash``;
+    shared_file_impact's ``scope_hash``; write_path_audit's ``flag``/
+    ``verdict``), appended in the order passed.
     """
     payload: dict[str, object] = {
         "gate": gate_name,
@@ -4679,7 +4681,7 @@ def _load_gate_config_or_report(gate_name: str, canonical_repo: str) -> "Resolve
     Single gate-agnostic loader shared by every gate command: an ``int``
     result means "already handled -- return this exit code as-is" (the
     loader's own fail-fast ``ERROR:`` message, or the spec 5.2
-    ``{"gate":"<gate_name>","status":"disabled"}`` line, is already
+    ``{"gate": "<gate_name>", "status": "disabled"}`` line, is already
     printed); a ``ResolvedGateConfig`` result means the gate is enabled and
     the caller should proceed.
     """
@@ -8991,6 +8993,146 @@ def _fixture_finding_is_attributable(finding: "FixtureFinding", scope_files: fro
     return normalize_repo_relative_path(finding.location) in normalized_scope_files
 
 
+# ---------------------------------------------------------------------------
+# Write-path audit gate (spec `integration-reality-gates-hardening.md`
+# section 4.8; caylent-solutions/devbench-internal-backlog#16; from #321;
+# judge-evidence tier). CLI-ifies the `plugin_helpers` module a
+# `python -c` one-liner previously invoked directly -- spec 4.8 rejects
+# that shape as an unversioned interface -- while keeping `audit_write_path`
+# importable for the `spec-to-backlog` skill's Step 3b narrative.
+# ---------------------------------------------------------------------------
+
+_WRITE_PATH_AUDIT_GATE_NAME: str = "write_path_audit"
+
+
+def _parse_check_write_path_argv(argv: tuple[str, ...]) -> tuple[str, str] | int:
+    """Parse the ``check-write-path`` flag grammar: ``<unit-id> --flag <name>`` (spec 4.8, Section 14).
+
+    Returns ``(unit_id, flag_name)`` on success. On a usage failure -- a
+    missing or duplicated positional unit id, an unknown flag, or a
+    missing/empty ``--flag`` value -- returns the ``2`` usage-error exit
+    code (already printed to stderr via :func:`_gate_verb_usage_error`),
+    reusing the SAME shared usage-error shape and flag-value consumption
+    ``log-waiver``/``log-newly-reachable`` already own
+    (:func:`_gate_verb_usage_error`, :func:`_consume_gate_verb_flag_value`)
+    instead of a third hand-typed copy (spec Section 7, AC-WP-007).
+    """
+    args = list(argv)
+    positional: list[str] = []
+    flag_name = ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--flag":
+            consumed = _consume_gate_verb_flag_value(args, i, "--flag")
+            if isinstance(consumed, int):
+                return consumed
+            flag_name, i = consumed
+            continue
+        if arg.startswith("--"):
+            return _gate_verb_usage_error(f"unknown flag: {arg}")
+        positional.append(arg)
+        i += 1
+
+    if len(positional) != 1:
+        return _gate_verb_usage_error(
+            "check-write-path requires exactly one unit id: check-write-path <id> --flag <name>"
+        )
+    if not flag_name:
+        return _gate_verb_usage_error("--flag is required: check-write-path <id> --flag <name>")
+    return positional[0], flag_name
+
+
+def cmd_check_write_path(*argv: str) -> int:
+    """Write-path audit gate: check-write-path <unit-id> --flag <name> (spec 4.8; judge-evidence).
+
+    CLI-ifies :func:`devbench.plugin_helpers.permission_flag_writepath.audit_write_path`
+    -- the ``spec-to-backlog`` skill's Step 3b previously invoked it only
+    through a ``python -c`` one-liner (see that module's own docstring),
+    which spec 4.8 rejects as an unversioned interface. ``audit_write_path``
+    stays importable for the skill's own narrative (AC-WP-001); this verb
+    is the versioned surface every OTHER caller (a human, CI, a review
+    judge) should use instead.
+
+    Resolves *unit-id* to its repo through the same shared
+    :func:`_resolve_unit_repo_and_path` helper :func:`cmd_check_reachability`
+    calls directly and :func:`_prepare_shared_file_impact_run` (on behalf of
+    :func:`cmd_check_shared_file_impact`) calls indirectly -- verified
+    against the shipped file, not every gate command: :func:`cmd_check_ancestry`
+    and :func:`cmd_check_fixture_consistency` resolve their unit through a
+    different path (the latter via :func:`_resolve_fixture_consistency_repo_path`)
+    and are NOT callers of this helper. This verb then resolves
+    ``gates.write_path_audit.enabled`` exclusively through
+    :func:`_load_gate_config_or_report` (i.e. ``config_loader.resolve_gate_config``,
+    spec 4.1's single read path) -- never by reaching into raw config. When
+    the gate is disabled or unconfigured for the unit's repo, prints exactly
+    ``{"gate": "write_path_audit", "status": "disabled"}`` and exits 0 (spec
+    4.1, AC-WP-006) before ``--flag`` is ever audited.
+
+    An enabled run audits ``--flag <name>`` against the resolved repo
+    checkout and prints the spec 5.2 status line as the FIRST stdout line
+    -- ``{"gate": "write_path_audit", "tier": "judge-evidence", "status":
+    "pass"|"fail", "findings": <int>, "flag": "<name>", "verdict": "<verdict>"}``
+    -- followed by the audit's human-readable findings
+    (:meth:`WritePathAudit.render`).
+
+    Verdict-to-status mapping (AC-WP-005, AC-WP-006): ``live`` is
+    ``status="pass"`` (a confirmed runtime write path exists);
+    ``indeterminate`` is ALSO ``status="pass"`` -- an unresolved shape is
+    reported with its evidence lines but never auto-blocks, closing the
+    old always-block-on-unknown behaviour that produced the
+    every-repo-blocks defect (spec 4.8) -- exiting 0 in both cases.
+    ``default``, ``no_write_path`` and ``not_found`` are each
+    ``status="fail"`` (the referenced flag has no verified live write
+    path -- the genuine finding this gate exists to surface), exiting 1.
+
+    Returns:
+        0 when the gate is disabled/unconfigured, or an enabled run's
+        verdict is ``live``/``indeterminate``. 1 when the unit id is
+        unknown, the repo has no configured local path, the gate config
+        fails to load, or an enabled run's verdict is
+        ``default``/``no_write_path``/``not_found``. 2 on a usage error
+        (missing/duplicated unit id, unknown flag, or a missing/empty
+        ``--flag`` value).
+    """
+    parsed = _parse_check_write_path_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, flag_name = parsed
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _unit, canonical_repo, repo_path = resolved
+
+    gate_config = _load_gate_config_or_report(_WRITE_PATH_AUDIT_GATE_NAME, canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    from devbench.plugin_helpers.permission_flag_writepath import (
+        VERDICT_INDETERMINATE,
+        VERDICT_LIVE,
+        audit_write_path,
+    )
+
+    audit = audit_write_path(repo_path, flag_name)
+
+    if audit.verdict in (VERDICT_LIVE, VERDICT_INDETERMINATE):
+        status = GATE_STATUS_PASS
+        findings = 0
+    else:
+        status = GATE_STATUS_FAIL
+        findings = 1
+
+    print(_gate_status_line(_WRITE_PATH_AUDIT_GATE_NAME, status, findings, flag=flag_name, verdict=audit.verdict))
+    print(audit.render())
+
+    return 1 if status == GATE_STATUS_FAIL else 0
+
+
 def _reject_em_dash(field_name: str, text: str) -> int | None:
     """Reject any agent-supplied text containing U+2014 before it reaches the backlog.
 
@@ -9415,9 +9557,24 @@ def _gate_verb_usage_error(message: str) -> int:
     mirrors these semantics for its fields"): every usage failure -- an
     unknown judge/gate name, an empty required field, or a machine-blocking
     gate waived without ``--operator`` -- exits 2 naming the offending
-    argument. Centralising the shape here means the two verbs' usage errors
-    can never drift (their argument sets differ, but the exit code and
-    stderr shape must not).
+    argument. :func:`_parse_check_write_path_argv` (spec 4.8, Section 14) is
+    a THIRD caller: ``check-write-path`` is a gate CHECK verb, not one of the
+    structured gate-MARKER verbs section 4.9 scopes this shape to -- its use
+    here is an incidental reuse of the same exit-2 shape for its own
+    (unrelated) usage grammar, not a claim that it is a gate-marker verb.
+    Centralising the shape here means all three verbs' usage errors can
+    never drift (their argument sets differ, but the exit code and stderr
+    shape must not). "Three" counts VERBS (log-waiver, log-newly-reachable,
+    check-write-path), not calling functions -- counting call sites by grep
+    yields a larger, unrelated number, and the count-per-verb is not
+    uniform: ``log-waiver`` and ``log-newly-reachable`` each reach this
+    helper from TWO functions of their own (a ``_parse_*_argv`` grammar
+    function and a separate ``_validate_*_semantics`` function),
+    while ``check-write-path`` reaches it from exactly ONE function of its
+    own (:func:`_parse_check_write_path_argv`) -- its only other route here
+    is through the SHARED :func:`_consume_gate_verb_flag_value` helper, not
+    a second dedicated function of its own, since it has no semantics
+    validation step beyond argument parsing.
 
     Args:
         message: Already names the offending argument, e.g. ``"--reason is
@@ -9433,13 +9590,18 @@ def _gate_verb_usage_error(message: str) -> int:
 def _consume_gate_verb_flag_value(args: list[str], i: int, flag: str) -> tuple[str, int] | int:
     """Return ``(value, next_index)`` for *flag*'s value at ``args[i + 1]``.
 
-    Shared by every flag-scanning function behind a structured gate-marker
-    verb -- :func:`_scan_log_waiver_flags` (``--gate``/``--target``/``--reason``)
-    and :func:`_scan_log_newly_reachable_flags` (``--path``/``--method``/``--result``)
-    -- so the "flag requires a value" usage error has exactly one definition
-    across both verbs instead of being duplicated per verb (E2-F4-S1-T2
-    REFACTOR: was ``_consume_log_waiver_flag_value``, generalised once
-    ``log-newly-reachable`` needed the identical behaviour).
+    Shared by every flag-scanning function that needs the "flag requires a
+    value" usage error: :func:`_scan_log_waiver_flags`
+    (``--gate``/``--target``/``--reason``) and
+    :func:`_scan_log_newly_reachable_flags` (``--path``/``--method``/``--result``)
+    behind the two structured gate-marker verbs, and
+    :func:`_parse_check_write_path_argv` (``--flag``, spec 4.8) behind the
+    ``check-write-path`` gate CHECK verb -- so the value-consumption logic
+    has exactly one definition across all three callers instead of being
+    duplicated per verb (E2-F4-S1-T2 REFACTOR: was
+    ``_consume_log_waiver_flag_value``, generalised once
+    ``log-newly-reachable`` needed the identical behaviour; a third,
+    unrelated-verb caller followed in E7-F1-S1-T1).
 
     Returns:
         ``(value, i + 2)`` on success, or the ``2`` usage-error exit code
@@ -18734,6 +18896,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "check-fixture-consistency <id>"
         ),
     ),
+    "check-write-path": (
+        cmd_check_write_path,
+        0,
+        "Write-path audit: check-write-path <id> --flag <name>",
+    ),
     "log-waiver": (
         cmd_log_waiver,
         2,
@@ -18863,6 +19030,9 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         # 317-D23 (E4-F1-S1-T2): owns its own <id> / --blocks-roots parsing,
         # same rationale as add-dep above.
         "wire-gate",
+        # E7-F1-S1-T1 (spec 4.8): owns its own <id> / --flag <name> parsing,
+        # same rationale as wire-gate above.
+        "check-write-path",
         "decline",
         # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
         "green-green-check",

@@ -1,14 +1,18 @@
 """Tests for ``devbench.plugin_helpers.permission_flag_writepath`` (QA finding 07).
 
-Covers the write-path verdict classifier (live / default_only /
-no_write_path / not_found / indeterminate), the placeholder-seam
-finder, and the rendered audit-line / blocking-finding text the
-``spec-to-backlog`` skill's Step 3b pastes into its audit trail.
+Covers the write-path verdict classifier (live / default /
+no_write_path / not_found / indeterminate), the assignment-context
+rework's per-expression classification (spec
+`integration-reality-gates-hardening.md` section 4.8, 321-D03/321-D28),
+the placeholder-seam finder, and the rendered audit-line /
+blocking-finding text the ``spec-to-backlog`` skill's Step 3b pastes
+into its audit trail.
 """
 
 from __future__ import annotations
 
 import textwrap
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -95,7 +99,7 @@ class TestAuditWritePath:
         assert audit.assignment_sites == ()
         assert audit.is_verified_live is False
 
-    def test_flag_assigned_only_in_default_signalled_file_is_default_only(self, tmp_path: Path) -> None:
+    def test_flag_assigned_only_as_a_literal_is_default(self, tmp_path: Path) -> None:
         pfw = _pfw()
         _write(
             tmp_path / "src" / "state" / "defaultState.ts",
@@ -106,7 +110,7 @@ class TestAuditWritePath:
             """,
         )
         audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
-        assert audit.verdict == "default_only"
+        assert audit.verdict == "default"
         assert audit.is_verified_live is False
         assert len(audit.assignment_sites) == 1
         assert audit.assignment_sites[0].relative_path == "src/state/defaultState.ts"
@@ -280,6 +284,1419 @@ class TestAuditWritePath:
         pfw.audit_write_path(tmp_path, "isPremiumEligible")
 
 
+@pytest.mark.unit
+class TestSymlinkContainment:
+    """SECURITY (security_review MEDIUM, this unit): `_iter_source_files`
+    walks via `Path.rglob`, which FOLLOWS file symlinks. A committed
+    symlink whose target resolves OUTSIDE the repo root must never be
+    read, whichever direction the escape or false-positive risk runs."""
+
+    def test_file_symlink_escaping_the_repo_root_is_excluded(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        repo_root = tmp_path / "repo"
+        outside_dir = tmp_path / "outside"
+        repo_root.mkdir()
+        outside_dir.mkdir()
+        (outside_dir / "leak.ts").write_text("isPremiumEligible = true;\n", encoding="utf-8")
+        (repo_root / "linked.ts").symlink_to(outside_dir / "leak.ts")
+
+        audit = pfw.audit_write_path(repo_root, "isPremiumEligible")
+        assert audit.verdict == "not_found"
+        assert audit.mention_count == 0
+
+    def test_file_symlink_pointing_inside_the_repo_root_is_still_scanned(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        repo_root = tmp_path / "repo"
+        (repo_root / "src").mkdir(parents=True)
+        (repo_root / "src" / "real.ts").write_text("isPremiumEligible = true;\n", encoding="utf-8")
+        (repo_root / "src" / "linked.ts").symlink_to(repo_root / "src" / "real.ts")
+
+        audit = pfw.audit_write_path(repo_root, "isPremiumEligible")
+        # Both the real file and the in-root symlink to it are scanned.
+        assert audit.mention_count == 2
+
+    def test_repo_root_itself_reached_through_a_symlink_still_scans_its_files(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        real_root = tmp_path / "real_root"
+        (real_root / "src").mkdir(parents=True)
+        (real_root / "src" / "reducer.ts").write_text("isPremiumEligible = action.payload.value;\n", encoding="utf-8")
+        linked_root = tmp_path / "linked_root"
+        linked_root.symlink_to(real_root, target_is_directory=True)
+
+        audit = pfw.audit_write_path(linked_root, "isPremiumEligible")
+        assert audit.verdict == "live"
+        assert audit.mention_count == 1
+
+    def test_sibling_directory_sharing_a_name_prefix_is_not_treated_as_contained(self, tmp_path: Path) -> None:
+        """A symlink escaping into a SIBLING directory whose name merely
+        shares the repo root's own name as a string prefix (`repo` vs
+        `repo-other`) must still be excluded -- containment is evaluated by
+        real path-segment membership (`Path.is_relative_to`), never by
+        string prefix comparison."""
+        pfw = _pfw()
+        repo_root = tmp_path / "repo"
+        sibling_root = tmp_path / "repo-other"
+        repo_root.mkdir()
+        sibling_root.mkdir()
+        (sibling_root / "leak.ts").write_text("isPremiumEligible = true;\n", encoding="utf-8")
+        (repo_root / "linked.ts").symlink_to(sibling_root / "leak.ts")
+
+        audit = pfw.audit_write_path(repo_root, "isPremiumEligible")
+        assert audit.verdict == "not_found"
+        assert audit.mention_count == 0
+
+
+@pytest.mark.unit
+class TestAsTypeSuffixRegexIsNotQuadratic:
+    """SECURITY (security_review MEDIUM ReDoS, this unit): the trailing
+    type-assertion suffix regex must run in bounded time even against an
+    expression containing a long mid-expression whitespace run (the shape
+    that was quadratic in the retired `_AS_CONST_SUFFIX_RE`, since a
+    leading unbounded `\\s+` before an anchored `$` forces the engine to
+    retry the match at every offset within the run)."""
+
+    def test_long_whitespace_run_normalizes_in_bounded_time(self) -> None:
+        pfw = _pfw()
+        # A mid-expression whitespace run with no "as <Type>" suffix
+        # following it -- the adversarial shape security_review measured
+        # at 40.19s for a 1.53 MB file. A single ~64k-char expression run
+        # through the same normalization path must complete in a small,
+        # constant-bounded time, not scale quadratically with length.
+        expression = "false" + (" " * 64_000)
+        start = time.monotonic()
+        result = pfw._normalize_rhs_expression(expression)
+        elapsed = time.monotonic() - start
+        assert result == "false"
+        assert elapsed < 2.0, f"_normalize_rhs_expression took {elapsed:.3f}s on a 64k whitespace run (must be O(n))"
+
+
+@pytest.mark.unit
+class TestAssignmentRegexAnnotationGroupIsNotCubic:
+    """SECURITY (security_review HIGH, this unit): `_assignment_regex`'s
+    optional type-annotation group `(?::\\s*[\\w\\[\\].,<> ]+)?` overlaps
+    with the `\\s*` that follows it before `=` -- both can consume the
+    same run of whitespace/word characters. At the previous revision the
+    pattern ended at `\\s*=\\s*(?!=)` and matched as soon as an `=` was
+    found, so the ambiguity was never exercised. This unit's own change
+    appends `(?P<assignment_rhs>[^;]+)`, which requires a character other
+    than `;` after the `=`. A line whose `=` ends the line (nothing for
+    that group to capture) makes the whole alternation fail, and the
+    engine backtracks through every split point of the annotation-group
+    ambiguity before giving up -- O(n^3) in the run of characters between
+    the flag name and the `=`, reachable through the shipped
+    `check-write-path` verb with no size guard.
+
+    The fix makes the optional annotation group ATOMIC
+    (`(?>:\\s*[\\w\\[\\].,<> ]+)?`) so the engine commits to its match and
+    never re-splits it on backtrack. Python's `re` module supports atomic
+    groups from 3.11; this project requires >=3.12 (`pyproject.toml`), so
+    `(?>...)` is used directly rather than an equivalent nested-lookahead
+    workaround."""
+
+    @pytest.mark.parametrize("padding", [2000, 4000])
+    def test_annotation_group_ambiguity_stays_bounded_across_doublings(self, padding: int) -> None:
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        # A line ending in `=` with nothing for `assignment_rhs` to
+        # capture: the shape that forces the retired pattern's full
+        # backtracking unwind. Measured at the previous revision:
+        # n=500 0.07s, n=1000 0.54s, n=2000 4.24s, n=4000 33.57s. The
+        # n=500/1000 cases are dropped here (test_review W1): they never
+        # exceed the bound even against the vulnerable pre-fix pattern,
+        # so they cannot distinguish a fix from a regression.
+        line = "isPremiumEligible:" + (" " * padding) + "="
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} "
+            "(must be O(n), not O(n^3), in the gap between the flag name and '=')"
+        )
+        # SHAPE ASSERTION (test_review W1): a timing-only assertion cannot
+        # tell the real pattern apart from a mutant that can never match
+        # anything -- a never-matching pattern also "passes" every timing
+        # bound, since there is nothing left to backtrack over. The
+        # pathological line's trailing `=` has nothing after it for
+        # `assignment_rhs` to capture (the group requires `[^;]+`, at
+        # least one character), so a correctly functioning pattern must
+        # not match this line.
+        assert match is None, f"_assignment_regex unexpectedly matched the no-rhs colon line at padding={padding}"
+
+    @pytest.mark.parametrize("padding", [8000, 16000, 32000, 64000])
+    def test_annotation_group_ambiguity_stays_bounded_across_doublings_no_colon(self, padding: int) -> None:
+        """SECURITY (security_review HIGH, this unit, round 2): the ATOMIC
+        annotation group above only guards the COLON-BEARING branch. When
+        a line has no colon the optional group cannot participate at
+        all, and `\\b{flag}\\b\\s*` sits directly against the trailing
+        `\\s*=` -- an unguarded adjacent-`\\s*` ambiguity reachable via
+        the very same `(?P<assignment_rhs>[^;]+)` group that made the
+        colon-bearing shape reachable. Measured at the previous revision
+        (this pattern, before the fix that widens the atomic boundary):
+        n=8000 0.10s, n=16000 0.40s, n=32000 1.59s, n=64000 6.36s -- a
+        clean ~4x-per-doubling growth. n=8000/16000 are kept even though
+        they stay under the bound pre-fix (deliberately, to align with
+        security_review's own reported table) while n=32000/64000 cross
+        it and catch the regression."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "isPremiumEligible" + (" " * padding) + "="
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} (no-colon shape) "
+            "(must be O(n) in the gap between the flag name and '=')"
+        )
+        assert match is None, f"_assignment_regex unexpectedly matched the no-rhs no-colon line at padding={padding}"
+
+    @pytest.mark.parametrize("colon", [True, False], ids=["colon", "no_colon"])
+    def test_annotation_group_still_matches_a_real_assignment(self, colon: bool) -> None:
+        """Companion to the no-match shape assertions above (test_review
+        W1): those assertions alone cannot catch a mutant that replaces
+        the assignment alternative with a never-matching literal, since
+        the pathological no-rhs line does not match the real pattern
+        either. This test proves the atomic annotation group still
+        participates in a GENUINE match, with and without the optional
+        type annotation, so that mutant fails here instead."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "isPremiumEligible: boolean = true;" if colon else "isPremiumEligible = true;"
+        match = pattern.search(line)
+        assert match is not None, f"_assignment_regex failed to match a real assignment line (colon={colon})"
+        assert match.group("assignment_rhs").strip() == "true"
+
+    def test_end_to_end_no_rhs_line_audits_in_bounded_time(self, tmp_path: Path) -> None:
+        """End-to-end regression through `audit_write_path` on a single
+        crafted line matching the magnitude security_review used to
+        demonstrate the pre-fix cubic behaviour: a 3,019-byte file took
+        14.2316s under `cmd_check_write_path` before this fix."""
+        pfw = _pfw()
+        content = "isPremiumEligible:" + (" " * 3000) + "=\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"audit_write_path took {elapsed:.3f}s on a 3,019-byte no-rhs crafted line (must be O(n), not cubic)"
+        )
+
+    def test_end_to_end_no_rhs_line_audits_in_bounded_time_no_colon(self, tmp_path: Path) -> None:
+        """SECURITY (security_review HIGH, this unit, round 2): end-to-end
+        no-colon counterpart to the test above, on a 64,019-byte crafted
+        line matching the magnitude security_review used to demonstrate
+        the round-2 unguarded adjacent-`\\s*` ambiguity: measured
+        6.4204s under `audit_write_path` before this fix."""
+        pfw = _pfw()
+        content = "isPremiumEligible" + (" " * 64000) + "=\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"audit_write_path took {elapsed:.3f}s on a 64,019-byte no-rhs no-colon crafted line "
+            "(must be O(n), not O(n^2))"
+        )
+
+
+@pytest.mark.unit
+class TestSetterRegexArgumentGroupIsNotQuadratic:
+    """SECURITY (security_review HIGH, this unit, round 5): the `setter`
+    alternative in `_assignment_regex` had no trailing required element at
+    the previous revision (`rf"\\bset[_-]?{escaped}\\s*\\("`), so it
+    matched as soon as the opening paren was found and the ambiguity below
+    was never reachable. This unit's own change appends
+    `\\s*(?P<setter_arg>[^)]*)\\)`, which requires a closing paren. The
+    added `\\s*` and `[^)]*` are adjacent variable-width regions that both
+    match whitespace, so a line whose call is never closed (no `)`
+    anywhere after the opening paren) makes the whole alternative fail,
+    and the engine backtracks through every split point of that
+    whitespace/`[^)]*` overlap before giving up -- O(n^2) in the run of
+    characters between the opening paren and the end of the searched
+    text, reachable through the shipped `check-write-path` verb with no
+    size guard.
+
+    The fix makes the leading whitespace inside the call ATOMIC
+    (`\\((?>\\s*)(?P<setter_arg>[^)]*)\\)`), the same treatment already
+    applied to the assignment alternative's annotation group above."""
+
+    @pytest.mark.parametrize("padding", [8000, 16000, 32000, 64000])
+    def test_argument_group_ambiguity_stays_bounded_across_doublings(self, padding: int) -> None:
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        # An unclosed setter call: nothing for `setter_arg` to close
+        # against, the shape that forces the vulnerable pattern's full
+        # backtracking unwind. Measured at the previous revision (isolated
+        # `pattern.search`): n=4000 0.0587s, n=8000 0.2343s, n=16000
+        # 0.9361s, n=32000 3.7438s, n=64000 15.0750s -- a clean ~4x per
+        # doubling. n=8000/16000 are kept even though they stay under the
+        # bound pre-fix (aligned with security_review's own reported
+        # table) while n=32000/64000 cross it and catch the regression.
+        line = "setisPremiumEligible(" + (" " * padding)
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} (setter shape) "
+            "(must be O(n), not O(n^2), in the gap after the setter's opening paren)"
+        )
+        # SHAPE ASSERTION (mirrors test_review W1's guard on the
+        # assignment-alternative tests above): a timing-only assertion
+        # cannot tell the real pattern apart from a mutant that can never
+        # match anything -- a never-matching pattern also "passes" every
+        # timing bound, since there is nothing left to backtrack over.
+        # The unclosed call has no `)` for `setter_arg` to close against,
+        # so a correctly functioning pattern must not match this line.
+        assert match is None, f"_assignment_regex unexpectedly matched the unclosed setter call at padding={padding}"
+
+    def test_argument_group_still_matches_a_real_setter(self) -> None:
+        """Companion to the no-match shape assertion above: proves the
+        atomic whitespace group still participates in a GENUINE match, so
+        a mutant that replaces the setter alternative with a
+        never-matching literal fails here instead."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "setIsPremiumEligible(   request.user.isPremium   );"
+        match = pattern.search(line)
+        assert match is not None, "_assignment_regex failed to match a real setter call"
+        assert match.group("setter_arg").strip() == "request.user.isPremium"
+
+    def test_end_to_end_unclosed_setter_call_audits_in_bounded_time(self, tmp_path: Path) -> None:
+        """End-to-end regression through `audit_write_path` on a single
+        crafted line matching the magnitude security_review used to
+        demonstrate the pre-fix quadratic behaviour: a 64,022-byte file
+        took 15.204s under `audit_write_path` before this fix."""
+        pfw = _pfw()
+        content = "setisPremiumEligible(" + (" " * 64000) + "\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"audit_write_path took {elapsed:.3f}s on a 64,022-byte unclosed-setter crafted line "
+            "(must be O(n), not O(n^2))"
+        )
+
+
+@pytest.mark.unit
+class TestObjectLiteralRegexSuffixIsNotQuadratic:
+    """SECURITY (security_review MEDIUM, this unit, round 5): the
+    `object_literal` alternative's trailing `\\s*[,;]?\\s*$` is
+    byte-identical to the pre-image (a pre-existing defect, not a
+    regression introduced by this unit's diff) -- the two adjacent `\\s*`
+    regions straddling the optional `[,;]?` both match whitespace, so a
+    line whose trailing run of whitespace is never followed by the end of
+    the searched text (some non-whitespace, non-`[,;]` character breaks
+    the `$` anchor) makes the whole alternative fail, and the engine
+    backtracks through every split point of that overlap before giving up
+    -- O(n^2) in the length of the trailing whitespace run.
+
+    This unit's own diff actually IMPROVES this input's measured time,
+    because the previous cubic assignment-alternative backtracking was
+    masking it; it is fixed here anyway because it lives in the function
+    this unit rewrote and the same class already shipped twice in this
+    unit's own diff.
+
+    The fix makes the whole suffix ATOMIC (`(?>\\s*[,;]?\\s*)$`)."""
+
+    @pytest.mark.parametrize("padding", [8000, 16000, 32000])
+    def test_suffix_ambiguity_stays_bounded_across_doublings(self, padding: int) -> None:
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        # A trailing non-whitespace, non-[,;] character defeats the `$`
+        # anchor, forcing the engine to try every split of
+        # `\\s*[,;]?\\s*` before giving up. Measured at the previous
+        # revision (isolated `pattern.search`): n=8000 0.2615s, n=16000
+        # 1.0447s, n=32000 4.1881s -- a clean ~4x per doubling.
+        line = "isPremiumEligible: false" + (" " * padding) + "x"
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} (object-literal shape) "
+            "(must be O(n), not O(n^2), in the trailing whitespace run)"
+        )
+        # SHAPE ASSERTION: the trailing `x` breaks the `$` anchor for
+        # every candidate split of the suffix, so a correctly functioning
+        # pattern must not match this line via the object-literal
+        # alternative (and no other alternative applies either).
+        assert match is None, (
+            f"_assignment_regex unexpectedly matched the anchor-defeating object-literal line at padding={padding}"
+        )
+
+    def test_suffix_still_matches_a_real_object_literal(self) -> None:
+        """Companion to the no-match shape assertion above: proves the
+        atomic suffix group still participates in a GENUINE match, with a
+        trailing comma and trailing whitespace, so a mutant that replaces
+        the object-literal alternative with a never-matching literal
+        fails here instead."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "isPremiumEligible: false,   "
+        match = pattern.search(line)
+        assert match is not None, "_assignment_regex failed to match a real object-literal line"
+        assert match.group("object_literal_value") == "false"
+
+    def test_end_to_end_anchor_defeating_object_literal_audits_in_bounded_time(self, tmp_path: Path) -> None:
+        """End-to-end regression through `audit_write_path` on a single
+        crafted line matching the magnitude security_review used to
+        demonstrate the pre-fix quadratic behaviour: a 64,026-byte file
+        took 17.928s under `audit_write_path` before this fix (measured
+        this round; the class is pre-existing, not a regression)."""
+        pfw = _pfw()
+        content = "isPremiumEligible: false" + (" " * 64000) + "x\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"audit_write_path took {elapsed:.3f}s on a 64,026-byte anchor-defeating object-literal crafted line "
+            "(must be O(n), not O(n^2))"
+        )
+
+
+@pytest.mark.unit
+class TestSetterArgumentGroupIsNotQuadraticOnManyOffsets:
+    """SECURITY (security_review HIGH, this unit, round 6): the fixes above
+    (`TestSetterRegexArgumentGroupIsNotQuadratic`) only close DRIVER A of
+    the ReDoS class -- a single unclosed setter call with a long tail. They
+    say nothing about DRIVER B: how many START OFFSETS in one line the
+    `setter` prefix (`\\bset[_-]?{flag}\\s*\\(`) can match, and what each
+    costs. `(?>\\s*)` bounds only the leading whitespace INSIDE one call;
+    it does nothing to `[^)]*`, which still scans to end of line at EVERY
+    start offset where the setter prefix occurs. Repeating the prefix `k`
+    times with no `)` anywhere gives `k` start offsets that each cost
+    O(remaining length) before failing: `k = L / 22` roughly, so total
+    cost is O(L^2) even though `(?>\\s*)` already closed driver A.
+    Measured against the pre-fix (unbounded `[^)]*`) pattern: k=1000
+    0.076s, k=2000 0.305s, k=4000 1.219s, k=8000 4.857s, k=16000 19.343s,
+    k=32000 75.389s -- a clean ~4x per doubling (O(n^2), exponent ~2.0).
+
+    The fix bounds the argument capture itself, the same treatment
+    `_TRAILING_TYPE_ASSERTION_RE` already uses for its own quantifiers:
+    `[^)\\n]{0,512}`. A bounded quantifier cannot be re-tried at more than
+    a constant number of lengths per start offset, so `k` failing start
+    offsets now cost O(k), not O(k * L), making the whole scan linear in
+    the line length regardless of how many unclosed setter prefixes it
+    contains."""
+
+    @pytest.mark.parametrize("occurrences", [8000, 16000, 32000, 64000])
+    def test_many_unclosed_setter_calls_on_one_line_stay_bounded(self, occurrences: int) -> None:
+        # Many start offsets, no closing paren anywhere in the line: the
+        # driver-B shape a single-occurrence long-tail test cannot reach,
+        # since a single occurrence only ever contributes ONE start
+        # offset. Pre-fix, this is O(n^2) as documented above; post-fix
+        # it must stay linear.
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "setisPremiumEligible(" * occurrences
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at occurrences={occurrences} "
+            "(many-offset unclosed setter shape) (must be O(n), not O(n^2), across many start offsets)"
+        )
+        # SHAPE ASSERTION (mirrors the driver-A tests above): none of the
+        # k unclosed calls has a closing paren, so a correctly functioning
+        # pattern must not match this line via the setter alternative (and
+        # no other alternative applies either).
+        assert match is None, (
+            f"_assignment_regex unexpectedly matched the many-offset unclosed setter line at occurrences={occurrences}"
+        )
+
+    def test_end_to_end_many_unclosed_setter_calls_audit_in_bounded_time(self, tmp_path: Path) -> None:
+        """End-to-end regression through `audit_write_path` on a single
+        crafted line containing many unclosed setter-prefix occurrences --
+        the many-offset counterpart to
+        `TestSetterRegexArgumentGroupIsNotQuadratic`'s single-occurrence
+        long-tail end-to-end test.
+
+        LOW (security_review, this unit): the original 5.0s budget at
+        k=8000 left the pre-fix (unbounded `setter_arg`) mutant at 0.964
+        of budget (measured 4.818s), so the mutant SURVIVED here even
+        though the sibling regex-level test at the same k
+        (`test_many_unclosed_setter_calls_on_one_line_stay_bounded`)
+        already kills it decisively at a 2.0s budget. The post-fix
+        elapsed time here is on the order of tens of milliseconds
+        (measured: 0.046s), so tightening to the same 2.0s budget the
+        sibling test already proves discriminative leaves a wide,
+        non-flaky margin above the real implementation while forcing the
+        mutant to fail here too."""
+        pfw = _pfw()
+        content = ("setisPremiumEligible(" * 8000) + "\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0, (
+            f"audit_write_path took {elapsed:.3f}s on a many-offset unclosed-setter crafted line "
+            "(must be O(n), not O(n^2), across many start offsets)"
+        )
+
+    def test_argument_group_still_matches_a_real_setter_under_the_bound(self) -> None:
+        """Companion to the no-match shape assertion above: proves the
+        bounded argument group still participates in a GENUINE match for
+        an ordinary, well-under-the-bound setter argument, so a mutant
+        that replaces the setter alternative with a never-matching literal
+        fails here instead."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        line = "setIsPremiumEligible(   request.user.isPremium   );"
+        match = pattern.search(line)
+        assert match is not None, "_assignment_regex failed to match a real setter call under the bound"
+        assert match.group("setter_arg").strip() == "request.user.isPremium"
+
+    def test_setter_argument_longer_than_the_bound_does_not_match_the_setter_alternative(self) -> None:
+        """The bound's operator-visible effect (documented in
+        `_assignment_regex`'s docstring): a setter argument longer than
+        512 characters no longer matches the setter alternative at all,
+        even though it has a real closing paren. This must be the
+        CONSERVATIVE direction -- see
+        `test_overlong_setter_argument_falls_through_to_a_blocking_verdict_not_live`
+        below for the end-to-end confirmation that this never silently
+        resolves to `live`."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        long_arg = "request.user." + ("x" * 600)
+        assert len(long_arg) > 512
+        line = f"setIsPremiumEligible({long_arg});"
+        match = pattern.search(line)
+        assert match is None, (
+            "_assignment_regex unexpectedly matched a setter argument longer than the 512-character bound"
+        )
+
+    def test_setter_argument_at_exactly_the_bound_still_matches(self) -> None:
+        """Boundary companion to the over-bound test above: an argument of
+        EXACTLY 512 characters is still within `{0,512}` and must match,
+        proving the bound is inclusive of its own limit rather than an
+        off-by-one under-count."""
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        arg = "x" * 512
+        line = f"setIsPremiumEligible({arg});"
+        match = pattern.search(line)
+        assert match is not None, "_assignment_regex failed to match a setter argument of exactly 512 characters"
+        assert match.group("setter_arg") == arg
+
+    def test_overlong_setter_argument_falls_through_to_a_blocking_verdict_not_live(self, tmp_path: Path) -> None:
+        """End-to-end confirmation that the bound's operator-visible
+        change is conservative. When the ONLY site for a flag is a setter
+        call whose argument exceeds the 512-character bound, the setter
+        alternative no longer matches that line at all: the line still
+        counts as a mention (`flag_name in line`), but produces no
+        `FlagAssignmentSite`, so `_classify` falls to
+        `VERDICT_NO_WRITE_PATH` -- a BLOCKING finding (`cmd_check_write_path`
+        exit 1) -- rather than ever silently resolving to `VERDICT_LIVE`.
+        This is the same fail-closed direction the module docstring
+        documents for every other unresolved shape."""
+        pfw = _pfw()
+        long_arg = "request.user." + ("x" * 600)
+        # Lowercase "set" + lowercase "i" (not "setIsPremiumEligible"):
+        # `audit_write_path`'s case-SENSITIVE mention gate
+        # (`if flag_name not in line`) requires the exact-case flag
+        # substring to reach the assignment regex at all -- see
+        # `test_camelcase_setter_spelling_still_blocked_by_case_sensitive_mention_gate`.
+        content = f"setisPremiumEligible({long_arg});\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+
+        assert audit.verdict == pfw.VERDICT_NO_WRITE_PATH, (
+            f"expected an overlong setter argument to fall through to {pfw.VERDICT_NO_WRITE_PATH!r} "
+            f"(blocking, conservative), got {audit.verdict!r}"
+        )
+        assert audit.assignment_sites == ()
+
+
+@pytest.mark.unit
+class TestAssignmentAndObjectLiteralRegexesAreNotQuadraticOnManyOffsets:
+    """SECURITY (security_review HIGH, this unit, round 6): the driver-B
+    method (many start offsets in one line, not just one occurrence's long
+    tail) applies to EVERY alternative, not only `setter`. This class
+    measures `assignment` and `object_literal` under many STACKED
+    occurrences, each individually shaped to defeat the atomic group that
+    already closes driver A for that alternative (round 1/2 for
+    `assignment`'s annotation group, round 5 for `object_literal`'s
+    trailing suffix) -- proving the atomic fix also closes driver B, not
+    only driver A, for both alternatives.
+
+    Manual mutation check (recorded in the TDD log, not committed as
+    source): reverting each alternative's atomic group
+    (`(?>...)` back to a plain `(?:...)`) on this same stacked input
+    reproduces the quadratic-per-occurrence growth: assignment mutant at
+    25 stacked occurrences, padding 200/400/800: 0.130s/0.936s/7.064s;
+    object_literal mutant at 25 stacked occurrences, padding
+    2000/4000/8000: 0.417s/1.668s/6.634s. The real (atomic) patterns stay
+    under 0.004s across the same inputs."""
+
+    @pytest.mark.parametrize("padding", [200, 400, 800])
+    def test_many_stacked_no_rhs_assignments_stay_bounded(self, padding: int) -> None:
+        # 25 stacked no-rhs assignment blocks, each individually shaped
+        # like `TestAssignmentRegexAnnotationGroupIsNotCubic`'s no-colon
+        # driver-A case, but concatenated so the search must try many
+        # start offsets, not just one.
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        one_block = "isPremiumEligible:" + (" " * padding) + "=;"
+        line = one_block * 25
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} across 25 stacked no-rhs blocks "
+            "(must be O(n), not quadratic-per-occurrence, across many start offsets)"
+        )
+        assert match is None, (
+            f"_assignment_regex unexpectedly matched a stacked no-rhs assignment block at padding={padding}"
+        )
+
+    @pytest.mark.parametrize("padding", [2000, 4000, 8000])
+    def test_many_stacked_anchor_defeating_object_literals_stay_bounded(self, padding: int) -> None:
+        # 25 stacked anchor-defeating object-literal blocks, each
+        # individually shaped like
+        # `TestObjectLiteralRegexSuffixIsNotQuadratic`'s driver-A case,
+        # concatenated so the search must try many start offsets.
+        pattern = _pfw()._assignment_regex("isPremiumEligible")
+        one_block = "isPremiumEligible: false" + (" " * padding) + "x "
+        line = one_block * 25
+        start = time.monotonic()
+        match = pattern.search(line)
+        elapsed = time.monotonic() - start
+        assert elapsed < 2.0, (
+            f"_assignment_regex search took {elapsed:.3f}s at padding={padding} across 25 stacked "
+            "anchor-defeating object-literal blocks (must be O(n), not quadratic-per-occurrence, across many "
+            "start offsets)"
+        )
+        assert match is None, (
+            f"_assignment_regex unexpectedly matched a stacked anchor-defeating object-literal block "
+            f"at padding={padding}"
+        )
+
+
+@pytest.mark.unit
+class TestStripLeadingNegationIsLinear:
+    """SECURITY (security_review MEDIUM ReDoS, this unit): the previous
+    `_strip_leading_negation` was `while stripped.startswith("!"): stripped
+    = stripped[1:]`, an O(k) string copy on EVERY iteration for a run of k
+    leading `!` characters -- O(k^2) total. This shape is NOT exercised by
+    `TestAsTypeSuffixRegexIsNotQuadratic`'s whitespace-run case above (a
+    different function), so it needs its own bounded-time regression."""
+
+    def test_long_negation_run_normalizes_in_bounded_time(self) -> None:
+        # A million leading `!` characters: at the measured quadratic rate
+        # (40k=0.0141s, ~4x per doubling), this shape would take roughly
+        # 8-9s under the retired implementation; the linear replacement
+        # completes in well under a second.
+        expression = ("!" * 1_000_000) + "false"
+        start = time.monotonic()
+        result = _pfw()._strip_leading_negation(expression)
+        elapsed = time.monotonic() - start
+        assert result == "false"
+        assert elapsed < 2.0, f"_strip_leading_negation took {elapsed:.3f}s on a 1M-char '!' run (must be O(k))"
+
+    def test_negation_run_through_full_normalization_pipeline_in_bounded_time(self) -> None:
+        expression = ("!" * 1_000_000) + "false"
+        start = time.monotonic()
+        result = _pfw()._normalize_rhs_expression(expression)
+        elapsed = time.monotonic() - start
+        assert result == "false"
+        assert elapsed < 2.0, f"_normalize_rhs_expression took {elapsed:.3f}s on a 1M-char '!' run (must be O(n))"
+
+
+@pytest.mark.unit
+class TestStripTrailingBlockCommentIsLinear:
+    """SECURITY (security_review MEDIUM ReDoS, this unit): the previous
+    `_strip_trailing_block_comment` re-checked "is everything after this
+    comment's `*/` pure whitespace" with a FRESH `expression[end + 2
+    :].strip() == ""` for EVERY block comment encountered -- O(n^2) total
+    over n block comments in one expression (measured: 120k=0.041s,
+    960k=6.806s, 1.92 MB=22.015s isolated). The linear replacement (a
+    single up-front `len(expression.rstrip())` plus an O(1) comparison
+    per comment) must stay flat across doublings well beyond that range.
+
+    W1 (test_review): sized at 100k/200k repetitions rather than the
+    original 1M/1.92M/3.84M -- at these smaller sizes the retired
+    quadratic implementation already measures 3.345s / 10.084s against
+    the linear replacement's 0.033s / 0.066s, the same kill in a fraction
+    of the wall-clock time, so a mutation run against this class does not
+    need to spend minutes per mutant to observe the retired shape fail."""
+
+    def test_many_trailing_block_comments_strip_in_bounded_time(self) -> None:
+        # 100k repetitions of " /*c*/" (~600 KB): the retired quadratic
+        # implementation measures ~3.345s here; the linear replacement
+        # completes in a small fraction of a second.
+        expression = "false" + (" /*c*/" * 100_000)
+        start = time.monotonic()
+        result = _pfw()._strip_trailing_block_comment(expression)
+        elapsed = time.monotonic() - start
+        assert result == expression[:-5]
+        assert elapsed < 1.0, f"_strip_trailing_block_comment took {elapsed:.3f}s on 100k block comments (must be O(n))"
+
+    def test_doubling_a_large_block_comment_count_scales_linearly_not_quadratically(self) -> None:
+        """Direct doubling comparison: a linear implementation's elapsed
+        time at 200k repetitions must not exceed roughly 3x its time at
+        100k repetitions -- a genuinely quadratic implementation would
+        show close to 4x (measured: 3.345s vs 10.084s, ~3.0x)."""
+        pfw = _pfw()
+        small = "false" + (" /*c*/" * 100_000)
+        large = "false" + (" /*c*/" * 200_000)
+
+        start = time.monotonic()
+        pfw._strip_trailing_block_comment(small)
+        small_elapsed = time.monotonic() - start
+
+        start = time.monotonic()
+        pfw._strip_trailing_block_comment(large)
+        large_elapsed = time.monotonic() - start
+
+        assert small_elapsed > 0.0
+        ratio = large_elapsed / small_elapsed
+        assert ratio < 3.0, (
+            f"doubling the block-comment count changed elapsed time by {ratio:.2f}x "
+            "(must be close to 2x for a linear implementation, not ~4x for a quadratic one)"
+        )
+
+
+@pytest.mark.unit
+class TestEndToEndAuditWritePathRemainsLinearForNewNormalizationLoops:
+    """End-to-end regression through `audit_write_path` itself (not just
+    the isolated helper functions above), on crafted files matching the
+    magnitude security_review used to demonstrate the pre-fix quadratic
+    behaviour (0.23-1.37 MB, 27.209s at 1.37 MB before this fix)."""
+
+    @pytest.mark.parametrize("target_mb", [0.23, 0.46, 0.92, 1.37])
+    def test_block_comment_heavy_file_audits_in_bounded_time(self, tmp_path: Path, target_mb: float) -> None:
+        pfw = _pfw()
+        target_bytes = int(target_mb * 1024 * 1024)
+        prefix = "isPremiumEligible = false"
+        unit = " /*c*/"
+        repetitions = max(1, (target_bytes - len(prefix) - 1) // len(unit))
+        content = prefix + (unit * repetitions) + ";\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        # Pre-fix magnitude was 27.209s at 1.37 MB; a generous 10s bound at
+        # every size below that comfortably distinguishes the linear
+        # replacement from the retired quadratic implementation.
+        assert elapsed < 10.0, (
+            f"audit_write_path took {elapsed:.3f}s on a {target_mb} MB block-comment-heavy file (must be O(n))"
+        )
+        assert audit.verdict == "indeterminate"
+
+    def test_negation_heavy_file_audits_in_bounded_time(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        content = "isPremiumEligible = " + ("!" * 800_000) + "false;\n"
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 10.0, f"audit_write_path took {elapsed:.3f}s on a 0.76 MB negation-heavy file (must be O(n))"
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+
+@pytest.mark.unit
+class TestStripTrailingBlockComment:
+    """Direct unit coverage of `_strip_trailing_block_comment`'s quote-aware
+    state machine, mirroring `TestStripTrailingLineComment`'s coverage of
+    its line-comment sibling: the single-quote/double-quote escape branches
+    and the non-terminated/mid-expression edge cases are not all reachable
+    through `audit_write_path`'s own literal check alone."""
+
+    def test_single_quoted_string_containing_block_comment_markers_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = "'/* not a comment */' "
+        assert pfw._strip_trailing_block_comment(literal_part + "/* real comment */") == literal_part
+
+    def test_escaped_quote_inside_single_quoted_string_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = r"'it\'s' "
+        assert pfw._strip_trailing_block_comment(literal_part + "/* comment */") == literal_part
+
+    def test_escaped_quote_inside_double_quoted_string_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = r'"a\"" '
+        assert pfw._strip_trailing_block_comment(literal_part + "/* comment */") == literal_part
+
+    def test_double_quoted_string_containing_block_comment_markers_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = '"/* not a comment */" '
+        assert pfw._strip_trailing_block_comment(literal_part + "/* real comment */") == literal_part
+
+    def test_unclosed_quoted_string_containing_a_block_comment_marker_survives_intact(self) -> None:
+        """test_review: the four `survives_intact` fixtures above embed a
+        BALANCED `/* ... */` pair inside the quote, so the mid-expression
+        rule ("only strip a comment that runs to the end") returns the
+        same answer whether or not the scanner is actually quote-aware --
+        the coincidence masks a quote-BLIND mutant. Making the marker's
+        surrounding quote UNCLOSED removes the coincidence: a quote-blind
+        scan treats the `/*` inside `'/* unclosed'` as a real comment
+        start, finds the LATER `*/` that closes the real trailing
+        comment, and truncates at the wrong point (`'` alone) instead of
+        leaving the whole literal (plus its trailing space) intact."""
+        pfw = _pfw()
+        literal_part = "'/* unclosed' "
+        assert pfw._strip_trailing_block_comment(literal_part + "/* real */") == literal_part
+
+    def test_unterminated_block_comment_returns_expression_unchanged(self) -> None:
+        pfw = _pfw()
+        expression = "false /* forgot to close"
+        assert pfw._strip_trailing_block_comment(expression) == expression
+
+    def test_mid_expression_block_comment_followed_by_more_text_is_left_alone(self) -> None:
+        """A `/* ... */` block comment that does NOT run to the end of the
+        expression (real content follows its closing `*/`) is not the
+        trailing-noise shape this function strips -- unwrapping it could
+        change what the remaining, un-parsed expression means."""
+        pfw = _pfw()
+        expression = "false /* note */ + extra"
+        assert pfw._strip_trailing_block_comment(expression) == expression
+
+    def test_no_comment_marker_returns_expression_unchanged(self) -> None:
+        pfw = _pfw()
+        assert pfw._strip_trailing_block_comment("false") == "false"
+
+
+@pytest.mark.unit
+class TestClassifyRhsExpressionBlockCommentCallerIsQuoteAware:
+    """test_review: `_strip_trailing_block_comment`'s quote-open branches
+    were previously pinned ONLY through `TestStripTrailingLineComment`'s
+    sibling coverage (deleting both quote-open branches killed three
+    line-comment tests and ZERO block-comment tests) -- the shared
+    `_QuoteScanState` extraction meant the block-comment CALLER path was
+    never independently exercised. This class closes that gap by going
+    through `_classify_rhs_expression` (the caller, not the raw helper)
+    with a setter-argument shape a quote-blind scan misclassifies.
+
+    security_review's demonstrated fail-open: a setter call whose
+    hardcoded string-literal argument itself contains `/*`, followed by a
+    real trailing block comment (`setIsPremiumEligible("/*" /* legacy
+    */)`), must still resolve the argument to the literal `"/*"` and
+    classify `default`. A quote-blind scan instead treats the `/*` inside
+    the string as the real comment's start, finds the LATER `*/` that
+    closes the actual trailing comment, and leaves a bare unterminated
+    `"` behind -- not a recognised literal -- so the setter-argument
+    branch falls through to its unconditional `live`, exactly the
+    fail-open direction this unit and two security rounds exist to
+    close."""
+
+    def test_setter_argument_literal_containing_a_slash_star_marker_classifies_default(self) -> None:
+        pfw = _pfw()
+        verdict = pfw._classify_rhs_expression('"/*" /* legacy */', is_setter_argument=True)
+        assert verdict == pfw.VERDICT_DEFAULT
+
+
+@pytest.mark.unit
+class TestStripWrappingParensDoesNotUnwrapPartialWrap:
+    def test_two_separately_parenthesised_terms_are_left_alone(self) -> None:
+        """`(a)+(b)`'s first `(` closes before the expression ends, so
+        stripping it would change the expression's meaning rather than
+        merely unwrap a single outer layer -- must be left untouched."""
+        pfw = _pfw()
+        expression = "(a)+(b)"
+        assert pfw._strip_wrapping_parens(expression) == expression
+
+
+@pytest.mark.unit
+class TestNormalizeRhsExpressionMultiPassConvergence:
+    def test_doubly_wrapped_literal_converges_across_multiple_passes(self, tmp_path: Path) -> None:
+        """`((false))` requires TWO passes of `_strip_wrapping_parens` to
+        reach the bare literal -- exercises `_normalize_rhs_expression`'s
+        bounded-loop re-application, not just a single pass."""
+        pfw = _pfw()
+        assert pfw._normalize_rhs_expression("((false))") == "false"
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "isPremiumEligible = ((false))\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+
+    def test_exactly_max_pass_count_of_nesting_still_resolves_via_the_bounded_fallback(self) -> None:
+        """A literal wrapped in exactly `_MAX_NORMALIZATION_PASSES` layers
+        of parens (one layer stripped per pass) exhausts every pass without
+        the early-exit `next_value == value` check ever firing -- the
+        function falls through to its final bounded-loop `return value`
+        instead, and still returns the fully-resolved literal."""
+        pfw = _pfw()
+        nested = "(" * pfw._MAX_NORMALIZATION_PASSES + "false" + ")" * pfw._MAX_NORMALIZATION_PASSES
+        assert pfw._normalize_rhs_expression(nested) == "false"
+
+
+# ---------------------------------------------------------------------------
+# Assignment-context classifier rework (spec
+# `integration-reality-gates-hardening.md` section 4.8; 321-D03, 321-D28;
+# AC-WP-002, AC-WP-003, AC-WP-004). The verdict is decided from the
+# assigned VALUE, not from the file's path vocabulary -- path vocabulary
+# survives only as a tiebreak for `indeterminate` (see
+# `TestIndeterminateStillFallsBackToPathVocabularyTiebreak` below).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAssignmentContextClassifier:
+    def test_initial_state_literal_classifies_default_despite_live_path_vocabulary(self, tmp_path: Path) -> None:
+        """AC-WP-002 (321-D03, the flagship false-`live`): a flag whose only
+        assignment is a literal inside an `initialState` object classifies
+        `default` even though the file's path (`src/store/slices/...`)
+        carries live-sounding vocabulary (`store`, `slice`)."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            """
+            const initialState = {
+              isPremiumEligible: false,
+            };
+            """,
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+    def test_runtime_derived_assignment_in_the_same_live_named_file_is_live(self, tmp_path: Path) -> None:
+        """AC-WP-003: `isPremiumEligible = action.payload.value` in the SAME
+        file as the initialState literal above classifies `live` -- a
+        confirmed runtime write site outweighs a hardcoded default living
+        alongside it in the same slice."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            """
+            const initialState = {
+              isPremiumEligible: false,
+            };
+
+            function permissionReducer(state, action) {
+              switch (action.type) {
+                case 'SET_ELIGIBILITY':
+                  isPremiumEligible = action.payload.value;
+                  return state;
+                default:
+                  return state;
+              }
+            }
+            """,
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "live"
+        assert audit.is_verified_live is True
+        paths = {s.relative_path for s in audit.assignment_sites}
+        assert paths == {"src/store/slices/permissionSlice.ts"}
+
+    def test_rails_literal_only_writer_classifies_default(self, tmp_path: Path) -> None:
+        """AC-WP-004 (321-D28): a Rails literal-only writer classifies
+        `default`, not a blocking/`live` false positive."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "app" / "models" / "user.rb",
+            """
+            class User < ApplicationRecord
+              def initialize(*)
+                super
+                self.is_premium_eligible = false
+              end
+            end
+            """,
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict == "default"
+
+    def test_django_model_field_default_classifies_default(self, tmp_path: Path) -> None:
+        """AC-WP-004 (321-D28): a Django model field default -- a call whose
+        OUTER expression is not itself a bare literal
+        (`models.BooleanField(...)`) but whose `default=` keyword argument
+        is -- still classifies `default`, not `live` from the dotted
+        attribute access alone."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "myapp" / "models.py",
+            """
+            class UserProfile(models.Model):
+                is_premium_eligible = models.BooleanField(default=False)
+            """,
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict == "default"
+
+    def test_bare_identifier_rhs_of_unknown_origin_is_indeterminate(self, tmp_path: Path) -> None:
+        """A right-hand side that is a bare identifier with no recognised
+        runtime-source access pattern (no `.`/`[` on a known request/action/
+        payload-shaped name) and no default-signalling path vocabulary
+        classifies `indeterminate` -- the classifier never guesses `live`
+        on an unresolved shape."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "misc" / "assign.py",
+            "isPremiumEligible = someUnknownVar\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "indeterminate"
+        assert audit.is_verified_live is False
+
+    @pytest.mark.parametrize(
+        ("case_id", "rhs_expression"),
+        [
+            pytest.param("control-bare-false", "false", id="control-bare-false"),
+            pytest.param("wrapped-in-parens", "(false)", id="wrapped-in-parens"),
+            pytest.param("double-negation", "!!false", id="double-negation"),
+            pytest.param("trailing-comma", "false,", id="trailing-comma"),
+            pytest.param("as-type-assertion", "false as boolean", id="as-type-assertion"),
+            pytest.param("trailing-block-comment", "false /* TODO: wire */", id="trailing-block-comment"),
+        ],
+    )
+    def test_idiomatic_hardcoded_literal_spellings_classify_default_under_live_vocabulary_path(
+        self, tmp_path: Path, case_id: str, rhs_expression: str
+    ) -> None:
+        """AC-WP-002, security_review HIGH (fail-open): five idiomatic
+        spellings of a hardcoded literal -- parenthesised, double-negated,
+        trailing-comma, a trailing `as <Type>` assertion, and a trailing
+        block comment -- must classify `default` exactly like the bare
+        `false` control, even under `src/store/slices/...`'s live-sounding
+        path vocabulary. Before this fix, each of the five non-control
+        spellings fell through to the path-vocabulary tiebreak and
+        classified `live` with zero confirmed runtime evidence."""
+        del case_id
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            f"isPremiumEligible = {rhs_expression}\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+    def test_unresolved_identifier_under_live_vocabulary_path_is_indeterminate_not_live(self, tmp_path: Path) -> None:
+        """security_review HIGH: an assignment whose RHS is a bare
+        identifier of unknown origin (zero runtime evidence) under a
+        live-vocabulary path (`src/store/slices/...`) must classify
+        `indeterminate`, never `live` -- `_classify_path_tiebreak`'s `live`
+        branch is removed, so a genuinely unresolved shape can no longer be
+        manufactured into a confirmed write path by path vocabulary alone."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "isPremiumEligible = someUnknownVar;\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "indeterminate"
+        assert audit.is_verified_live is False
+
+    @pytest.mark.parametrize("directory", ["src/constants", "src/services"])
+    def test_wrapped_literal_classifies_default_regardless_of_directory_rename(
+        self, tmp_path: Path, directory: str
+    ) -> None:
+        """security_review HIGH: a hardcoded literal's verdict must not
+        flip on a bare directory rename. Both a `default`-vocabulary
+        directory (`src/constants`) and a `live`-vocabulary one
+        (`src/services`) resolve `default` identically, because `(false)`
+        now classifies as a literal directly via expression analysis and
+        never reaches the path tiebreak at all."""
+        pfw = _pfw()
+        _write(tmp_path / directory / "flags.ts", "isPremiumEligible = (false);\n")
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+
+@pytest.mark.unit
+class TestSetterArgumentUnbalancedCaptureIsNeverLive:
+    """SECURITY (security_review MEDIUM fail-open, this unit):
+    `_assignment_regex`'s setter alternative captures argument text only
+    up to the FIRST `)` (`[^)]*`), so a parenthesised or call-wrapped
+    setter argument is captured as a truncated fragment carrying an
+    unclosed `(`. Before this fix, that truncated fragment matched
+    neither `_LITERAL_VALUE_RE` nor `_DEFAULT_KEYWORD_ARG_RE`, and the
+    `is_setter_argument` branch of `_classify_rhs_expression` returned
+    `VERDICT_LIVE` unconditionally -- reporting a hardcoded literal
+    written through a setter as a CONFIRMED runtime write path, exactly
+    the fail-open direction the module's own docstring says the
+    classifier must never guess in."""
+
+    def test_bare_literal_setter_argument_classifies_default(self, tmp_path: Path) -> None:
+        """Control row: a setter called with a bare literal argument (no
+        redundant parens) classifies `default`, unchanged by this fix."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "set_is_premium_eligible(False)\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+    def test_parenthesised_literal_setter_argument_is_not_live(self, tmp_path: Path) -> None:
+        """`set_is_premium_eligible((False))`: one layer of redundant
+        parentheses around a hardcoded literal must not classify `live`."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "set_is_premium_eligible((False))\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict != "live"
+        assert audit.is_verified_live is False
+
+    def test_call_wrapped_literal_setter_argument_is_not_live(self, tmp_path: Path) -> None:
+        """`set_is_premium_eligible(bool(False))`: a call-wrapped literal
+        setter argument must not classify `live` either -- the classifier
+        cannot reliably tell `bool(False)` apart from `bool(request.x)` by
+        shape alone, so the truncated capture reports `indeterminate`
+        rather than guessing either way."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "set_is_premium_eligible(bool(False))\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict != "live"
+        assert audit.is_verified_live is False
+
+    def test_nested_parenthesised_setter_argument_is_not_live(self, tmp_path: Path) -> None:
+        """Nested variant beyond the three security_review rows: three
+        layers of redundant parentheses must not classify `live` either."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "set_is_premium_eligible(((False)))\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "is_premium_eligible")
+        assert audit.verdict != "live"
+        assert audit.is_verified_live is False
+
+    def test_camelcase_setter_spelling_still_blocked_by_case_sensitive_mention_gate(self, tmp_path: Path) -> None:
+        """Unchanged by this fix: a camelCase JS setter spelling
+        (`setIsPremiumEligible`) never even reaches assignment-context
+        classification when the flag is queried by a differently-cased
+        name -- `audit_write_path`'s case-sensitive substring mention gate
+        (`if flag_name not in line: continue`) filters that LINE out
+        entirely, before `_assignment_regex` or `_classify_match_verdict`
+        ever runs on it. A separate line mentioning the flag in prose
+        keeps `mention_count` above zero, so the verdict resolves
+        `no_write_path` (exit 1, the conservative direction) rather than
+        `not_found` -- this fix touches only `_classify_match_verdict`,
+        which a filtered-out line never reaches, so this behaviour is
+        identical before and after."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "// isPremiumEligible governs premium UI gating\nsetIsPremiumEligible((False));\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "no_write_path"
+        assert audit.mention_count == 1
+        assert audit.assignment_sites == ()
+
+    def test_unbalanced_setter_argument_capture_helper_directly(self) -> None:
+        """Direct unit coverage of `_is_unbalanced_setter_argument_capture`:
+        an unmatched leading `(` in the captured fragment is detected; a
+        fragment with balanced (here, zero) parens is not."""
+        pfw = _pfw()
+        assert pfw._is_unbalanced_setter_argument_capture("(False") is True
+        assert pfw._is_unbalanced_setter_argument_capture("bool(False") is True
+        assert pfw._is_unbalanced_setter_argument_capture("False") is False
+        assert pfw._is_unbalanced_setter_argument_capture("") is False
+        assert pfw._is_unbalanced_setter_argument_capture('payload["eligible"]') is False
+
+    def test_quote_truncated_setter_argument_is_not_live(self, tmp_path: Path) -> None:
+        """SECURITY (security_review MEDIUM M-1, this unit): a `)` inside a
+        QUOTED setter argument truncates `_assignment_regex`'s
+        `[^)\n]{0,512}` capture into a fragment that ends mid-string --
+        `set_isPremiumEligible("a)b")` captures only `"a`, which is
+        balanced on parens (so `_is_unbalanced_setter_argument_capture`'s
+        existing paren check does not catch it) and does not match
+        `_LITERAL_VALUE_RE` (it is not a complete literal), so the
+        setter-argument branch of `_classify_rhs_expression` previously
+        returned `VERDICT_LIVE` unconditionally on this corrupted text --
+        a false `live` for a hardcoded string literal, the exact fail-open
+        321-D03 direction this unit exists to eliminate."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            'set_isPremiumEligible("a)b");\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict != "live"
+        assert audit.is_verified_live is False
+
+    def test_single_quote_truncated_setter_argument_is_not_live(self, tmp_path: Path) -> None:
+        """Single-quoted variant of the M-1 row above:
+        `set_isPremiumEligible(')')` captures `'` (a single unmatched
+        quote character), which must not classify `live`."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "set_isPremiumEligible(')');\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict != "live"
+        assert audit.is_verified_live is False
+
+    def test_quote_truncated_setter_argument_helper_directly(self) -> None:
+        """Direct unit coverage of the M-1 quote-parity check: an ODD
+        count of `"` or `'` in the captured fragment is flagged as
+        truncated (unresolved), an EVEN count is not."""
+        pfw = _pfw()
+        assert pfw._is_unbalanced_setter_argument_capture('"a') is True
+        assert pfw._is_unbalanced_setter_argument_capture("'") is True
+        assert pfw._is_unbalanced_setter_argument_capture('"tier2"') is False
+        assert pfw._is_unbalanced_setter_argument_capture("isEligible") is False
+
+    def test_runtime_derived_setter_argument_with_balanced_quoted_string_stays_live(self, tmp_path: Path) -> None:
+        """M-1's fix must not downgrade a genuinely `live` shape: a
+        runtime-derived setter argument that itself contains a balanced
+        (even quote count) quoted string -- `set_isPremiumEligible(user.email
+        + "@test")` -- is neither an unmatched paren nor an odd quote
+        count, is not a bare literal, and must still classify `live`."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            'set_isPremiumEligible(user.email + "@test");\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "live"
+        assert audit.is_verified_live is True
+
+
+@pytest.mark.unit
+class TestQuoteParityCheckIsLinearOnManyOccurrences:
+    """SECURITY (security_review, this unit): M-1's quote-parity check
+    (`_is_unbalanced_setter_argument_capture`'s new `"`/`'` count branch)
+    runs once per matched line and only ever inspects a `setter_arg`
+    capture already bounded to 512 characters by `_assignment_regex`, so
+    a single call is O(1). This class proves the DRIVER-B shape --
+    stacking the check across many separate matching lines, one call
+    each -- stays linear in the number of lines rather than accidentally
+    compounding, the same discipline `TestSetterArgumentGroupIsNotQuadraticOnManyOffsets`
+    already applies to the regex match itself. Measured directly (not
+    asserted here, to avoid a flaky wall-clock exponent assertion):
+    k=2000 0.008s, k=4000 0.015s, k=8000 0.031s, k=16000 0.057s,
+    k=32000 0.116s -- exponent ~1.0 across every doubling."""
+
+    @pytest.mark.parametrize("occurrences", [8000, 16000, 32000])
+    def test_many_quote_truncated_setter_lines_stay_bounded(self, occurrences: int, tmp_path: Path) -> None:
+        pfw = _pfw()
+        content = 'set_isPremiumEligible("a)b");\n' * occurrences
+        _write(tmp_path / "src" / "store" / "slices" / "permissionSlice.ts", content)
+
+        start = time.monotonic()
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0, (
+            f"audit_write_path took {elapsed:.3f}s at occurrences={occurrences} "
+            "(many quote-truncated setter lines) (must be O(n), not O(n^2), across many calls "
+            "to the new quote-parity check)"
+        )
+        assert audit.verdict == "indeterminate", audit.verdict
+
+
+@pytest.mark.unit
+class TestLiteralAssignmentTrailingNoiseIsStrippedBeforeClassification:
+    """AC-WP-002 (321-D03, round 2): a literal right-hand side followed by a
+    trailing line comment or a TypeScript `as const` suffix must still
+    classify `default`. `_LITERAL_VALUE_RE` is anchored `^...\\s*$` against
+    the RAW captured expression, so `isPremiumEligible = false // TODO: wire
+    to entitlements API` previously did not match the literal pattern, fell
+    through to `_classify_path_tiebreak`, and was verdicted `live` from path
+    vocabulary alone -- exactly 321-D03's flagship false-`live`, and the
+    spelling a placeholder flag awaiting wiring is most often written with
+    (a trailing TODO comment), so the untreated case was the common one."""
+
+    @pytest.mark.parametrize(
+        ("relative_path", "line"),
+        [
+            pytest.param(
+                "src/store/slices/permissionSlice.ts",
+                "isPremiumEligible = false // TODO: wire to entitlements API\n",
+                id="ts-trailing-double-slash-comment",
+            ),
+            pytest.param(
+                "src/store/slices/permissionSlice.ts",
+                "isPremiumEligible = false as const\n",
+                id="ts-as-const-suffix",
+            ),
+            pytest.param(
+                "src/services/permission_service.py",
+                "isPremiumEligible = False  # hardcoded placeholder\n",
+                id="python-trailing-hash-comment",
+            ),
+        ],
+    )
+    def test_literal_with_trailing_noise_still_classifies_default(
+        self, tmp_path: Path, relative_path: str, line: str
+    ) -> None:
+        pfw = _pfw()
+        _write(tmp_path / relative_path, line)
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+    def test_double_slash_inside_a_string_literal_is_not_mistaken_for_a_comment(self, tmp_path: Path) -> None:
+        """A quoted string literal whose CONTENT contains `//` (a URL),
+        followed by a GENUINE trailing comment, must be stripped at the
+        comment marker OUTSIDE the string, not at the first `//` overall --
+        a naive split would truncate `"http://example.com"` down to
+        `"http:` (an unterminated string that no longer matches the literal
+        pattern), reintroducing the same false-`live` this fix closes."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            'isPremiumEligible = "http://example.com" // fallback default\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+    def test_hash_inside_a_string_literal_is_not_mistaken_for_a_comment(self, tmp_path: Path) -> None:
+        """Same quote-awareness requirement, Python `#` comment style: a
+        string literal containing `#` must survive stripping intact, with
+        only the genuine trailing `#` comment removed."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "services" / "permission_service.py",
+            'isPremiumEligible = "value#withhash"  # actual comment\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+        assert audit.is_verified_live is False
+
+
+@pytest.mark.unit
+class TestIndeterminateStillFallsBackToPathVocabularyTiebreak:
+    """Path vocabulary (`_DEFAULT_SIGNAL_RE`) is demoted (spec 4.8) to a
+    tiebreak consulted ONLY when expression analysis leaves every site
+    `indeterminate` -- never as the primary signal (that would reintroduce
+    321-D03). security_review (this unit) found the tiebreak's own `live`
+    branch itself reintroduced 321-D03 by deciding `live` from path
+    vocabulary alone with no confirmed runtime evidence: that branch is
+    removed, so an indeterminate-expression site under a live-vocabulary
+    path (e.g. `reducers`) now stays `indeterminate` rather than resolving
+    `live`. The `default` branch is unchanged -- it remains the
+    CONSERVATIVE direction (a blocking finding, never a false pass)."""
+
+    def test_indeterminate_expression_in_a_reducer_named_path_stays_indeterminate_not_live(
+        self, tmp_path: Path
+    ) -> None:
+        """PIN UPDATE (security_review HIGH, this unit): this test
+        previously asserted `verdict == "live"`, pinning the fail-open
+        defect where `_classify_path_tiebreak`'s `live` branch manufactured
+        a confirmed write-path verdict from path vocabulary alone, with no
+        site's assigned-value expression ever resolved. That branch is
+        removed; the same fixture now must classify `indeterminate`."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = computeSomething()\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "indeterminate"
+        assert audit.is_verified_live is False
+
+    def test_indeterminate_expression_with_no_path_signal_stays_indeterminate(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "misc" / "assign.py",
+            "isPremiumEligible = computeSomething()\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "indeterminate"
+
+    def test_indeterminate_expression_in_a_constants_named_path_resolves_default_via_tiebreak(
+        self, tmp_path: Path
+    ) -> None:
+        """The tiebreak's own `default` branch (`_classify_path_tiebreak`):
+        an indeterminate-expression site whose PATH carries default-signal
+        vocabulary (`constants`) resolves to `default`, not `live` and not
+        `indeterminate`."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "constants" / "flags.py",
+            "isPremiumEligible = someUnknownVar\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "default"
+
+
+@pytest.mark.unit
+class TestStripTrailingLineComment:
+    """Direct unit coverage of `_strip_trailing_line_comment`'s quote-aware
+    state machine (321-D03 round 2 fix): the single-quote branch and the
+    backslash-escape branches inside each quote kind are not reachable
+    through `audit_write_path`'s own `_LITERAL_VALUE_RE`-anchored literal
+    check alone (an escaped-quote string is not itself a bare literal the
+    regex recognises), so they are exercised here against the helper
+    directly -- the same pattern `test_raises_when_no_named_group_is_populated`
+    below uses for `_classify_match_verdict`."""
+
+    def test_single_quoted_string_containing_double_slash_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = "'http://example.com' "
+        assert pfw._strip_trailing_line_comment(literal_part + "// comment") == literal_part
+
+    def test_escaped_quote_inside_single_quoted_string_survives_intact(self) -> None:
+        pfw = _pfw()
+        literal_part = r"'it\'s' "
+        assert pfw._strip_trailing_line_comment(literal_part + "// comment") == literal_part
+
+    def test_escaped_quote_inside_double_quoted_string_survives_intact(self) -> None:
+        """Uses an ODD count of double-quote characters (3: the opening
+        quote, one escaped quote, and the unescaped closing quote) so the
+        escape branch is load-bearing for THIS assertion. An earlier
+        fixture (`'"she said \\"hi\\"" '`) had an EVEN count of quote
+        characters (4), so deleting the escape branch produced spurious
+        open/close toggles that cancelled out and left the comparison
+        passing even with the branch gone -- a mutation-blind pin. This
+        fixture's odd count makes the mutant re-enter a phantom quote state
+        after the fourth character and never find the trailing comment
+        marker, returning the whole unterminated string instead."""
+        pfw = _pfw()
+        literal_part = r'"a\"" '
+        assert pfw._strip_trailing_line_comment(literal_part + "// comment") == literal_part
+
+    def test_no_comment_marker_returns_expression_unchanged(self) -> None:
+        pfw = _pfw()
+        assert pfw._strip_trailing_line_comment("false") == "false"
+
+
+@pytest.mark.unit
+class TestClassifyRhsExpressionEdgeCases:
+    def test_setter_call_with_no_argument_is_indeterminate(self, tmp_path: Path) -> None:
+        """An empty right-hand side (a setter call with no argument at all,
+        `_classify_rhs_expression`'s `if not value` branch) classifies
+        `indeterminate` -- there is no value to derive a verdict from."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "misc" / "assign.py",
+            "self.set_isPremiumEligible()\n",
+        )
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+        assert audit.verdict == "indeterminate"
+
+
+@pytest.mark.unit
+class TestClassifyMatchVerdictInvariantGuard:
+    """`_classify_match_verdict`'s defensive fail-fast guard (CLAUDE.md: no
+    fallback logic, no silent guess): a match object with none of the three
+    named groups populated can only happen if `_assignment_regex`'s
+    mutual-exclusivity invariant is broken by a future edit -- this raises
+    rather than silently returning a verdict for a structurally impossible
+    case."""
+
+    def test_raises_when_no_named_group_is_populated(self) -> None:
+        pfw = _pfw()
+
+        class _NoGroupsMatch:
+            def group(self, _name: str) -> str | None:
+                return None
+
+        fake_match = _NoGroupsMatch()
+        with pytest.raises(AssertionError, match="none of its three named groups"):
+            pfw._classify_match_verdict(fake_match)
+
+
 # ---------------------------------------------------------------------------
 # WritePathAudit.render
 # ---------------------------------------------------------------------------
@@ -304,6 +1721,46 @@ class TestRender:
         audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
         rendered = audit.render()
         assert "src/reducers/permissionReducer.ts:1" in rendered
+
+    def test_render_never_echoes_the_matched_source_line(self, tmp_path: Path) -> None:
+        """SECURITY (security_review MEDIUM, this unit): a credential-shaped
+        assignment must never be echoed verbatim into gate output -- only
+        `relative_path:line_number` and the already-computed
+        `expression_verdict` are actionable evidence a reviewer needs
+        (file/line is enough to inspect the real value directly)."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "config" / "settings.py",
+            'STRIPE_SECRET_KEY = "sk_live_FAKE0000000000000000EXAMPLE"\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "STRIPE_SECRET_KEY")
+        rendered = audit.render()
+        assert "sk_live_FAKE0000000000000000EXAMPLE" not in rendered
+        assert "src/config/settings.py:1" in rendered
+
+    def test_render_still_shows_the_per_site_expression_verdict(self, tmp_path: Path) -> None:
+        """The redacted site line still carries `expression_verdict` so a
+        reviewer can distinguish a `default` (literal) site from an
+        `indeterminate` one without ever seeing the raw source text.
+
+        W2 (test_review, mutation-blind pin): the previous assertion
+        (`audit.assignment_sites[0].expression_verdict in rendered`)
+        derived its expected text from the object under check itself, and
+        the bare word "default" already appears in the header's own
+        `verdict=default` segment -- deleting
+        `expression_verdict={site.expression_verdict}` from `render()`
+        left every test in the suite passing. Asserting the exact
+        `expression_verdict=default` key=value fragment as a hand-typed
+        literal can only be satisfied by the per-site line, since the
+        header line never spells that key."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "config" / "settings.py",
+            'STRIPE_SECRET_KEY = "sk_live_FAKE0000000000000000EXAMPLE"\n',
+        )
+        audit = pfw.audit_write_path(tmp_path, "STRIPE_SECRET_KEY")
+        rendered = audit.render()
+        assert "expression_verdict=default" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +1823,7 @@ class TestRenderBlockingFinding:
         assert finding.startswith("[BLOCKING_FINDING]")
         assert "isTrialEligible" in finding
         assert "isPremiumEligible" in finding
-        assert "verdict=default_only" in finding
+        assert "verdict=default" in finding
         assert "src/state/defaultState.ts:1" in finding
 
     def test_renders_none_found_when_no_sites(self, tmp_path: Path) -> None:

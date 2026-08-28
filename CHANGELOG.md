@@ -5,6 +5,47 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **New CLI verb `check-write-path <id> --flag <name>` replaces the write-path audit's
+  skill-invoked `python -c` one-liner, and the classifier it runs is rebuilt around
+  assignment-context analysis** (spec `integration-reality-gates-hardening.md` section
+  4.8; issue #16; from #321; `judge-evidence` tier; E7-F1-S1-T1). `_classify` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` used to decide `live`
+  purely from path-name vocabulary, so a flag hardcoded in an `initialState` literal
+  under a `store`/`slice`-named directory was reported `live` (321-D03, the flagship
+  false-`live`) and any shape the vocabulary did not recognise auto-blocked, producing
+  an every-repo-blocks defect. The classifier now decides primarily from the ASSIGNED
+  VALUE: a write classifies `live` when the value is an attribute/subscript access on a
+  request/action/payload/param-like identifier (`action`, `payload`, `request`, `req`,
+  `event`, `args`, `kwargs`, `params`, `context`, `ctx`) or is a non-literal argument
+  passed to a `set<Flag>(...)` setter call -- except a parenthesised or call-wrapped
+  setter argument (`set_is_premium_eligible(bool(request.x))`), which is captured as a
+  truncated fragment carrying an unmatched opening parenthesis, or a `)` character
+  inside a QUOTED setter argument (`set_isPremiumEligible("a)b")`, security fix M-1),
+  which truncates the capture into a fragment carrying an odd count of `"` or `'`
+  characters -- both classify `indeterminate` rather than `live`, since a truncated
+  fragment cannot be reliably classified either way, or a setter argument longer than
+  512 characters (security fix,
+  ReDoS: many unclosed `set<Flag>(` prefixes on one line previously cost time quadratic
+  in the line's length), which no longer matches the setter shape at all and falls
+  through to `no_write_path` (blocking) rather than `live` when it is the flag's only
+  site; literal-only assignments classify `default`
+  even inside live-named directories, with Rails and Django layouts in the parametrised
+  matrix (321-D28), and literal recognition tolerates idiomatic noise around the value
+  (wrapping parens, leading `!`/`!!` negation, a trailing line/block comment, a trailing
+  `as <Type>`/`satisfies <Type>` assertion, a trailing comma). A shape expression
+  analysis cannot resolve classifies `indeterminate` and falls back to a
+  path-vocabulary tiebreak, consulted ONLY for these unresolved shapes; the tiebreak
+  can still resolve one to `default` from the file's path but can NEVER resolve one to
+  `live` -- the tiebreak's `live` branch was removed entirely, so it can no longer
+  return `live` under any input, closing a fail-open path that would have reproduced 321-D03 for any shape
+  expression analysis could not resolve. Every verdict is reported with its evidence
+  lines and none of them auto-blocks except `default`, `no_write_path` and
+  `not_found`; a site's matched source line is never printed, only its
+  `relative_path:line_number` and `expression_verdict`, so a credential-shaped
+  assignment is never echoed into gate output. `audit_write_path` stays importable for
+  the `spec-to-backlog` skill's Step 3b narrative (AC-WP-001). The file enumerator also
+  excludes any symlink whose resolved real location escapes the audited repo root.
+
 - **`check-fixture-consistency` is wired into the `mark-done` done-path gate and proven
   end to end by a journey suite** (spec `integration-reality-gates-hardening.md` section
   4.2, 4.7 done-path sentence, 4.3 attribution rule; issue #17; E6-F2-S1-T2). A passing

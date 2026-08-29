@@ -254,10 +254,27 @@ uv run python -c "from devbench.plugin_helpers.permission_flag_writepath import 
 This is a best-effort source-grep heuristic (see the module docstring
 in `src/devbench/plugin_helpers/permission_flag_writepath.py`), not a
 proof -- it exists to surface a finding for confirmation, not to
-silently decide the matter. Treat any verdict other than `live` (i.e.
-`default_only`, `no_write_path`, `not_found`, or `indeterminate`) as
-requiring the blocking-finding treatment below; only `live` clears the
-clause without further action.
+silently decide the matter.
+
+The block below is generated from `VERDICT_DESCRIPTIONS` in `src/devbench/plugin_helpers/permission_flag_writepath.py` by `render_verdict_reference()`; do not hand-edit content between the markers -- the next regeneration run overwrites it. Regenerate with `uv run python -c "from pathlib import Path; from devbench.plugin_helpers.permission_flag_writepath import regenerate_skill_step_3b; regenerate_skill_step_3b(Path('<repo-root>'))"` after changing the verdict constants or their descriptions; `TestSkillStep3bGeneratedFromConstants` in `tests/test_plugin_helpers/test_permission_flag_writepath.py` pins that this block and the module's constants stay in sync.
+
+<!-- generated:write-path-verdicts -->
+Treat any verdict other than `live` (i.e. `default`, `no_write_path`, `not_found`, or `indeterminate`) as requiring the blocking-finding treatment below; only `live` clears the clause without further action.
+
+- `live`: a confirmed runtime-derived write path exists
+- `default`: no site's assigned value is confirmed runtime-derived: every site's assigned value is a bare literal or a call carrying a literal keyword-default argument (e.g. `BooleanField(default=False)`), or every site's file path (including a site whose own expression already resolved to default) signals a default/constants location
+- `no_write_path`: the flag name appears somewhere in the scanned source, but no assignment/setter-shaped occurrence was found
+- `not_found`: the flag name does not appear anywhere in the scanned source
+- `indeterminate`: at least one site's assigned value could not be resolved either way
+
+Sample `audit_write_path(...).render()` output:
+
+```
+[PERMISSION_FLAG_WRITE_PATH_AUDIT] isPremiumEligible: verdict=default mentions=2 assignment_sites=1
+  - src/reducers/permissionReducer.ts:4 | expression_verdict=default <line redacted; see file:line above to inspect it directly>
+  - load_error src/legacy/broken.ts: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+```
+<!-- /generated:write-path-verdicts -->
 
 When no target repo checkout is resolvable yet (e.g. a greenfield spec
 authored before any checkout exists), skip the helper invocation and

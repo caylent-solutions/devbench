@@ -63,6 +63,13 @@ from devbench.utils.io import atomic_write_text
 GUARD_MARKER_START: Final[str] = "<!-- generated:vocabulary -->"
 GUARD_MARKER_END: Final[str] = "<!-- /generated:vocabulary -->"
 
+#: Command an operator runs to fix reported drift. A single module constant
+#: so the text is never repeated (and so can never itself drift) across the
+#: per-surface stderr lines `_run_check` prints, and the default remediation
+#: text `_find_guard_block`/`replace_guarded_block` name in their own
+#: raised errors for callers that do not pass their own command.
+DRIFT_REMEDIATION_COMMAND: Final[str] = "make generate-vocabulary"
+
 
 class GuardMarkerError(ValueError):
     """Raised when a target surface's guard markers are missing or malformed (spec Section 7)."""
@@ -262,7 +269,16 @@ CATEGORY_DESCRIPTIONS: Final[dict[str, dict[str, tuple[str, str]]]] = {
 # ---------------------------------------------------------------------------
 
 
-def _find_guard_block(content: str, source: str, *, search_from: int = 0) -> tuple[int, int]:
+def _find_guard_block(
+    content: str,
+    source: str,
+    *,
+    search_from: int = 0,
+    start_marker: str = GUARD_MARKER_START,
+    end_marker: str = GUARD_MARKER_END,
+    remediation_command: str = DRIFT_REMEDIATION_COMMAND,
+    reject_duplicate: bool = False,
+) -> tuple[int, int]:
     """Locate the first guard-marker pair in *content* at or after *search_from*.
 
     Args:
@@ -273,37 +289,75 @@ def _find_guard_block(content: str, source: str, *, search_from: int = 0) -> tup
             a caller with multiple sequential pairs (the docs surface)
             process them left to right without re-matching an already
             replaced pair.
+        start_marker: Opening guard-marker literal. Defaults to
+            :data:`GUARD_MARKER_START`; a caller generating a distinctly
+            named surface (so its own regeneration can never clobber this
+            module's ``vocabulary`` block) passes its own marker text.
+        end_marker: Closing guard-marker literal, paired with
+            *start_marker*. Defaults to :data:`GUARD_MARKER_END`.
+        remediation_command: Command named in every raised error's
+            remediation text. Defaults to :data:`DRIFT_REMEDIATION_COMMAND`;
+            a caller with its own regeneration entry point passes that
+            command instead so the error message never suggests the wrong
+            fix.
+        reject_duplicate: When ``True``, also raise if a second
+            *start_marker* occurs after the located pair -- for a surface
+            whose marker name is used for exactly one block, so a second
+            occurrence is unambiguously a stale leftover rather than a
+            second intentional pair (unlike a multi-pair surface such as
+            the docs table, which relies on *search_from* to process
+            several pairs left to right and must leave duplicates alone).
+            Defaults to ``False`` to preserve that multi-pair behaviour.
 
     Returns:
-        A ``(start, end)`` tuple: *start* is the index of
-        :data:`GUARD_MARKER_START`'s first character; *end* is the index of
-        :data:`GUARD_MARKER_END`'s first character.
+        A ``(start, end)`` tuple: *start* is the index of *start_marker*'s
+        first character; *end* is the index of *end_marker*'s first
+        character.
 
     Raises:
-        GuardMarkerError: *content* has no :data:`GUARD_MARKER_START` at or
-            after *search_from* (naming *source*), or has an opening marker
-            with no matching :data:`GUARD_MARKER_END` (naming *source* and
-            the opening marker's 1-indexed line number).
+        GuardMarkerError: *content* has no *start_marker* at or after
+            *search_from* (naming *source*); has an opening marker with no
+            matching *end_marker* (naming *source* and the opening marker's
+            1-indexed line number); or, when *reject_duplicate* is
+            ``True``, has a second *start_marker* after the located pair
+            (naming *source*).
     """
-    start = content.find(GUARD_MARKER_START, search_from)
+    start = content.find(start_marker, search_from)
     if start == -1:
         raise GuardMarkerError(
-            f"'{source}' has no '{GUARD_MARKER_START}' guard-marker pair. Add "
-            f"'{GUARD_MARKER_START}' ... '{GUARD_MARKER_END}' around the block to generate, "
-            f"then re-run 'make generate-vocabulary'."
+            f"'{source}' has no '{start_marker}' guard-marker pair. Add "
+            f"'{start_marker}' ... '{end_marker}' around the block to generate, "
+            f"then re-run '{remediation_command}'."
         )
-    end = content.find(GUARD_MARKER_END, start + len(GUARD_MARKER_START))
+    end = content.find(end_marker, start + len(start_marker))
     if end == -1:
         line_no = content.count("\n", 0, start) + 1
         raise GuardMarkerError(
-            f"'{source}' line {line_no}: '{GUARD_MARKER_START}' has no matching "
-            f"'{GUARD_MARKER_END}'. Close the guard-marker block, then re-run "
-            f"'make generate-vocabulary'."
+            f"'{source}' has a '{start_marker}' (line {line_no}) with no matching "
+            f"'{end_marker}'. Close the guard-marker block, then re-run "
+            f"'{remediation_command}'."
         )
+    if reject_duplicate:
+        duplicate_start = content.find(start_marker, start + len(start_marker))
+        if duplicate_start != -1:
+            raise GuardMarkerError(
+                f"'{source}' has more than one '{start_marker}' guard-marker pair; exactly one is "
+                f"expected. Remove the duplicate block, then re-run '{remediation_command}'."
+            )
     return start, end
 
 
-def replace_guarded_block(content: str, new_inner: str, *, source: str, search_from: int = 0) -> tuple[str, int]:
+def replace_guarded_block(
+    content: str,
+    new_inner: str,
+    *,
+    source: str,
+    search_from: int = 0,
+    start_marker: str = GUARD_MARKER_START,
+    end_marker: str = GUARD_MARKER_END,
+    remediation_command: str = DRIFT_REMEDIATION_COMMAND,
+    reject_duplicate: bool = False,
+) -> tuple[str, int]:
     """Replace one guard-marker pair's inner content, leaving everything else untouched.
 
     Args:
@@ -315,6 +369,10 @@ def replace_guarded_block(content: str, new_inner: str, *, source: str, search_f
             error messages.
         search_from: Offset into *content* to start searching for the pair
             (see :func:`_find_guard_block`).
+        start_marker: See :func:`_find_guard_block`.
+        end_marker: See :func:`_find_guard_block`.
+        remediation_command: See :func:`_find_guard_block`.
+        reject_duplicate: See :func:`_find_guard_block`.
 
     Returns:
         A ``(new_content, offset)`` tuple. *new_content* is *content* with
@@ -327,10 +385,18 @@ def replace_guarded_block(content: str, new_inner: str, *, source: str, search_f
     Raises:
         GuardMarkerError: See :func:`_find_guard_block`.
     """
-    start, end = _find_guard_block(content, source, search_from=search_from)
+    start, end = _find_guard_block(
+        content,
+        source,
+        search_from=search_from,
+        start_marker=start_marker,
+        end_marker=end_marker,
+        remediation_command=remediation_command,
+        reject_duplicate=reject_duplicate,
+    )
     inserted = "\n" + new_inner + "\n"
-    new_content = content[: start + len(GUARD_MARKER_START)] + inserted + content[end:]
-    offset = start + len(GUARD_MARKER_START) + len(inserted)
+    new_content = content[: start + len(start_marker)] + inserted + content[end:]
+    offset = start + len(start_marker) + len(inserted)
     return new_content, offset
 
 
@@ -558,11 +624,6 @@ def find_drifted_surfaces(repo_root: Path) -> list[str]:
 
 #: ``main`` argv flag that switches from regenerate mode to verify mode.
 CHECK_FLAG: Final[str] = "--check"
-
-#: Command an operator runs to fix reported drift. A single module constant
-#: so the text is never repeated (and so can never itself drift) across the
-#: per-surface stderr lines `_run_check` prints.
-DRIFT_REMEDIATION_COMMAND: Final[str] = "make generate-vocabulary"
 
 
 def _repo_root() -> Path:

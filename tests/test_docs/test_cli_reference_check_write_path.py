@@ -191,3 +191,101 @@ class TestCheckWritePathWorkedExample:
             "'### `check-write-path`' worked example must show the spec 5.2 "
             "status line carrying the judge-evidence tier."
         )
+
+
+@pytest.mark.unit
+class TestCheckWritePathLoadErrorDocumented:
+    """AC-WP-015 amendment (this unit): `WritePathAudit.render()` appends a
+    `load_error` line per unreadable file; the stdout enumeration this file
+    documents must include that line kind, and must be explicit that a
+    `load_error` finding does NOT move the machine-readable `findings`
+    count, the verdict-to-status mapping, or the exit code -- all three
+    are derived from `verdict` alone (changes_manifest, doc_review, and
+    code_review all flagged the prior closed enumeration as stale)."""
+
+    def test_stdout_enumeration_names_the_load_error_line(self) -> None:
+        section = _section()
+        assert "load_error <relative_path>: <error>" in section, (
+            "'### `check-write-path`' must document the `load_error` line kind in its stdout enumeration (AC-WP-015)."
+        )
+
+    def test_load_error_does_not_affect_findings_status_or_exit_code(self) -> None:
+        section = _section()
+        assert (
+            "does NOT increment the `findings` count" in section
+            and "does NOT change the verdict-to-status mapping" in section
+            and "does NOT change the exit code" in section
+        ), (
+            "'### `check-write-path`' must state that a `load_error` finding "
+            "does not affect `findings`, `status`, or the exit code (AC-WP-015)."
+        )
+
+    def test_worked_example_shows_a_load_error_line(self) -> None:
+        section = _section()
+        assert "  - load_error src/legacy/broken.ts:" in section, (
+            "'### `check-write-path`' worked example must show a `load_error` "
+            "line alongside the assignment-site line (AC-WP-015)."
+        )
+
+
+@pytest.mark.unit
+class TestCheckWritePathRelativePathEscapingDocumented:
+    """BLOCKING 3 (doc_review + changes_manifest, round 5): the escaping
+    contract `WritePathAudit.render()` applies to `relative_path` on both
+    the assignment-site and `load_error` lines (via
+    `_escape_untrusted_path_for_rendering`) is stated only in a source
+    docstring, not on this operator-facing surface. An operator auditing
+    `check-write-path` stdout as judge evidence cannot otherwise tell an
+    escaped hostile filename (e.g. `src/a\\nfoo.ts`, one rendered line)
+    from a literal path containing a real backslash-n.
+
+    BLOCKING (doc_review round 7): the stdout-wide guarantee below --
+    "stdout is always printable single-line ASCII" / "can never inject a
+    newline ... into gate output" -- was FALSE as originally worded: only
+    `relative_path` was escaped, while `flag_name` (in the
+    `[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header line) and a `load_error`'s
+    `<error>` text reached stdout raw. `render()` and
+    `render_blocking_finding()` now route both through the same
+    `_escape_untrusted_path_for_rendering` sanitiser (this unit), so the
+    doc's stdout-wide wording is genuinely true; the added pin below keeps
+    doc and code from drifting apart on this point again.
+    """
+
+    def test_stdout_enumeration_states_relative_path_is_escaped(self) -> None:
+        section = _section()
+        assert "rendered backslash-escaped" in section, (
+            "'### `check-write-path`' must state that `relative_path` is rendered "
+            "backslash-escaped (BLOCKING 3, round 5)."
+        )
+
+    def test_stdout_enumeration_states_the_injection_guarantee(self) -> None:
+        section = _section()
+        assert (
+            "printable single-line ASCII" in section
+            and "can never inject a newline" in section
+            and "non-ASCII byte" in section
+        ), (
+            "'### `check-write-path`' must state the escaping guarantee: stdout is always printable "
+            "single-line ASCII and a repo-sourced filename can never inject a newline, a "
+            "carriage-return/ANSI escape sequence, or a non-ASCII byte into gate output (BLOCKING 3, round 5)."
+        )
+
+    def test_stdout_enumeration_states_literal_backslash_appears_doubled(self) -> None:
+        section = _section()
+        assert "backslash in the filename appears doubled" in section, (
+            "'### `check-write-path`' must state that a literal backslash in the filename appears "
+            "doubled in the rendered, escaped line (BLOCKING 3, round 5)."
+        )
+
+    def test_stdout_enumeration_states_flag_name_and_load_error_text_are_also_escaped(self) -> None:
+        section = _section()
+        assert (
+            "flag_name` in the `[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header line" in section
+            and "`<error>` text on a `load_error` line" in section
+            and "ALSO rendered through the same" in section
+        ), (
+            "'### `check-write-path`' must state that the audited `flag_name` (in the "
+            "`[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header line) and a `load_error`'s `<error>` text "
+            "are ALSO escaped, not just `relative_path` -- both reach stdout unescaped otherwise, "
+            "making the stdout-wide 'printable single-line ASCII' guarantee false (doc_review round 7)."
+        )

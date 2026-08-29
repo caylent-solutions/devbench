@@ -203,6 +203,86 @@ class TestReplaceGuardedBlock:
         assert "## first" in after_second
         assert "## second" in after_second
 
+    @pytest.mark.unit
+    def test_reject_duplicate_raises_on_second_start_marker(self, vg: ModuleType) -> None:
+        """AC-WP-014: a caller passing ``reject_duplicate=True`` gets a loud error naming
+        the file when a second start-marker occurs, instead of the silent
+        "first pair wins" behaviour multi-pair surfaces (like the docs table) rely on.
+        """
+        content = (
+            f"before\n{vg.GUARD_MARKER_START}\nfirst pair\n{vg.GUARD_MARKER_END}\n"
+            f"between\n{vg.GUARD_MARKER_START}\nsecond pair\n{vg.GUARD_MARKER_END}\nafter\n"
+        )
+        with pytest.raises(vg.GuardMarkerError, match="more than one") as excinfo:
+            vg.replace_guarded_block(content, "irrelevant", source="fixture.md", reject_duplicate=True)
+        assert "fixture.md" in str(excinfo.value)
+
+    @pytest.mark.unit
+    def test_reject_duplicate_false_default_allows_second_start_marker(self, vg: ModuleType) -> None:
+        """The default (``reject_duplicate=False``) leaves the multi-pair, ``search_from``-driven
+        replacement flow (the docs surface) unaffected -- a second start marker after the
+        located pair is not itself an error.
+        """
+        content = (
+            f"before\n{vg.GUARD_MARKER_START}\nfirst pair\n{vg.GUARD_MARKER_END}\n"
+            f"between\n{vg.GUARD_MARKER_START}\nsecond pair\n{vg.GUARD_MARKER_END}\nafter\n"
+        )
+        new_content, _ = vg.replace_guarded_block(content, "replaced", source="fixture.md")
+        assert "replaced" in new_content
+        assert vg.GUARD_MARKER_START in new_content
+
+    @pytest.mark.unit
+    def test_custom_markers_and_remediation_command_round_trip(self, vg: ModuleType) -> None:
+        """A caller with its own marker literals and remediation command (e.g. the SKILL
+        Step 3b surface) gets those literals back in both the replaced content and in
+        every raised error's text -- never the module's own default vocabulary literals.
+        """
+        start_marker = "<!-- generated:skill-step-3b -->"
+        end_marker = "<!-- /generated:skill-step-3b -->"
+        remediation_command = "make generate-skill-step-3b"
+        content = f"before\n{start_marker}\nstale\n{end_marker}\nafter\n"
+
+        new_content, offset = vg.replace_guarded_block(
+            content,
+            "fresh",
+            source="SKILL.md",
+            start_marker=start_marker,
+            end_marker=end_marker,
+            remediation_command=remediation_command,
+        )
+        assert new_content == f"before\n{start_marker}\nfresh\n{end_marker}\nafter\n"
+        assert offset == content.index(start_marker) + len(start_marker) + len("\nfresh\n")
+
+        # Missing-marker error names the caller's own marker/command literals, not the
+        # module's GUARD_MARKER_START/END/DRIFT_REMEDIATION_COMMAND defaults.
+        with pytest.raises(vg.GuardMarkerError) as missing:
+            vg.replace_guarded_block(
+                "no markers here at all",
+                "irrelevant",
+                source="SKILL.md",
+                start_marker=start_marker,
+                end_marker=end_marker,
+                remediation_command=remediation_command,
+            )
+        assert start_marker in str(missing.value)
+        assert remediation_command in str(missing.value)
+        assert vg.GUARD_MARKER_START not in str(missing.value)
+
+        # Unterminated-marker error also names the caller's own literals and the line.
+        unterminated = f"line one\nline two\n{start_marker}\nline four unterminated\n"
+        with pytest.raises(vg.GuardMarkerError) as unterminated_error:
+            vg.replace_guarded_block(
+                unterminated,
+                "irrelevant",
+                source="SKILL.md",
+                start_marker=start_marker,
+                end_marker=end_marker,
+                remediation_command=remediation_command,
+            )
+        assert "SKILL.md" in str(unterminated_error.value)
+        assert "line 3" in str(unterminated_error.value)
+        assert remediation_command in str(unterminated_error.value)
+
 
 # ---------------------------------------------------------------------------
 # render_prompt_sentence

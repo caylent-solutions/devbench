@@ -5,6 +5,147 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **SECURITY: `WritePathAudit.render()` and `render_blocking_finding()` now
+  also escape the audited `flag_name` and a `load_error`'s `<error>` text,
+  the same way `relative_path` was already escaped, closing the same
+  log-injection / evidence-forgery hole on two more untrusted fields**
+  (doc_review round 7, E7-F1-S1-T2). `relative_path` was already routed
+  through `_escape_untrusted_path_for_rendering` (round 4/5), but the
+  `flag_name` interpolated into the `[PERMISSION_FLAG_WRITE_PATH_AUDIT]`
+  header line and the `[BLOCKING_FINDING]` sentence, and the `<error>` text
+  on a `load_error` line, still reached stdout raw: `flag_name` is
+  spec-derived (the `spec-to-backlog` SKILL's Step 3b-ii lifts it out of
+  spec prose as `<existing-flag-name>`), not purely operator-typed, and
+  `cli._parse_check_write_path_argv` applies no control-character rejection
+  to it, while a `load_error`'s `<error>` text can carry a
+  locale-translated, non-ASCII `OSError.strerror`. `docs/cli-reference.md`'s
+  `check-write-path` stdout enumeration is corrected to state this, pinned
+  by a new `TestCheckWritePathRelativePathEscapingDocumented` case -- the
+  previous wording attributed the stdout-wide "printable single-line ASCII"
+  guarantee to `relative_path` escaping alone, which was false while these
+  two fields stayed unescaped.
+
+- **SECURITY: `render_blocking_finding()` now also escapes its
+  `new_field_name` parameter, closing the same log-injection /
+  evidence-forgery hole on the one remaining untrusted field this module
+  rendered raw** (code_review round 8, E7-F1-S1-T2). `new_field_name` has
+  identical provenance to `flag_name` above -- the `spec-to-backlog`
+  SKILL's Step 3b-iii one-liner passes both `<new-field-name>` and
+  `<existing-flag-name>` as placeholders lifted verbatim from spec prose in
+  the same instruction -- but round 7's fix escaped `flag_name` and
+  `relative_path` while leaving `new_field_name` interpolated raw in the
+  same f-string, letting a hostile `new_field_name` forge a standalone
+  second `[BLOCKING_FINDING] RESOLVED: ...` acknowledgement line.
+  `flag_name`, `relative_path`, a `load_error`'s `<error>` text and
+  `new_field_name` are now all routed through
+  `_escape_untrusted_path_for_rendering`, making "one escaping contract for
+  every untrusted value this module renders" true for every value this
+  module interpolates into rendered output, not just three of the four.
+
+- **SECURITY: every surface that renders an untrusted repo-sourced filename
+  -- `WritePathAudit.render()`'s `load_error` and assignment-site lines, AND
+  `render_blocking_finding()`'s assignment-site sentence -- now escapes it,
+  closing a log-injection / evidence-forgery hole** (security_review HIGH,
+  round 4; code_review + changes_manifest, round 5; E7-F1-S1-T2).
+  `relative_path` on both `FlagAssignmentSite` and `FileLoadError` is derived
+  from a filename INSIDE the audited repo -- the untrusted artefact this
+  gate exists to examine, not agent- or operator-authored text -- and a
+  POSIX filename may embed any byte except `/` and NUL. Rendered unescaped, a
+  crafted filename could forge a second `[PERMISSION_FLAG_WRITE_PATH_AUDIT]`
+  header line or a forged assignment-site line via an embedded newline,
+  duplicate the machine-readable spec 5.2 status line JSON so a consumer
+  that greps rather than parsing line 1 reads the forged line, emit `\r`
+  plus ANSI erase-line/colour escape sequences that erase already-rendered
+  evidence in a terminal, or -- on `render_blocking_finding()` specifically,
+  the `spec-to-backlog` SKILL's Step 3b-iii blocking-finding line -- forge a
+  second `[BLOCKING_FINDING] RESOLVED: ...` line claiming the operator had
+  already acknowledged the finding; security_review, code_review and
+  changes_manifest each reproduced one or more of these end to end. Round 4
+  fixed `WritePathAudit.render()`'s two lines but left
+  `render_blocking_finding()` -- a THIRD surface consuming the same
+  `relative_path` field, reachable directly from
+  `SKILL.md`'s own Step 3b-iii narrative -- interpolating it raw; round 5
+  closes that remaining surface with the same helper. All three now pass
+  `relative_path` through `_escape_untrusted_path_for_rendering`
+  (`unicode_escape`, then decoded as ASCII) before rendering: every C0/C1
+  control character, DEL, non-ASCII byte/character, and the Unicode
+  line/paragraph separators U+2028/U+2029 some line-oriented consumers treat
+  as a line break become a literal backslash-escape sequence, guaranteeing
+  printable-ASCII, single-line output that can never forge structure --
+  while the filename stays fully legible and recoverable for an operator to
+  act on, and the finding is still reported (escaping, not
+  `cli._reject_control_characters`-style rejection, so a hostile filename
+  can never make its own finding silently disappear from the audit). The
+  escaping contract is now also documented on the operator-facing
+  `docs/cli-reference.md` `check-write-path` stdout enumeration, pinned by
+  `TestCheckWritePathRelativePathEscapingDocumented` (doc_review +
+  changes_manifest, round 5), not only in the source docstring.
+  `VERDICT_DESCRIPTIONS[VERDICT_DEFAULT]`'s description is also corrected
+  twice more: it previously read as requiring the default/constants path
+  signal only on sites whose value could not be resolved, but
+  `_classify_path_tiebreak` requires EVERY site -- including one already
+  resolved to a literal `default` -- to carry the signal (doc_review, round
+  4); and its "every site is a hardcoded literal" disjunct did not cover a
+  site whose value is a CALL carrying a literal keyword-default argument
+  (e.g. Django's `BooleanField(default=False)`), which also verdicts
+  `default` with no default-signal path at all (doc_review, round 5). The
+  generated `spec-to-backlog` SKILL Step 3b block is regenerated to match
+  both corrections. `render_verdict_reference()` now raises `ValueError`
+  naming `VERDICT_DESCRIPTIONS` (rather than a bare `IndexError`) if that
+  mapping ever held no verdict other than `live` (code_review, round 4;
+  unreachable against the shipped five-entry mapping), and also now rejects
+  -- raising `devbench.vocabulary_generation.GuardMarkerError` naming the
+  offending key -- any `VERDICT_DESCRIPTIONS` value that itself contains a
+  guard-marker literal, closing a non-idempotent-regeneration hole that
+  became reachable once descriptions started rendering into the generated
+  block (code_review, round 5). `VERDICT_DESCRIPTIONS` is wrapped in
+  `types.MappingProxyType` so it is genuinely immutable, not merely
+  unrebindable (`Final` is a static-only annotation; code_review mutated it
+  at runtime during review) (code_review, round 5). The `FileLoadError`
+  docstring's description of `UnicodeDecodeError.__str__`'s shape is
+  corrected a second time: the hex vs. byte-range form is determined by the
+  offending byte SPAN (`exc.end - exc.start == 1`), not by the count of
+  remaining unread bytes -- a real binary file (a PNG, a JPEG, or any
+  content starting with an invalid UTF-8 lead byte, the modal `load_error`
+  case) reports a single hex byte even with many bytes remaining, not a
+  range (doc_review, round 5). The Step 3b guard-marker find/splice logic,
+  previously a copy-paste fork of `devbench.vocabulary_generation`'s shared
+  `_find_guard_block`/`replace_guarded_block` implementation, now delegates
+  to that shared implementation (parameterised with this module's own
+  marker literals, remediation command, and a `reject_duplicate` flag) --
+  the module-local `SkillGuardMarkerError` class and
+  `_locate_skill_guard_block` function are removed (code_review, round 6).
+
+- **Write-path audit: unreadable files become `load_error` findings, the
+  assertion-free `test_unreadable_binary_file_is_skipped_not_fatal` is rewritten
+  to assert outcomes, and the `spec-to-backlog` SKILL's Step 3b verdict prose is
+  now generated from the module's constants** (spec `integration-reality-gates-hardening.md`
+  section 4.8, Section 7; issue #16; from #321; E7-F1-S1-T2). `audit_write_path` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` used to silently
+  `continue` past a file it could not decode or read (`except (UnicodeDecodeError,
+  OSError): continue`), so a repo with one unreadable source file produced a
+  verdict computed from a silently truncated scan -- the fail-open shape spec
+  Section 7 bans. Every unreadable file now becomes a `FileLoadError` finding
+  naming the file's relative path and the underlying decode/read error, carried
+  on `WritePathAudit.load_errors` and rendered alongside the assignment-site
+  findings; the verdict itself is still computed from the readable files only.
+  The recorded error text never carries an absolute filesystem path (an
+  `OSError`'s `strerror` is used, never its `filename` attribute) and never
+  echoes the surrounding, attacker-influenced byte content itself (it may
+  report a position, and for a single offending byte its hex value, but
+  never the byte content). The verdict vocabulary is now also
+  exposed as a public, ordered `VERDICT_DESCRIPTIONS` mapping with a
+  `render_verdict_reference()` renderer; the `spec-to-backlog` SKILL's Step 3b
+  verdict sentence and a sample `audit_write_path(...).render()` output are
+  generated from it inside `<!-- generated:write-path-verdicts -->` guard
+  markers (the same grammar `devbench.vocabulary_generation` established), fixing
+  the SKILL prose that still named the pre-rework verdict `default_only` after
+  E7-F1-S1-T1's classifier rework retired that spelling in favour of `default`.
+  `regenerate_skill_step_3b` regenerates the block in place; a hand-edit to the
+  generated block now fails the pin test in
+  `tests/test_plugin_helpers/test_permission_flag_writepath.py`, naming the
+  regeneration command.
+
 - **New CLI verb `check-write-path <id> --flag <name>` replaces the write-path audit's
   skill-invoked `python -c` one-liner, and the classifier it runs is rebuilt around
   assignment-context analysis** (spec `integration-reality-gates-hardening.md` section

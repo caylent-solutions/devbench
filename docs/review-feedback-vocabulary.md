@@ -38,6 +38,7 @@ remains hand-maintained (it mirrors a different source,
 | `SECURITY_BYPASS_ANNOTATION` | `# noqa` / `# nosec` / equivalent suppression | Remove the suppression and fix the underlying finding. |
 | `SOLID_VIOLATION` | Single-responsibility / open-closed / etc. violation | Refactor to comply with the named SOLID principle. |
 | `UNREACHABLE_ARTIFACT` | New component/hook/slice/function has zero non-test importers per `devbench check-reachability` evidence | Import and wire the artifact into its real composition root (route table, parent container, shell), or record a legitimate deferral with `uv run devbench log-waiver <judge> <unit-id> --gate reachability --target <t> --reason <r> --operator` (the operator is the only waiver authority for the reachability gate). |
+| `WRITE_PATH_UNVERIFIED` | Delivered write-path task's flag still classifies `default`, `no_write_path` or `not_found` per `uv run devbench check-write-path <unit-id> --flag <name>` | Wire the flag to a real runtime write path (or an explicit placeholder seam); re-run `uv run devbench check-write-path <unit-id> --flag <name>` until the verdict is `live` or `indeterminate`. |
 <!-- /generated:vocabulary -->
 
 ## `test_review`

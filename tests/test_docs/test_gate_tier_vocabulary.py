@@ -109,13 +109,11 @@ DISABLED_LINE_SEMANTICS_PHRASE = "neither a pass nor a fail signal"
 
 # The judge-evidence gates that have a rubric in one of the three swept
 # prompts, and which file(s) that rubric lives in (AC-E2-F2-S2-T1-5).
-# `write_path_audit` has no rubric text in any of the three swept prompts
-# yet (its CLI verb lands in a later per-gate epic), so it is intentionally
-# absent from this mapping.
 JUDGE_EVIDENCE_GATE_RUBRIC_LOCATIONS: dict[str, tuple[Path, ...]] = {
     "newly_reachable_paths": (CODE_REVIEWER_PROMPT, EXECUTOR_PROMPT),
     "composition_root": (TEST_REVIEWER_PROMPT,),
     "layout_geometry": (TEST_REVIEWER_PROMPT,),
+    "write_path_audit": (CODE_REVIEWER_PROMPT,),
 }
 
 

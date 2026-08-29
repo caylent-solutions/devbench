@@ -32,6 +32,7 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
             "AGENT_LOG_CONTRADICTS_DIFF",
             "NEWLY_REACHABLE_PATH_UNVERIFIED",
             "UNREACHABLE_ARTIFACT",
+            "WRITE_PATH_UNVERIFIED",
         }
     ),
     "test_review": frozenset(

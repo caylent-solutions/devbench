@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Final
 
 import pytest
@@ -114,10 +115,7 @@ _LEGACY_CODES_SNAPSHOT: Final[frozenset[str]] = frozenset(
 #: Codes introduced by the integration-reality-gates-hardening campaign
 #: (spec `integration-reality-gates-hardening.md` section 4.10), each proven
 #: by a dedicated ownership + non-membership assertion in
-#: `TestCampaignCodeMembership` below. The sixth campaign code,
-#: `WRITE_PATH_UNVERIFIED`, lands with a later unit (E7); that unit MUST add
-#: it here in the same change that adds it to `JUDGE_CATEGORIES`, or
-#: `TestJudgeCategoryMembershipCoverage` fails naming it.
+#: `TestCampaignCodeMembership` below.
 _CAMPAIGN_CODES: Final[tuple[str, ...]] = (
     # caylent-solutions/devbench-internal-backlog#10
     "UNREACHABLE_ARTIFACT",
@@ -129,6 +127,8 @@ _CAMPAIGN_CODES: Final[tuple[str, ...]] = (
     "NEWLY_REACHABLE_PATH_UNVERIFIED",
     # caylent-solutions/devbench-internal-backlog#17 -- finding 322-D21
     "FIXTURE_CATALOG_MISMATCH",
+    # caylent-solutions/devbench-internal-backlog#16 -- finding 321-D21
+    "WRITE_PATH_UNVERIFIED",
 )
 
 #: Literal code -> owning-judge contract for every entry in
@@ -148,6 +148,7 @@ _CAMPAIGN_CODE_OWNERS: Final[dict[str, str]] = {
     "LAYOUT_STUB_WITHOUT_LIVE_TEST": "test_review",
     "NEWLY_REACHABLE_PATH_UNVERIFIED": "code_review",
     "FIXTURE_CATALOG_MISMATCH": "test_review",
+    "WRITE_PATH_UNVERIFIED": "code_review",
 }
 
 
@@ -291,3 +292,92 @@ class TestIsValidCode:
 
     def test_empty_inputs_return_false(self) -> None:
         assert is_valid_code("", "") is False
+
+
+# ---------------------------------------------------------------------------
+# WRITE_PATH_UNVERIFIED surfaces (spec 4.8, 4.10; AC-WP-016, AC-WP-018): the
+# generated docs table, the generated code-reviewer prompt sentence, and the
+# hand-authored conditional Evidence re-run instruction all name the code.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+_DOC_PATH: Final[Path] = _REPO_ROOT / "docs" / "review-feedback-vocabulary.md"
+_CODE_REVIEWER_PATH: Final[Path] = (
+    _REPO_ROOT / "plugin" / "devbench-orchestrate" / "agents" / "review_team" / "code-reviewer.md"
+)
+_GUARD_START: Final[str] = "<!-- generated:vocabulary -->"
+_GUARD_END: Final[str] = "<!-- /generated:vocabulary -->"
+
+
+def _section_between(text: str, start_heading: str, end_heading: str | None, *, source: Path) -> str:
+    """Return *text* sliced from *start_heading* up to (excluding) *end_heading*.
+
+    Raises AssertionError naming the missing heading and *source* rather than
+    silently returning an empty or wrong slice -- callers use this to scope a
+    guard-marker search to the correct judge's section of a multi-section
+    file.
+    """
+    start = text.find(start_heading)
+    assert start != -1, f"no {start_heading!r} heading found in {source}"
+    if end_heading is None:
+        return text[start:]
+    end = text.find(end_heading, start)
+    assert end != -1, f"no {end_heading!r} heading found after {start_heading!r} in {source}"
+    return text[start:end]
+
+
+def _first_guarded_block(text: str) -> str:
+    """Return the content of the first guard-marker pair found in *text*.
+
+    Raises AssertionError naming whichever marker is missing, rather than
+    returning an empty slice that would let a mis-scoped search pass
+    silently.
+    """
+    start = text.find(_GUARD_START)
+    assert start != -1, f"no {_GUARD_START!r} marker found in the scanned text"
+    end = text.find(_GUARD_END, start)
+    assert end != -1, f"no {_GUARD_END!r} marker found after the opening marker"
+    return text[start + len(_GUARD_START) : end]
+
+
+class TestWritePathUnverifiedSurfaces:
+    """AC-WP-018: the code's docs-table row and the code-reviewer prompt's
+    inline sentence are both generated between the
+    `<!-- generated:vocabulary -->` guard markers (run `make
+    generate-vocabulary` to regenerate them from `JUDGE_CATEGORIES` after a
+    source change). AC-WP-016: the code-reviewer's hand-authored `##
+    Evidence` section instructs the conditional `check-write-path` re-run
+    the vocabulary code exists to gate."""
+
+    def test_docs_table_lists_code_inside_code_review_guard_markers(self) -> None:
+        text = _DOC_PATH.read_text(encoding="utf-8")
+        code_review_section = _section_between(text, "## `code_review`", "## `test_review`", source=_DOC_PATH)
+        block = _first_guarded_block(code_review_section)
+        assert "WRITE_PATH_UNVERIFIED" in block, (
+            f"{_DOC_PATH}'s code_review table (inside its guard markers) must list "
+            "WRITE_PATH_UNVERIFIED; run `make generate-vocabulary`."
+        )
+
+    def test_prompt_inline_sentence_names_code_inside_guard_markers(self) -> None:
+        text = _CODE_REVIEWER_PATH.read_text(encoding="utf-8")
+        block = _first_guarded_block(text)
+        assert "WRITE_PATH_UNVERIFIED" in block, (
+            f"{_CODE_REVIEWER_PATH}'s guard-marked inline vocabulary sentence must list "
+            "WRITE_PATH_UNVERIFIED; run `make generate-vocabulary`."
+        )
+
+    def test_evidence_section_instructs_conditional_check_write_path_rerun(self) -> None:
+        text = _CODE_REVIEWER_PATH.read_text(encoding="utf-8")
+        evidence_section = _section_between(text, "## Evidence", "\n---\n", source=_CODE_REVIEWER_PATH)
+        assert "check-write-path" in evidence_section, (
+            f"{_CODE_REVIEWER_PATH}'s ## Evidence section must hand-author a conditional "
+            "`check-write-path` re-run instruction (spec 4.8, AC-WP-016)."
+        )
+        assert "no_write_path" in evidence_section and "not_found" in evidence_section, (
+            f"{_CODE_REVIEWER_PATH}'s ## Evidence section must name the failing "
+            "`check-write-path` verdicts (`default`, `no_write_path`, `not_found`)."
+        )
+        assert "WRITE_PATH_UNVERIFIED" in evidence_section, (
+            f"{_CODE_REVIEWER_PATH}'s ## Evidence section must state that a failing verdict "
+            "is treated as a WRITE_PATH_UNVERIFIED rejection."
+        )

@@ -14,6 +14,16 @@ Work unit and repo context:
 Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
 
+Write-path audit re-run (judge-evidence, conditional -- spec 4.8, 321-D21): if this unit's
+Acceptance Criteria name a permission or eligibility flag (the write-path task shape the
+`spec-to-backlog` skill's Step 4a generates from a Step 3b copy-pattern match), run
+`uv run devbench check-write-path $ARGUMENTS --flag <flag-name>` with your Bash tool, substituting
+the flag named in the Acceptance Criteria for `<flag-name>`, and read the spec 5.2 status line it
+prints as its first stdout line. A `verdict` of `default`, `no_write_path` or `not_found` on a
+delivered write-path task is a `WRITE_PATH_UNVERIFIED` rejection: quote the printed `verdict` and
+the audit's evidence lines in the feedback. See the WRITE-PATH AUDIT rubric below for how to weigh
+the result.
+
 Optional cross-cutting-primitives registry, if the workspace defines one (see `docs/newly-reachable-paths.md`):
 !`test -f backlog/config/cross-cutting-primitives.md && cat backlog/config/cross-cutting-primitives.md || echo "No cross-cutting-primitives registry at backlog/config/cross-cutting-primitives.md -- skip rule 55."`
 
@@ -124,6 +134,11 @@ This section applies only when the work unit is bug-fix-shaped: its title starts
     e. If a candidate is genuinely orphaned and not legitimately waived, FAIL with finding code `UNREACHABLE_ARTIFACT`: name the file, the symbol(s) checked, and state plainly that it is not imported by any non-test file, then require it be wired into the real app (or recorded as a legitimate deferral via `uv run devbench log-waiver <judge> <unit-id> --gate reachability --target <t> --reason <r> --operator`, since the operator is the only waiver authority for the reachability gate).
     f. A `[LOAD_ERROR]` entry (candidate file unreadable) IS a blocking finding, not informational: it is counted in the spec 5.2 status line's `findings` total and drives `check-reachability`'s own exit code 1. Treat it like `[POTENTIALLY UNREACHABLE]` above -- FAIL with finding code `UNREACHABLE_ARTIFACT` naming the path and the OS error, unless the unreadability is itself explained and fixed elsewhere in the diff. The message "No classified source files found in this work unit's Changes Manifest." (an empty, correctly-scoped Manifest) is informational only -- not itself a finding.
 
+## WRITE-PATH AUDIT
+This section applies only when this unit's Acceptance Criteria name a permission or eligibility flag (the write-path task shape the `spec-to-backlog` skill's Step 4a generates from a Step 3b copy-pattern match); skip it entirely otherwise.
+
+58. `write_path_audit` is a judge-evidence gate (`constants.GATE_TIERS`); run the conditional `check-write-path` re-run instructed in the Evidence section above and read the printed spec 5.2 status line. A `verdict` of `default`, `no_write_path` or `not_found` is evidence this review weighs as a `WRITE_PATH_UNVERIFIED` finding: quote the printed `verdict` and the audit's evidence lines in the feedback, and require the flag be wired to a real (or explicit placeholder) write path before the unit is considered delivered. A `verdict` of `live` or `indeterminate` is a pass signal for this rubric item, and a `{"gate":"write_path_audit","status":"disabled"}` line means the gate is not configured for this repo -- treat it as neither a pass nor a fail signal, never as a finding.
+
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` -- work-unit status index
@@ -154,7 +169,7 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
 ```
 Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
-Every `code` MUST come from the controlled vocabulary for `code_review`: `AGENT_LOG_CONTRADICTS_DIFF`, `HARDCODED_URL`, `MAKE_VALIDATE_FAILURE`, `MANIFEST_TODO_UNFILLED`, `MISSING_AC_EVIDENCE`, `NEWLY_REACHABLE_PATH_UNVERIFIED`, `SCOPE_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SOLID_VIOLATION`, `UNREACHABLE_ARTIFACT`.
+Every `code` MUST come from the controlled vocabulary for `code_review`: `AGENT_LOG_CONTRADICTS_DIFF`, `HARDCODED_URL`, `MAKE_VALIDATE_FAILURE`, `MANIFEST_TODO_UNFILLED`, `MISSING_AC_EVIDENCE`, `NEWLY_REACHABLE_PATH_UNVERIFIED`, `SCOPE_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SOLID_VIOLATION`, `UNREACHABLE_ARTIFACT`, `WRITE_PATH_UNVERIFIED`.
 <!-- /generated:vocabulary --> The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**

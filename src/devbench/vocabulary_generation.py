@@ -159,6 +159,13 @@ CATEGORY_DESCRIPTIONS: Final[dict[str, dict[str, tuple[str, str]]]] = {
             "<judge> <unit-id> --gate reachability --target <t> --reason <r> --operator` "
             "(the operator is the only waiver authority for the reachability gate).",
         ),
+        "WRITE_PATH_UNVERIFIED": (
+            "Delivered write-path task's flag still classifies `default`, `no_write_path` or "
+            "`not_found` per `uv run devbench check-write-path <unit-id> --flag <name>`",
+            "Wire the flag to a real runtime write path (or an explicit placeholder seam); re-run "
+            "`uv run devbench check-write-path <unit-id> --flag <name>` until the verdict is "
+            "`live` or `indeterminate`.",
+        ),
     },
     "test_review": {
         "GIT_COMPLETENESS": (

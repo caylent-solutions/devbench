@@ -432,6 +432,46 @@ class TestFixtureCatalogMismatchRemediationNamesInFixtureMarker:
 
 
 # ---------------------------------------------------------------------------
+# CATEGORY_DESCRIPTIONS content pin -- WRITE_PATH_UNVERIFIED meaning/remediation
+# ---------------------------------------------------------------------------
+
+
+class TestWritePathUnverifiedRemediationNamesCheckWritePathAndVerdicts:
+    """The code-reviewer `## Evidence` re-run (spec 4.8, AC-WP-016) rejects a
+    delivered write-path task whose flag still classifies `default`,
+    `no_write_path` or `not_found` per `uv run devbench check-write-path
+    <unit-id> --flag <name>`. The `CATEGORY_DESCRIPTIONS["code_review"]
+    ["WRITE_PATH_UNVERIFIED"]` meaning must name all three failing verdicts so
+    an operator reading the rendered doc table / prompt sentence knows
+    exactly which classifications trigger rejection, and the remediation must
+    name the `check-write-path` re-run command plus both passing verdicts
+    (`live`, `indeterminate`) so the operator knows what a cleared flag looks
+    like."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("failing_verdict", ["default", "no_write_path", "not_found"])
+    def test_meaning_names_every_failing_verdict(self, vg: ModuleType, failing_verdict: str) -> None:
+        meaning, _remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["WRITE_PATH_UNVERIFIED"]
+        assert failing_verdict in meaning
+
+    @pytest.mark.unit
+    def test_meaning_names_check_write_path_command(self, vg: ModuleType) -> None:
+        meaning, _remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["WRITE_PATH_UNVERIFIED"]
+        assert "check-write-path" in meaning
+
+    @pytest.mark.unit
+    def test_remediation_names_check_write_path_command(self, vg: ModuleType) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["WRITE_PATH_UNVERIFIED"]
+        assert "check-write-path" in remediation
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("passing_verdict", ["live", "indeterminate"])
+    def test_remediation_names_every_passing_verdict(self, vg: ModuleType, passing_verdict: str) -> None:
+        _meaning, remediation = vg.CATEGORY_DESCRIPTIONS["code_review"]["WRITE_PATH_UNVERIFIED"]
+        assert passing_verdict in remediation
+
+
+# ---------------------------------------------------------------------------
 # Module-internal consistency
 # ---------------------------------------------------------------------------
 

@@ -5,6 +5,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **Review-time re-run closes 321-D21: a delivered write-path task whose flag
+  still classifies `default` now fails code review** (spec
+  `integration-reality-gates-hardening.md` section 4.8, AC-20; E7-F2-S1-T1).
+  Authoring-time detection in the `spec-to-backlog` skill's Step 3b already
+  caught the copy-pattern clause, but nothing re-ran the audit at delivery
+  time, so a write-path task could reach review with its flag still
+  classifying `default`/`no_write_path`/`not_found` and no judge would ever
+  see it. `code-reviewer.md`'s `## Evidence` section now instructs a
+  conditional re-run: for a unit whose Acceptance Criteria name a permission
+  or eligibility flag, run `uv run devbench check-write-path <unit-id>
+  --flag <flag-name>` and treat a `default`, `no_write_path` or `not_found`
+  verdict as a new `WRITE_PATH_UNVERIFIED` rejection. The code is registered
+  in the `code_review` set in
+  `src/devbench/backlog/review_feedback_vocabulary.py` (and no other
+  judge's), with a membership test proving both halves of the ownership
+  rule, and its docs-table row and inline prompt sentence are generated
+  from `JUDGE_CATEGORIES` via `make generate-vocabulary` rather than
+  hand-edited.
+
 - **SECURITY: `WritePathAudit.render()` and `render_blocking_finding()` now
   also escape the audited `flag_name` and a `load_error`'s `<error>` text,
   the same way `relative_path` was already escaped, closing the same

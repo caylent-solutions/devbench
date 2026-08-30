@@ -15876,31 +15876,46 @@ class TestCmdCheckFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
         assert "_write_gate_pass_record`, E6-F2-S1-T2)" in source
 
 
-class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
+class _CliReferenceSectionPin:
+    """Shared base for ``docs/cli-reference.md`` section-pinning test classes
+    (code_review round 3, E7-F2-S1-T3): both
+    ``TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync``
+    and ``TestCliReferenceCheckWritePathScopeAttributionDocsSync`` need the
+    identical "slice the doc down to one command's section, bounded at the
+    next ``##``/``###`` heading" idiom; hoisting it here (parameterised by
+    the per-subclass ``_HEADING`` class attribute) means the two pin classes
+    can no longer drift into two independently-maintained copies of the same
+    slicing logic."""
+
+    _DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "cli-reference.md"
+    _HEADING_RE = re.compile(r"^#{2,3} ", re.MULTILINE)
+    _HEADING: str = ""
+
+    def _doc_text(self) -> str:
+        return self._DOC_PATH.read_text(encoding="utf-8")
+
+    def _section(self) -> str:
+        """Return only this class's ``_HEADING`` section, bounded at the NEXT
+        ``##``/``###`` heading. Unlike a whole-document ``text.split(...)[1]``
+        (which runs to end of file), this stops the slice at the section's own
+        end so an assertion cannot be satisfied by prose relocated into a later
+        command's section."""
+        text = self._doc_text()
+        start = text.index(self._HEADING)
+        after_heading = start + len(self._HEADING)
+        match = self._HEADING_RE.search(text, after_heading)
+        end = match.start() if match is not None else len(text)
+        return text[start:end]
+
+
+class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync(_CliReferenceSectionPin):
     """Same defect class as the class above, pinned against the ``docs/cli-reference.md``
     prose this unit's diff rewrites (code_review/doc_review round-1, E6-F2-S1-T2): the
     doc's own opening sentence must carry the corrected 'findings-based or config-error
     verdict' phrasing and the six-terminal count, matching ``cmd_check_fixture_consistency``'s
     docstring exactly, or the two prose copies can drift independently again."""
 
-    _DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "cli-reference.md"
-    _HEADING_RE = re.compile(r"^#{2,3} ", re.MULTILINE)
-
-    def _doc_text(self) -> str:
-        return self._DOC_PATH.read_text(encoding="utf-8")
-
-    def _section(self) -> str:
-        """Return only the ``check-fixture-consistency`` section, bounded at the
-        NEXT ``##``/``###`` heading. Unlike a whole-document ``text.split(...)[1]``
-        (which runs to end of file), this stops the slice at the section's own
-        end so an assertion cannot be satisfied by prose relocated into a later
-        command's section."""
-        text = self._doc_text()
-        start = text.index("### `check-fixture-consistency`")
-        after_heading = start + len("### `check-fixture-consistency`")
-        match = self._HEADING_RE.search(text, after_heading)
-        end = match.start() if match is not None else len(text)
-        return text[start:end]
+    _HEADING = "### `check-fixture-consistency`"
 
     def test_doc_drops_the_false_universal_quantifier(self) -> None:
         section = self._section()
@@ -15917,15 +15932,61 @@ class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
         assert "the audit-marker append itself raises `OSError`" in section
 
 
+class TestCliReferenceCheckWritePathScopeAttributionDocsSync(_CliReferenceSectionPin):
+    """doc_review round 1 (E7-F2-S1-T3): the ``check-write-path`` section of
+    ``docs/cli-reference.md`` must document the scope-limited BLAME vs
+    repo-wide RESULTS split this unit introduces, the new out-of-scope
+    fallback rendering line, and the new zero-stdout exit-1 scope-resolution
+    terminal -- pinned the same way
+    ``TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync``
+    pins the sibling fixture-consistency gate's docs (both now share
+    ``_CliReferenceSectionPin``, code_review round 3, E7-F2-S1-T3), so the
+    doc and the shipped behavior cannot drift independently again."""
+
+    _HEADING = "### `check-write-path`"
+
+    def test_doc_documents_the_scope_attribution_dependency(self) -> None:
+        section = self._section()
+        assert "devbench.work_unit_scope.resolve_changed_files" in section
+        assert "scope-limited BLAME" in section
+        assert "repo-wide RESULTS" in section
+
+    def test_doc_documents_the_new_out_of_scope_fallback_line(self) -> None:
+        section = self._section()
+        assert ("(no assignment/setter sites found within this unit's scope; N found outside scope)") in section
+
+    def test_doc_documents_the_new_scope_resolution_exit_one_terminal(self) -> None:
+        section = self._section()
+        assert "resolve_changed_files` fails to resolve the calling unit's scope" in section
+        assert "writes ZERO bytes to stdout" in section
+
+
 class _WritePathCmdFixtures:
     """Shared fixture helpers for ``cmd_check_write_path`` test classes
-    (E7-F1-S1-T1, spec `integration-reality-gates-hardening.md` section 4.8).
+    (E7-F1-S1-T1, E7-F2-S1-T3; spec `integration-reality-gates-hardening.md`
+    section 4.8).
 
-    Unlike the other gate commands' fixtures, ``check-write-path`` never
-    shells out to git/`gh` (:func:`devbench.plugin_helpers.permission_flag_writepath.audit_write_path`
-    scans the repo checkout's files directly), so no ``run_command`` stub
-    or real git init is needed -- only a plain directory tree of fixture
-    source files under ``repo_path``.
+    ``audit_write_path`` itself never shells out to git (it scans the repo
+    checkout's files directly) -- only ``cmd_check_write_path``'s scope
+    resolution does, since E7-F2-S1-T3 wired it to
+    ``work_unit_scope.resolve_changed_files`` (spec 4.3, AC-9, AC-WP-025) so
+    it can limit BLAME attribution (the itemized findings ``WritePathAudit.render``
+    prints) to the calling unit's own Changes-Manifest scope while still
+    reporting a repo-wide verdict/status line. ``_patch_common`` below seeds
+    a real, on-disk Changes Manifest for every call (reusing
+    ``_seed_scope_backlog``, this module's shared scope-fixture helper --
+    DRY, not a second hand-rolled copy), defaulting to an EMPTY manifest (a
+    verification-only unit) unless a caller passes ``manifest_files`` -- an
+    empty manifest resolves without any git work tree at all
+    (``resolve_changed_files`` short-circuits before its own git plumbing
+    when ``files`` is empty), so most of this fixture's existing callers
+    (usage-error / unknown-unit / disabled / config-load-failure tests, none
+    of which ever reach scope resolution) need no git repo either. A caller
+    that DOES pass non-empty ``manifest_files`` must first turn ``repo_path``
+    into a real git work tree via ``_init_scratch_repo_for_cli`` (imported
+    from ``test_tdd_gate.init_scratch_repo`` at module scope, not re-derived
+    here) -- ``resolve_changed_files`` hashes every non-empty scope's files
+    through ``git hash-object``.
     """
 
     _REPO = "caylent-solutions/devbench"
@@ -15962,14 +16023,48 @@ class _WritePathCmdFixtures:
         monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
 
     @contextlib.contextmanager
-    def _patch_common(self, unit: WorkUnit, repo_path: Path) -> Iterator[None]:
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        *,
+        manifest_files: tuple[str, ...] = (),
+        manifest_body: str | None = None,
+    ) -> Iterator[None]:
+        """Patch surface every ``cmd_check_write_path`` test class shares.
+
+        ``manifest_files`` (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3) seeds
+        ``unit``'s real ``## Changes Manifest`` via ``_seed_scope_backlog``
+        (this module's shared scope-fixture helper, reused directly rather
+        than re-derived) and patches ``devbench.work_unit_scope.BACKLOG_ROOT``/
+        ``BACKLOG_INDEX`` alongside this fixture's pre-existing
+        ``devbench.cli.BacklogParser``/``REPO_LOCAL_PATHS`` patches --
+        ``work_unit_scope.resolve_changed_files`` does its OWN, independent
+        ``BacklogParser`` lookup against those two module-level constants,
+        never satisfied by a mocked ``devbench.cli.BacklogParser`` alone
+        (``_seed_scope_backlog``'s own docstring), so both must point at the
+        same real, on-disk fixture data for scope resolution to succeed.
+        ``manifest_body`` is forwarded to ``_seed_scope_backlog`` verbatim
+        (overriding ``manifest_files`` entirely) for a caller that needs a
+        deliberately malformed ``## Changes Manifest`` table, e.g. to prove
+        ``cmd_check_write_path`` propagates a scope-resolution failure.
+        """
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
+        backlog_root, backlog_index = _seed_scope_backlog(
+            repo_path.parent, unit_id=unit.id, files=manifest_files, manifest_body=manifest_body
+        )
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
             patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             yield
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
 
 @pytest.mark.unit
@@ -16131,22 +16226,18 @@ class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
     (judge-evidence tier, first line) then human-readable findings, and
     never blocks on an `indeterminate` verdict."""
 
-    def _write(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-
     def test_live_verdict_prints_pass_status_and_exits_zero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         self._enable_gate(tmp_path, monkeypatch, enabled=True)
         unit = self._make_unit()
-        repo_path = tmp_path / "devbench"
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
         self._write(
             repo_path / "src" / "reducers" / "permissionReducer.ts",
             "isPremiumEligible = action.payload.value;\n",
         )
 
-        with self._patch_common(unit, repo_path):
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
             result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
 
         assert result == 0
@@ -16168,13 +16259,13 @@ class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
     ) -> None:
         self._enable_gate(tmp_path, monkeypatch, enabled=True)
         unit = self._make_unit()
-        repo_path = tmp_path / "devbench"
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
         self._write(
             repo_path / "src" / "store" / "slices" / "permissionSlice.ts",
             "const initialState = {\n  isPremiumEligible: false,\n};\n",
         )
 
-        with self._patch_common(unit, repo_path):
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/slices/permissionSlice.ts",)):
             result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
 
         assert result == 1
@@ -16189,13 +16280,13 @@ class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
     ) -> None:
         self._enable_gate(tmp_path, monkeypatch, enabled=True)
         unit = self._make_unit()
-        repo_path = tmp_path / "devbench"
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
         self._write(
             repo_path / "src" / "misc" / "assign.py",
             "isPremiumEligible = someUnknownVar\n",
         )
 
-        with self._patch_common(unit, repo_path):
+        with self._patch_common(unit, repo_path, manifest_files=("src/misc/assign.py",)):
             result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
 
         assert result == 0
@@ -16223,13 +16314,107 @@ class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
         assert "ERROR" in captured.err
 
 
+@pytest.mark.unit
+class TestCmdCheckWritePathScopeAttribution(_WritePathCmdFixtures):
+    """AC-CODE-001, AC-TEST-001 (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3):
+    ``cmd_check_write_path`` resolves the calling unit's own Changes-Manifest
+    scope via ``work_unit_scope.resolve_changed_files`` and threads it into
+    ``audit_write_path`` as the new keyword-only ``scope`` parameter, so a
+    live write in a file OUTSIDE that scope is never named in the rendered
+    findings, while the overall verdict/status line still reflects the
+    REPO-WIDE scan -- matching the pattern already used by the
+    machine-blocking gates (``_shared_file_gate_attributable``/#318,
+    ``_fixture_finding_is_attributable``/#322)."""
+
+    def test_out_of_scope_live_write_excluded_from_findings_verdict_stays_repo_wide(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        captured = capsys.readouterr()
+        assert result == 0, f"stdout={captured.out!r} stderr={captured.err!r}"
+        first_line = json.loads(captured.out.splitlines()[0])
+        # Repo-wide RESULT: the only live write found anywhere in the repo still
+        # drives a `live`/pass verdict, even though it is out of this unit's scope.
+        assert first_line["status"] == "pass"
+        assert first_line["verdict"] == "live"
+        # Scope-limited BLAME: the out-of-scope write is never named.
+        assert "src/legacy/unrelated_module.ts:1" not in captured.out
+
+    def test_in_scope_live_write_still_surfaces_in_findings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "src/reducers/permissionReducer.ts:1" in captured.out
+        assert "src/legacy/unrelated_module.ts:1" not in captured.out
+
+    def test_malformed_manifest_fails_scope_resolution_and_exits_one_before_any_audit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A malformed ``## Changes Manifest`` table (spec 4.3's
+        ``ManifestParseError`` path, caught by ``_resolve_scope_or_report``)
+        fails scope resolution before ``audit_write_path`` is ever called --
+        no spec 5.2 status line is printed, and the ERROR reaches stderr."""
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_body="| File | Change | Extra |\n|------|--------|-------|\n"
+            "| `src/reducers/permissionReducer.ts` | modify | oops |\n",
+        ):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+
 class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
     """doc_review round-2 (E6-F2-S1-T2 Blocking 3): ``_resolve_scope_mode`` and
     ``_resolve_scope_or_report`` each carry an exhaustive parenthetical caller
     enumeration. This task adds a fifth caller
     (:func:`cli._finalize_fixture_consistency_result`) to both helpers, so both
     enumerations must name it -- pinned here so a future new caller of either
-    helper cannot land without this list being swept too."""
+    helper cannot land without this list being swept too.
+
+    code_review round 4 (E7-F2-S1-T3, advisory): both enumerations were also
+    swept to name a sixth caller, :func:`cli.cmd_check_write_path`, in the
+    same diff that added the ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX``
+    pin below, but neither of the two tests here was extended to assert it --
+    added here so the write-path gate is pinned in both enumerations too."""
 
     def test_resolve_scope_mode_names_the_fixture_consistency_gate(self) -> None:
         import inspect
@@ -16237,11 +16422,23 @@ class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
         source = inspect.getsource(cli._resolve_scope_mode)
         assert "fixture-consistency gate" in source
 
+    def test_resolve_scope_mode_names_check_write_path(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "cmd_check_write_path" in source
+
     def test_resolve_scope_or_report_names_the_fixture_consistency_gate(self) -> None:
         import inspect
 
         source = inspect.getsource(cli._resolve_scope_or_report)
         assert "fixture-consistency gate" in source
+
+    def test_resolve_scope_or_report_names_check_write_path(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "cmd_check_write_path" in source
 
 
 @pytest.mark.unit
@@ -16296,6 +16493,42 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
         # field names the docstring documents for write_path_audit.
         assert "``flag``" in source
         assert "``verdict``" in source
+
+    def test_generic_scope_resolution_message_prefix_names_check_write_path_as_a_third_caller(
+        self,
+    ) -> None:
+        """code_review round 1, this unit (E7-F2-S1-T3): the comment above
+        ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX`` enumerated only two
+        callers before ``cmd_check_write_path`` became the shared template's
+        third consumer; pinned so a fourth future caller cannot land without
+        this comment being swept too.
+
+        code_review round 3 (E7-F2-S1-T3): derives the contiguous ``# ``-prefixed
+        comment block immediately preceding the marker line instead of slicing a
+        magic, underived 700-character look-back window (which would silently
+        truncate if the comment grows, or bleed into the unrelated
+        ``_resolve_scope_or_report`` body above it if the comment shrinks), and
+        asserts the exact ordinal phrases the comment makes rather than the bare
+        substring "three" -- the loose-ordinal-assertion pattern this same file's
+        test_review rounds already rejected twice (see the sibling tests' "W3
+        (test_review): tightened from bare ..." comments above)."""
+        import inspect
+
+        module_lines = inspect.getsource(cli).splitlines()
+        marker_line_index = next(
+            index
+            for index, line in enumerate(module_lines)
+            if line.startswith("_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str =")
+        )
+        comment_lines: list[str] = []
+        for line in reversed(module_lines[:marker_line_index]):
+            if not line.startswith("# "):
+                break
+            comment_lines.insert(0, line)
+        preceding_comment = "\n".join(comment_lines)
+        assert "cmd_check_write_path" in preceding_comment
+        assert "the three :func:`_resolve_scope_or_report`" in preceding_comment
+        assert "the three call sites" in preceding_comment
 
 
 class _FixtureGateCmdFixtures:

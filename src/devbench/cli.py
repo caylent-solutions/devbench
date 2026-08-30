@@ -4435,9 +4435,11 @@ def _resolve_scope_mode() -> str:
     ``MODE_PER_TASK_BRANCH``. Every scope-resolving gate/verb
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
     reachability gate, :func:`cmd_check_shared_file_impact`, the
-    fixture-consistency gate) calls this single helper instead of
-    re-deriving the same two-branch ternary, so the mode-selection rule
-    can never drift between call sites (spec 4.3, ADR-12).
+    fixture-consistency gate, and the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3) calls this single helper
+    instead of re-deriving the same two-branch ternary, so the
+    mode-selection rule can never drift between call sites (spec 4.3,
+    ADR-12).
     """
     from devbench.config import DEFER_PR
 
@@ -4449,9 +4451,11 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
 
     Shared by every gate/verb that needs the unit's ADR-12 mode-aware scope
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
-    reachability gate, :func:`cmd_check_shared_file_impact`, and the
-    fixture-consistency gate; spec 4.3, AC-9) so every consumer resolves
-    scope through the single mode-aware implementation and reports a
+    reachability gate, :func:`cmd_check_shared_file_impact`, the
+    fixture-consistency gate, and the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3; spec 4.3, AC-9) so every
+    consumer resolves scope through the single mode-aware implementation
+    and reports a
     resolution failure through one shared error path, never a divergent
     per-caller try/except copy. Each caller passes its own operator-facing
     ``message_prefix`` (e.g. ``"Cannot scope diff for '<unit>'"`` or
@@ -4480,11 +4484,13 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
         return None
 
 
-# Shared ``message_prefix`` template for the two :func:`_resolve_scope_or_report`
+# Shared ``message_prefix`` template for the three :func:`_resolve_scope_or_report`
 # callers (:func:`_prepare_shared_file_impact_scope_and_registry`,
-# :func:`_finalize_fixture_consistency_result`) that have no gate-specific wording
-# of their own to preserve, so the identical prefix text can never drift between
-# the two call sites (doc_review round-2 W4, E6-F2-S1-T2).
+# :func:`_finalize_fixture_consistency_result`, :func:`cmd_check_write_path`) that
+# have no gate-specific wording of their own to preserve, so the identical prefix
+# text can never drift between the three call sites (doc_review round-2 W4,
+# E6-F2-S1-T2; extended to a third caller by E7-F2-S1-T3, code_review round 1
+# Blocking).
 _GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str = "cannot resolve scope for unit {unit_id}"
 
 
@@ -9072,6 +9078,23 @@ def cmd_check_write_path(*argv: str) -> int:
     ``{"gate": "write_path_audit", "status": "disabled"}`` and exits 0 (spec
     4.1, AC-WP-006) before ``--flag`` is ever audited.
 
+    Attribution (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3): once enabled, this
+    verb resolves *unit-id*'s own Changes-Manifest scope through the SAME
+    shared :func:`_resolve_scope_or_report` (i.e.
+    :func:`devbench.work_unit_scope.resolve_changed_files`) every other
+    scope-resolving gate/verb uses, and passes it to :func:`audit_write_path`
+    as its ``scope`` keyword argument. The underlying scan stays repo-wide
+    (this audit reports repo-wide RESULTS: ``verdict``/``mentions``/
+    ``assignment_sites`` in :meth:`WritePathAudit.render`'s header, and the
+    ``verdict``/``findings``/``status`` fields on the spec 5.2 status line
+    below, are ALL unaffected by scope) -- only the itemized findings
+    :meth:`WritePathAudit.render` prints are BLAME-limited to *unit-id*'s
+    own scope, matching the pattern already used by the machine-blocking
+    gates (``_shared_file_gate_attributable``/#318,
+    ``_fixture_finding_is_attributable``/#322): a live write in a file
+    outside this unit's own scope drives the SAME verdict a fully unscoped
+    run would reach, but is never named in the printed findings.
+
     An enabled run audits ``--flag <name>`` against the resolved repo
     checkout and prints the spec 5.2 status line as the FIRST stdout line
     -- ``{"gate": "write_path_audit", "tier": "judge-evidence", "status":
@@ -9093,10 +9116,11 @@ def cmd_check_write_path(*argv: str) -> int:
         0 when the gate is disabled/unconfigured, or an enabled run's
         verdict is ``live``/``indeterminate``. 1 when the unit id is
         unknown, the repo has no configured local path, the gate config
-        fails to load, or an enabled run's verdict is
-        ``default``/``no_write_path``/``not_found``. 2 on a usage error
-        (missing/duplicated unit id, unknown flag, or a missing/empty
-        ``--flag`` value).
+        fails to load, scope resolution fails (no status line printed in
+        that case; the ERROR is already on stderr), or an enabled run's
+        verdict is ``default``/``no_write_path``/``not_found``. 2 on a
+        usage error (missing/duplicated unit id, unknown flag, or a
+        missing/empty ``--flag`` value).
     """
     parsed = _parse_check_write_path_argv(argv)
     if isinstance(parsed, int):
@@ -9112,13 +9136,20 @@ def cmd_check_write_path(*argv: str) -> int:
     if isinstance(gate_config, int):
         return gate_config
 
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+
     from devbench.plugin_helpers.permission_flag_writepath import (
         VERDICT_INDETERMINATE,
         VERDICT_LIVE,
         audit_write_path,
     )
 
-    audit = audit_write_path(repo_path, flag_name)
+    audit = audit_write_path(repo_path, flag_name, scope=frozenset(scope.files))
 
     if audit.verdict in (VERDICT_LIVE, VERDICT_INDETERMINATE):
         status = GATE_STATUS_PASS

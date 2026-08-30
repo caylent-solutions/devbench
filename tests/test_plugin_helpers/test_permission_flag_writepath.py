@@ -380,6 +380,118 @@ class TestAuditWritePath:
 
 
 @pytest.mark.unit
+class TestAuditWritePathScopeAttribution:
+    """Scope-limited BLAME attribution (spec 4.3, AC-9, AC-WP-025, this unit):
+    ``audit_write_path``'s optional keyword-only ``scope`` parameter limits
+    which assignment sites are ATTRIBUTED (returned via ``attributed_sites``
+    and rendered by ``WritePathAudit.render()``) without narrowing the
+    REPO-WIDE scan that decides ``verdict``/``mention_count``/``assignment_sites``
+    -- the same "repo-wide RESULTS, scope-limited BLAME" split
+    ``_shared_file_gate_attributable`` (#318) and
+    ``_fixture_finding_is_attributable`` (#322) already apply to their own
+    gates.
+    """
+
+    def test_out_of_scope_live_write_excluded_from_attribution_in_scope_write_still_included(
+        self, tmp_path: Path
+    ) -> None:
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+        _write(
+            tmp_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        audit = pfw.audit_write_path(
+            tmp_path, "isPremiumEligible", scope=frozenset({"src/reducers/permissionReducer.ts"})
+        )
+
+        attributed_paths = {site.relative_path for site in audit.attributed_sites}
+        assert attributed_paths == {"src/reducers/permissionReducer.ts"}
+        assert "src/legacy/unrelated_module.ts" not in attributed_paths
+        # repo-wide RESULTS (verdict, mention_count, assignment_sites) stay unaffected by scope.
+        assert audit.verdict == pfw.VERDICT_LIVE
+        assert len(audit.assignment_sites) == 2
+        rendered = audit.render()
+        assert "src/reducers/permissionReducer.ts:1" in rendered
+        assert "src/legacy/unrelated_module.ts:1" not in rendered
+
+    def test_no_scope_argument_attributes_every_site_unchanged(self, tmp_path: Path) -> None:
+        """Backward compatibility: an unscoped call (the `spec-to-backlog`
+        skill's own Step 3b narrative, which never has a Changes-Manifest
+        scope) still attributes every real assignment site, matching this
+        module's pre-scope-attribution behaviour byte-for-byte."""
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible")
+
+        assert audit.attributed_sites == audit.assignment_sites
+
+    def test_empty_scope_attributes_nothing_while_verdict_stays_repo_wide(self, tmp_path: Path) -> None:
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible", scope=frozenset())
+
+        assert audit.attributed_sites == ()
+        assert audit.verdict == pfw.VERDICT_LIVE
+        assert len(audit.assignment_sites) == 1
+
+        rendered = audit.render()
+
+        assert ("  (no assignment/setter sites found within this unit's scope; 1 found outside scope)") in rendered
+        assert "src/legacy/unrelated_module.ts" not in rendered
+
+    @pytest.mark.parametrize(
+        "manifest_spelling",
+        ["./src/reducers/permissionReducer.ts", "src/x/../reducers/permissionReducer.ts"],
+        ids=["dot-slash-prefixed", "dot-dot-component"],
+    )
+    def test_uncanonicalized_manifest_spelling_still_attributes_the_in_scope_site(
+        self, tmp_path: Path, manifest_spelling: str
+    ) -> None:
+        """Regression (round-4 code_review BLOCKING): `work_unit_scope._load_manifest_paths`
+        returns Changes-Manifest cell text VERBATIM (no normalisation anywhere in
+        `resolve_changed_files`), while `site.relative_path` is always the canonical
+        `path.relative_to(repo_root).as_posix()` form. A Manifest row spelled with a
+        leading `./` or an internal `a/../` component therefore compared unequal to the
+        canonical site path under a raw `in` check, silently misattributing a genuinely
+        in-scope live write as out-of-scope -- the same defect class
+        `fixture_consistency.normalize_repo_relative_path` was introduced to close for
+        `cli._fixture_finding_is_attributable` (#322). Both operands must be normalised
+        before comparison so any lexically-equivalent Manifest spelling still attributes.
+        """
+        pfw = _pfw()
+        _write(
+            tmp_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+        _write(
+            tmp_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        audit = pfw.audit_write_path(tmp_path, "isPremiumEligible", scope=frozenset({manifest_spelling}))
+
+        attributed_paths = {site.relative_path for site in audit.attributed_sites}
+        assert attributed_paths == {"src/reducers/permissionReducer.ts"}
+        assert "src/legacy/unrelated_module.ts" not in attributed_paths
+        rendered = audit.render()
+        assert "src/reducers/permissionReducer.ts:1" in rendered
+        assert "src/legacy/unrelated_module.ts:1" not in rendered
+
+
+@pytest.mark.unit
 class TestDescribeOsError:
     def test_uses_strerror_when_present(self) -> None:
         pfw = _pfw()

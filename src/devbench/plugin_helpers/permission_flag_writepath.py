@@ -340,13 +340,47 @@ class FileLoadError:
 
 @dataclass(frozen=True)
 class WritePathAudit:
-    """Result of auditing a single flag name's write-path status."""
+    """Result of auditing a single flag name's write-path status.
+
+    ``assignment_sites``, ``mention_count`` and ``verdict`` are always
+    computed from the FULL, repo-wide scan (spec 4.3: a repo-wide gate
+    reports repo-wide RESULTS) -- passing ``scope`` to :func:`audit_write_path`
+    never narrows the scan itself, and never changes ``verdict``.
+
+    ``attributed_sites`` (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3) is the
+    subset of ``assignment_sites`` :meth:`render` actually names -- the
+    attribution BOUNDARY a repo-wide gate must still respect: a repo-wide
+    gate may report repo-wide RESULTS, but may only attribute BLAME
+    (name a file in its rendered findings) within the calling unit's own
+    scope. Defaults to ``None`` at construction time and is resolved to
+    ``assignment_sites`` unchanged (every site attributed, matching this
+    module's pre-scope-attribution behaviour byte-for-byte) by
+    :meth:`__post_init__` whenever the caller does not supply it directly
+    -- both :func:`audit_write_path`'s own unscoped callers (the
+    ``spec-to-backlog`` skill's Step 3b narrative, per this module's
+    docstring) and every direct ``WritePathAudit(...)`` construction that
+    pre-dates this field (this module's own doc-generation helper,
+    :func:`render_verdict_reference`, and this suite's own direct
+    constructions) keep their exact prior ``render()`` output with no
+    caller-side change required.
+    """
 
     flag_name: str
     verdict: str
     assignment_sites: tuple[FlagAssignmentSite, ...]
     mention_count: int
     load_errors: tuple[FileLoadError, ...]
+    attributed_sites: tuple[FlagAssignmentSite, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.attributed_sites is None:
+            # `frozen=True` disallows plain attribute assignment (`self.x = y`
+            # raises `FrozenInstanceError`); `object.__setattr__` is the
+            # standard-library `dataclasses` module's own documented escape
+            # hatch for a `__post_init__`-derived default on a frozen
+            # dataclass, used here (and only here in this module) purely to
+            # resolve the "no `scope` was ever supplied" default.
+            object.__setattr__(self, "attributed_sites", self.assignment_sites)
 
     @property
     def is_verified_live(self) -> bool:
@@ -412,6 +446,17 @@ class WritePathAudit:
         can carry a locale-translated, non-ASCII `OSError.strerror`; see
         :func:`_escape_untrusted_path_for_rendering`'s own docstring for
         the full threat model on both.
+
+        ATTRIBUTION (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3): the header's
+        `assignment_sites=<N>` count is the repo-wide RESULT (unaffected by
+        scope, mirrors `verdict`/`mentions`); the itemized bullet list below
+        it is scope-limited BLAME and iterates :attr:`attributed_sites`, not
+        :attr:`assignment_sites` -- a live write outside the calling unit's
+        own scope is never named here, even though the header's count still
+        reflects it. When a scope excluded every real site (`assignment_sites`
+        non-empty, `attributed_sites` empty), the fallback line below states
+        the OUT-OF-SCOPE COUNT ALONE, with no filename -- disclosing "how
+        many" is a repo-wide RESULT, disclosing "which file" is BLAME.
         """
         safe_flag_name = _escape_untrusted_path_for_rendering(self.flag_name)
         lines = [
@@ -419,13 +464,18 @@ class WritePathAudit:
             f"verdict={self.verdict} mentions={self.mention_count} "
             f"assignment_sites={len(self.assignment_sites)}"
         ]
-        if self.assignment_sites:
-            for site in self.assignment_sites:
+        if self.attributed_sites:
+            for site in self.attributed_sites:
                 safe_relative_path = _escape_untrusted_path_for_rendering(site.relative_path)
                 lines.append(
                     f"  - {safe_relative_path}:{site.line_number} | "
                     f"expression_verdict={site.expression_verdict} {_MSG_ASSIGNMENT_LINE_REDACTED}"
                 )
+        elif self.assignment_sites:
+            lines.append(
+                "  (no assignment/setter sites found within this unit's scope; "
+                f"{len(self.assignment_sites)} found outside scope)"
+            )
         else:
             lines.append("  (no assignment/setter sites found)")
         for load_error in self.load_errors:
@@ -1269,13 +1319,36 @@ def _load_source_text(path: Path, relative_path: str) -> str | FileLoadError:
         return FileLoadError(relative_path=relative_path, error=_describe_os_error(exc))
 
 
-def audit_write_path(repo_root: Path, flag_name: str) -> WritePathAudit:
+def audit_write_path(repo_root: Path, flag_name: str, *, scope: frozenset[str] | None = None) -> WritePathAudit:
     """Audit whether *flag_name* has a live, non-default write path in *repo_root*.
 
     Args:
         repo_root: Target repo checkout to scan.
         flag_name: The existing flag name a spec clause instructs a new
             field to "follow the pattern of."
+        scope: Optional attribution boundary (spec 4.3, AC-9, AC-WP-025,
+            E7-F2-S1-T3) -- typically a calling unit's own
+            :attr:`devbench.work_unit_scope.ScopeResult.files`, resolved by
+            the caller (:func:`devbench.cli.cmd_check_write_path`). The scan
+            itself is ALWAYS repo-wide regardless of this argument (this
+            audit reports repo-wide RESULTS, spec 4.3): ``scope`` narrows
+            only :attr:`WritePathAudit.attributed_sites` (and so
+            :meth:`WritePathAudit.render`'s itemized findings), never
+            ``assignment_sites``/``mention_count``/``verdict``. Defaults to
+            ``None`` -- every real site is attributed, matching this
+            function's behaviour before this parameter existed (the
+            ``spec-to-backlog`` skill's own Step 3b narrative, which has no
+            Changes-Manifest scope to pass, keeps calling this function
+            unscoped). Every member is compared against each site's
+            ``relative_path`` through
+            :func:`devbench.fixture_consistency.normalize_repo_relative_path`
+            (round-4 code_review BLOCKING, this unit) so a Manifest cell
+            spelled ``./src/foo.ts`` or ``src/x/../foo.ts`` still attributes
+            the SAME file as the canonical ``src/foo.ts`` spelling --
+            ``work_unit_scope._load_manifest_paths`` returns Changes-Manifest
+            paths verbatim with no canonicalisation of its own, matching the
+            same defect class ``cli._fixture_finding_is_attributable``
+            (#322) already closes this way.
 
     Returns:
         A :class:`WritePathAudit` recording every assignment/setter-shaped
@@ -1319,12 +1392,22 @@ def audit_write_path(repo_root: Path, flag_name: str) -> WritePathAudit:
                 )
 
     verdict = _classify(sites, mention_count)
+    if scope is None:
+        attributed_sites = tuple(sites)
+    else:
+        from devbench.fixture_consistency import normalize_repo_relative_path
+
+        normalized_scope = {normalize_repo_relative_path(path) for path in scope}
+        attributed_sites = tuple(
+            site for site in sites if normalize_repo_relative_path(site.relative_path) in normalized_scope
+        )
     return WritePathAudit(
         flag_name=flag_name,
         verdict=verdict,
         assignment_sites=tuple(sites),
         mention_count=mention_count,
         load_errors=tuple(load_errors),
+        attributed_sites=attributed_sites,
     )
 
 

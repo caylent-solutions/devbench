@@ -40,6 +40,17 @@ from pathlib import Path
 
 import pytest
 
+from devbench.backlog.proposal import ProposedTask
+from devbench.constants import (
+    TASK_TYPE_BEHAVIOR_FIX,
+    TASK_TYPE_CHORE,
+    TASK_TYPE_DOCS,
+    TASK_TYPE_FEATURE,
+    TASK_TYPE_REFACTOR,
+    TASK_TYPE_TEST_ONLY,
+    VALID_TASK_TYPES,
+)
+
 MANIFEST_AMENDER_PATH = (
     Path(__file__).resolve().parent.parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "manifest-amender.md"
 )
@@ -100,4 +111,100 @@ def assert_step_b_reject_section_has_git_invocation(manifest_amender_text: str) 
         "section that survives with an empty or command-free body would "
         "leave those pointers misleading even though the "
         "'**Step B.reject**' heading itself still exists."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared newly-reachable-paths task-type-keying helpers (E8-F2-S1-T1)
+#
+# `tests/test_backlog/test_proposal.py`'s `TestNewlyReachableTaskTypeKeying`
+# and `tests/test_integration/test_gate_newly_reachable_e2e.py`'s
+# `TestJourneyTaskTypeTaxonomyGatesAcceptanceCriterion` both call the same
+# real, unmocked `generate_draft_md` over the same six-value task-type
+# taxonomy to pin the same invariant (spec 4.9a, 1.3 S1): the
+# newly-reachable-paths acceptance-criterion line is appended only when
+# `ProposedTask.task_type` resolves to `constants.TASK_TYPE_BEHAVIOR_FIX`,
+# and no Definition-of-Done line is ever appended for any task type. Prior
+# to this extraction each suite independently hand-typed the taxonomy
+# tuple, the `ProposedTask` factory and the Definition-of-Done assertion
+# body (code_review and test_review both flagged the duplicate as
+# byte-identical). Defining each piece exactly once here means a future
+# change to the taxonomy or to `generate_draft_md`'s section structure
+# needs the fix applied in one place, not two.
+# ---------------------------------------------------------------------------
+
+NEWLY_REACHABLE_TASK_TYPE_TAXONOMY: tuple[str, ...] = tuple(sorted(VALID_TASK_TYPES))
+
+# Explicit per-type expectation table (deliberately NOT derived from
+# `task_type == TASK_TYPE_BEHAVIOR_FIX`): the newly-reachable-paths
+# acceptance-criterion line is a keyed exception granted to exactly one
+# task type today, and that grant must stay an explicit, reviewable
+# decision rather than an implicit formula that would silently re-derive
+# the "right" answer for a future seventh task type. If `VALID_TASK_TYPES`
+# (`devbench.constants`) ever grows a new member without a matching entry
+# here, `_ac_line_expected_for` below raises instead of defaulting, so the
+# taxonomy and the expectation table can never silently drift apart.
+_NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTED_BY_TYPE: dict[str, bool] = {
+    TASK_TYPE_BEHAVIOR_FIX: True,
+    TASK_TYPE_FEATURE: False,
+    TASK_TYPE_REFACTOR: False,
+    TASK_TYPE_TEST_ONLY: False,
+    TASK_TYPE_DOCS: False,
+    TASK_TYPE_CHORE: False,
+}
+
+
+def _ac_line_expected_for(task_type: str) -> bool:
+    """Look up the explicit AC-line expectation for `task_type`, raising
+    loudly (rather than defaulting) when `VALID_TASK_TYPES` has outpaced
+    `_NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTED_BY_TYPE`.
+    """
+    try:
+        return _NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTED_BY_TYPE[task_type]
+    except KeyError as exc:
+        raise AssertionError(
+            f"No newly-reachable AC-line expectation registered for task type {task_type!r}. "
+            "devbench.constants.VALID_TASK_TYPES gained a member that "
+            "_NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTED_BY_TYPE "
+            "(tests/test_integration/conftest.py) does not yet cover -- add an "
+            "explicit True/False entry for it before this suite can run."
+        ) from exc
+
+
+NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTATIONS: tuple[tuple[str, bool], ...] = tuple(
+    (task_type, _ac_line_expected_for(task_type)) for task_type in NEWLY_REACHABLE_TASK_TYPE_TAXONOMY
+)
+
+
+def make_newly_reachable_keying_task(task_type: str) -> ProposedTask:
+    """Shared `ProposedTask` factory for the newly-reachable task-type-keying
+    parametrized suites (see module docstring above). Only the resulting
+    draft's task-type-keyed content ever needed to differ between the two
+    suites; every other field is incidental to that assertion, so both now
+    build from this single factory instead of two near-identical copies.
+    """
+    return ProposedTask(
+        suggested_id="E0-F1-S1-T9",
+        title="Fix the newly-reachable-paths journey exporter crash",
+        files_to_own=["src/exporter.py"],
+        linked_scenarios=[],
+        suggested_acs=["AC-FIX-001 exporter no longer crashes"],
+        suggested_approach="Fix the crash and enumerate what it newly unlocks.",
+        task_type=task_type,
+    )
+
+
+def assert_no_newly_reachable_definition_of_done_line(md: str) -> None:
+    """Shared assertion: no Definition-of-Done line ever mentions the
+    newly-reachable-paths mechanism, for ANY task type (spec 1.3 S1,
+    findings 320-D04/C-06: a DoD checkbox is auto-ticked on the done
+    transition and is never a gate, so this mechanism must never live
+    there).
+    """
+    dod_section = md.split("## Definition of Done", maxsplit=1)[1].split("## TDD Cycle Log", maxsplit=1)[0]
+    assert "newly-reachable" not in dod_section.lower(), (
+        f"Definition of Done section must never mention newly-reachable-paths: {dod_section!r}"
+    )
+    assert "log-newly-reachable" not in dod_section, (
+        f"Definition of Done section must never reference log-newly-reachable: {dod_section!r}"
     )

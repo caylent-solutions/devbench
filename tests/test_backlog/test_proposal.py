@@ -9,6 +9,12 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from test_integration.conftest import (
+    NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTATIONS,
+    NEWLY_REACHABLE_TASK_TYPE_TAXONOMY,
+    assert_no_newly_reachable_definition_of_done_line,
+    make_newly_reachable_keying_task,
+)
 
 from devbench.backlog import proposal as proposal_mod
 from devbench.backlog.proposal import (
@@ -51,7 +57,6 @@ from devbench.constants import (
     TASK_TYPE_BEHAVIOR_FIX,
     TASK_TYPE_CHORE,
     TASK_TYPE_DOCS,
-    TASK_TYPE_FEATURE,
     TASK_TYPE_REFACTOR,
     TASK_TYPE_TEST_ONLY,
     VALID_TASK_TYPES,
@@ -559,57 +564,44 @@ class TestNewlyReachableTaskTypeKeying:
     off the drafted task's ``## Task Type:`` (spec 4.9a, decision D-8),
     replacing the Definition-of-Done auto-append the E1 cherry-pick shim
     left behind (spec 1.3 S1, findings 320-D04/C-06: a DoD checkbox is
-    auto-ticked on the done transition and is never a gate)."""
+    auto-ticked on the done transition and is never a gate).
 
-    _ALL_TASK_TYPES = (
-        TASK_TYPE_BEHAVIOR_FIX,
-        TASK_TYPE_FEATURE,
-        TASK_TYPE_REFACTOR,
-        TASK_TYPE_TEST_ONLY,
-        TASK_TYPE_DOCS,
-        TASK_TYPE_CHORE,
-    )
+    The task-type taxonomy, the ``ProposedTask`` factory and the
+    Definition-of-Done assertion are shared with
+    ``tests/test_integration/test_gate_newly_reachable_e2e.py``'s
+    ``TestJourneyTaskTypeTaxonomyGatesAcceptanceCriterion`` via
+    ``tests/test_integration/conftest.py`` -- both suites pin the same
+    invariant against the same real, unmocked ``generate_draft_md``, so the
+    taxonomy, factory and assertion body are defined exactly once there
+    rather than hand-copied in each module.
+    """
 
-    def _task(self, task_type: str) -> ProposedTask:
-        return ProposedTask(
-            suggested_id="E0-F1-S1-T9",
-            title="Fix the exporter crash",
-            files_to_own=["src/a.py"],
-            linked_scenarios=[],
-            suggested_acs=["AC-FIX-001 exporter no longer crashes"],
-            suggested_approach="Do the fix.",
-            task_type=task_type,
-        )
-
-    @pytest.mark.parametrize(
-        ("task_type", "expect_line"),
-        [
-            (TASK_TYPE_BEHAVIOR_FIX, True),
-            (TASK_TYPE_FEATURE, False),
-            (TASK_TYPE_REFACTOR, False),
-            (TASK_TYPE_TEST_ONLY, False),
-            (TASK_TYPE_DOCS, False),
-            (TASK_TYPE_CHORE, False),
-        ],
-    )
+    @pytest.mark.parametrize(("task_type", "expect_line"), NEWLY_REACHABLE_TASK_TYPE_AC_LINE_EXPECTATIONS)
     def test_ac_line_keyed_by_task_type_across_full_taxonomy(self, task_type: str, expect_line: bool) -> None:
         md = generate_draft_md(
-            self._task(task_type), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+            make_newly_reachable_keying_task(task_type),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
         )
         assert ("log-newly-reachable" in md) is expect_line
 
-    @pytest.mark.parametrize("task_type", _ALL_TASK_TYPES)
+    @pytest.mark.parametrize("task_type", NEWLY_REACHABLE_TASK_TYPE_TAXONOMY)
     def test_no_definition_of_done_line_for_any_task_type(self, task_type: str) -> None:
         md = generate_draft_md(
-            self._task(task_type), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+            make_newly_reachable_keying_task(task_type),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
         )
-        dod_section = md.split("## Definition of Done")[1].split("## TDD Cycle Log")[0]
-        assert "newly-reachable" not in dod_section.lower()
-        assert "log-newly-reachable" not in dod_section
+        assert_no_newly_reachable_definition_of_done_line(md)
 
     def test_behavior_fix_ac_line_names_the_log_newly_reachable_verb_and_doc(self) -> None:
         md = generate_draft_md(
-            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+            make_newly_reachable_keying_task(TASK_TYPE_BEHAVIOR_FIX),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
         )
         assert "uv run devbench log-newly-reachable" in md
         assert "docs/newly-reachable-paths.md" in md
@@ -633,7 +625,10 @@ class TestNewlyReachableTaskTypeKeying:
             ),
         )
         md = generate_draft_md(
-            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+            make_newly_reachable_keying_task(TASK_TYPE_BEHAVIOR_FIX),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
         )
         assert "src/ui/zindex.ts" in md
 
@@ -645,7 +640,10 @@ class TestNewlyReachableTaskTypeKeying:
 
         monkeypatch.setattr(config_module, "RUNTIME_CONFIG", RuntimeConfig())
         md = generate_draft_md(
-            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+            make_newly_reachable_keying_task(TASK_TYPE_BEHAVIOR_FIX),
+            repo="acme/example",
+            source_task_id="E0-F1-S1-T1",
+            generated_at="NOW",
         )
         assert "Configured cross-cutting primitives" not in md
 

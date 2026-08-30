@@ -1170,6 +1170,16 @@ Effective value at gate-check time resolves as: `DEVBENCH_GATE_NEWLY_REACHABLE_P
 
 Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
 
+#### `gates.newly_reachable_paths.paths` -- Cross-cutting-primitives registry
+
+Repo-relative paths naming shared, stateful primitives' defining file(s) (a z-index tier module, a shared dirty-flag write path, a shared close/dismiss callback) that a newly-reachable-paths fix should be cross-checked against (spec 4.9a, decision C-03). This is the migrated home of the retired free-text primitives registry under `backlog/config/`, resolved exclusively through `resolve_gate_config` (AC-27). A non-empty per-repo override under `gates.repos.<org/repo>.newly_reachable_paths.paths` replaces this project-level list wholesale for that repo.
+
+- **Recommended:** `[]` (empty) -- no registry configured; matches every other gate tunable's built-in-default posture until the workspace opts in.
+- **Alternatives:** a list of repo-relative path strings (e.g. `["src/ui/zindex.ts", "src/forms/useDirtyField.ts"]`); each element must be a non-empty, repo-relative path (no absolute paths, no `..` traversal).
+- **Free-form:** Type a comma-separated or one-per-line list of repo-relative paths; a non-list value, a non-string/empty element, an absolute path, or a `..` segment is rejected by the schema/loader check naming `gates.newly_reachable_paths.paths` and re-prompted.
+
+Current value shown to the operator: the existing config's value for this key if `backlog/config/devbench.yaml` already exists, otherwise the Recommended value above.
+
 #### `gates.composition_root.enabled` -- Enable the composition-root gate
 
 Enables the composition-root gate for this workspace (caylent-solutions/devbench-internal-backlog#11). Every gate is disabled by default at the built-in level (D-17); this is the per-gate opt-in.
@@ -1279,7 +1289,7 @@ shape.
 
 Optional per-repo override map, field-wise merged OVER the project-level `gates.*` values above (D-15 precedence). Keys must be `org/repo` and must already be present in the top-level `repos:` mapping -- an override naming an unconfigured repo is a load-time error. Ask the operator, per repo already collected in Step 2:
 
-> "Does repo <org/repo> need a gate override that differs from the project-level gates: settings above? If so, which gate(s) (reachability, ancestry, shared_file_impact, fixture_consistency, write_path_audit, newly_reachable_paths, composition_root, layout_geometry) and what enabled value? For shared_file_impact you may also set patterns: a list of fnmatch-style glob patterns (matched against POSIX paths relative to the repo root) identifying shared/high-fan-in composition-root files for this repo -- this is the migrated home of the retired per-repo glob key."
+> "Does repo <org/repo> need a gate override that differs from the project-level gates: settings above? If so, which gate(s) (reachability, ancestry, shared_file_impact, fixture_consistency, write_path_audit, newly_reachable_paths, composition_root, layout_geometry) and what enabled value? For shared_file_impact you may also set patterns: a list of fnmatch-style glob patterns (matched against POSIX paths relative to the repo root) identifying shared/high-fan-in composition-root files for this repo -- this is the migrated home of the retired per-repo glob key. For newly_reachable_paths you may also set gates.repos.<org/repo>.newly_reachable_paths.paths: a list of repo-relative paths naming this repo's cross-cutting primitives (spec 4.9a, decision C-03) -- a non-empty value here replaces the project-level gates.newly_reachable_paths.paths list wholesale for this repo."
 
 Leave `gates.repos` entirely absent when no repo needs an override.
 

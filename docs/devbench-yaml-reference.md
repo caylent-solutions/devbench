@@ -84,6 +84,7 @@ gates:
     enabled: false
   newly_reachable_paths:
     enabled: false
+    paths: []                 # repo-relative paths; empty/absent means no registry configured
   composition_root:
     enabled: false
   layout_geometry:
@@ -95,6 +96,10 @@ gates:
         patterns:
           - "src/app/Shell.tsx"
           - "src/hooks/useAuth.*"
+      newly_reachable_paths:
+        enabled: true
+        paths:
+          - "src/ui/zindex.ts"
 ```
 
 ### Value-resolution precedence (D-15)
@@ -121,18 +126,27 @@ the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool
 value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
 `config_loader.py` remains parse/validate-only and never reads environment variables itself. No
 consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
-`auto_derive_registry`, `fan_in_threshold`, `extract_source_literals`, `entry_points`) directly off
-`RuntimeConfig.gates` (AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it renders one
-row per declared gate with the resolved `enabled` status and per-field provenance for every row,
-calling `resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates` directly. Each
-per-gate check command adopts the resolver as its own hardening epic lands: `check-reachability`
-already reads both `enabled` and `entry_points` exclusively through `resolve_gate_config` (spec 4.4,
-E3-F1-S1-T2); `check-shared-file-impact` reads `enabled`, `auto_derive_registry` and
-`fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2); `check-fixture-consistency` reads
-`extract_source_literals` the same way (spec 4.7 bullet 4, E6-F2-S1-T1) -- it still reads
-`canonical_sources`/`scan` directly off `RuntimeConfig.gates.fixture_consistency`, since those are
-project/per-repo-only structural fields `resolve_gate_config` does not manage at all (no built-in
-default to merge against); later gate epics adopt the resolver in their own tasks.
+`auto_derive_registry`, `fan_in_threshold`, `extract_source_literals`, `entry_points`, `paths`)
+directly off `RuntimeConfig.gates` (AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it
+renders one row per declared gate with the resolved `enabled` status and per-field provenance for
+every row, calling `resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates`
+directly. Each per-gate check command adopts the resolver as its own hardening epic lands:
+`check-reachability` already reads both `enabled` and `entry_points` exclusively through
+`resolve_gate_config` (spec 4.4, E3-F1-S1-T2); `check-shared-file-impact` reads `enabled`,
+`auto_derive_registry` and `fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2);
+`check-fixture-consistency` reads `extract_source_literals` the same way (spec 4.7 bullet 4,
+E6-F2-S1-T1) -- it still reads `canonical_sources`/`scan` directly off
+`RuntimeConfig.gates.fixture_consistency`, since those are project/per-repo-only structural fields
+`resolve_gate_config` does not manage at all (no built-in default to merge against);
+`generate_draft_md` (`proposal.py`) reads `newly_reachable_paths.paths` exclusively through
+`resolve_gate_config` (spec 4.9a, decision C-03) when auto-appending the newly-reachable-paths
+acceptance criterion to a drafted `behavior-fix` task; later gate epics adopt the resolver in their
+own tasks.
+
+Unlike `entry_points`/`fan_in_threshold`, `newly_reachable_paths.paths` also carries a real
+per-repo override (`gates.repos.<org/repo>.newly_reachable_paths.paths`): a non-empty repo-level
+list replaces the project-level list wholesale for that repo (D-15 field-wise merge); an
+empty/absent repo-level list inherits the project-level list unchanged.
 
 ### Per-gate tunables
 
@@ -143,7 +157,7 @@ default to merge against); later gate epics adopt the resolver in their own task
 | `shared_file_impact` | `auto_derive_registry`, `fan_in_threshold` | `enabled`, `patterns` |
 | `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (heuristic, default false; spec 4.7 bullet 4) | `enabled` |
 | `write_path_audit` | none | `enabled` |
-| `newly_reachable_paths` | none | `enabled` |
+| `newly_reachable_paths` | `paths` (spec 4.9a, decision C-03) | `enabled`, `paths` |
 | `composition_root` | none | `enabled` |
 | `layout_geometry` | none | `enabled` |
 
@@ -193,6 +207,32 @@ file outside the checkout satisfy the existence check above.
 no module reads `gates.reachability.entry_points` off `RuntimeConfig.gates` directly. There is no
 per-repo override layer for this field today (this campaign configures a single target repo, spec
 Section 9); the `enabled` field's four-layer precedence is unaffected.
+
+### `gates.newly_reachable_paths.paths` -- cross-cutting-primitives registry (caylent-solutions/devbench-internal-backlog#15; spec 4.1, 4.9a; decision C-03)
+
+A list of repo-relative paths naming shared, stateful primitives' defining file(s) -- a shared
+z-index tier module, a shared dirty-flag/`setField` write path, a shared close/dismiss callback --
+that a newly-reachable-paths bug-fix task should be cross-checked against. This is the migrated,
+config-backed home of the retired free-text primitives registry under `backlog/config/`
+(`docs/newly-reachable-paths.md`'s "Optional: the cross-cutting-primitives registry" section): the
+same convention, now schema-validated and resolved through the same four-layer precedence model
+every other gate tunable uses, instead of a hand-maintained markdown table two prompt-driven agents
+read via `cat`.
+
+Every element must be a non-empty, repo-relative path string: a non-list value, a non-string or
+empty-string element, an absolute path, or a path containing a `..` parent-traversal segment fails
+config load fast, naming `gates.newly_reachable_paths.paths` and the offending value -- the same
+`_parse_repo_relative_path_list` validation `gates.reachability.entry_points` uses (DRY: one shared
+validator, not two hand-copied ones).
+
+Unlike `entry_points`, `paths` carries a real per-repo override layer
+(`gates.repos.<org/repo>.newly_reachable_paths.paths`): a non-empty repo-level list replaces the
+project-level list wholesale for that repo (D-15 field-wise merge); an empty/absent repo-level list
+inherits the project-level list unchanged. `paths` is read exclusively through
+`resolve_gate_config("newly_reachable_paths", repo)` (AC-27) -- `generate_draft_md` (`proposal.py`)
+is the first consumer, calling the resolver when auto-appending the newly-reachable-paths
+acceptance criterion to a drafted `behavior-fix` task; no module reads
+`gates.newly_reachable_paths.paths` off `RuntimeConfig.gates` directly.
 
 ### `gates.fixture_consistency` -- fixture-catalog cross-reference (caylent-solutions/devbench-internal-backlog#17)
 

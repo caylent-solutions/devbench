@@ -535,6 +535,18 @@ validate:
 #     enabled: false
 #   newly_reachable_paths:              # caylent-solutions/devbench-internal-backlog#15
 #     enabled: false
+#     # Migrated home of the free-text backlog/config/cross-cutting-primitives.md
+#     # registry PR #320 read from disk (spec 4.1 migration note, decision C-03):
+#     # repo-relative paths naming shared, stateful primitives' defining file(s)
+#     # (a z-index tier module, a shared dirty-flag write path, a shared
+#     # close/dismiss callback) that a newly-reachable-paths fix should be
+#     # cross-checked against. Resolved exclusively through
+#     # config_loader.resolve_gate_config -- no consumer reads this list off
+#     # RuntimeConfig.gates directly (spec AC-27). Rejects a non-list value, a
+#     # non-string or empty-string element, an absolute path, or a path
+#     # containing a `..` segment, naming gates.newly_reachable_paths.paths.
+#     # Empty/absent means no registry is configured for this repo.
+#     paths: []
 #   composition_root:                   # caylent-solutions/devbench-internal-backlog#11
 #     enabled: false
 #   layout_geometry:                    # caylent-solutions/devbench-internal-backlog#14

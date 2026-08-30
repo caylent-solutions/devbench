@@ -759,12 +759,20 @@
         },
         "newly_reachable_paths": {
           "type": "object",
-          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#15). No gate-specific tunables beyond enabled.",
+          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#15; spec 4.9a, decision C-03). `paths` is the migrated home of the retired free-text primitives registry under backlog/config/.",
           "additionalProperties": false,
           "properties": {
             "enabled": {
               "type": "boolean",
               "description": "Enable the newly-reachable-paths gate for this workspace. Default false."
+            },
+            "paths": {
+              "type": "array",
+              "description": "Repo-relative paths naming shared, stateful primitives' defining file(s) a newly-reachable-paths fix should be cross-checked against, resolved exclusively through config_loader.resolve_gate_config. Default empty (no registry configured).",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           }
         },
@@ -843,9 +851,17 @@
                 },
                 "newly_reachable_paths": {
                   "type": "object",
+                  "description": "Per-repo newly-reachable-paths override. `paths`, when non-empty, replaces the project-level list wholesale for this repo.",
                   "additionalProperties": false,
                   "properties": {
-                    "enabled": { "type": "boolean" }
+                    "enabled": { "type": "boolean" },
+                    "paths": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
                   }
                 },
                 "composition_root": {

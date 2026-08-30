@@ -659,9 +659,9 @@ GATE_NAMES: frozenset[str] = frozenset(_GATE_NAMES_ORDERED)
 class GateEnabledConfig:
     """Project-level tunables for a gate with no tunable beyond ``enabled``.
 
-    Shared by the five gates whose spec-4.1 tunable set is exactly
-    ``{enabled}``: ancestry, write_path_audit, newly_reachable_paths,
-    composition_root, layout_geometry. ``reachability`` moved to its own
+    Shared by the four gates whose spec-4.1 tunable set is exactly
+    ``{enabled}``: ancestry, write_path_audit, composition_root,
+    layout_geometry. ``reachability`` moved to its own
     :class:`GateReachabilityConfig` (spec 4.4 bullet 2, issue #10 AC2) once
     it gained the ``entry_points`` tunable.
 
@@ -730,6 +730,29 @@ class GateSharedFileImpactConfig:
 
 
 @dataclass(frozen=True)
+class GateNewlyReachablePathsConfig:
+    """Project-level ``gates.newly_reachable_paths:`` tunables (spec 4.1, 4.9a; decision C-03).
+
+    Attributes:
+        enabled: Whether this gate is enabled at the project level.
+            Default ``constants.GATE_ENABLED_DEFAULT`` (``False``).
+        paths: Repo-relative paths naming the shared, stateful primitives'
+            defining file(s) (a z-index tier module, a shared dirty-flag
+            write path, a shared close/dismiss callback) that a
+            newly-reachable-paths fix should be cross-checked against. The
+            migrated, config-backed home of the retired free-text
+            primitives registry under ``backlog/config/`` that PR #320 read
+            from disk (spec 4.1 migration note, decision C-03).
+            Empty tuple -- the default, and also what an explicit empty
+            YAML list parses to -- means "no registry configured for this
+            repo".
+    """
+
+    enabled: bool = GATE_ENABLED_DEFAULT
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class GateEnabledOverride:
     """Per-repo override for a gate with no tunable beyond ``enabled``.
 
@@ -766,6 +789,23 @@ class GateSharedFileImpactOverride:
 
 
 @dataclass(frozen=True)
+class GateNewlyReachablePathsOverride:
+    """Per-repo override for ``gates.repos.<org/repo>.newly_reachable_paths``.
+
+    Attributes:
+        enabled: ``None`` means "not overridden for this repo -- inherit
+            the project-level value"; ``True``/``False`` explicitly flips
+            the gate for this repo only.
+        paths: Per-repo cross-cutting-primitive path list, field-wise
+            merged OVER the project-level list (D-15). Empty tuple when
+            unset, which means this repo inherits the project-level list.
+    """
+
+    enabled: bool | None = None
+    paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class GateRepoOverrides:
     """Per-repo gate overrides nested under ``gates.repos.<org/repo>`` (spec 4.1, D-15).
 
@@ -784,7 +824,8 @@ class GateRepoOverrides:
         write_path_audit: Override for the write-path-audit gate, or
             ``None``.
         newly_reachable_paths: Override for the newly-reachable-paths
-            gate, or ``None``.
+            gate (carries ``paths`` in addition to ``enabled``), or
+            ``None``.
         composition_root: Override for the composition-root gate, or
             ``None``.
         layout_geometry: Override for the layout-geometry gate, or
@@ -796,7 +837,7 @@ class GateRepoOverrides:
     shared_file_impact: GateSharedFileImpactOverride | None = None
     fixture_consistency: GateEnabledOverride | None = None
     write_path_audit: GateEnabledOverride | None = None
-    newly_reachable_paths: GateEnabledOverride | None = None
+    newly_reachable_paths: GateNewlyReachablePathsOverride | None = None
     composition_root: GateEnabledOverride | None = None
     layout_geometry: GateEnabledOverride | None = None
 
@@ -822,7 +863,9 @@ class GatesConfig:
         shared_file_impact: check-shared-file-impact gate tunables.
         fixture_consistency: check-fixture-consistency gate tunables.
         write_path_audit: write-path-audit gate tunables.
-        newly_reachable_paths: newly-reachable-paths gate tunables.
+        newly_reachable_paths: newly-reachable-paths gate tunables,
+            including ``paths`` (spec 4.1, 4.9a; decision C-03 -- the
+            migrated cross-cutting-primitives registry).
         composition_root: composition-root gate tunables.
         layout_geometry: layout-geometry gate tunables.
         repos: Optional per-repo override map, keyed by ``org/repo``. Every
@@ -836,7 +879,7 @@ class GatesConfig:
     shared_file_impact: GateSharedFileImpactConfig = field(default_factory=GateSharedFileImpactConfig)
     fixture_consistency: FixtureConsistencyConfig = field(default_factory=FixtureConsistencyConfig)
     write_path_audit: GateEnabledConfig = field(default_factory=GateEnabledConfig)
-    newly_reachable_paths: GateEnabledConfig = field(default_factory=GateEnabledConfig)
+    newly_reachable_paths: GateNewlyReachablePathsConfig = field(default_factory=GateNewlyReachablePathsConfig)
     composition_root: GateEnabledConfig = field(default_factory=GateEnabledConfig)
     layout_geometry: GateEnabledConfig = field(default_factory=GateEnabledConfig)
     repos: dict[str, GateRepoOverrides] = field(default_factory=dict)
@@ -1417,6 +1460,65 @@ def _parse_simple_gate_enabled(path: Path, key: str, gate_raw: object) -> GateEn
     return GateEnabledConfig(enabled=_parse_gate_enabled_field(path, key, gate_raw))
 
 
+def _parse_repo_relative_path_list(path: Path, key: str, raw: object) -> tuple[str, ...]:
+    """Validate *raw* as a list of non-empty, repo-relative path strings.
+
+    Shared by every gate-specific structural path-list field
+    (``gates.reachability.entry_points``, spec 4.4 bullet 2;
+    ``gates.newly_reachable_paths.paths``, spec 4.1, 4.9a, decision C-03)
+    so the repo-relative-path validation rules -- no absolute paths, no
+    ``..`` traversal -- live in exactly one place (DRY) instead of being
+    hand-copied per gate.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key for the field being validated (e.g.
+            ``gates.reachability.entry_points``), embedded verbatim in
+            every raised message so a caller can grep the offending key.
+        raw: Raw value from YAML -- ``None`` when the key is absent.
+
+    Returns:
+        A tuple of the configured repo-relative paths, in the order
+        supplied. The empty tuple when *raw* is ``None`` (absent).
+
+    Raises:
+        ValueError: If *raw* is present but not a list; if any element is
+            not a string; if any element is an empty string; if any
+            element is an absolute path; or if any element contains a
+            parent-traversal (``..``) segment.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"Config file '{path}': {key} must be a list of repo-relative path strings, got "
+            f"{type(raw).__name__} ({raw!r})."
+        )
+    result: list[str] = []
+    for element in raw:
+        if not isinstance(element, str):
+            raise ValueError(
+                f"Config file '{path}': {key} must contain only strings; found {type(element).__name__} ({element!r})."
+            )
+        if not element:
+            raise ValueError(f"Config file '{path}': {key} must not contain an empty string.")
+        # code_review round-2 MISSING_AC_EVIDENCE finding (originally against
+        # gates.reachability.entry_points): an absolute path or a `..` escape
+        # defeats a repo-relative existence guard, because `repo_path /
+        # element` DISCARDS `repo_path` for an absolute right operand
+        # (pathlib's documented `/` behaviour). Rejected here, at the single
+        # shared parse boundary, so no caller of this helper can ever
+        # observe an unsafe path.
+        if Path(element).is_absolute():
+            raise ValueError(
+                f"Config file '{path}': {key} must contain only repo-relative paths, got absolute path {element!r}."
+            )
+        if ".." in Path(element).parts:
+            raise ValueError(f"Config file '{path}': {key} must not contain parent traversal ('..'), got {element!r}.")
+        result.append(element)
+    return tuple(result)
+
+
 def _parse_reachability_entry_points(path: Path, raw: object) -> tuple[str, ...]:
     """Parse and validate ``gates.reachability.entry_points`` (spec 4.1, 4.4; AC-5, AC-FUNC-005).
 
@@ -1433,50 +1535,33 @@ def _parse_reachability_entry_points(path: Path, raw: object) -> tuple[str, ...]
         (AC-FUNC-006), never this function.
 
     Raises:
-        ValueError: If *raw* is present but not a list; if any element is
-            not a string; if any element is an empty string; if any
-            element is an absolute path; or if any element contains a
-            parent-traversal (``..``) segment.
+        ValueError: See :func:`_parse_repo_relative_path_list`.
     """
-    if raw is None:
-        return ()
-    if not isinstance(raw, list):
-        raise ValueError(
-            f"Config file '{path}': gates.reachability.entry_points must be a list of repo-relative "
-            f"path strings, got {type(raw).__name__} ({raw!r})."
-        )
-    entry_points: list[str] = []
-    for element in raw:
-        if not isinstance(element, str):
-            raise ValueError(
-                f"Config file '{path}': gates.reachability.entry_points must contain only strings; "
-                f"found {type(element).__name__} ({element!r})."
-            )
-        if not element:
-            raise ValueError(f"Config file '{path}': gates.reachability.entry_points must not contain an empty string.")
-        # code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path or a
-        # `..` escape defeats `cli._reachability_missing_entry_point`'s existence
-        # guard, because `repo_path / element` DISCARDS `repo_path` for an
-        # absolute right operand (pathlib's documented `/` behaviour), letting
-        # `.is_file()` pass for a file outside the checkout that can then never
-        # match `_matches_reachability_entry_point`'s repo-relative comparison --
-        # exactly the false-orphan-from-an-empty-root-set outcome the Error
-        # Handling Contract's missing-entry-point bullet exists to prevent.
-        # Rejected here, at the single parse boundary, so no caller can ever
-        # observe an unsafe path (spec 4.4's own "a list of repo-relative
-        # paths" contract).
-        if Path(element).is_absolute():
-            raise ValueError(
-                f"Config file '{path}': gates.reachability.entry_points must contain only repo-relative "
-                f"paths, got absolute path {element!r}."
-            )
-        if ".." in Path(element).parts:
-            raise ValueError(
-                f"Config file '{path}': gates.reachability.entry_points must not contain parent "
-                f"traversal ('..'), got {element!r}."
-            )
-        entry_points.append(element)
-    return tuple(entry_points)
+    return _parse_repo_relative_path_list(path, "gates.reachability.entry_points", raw)
+
+
+def _parse_newly_reachable_paths(path: Path, raw: object) -> tuple[str, ...]:
+    """Parse and validate ``gates.newly_reachable_paths.paths`` (spec 4.1, 4.9a; AC-5, decision C-03).
+
+    The migrated, config-backed home of the retired free-text primitives
+    registry under ``backlog/config/`` that PR #320 read from disk: a list
+    of repo-relative paths naming the shared, stateful primitives' defining
+    file(s) a newly-reachable-paths fix should be cross-checked against.
+
+    Args:
+        path: Config file path (used in error messages).
+        raw: Raw value from YAML for ``paths`` -- ``None`` when the key is
+            absent from the ``gates.newly_reachable_paths`` block.
+
+    Returns:
+        A tuple of the configured repo-relative paths, in the order
+        supplied. The empty tuple when *raw* is ``None`` (absent), meaning
+        no registry is configured for this repo.
+
+    Raises:
+        ValueError: See :func:`_parse_repo_relative_path_list`.
+    """
+    return _parse_repo_relative_path_list(path, "gates.newly_reachable_paths.paths", raw)
 
 
 def _parse_reachability_gate(path: Path, gate_raw: object) -> GateReachabilityConfig:
@@ -1551,6 +1636,36 @@ def _parse_shared_file_impact_gate(path: Path, gate_raw: object) -> GateSharedFi
     )
 
 
+def _parse_gate_newly_reachable_paths(path: Path, gate_raw: object) -> GateNewlyReachablePathsConfig:
+    """Parse the project-level ``gates.newly_reachable_paths:`` YAML section (spec 4.1, 4.9a; decision C-03).
+
+    Args:
+        path: Config file path (used in error messages).
+        gate_raw: Raw value from YAML -- ``None`` when the key is absent,
+            otherwise a dict (schema-validated).
+
+    Returns:
+        ``GateNewlyReachablePathsConfig`` populated from *gate_raw*, or the
+        built-in default (``enabled=False``, ``paths=()``) when *gate_raw*
+        is ``None``.
+
+    Raises:
+        ValueError: If *gate_raw* is present but not a mapping, its
+            ``enabled`` field is not a boolean, or per
+            :func:`_parse_newly_reachable_paths`'s ``paths`` validation.
+    """
+    defaults = GateNewlyReachablePathsConfig()
+    if gate_raw is None:
+        return defaults
+    if not isinstance(gate_raw, dict):
+        raise ValueError(
+            f"Config file '{path}': gates.newly_reachable_paths must be a mapping, got {type(gate_raw).__name__}."
+        )
+    enabled = _parse_gate_enabled_field(path, "gates.newly_reachable_paths", gate_raw, defaults.enabled)
+    paths = _parse_newly_reachable_paths(path, gate_raw.get("paths"))
+    return GateNewlyReachablePathsConfig(enabled=enabled, paths=paths)
+
+
 def _parse_gate_override_enabled(path: Path, key: str, raw: dict) -> GateEnabledOverride:
     """Parse one per-repo enabled-only gate override.
 
@@ -1607,6 +1722,36 @@ def _parse_gate_override_shared_file_impact(path: Path, key: str, raw: dict) -> 
     return GateSharedFileImpactOverride(enabled=enabled, patterns=patterns)
 
 
+def _parse_gate_override_newly_reachable_paths(path: Path, key: str, raw: dict) -> GateNewlyReachablePathsOverride:
+    """Parse the per-repo ``gates.repos.<org/repo>.newly_reachable_paths`` override.
+
+    Args:
+        path: Config file path (used in error messages).
+        key: Dotted YAML key for this override.
+        raw: The override's own raw dict.
+
+    Returns:
+        ``GateNewlyReachablePathsOverride`` with ``enabled=None`` when the
+        override omits ``enabled`` (not overridden) and ``paths=()`` when
+        omitted (inherits the project-level list).
+
+    Raises:
+        ValueError: If ``enabled`` is present but not a boolean, or per
+            :func:`_parse_newly_reachable_paths`'s ``paths`` validation.
+    """
+    enabled: bool | None = None
+    if "enabled" in raw:
+        value = raw["enabled"]
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Config file '{path}': {key}.enabled must be a boolean (true/false), got "
+                f"{type(value).__name__} ({value!r})."
+            )
+        enabled = value
+    paths = _parse_newly_reachable_paths(path, raw.get("paths"))
+    return GateNewlyReachablePathsOverride(enabled=enabled, paths=paths)
+
+
 def _parse_one_gate_repo_override(path: Path, repo_name: str, raw: dict) -> GateRepoOverrides:
     """Parse the full set of gate overrides configured for one repo.
 
@@ -1628,7 +1773,7 @@ def _parse_one_gate_repo_override(path: Path, repo_name: str, raw: dict) -> Gate
     shared_file_impact: GateSharedFileImpactOverride | None = None
     fixture_consistency: GateEnabledOverride | None = None
     write_path_audit: GateEnabledOverride | None = None
-    newly_reachable_paths: GateEnabledOverride | None = None
+    newly_reachable_paths: GateNewlyReachablePathsOverride | None = None
     composition_root: GateEnabledOverride | None = None
     layout_geometry: GateEnabledOverride | None = None
 
@@ -1652,7 +1797,7 @@ def _parse_one_gate_repo_override(path: Path, repo_name: str, raw: dict) -> Gate
         elif gate_name == "write_path_audit":
             write_path_audit = _parse_gate_override_enabled(path, key, gate_raw)
         elif gate_name == "newly_reachable_paths":
-            newly_reachable_paths = _parse_gate_override_enabled(path, key, gate_raw)
+            newly_reachable_paths = _parse_gate_override_newly_reachable_paths(path, key, gate_raw)
         elif gate_name == "composition_root":
             composition_root = _parse_gate_override_enabled(path, key, gate_raw)
         else:
@@ -1746,9 +1891,7 @@ def _parse_gates_config(path: Path, gates_raw: dict, repos: dict[str, RepoConfig
         shared_file_impact=_parse_shared_file_impact_gate(path, gates_raw.get("shared_file_impact")),
         fixture_consistency=_parse_fixture_consistency_config(path, gates_raw.get("fixture_consistency") or {}),
         write_path_audit=_parse_simple_gate_enabled(path, "gates.write_path_audit", gates_raw.get("write_path_audit")),
-        newly_reachable_paths=_parse_simple_gate_enabled(
-            path, "gates.newly_reachable_paths", gates_raw.get("newly_reachable_paths")
-        ),
+        newly_reachable_paths=_parse_gate_newly_reachable_paths(path, gates_raw.get("newly_reachable_paths")),
         composition_root=_parse_simple_gate_enabled(path, "gates.composition_root", gates_raw.get("composition_root")),
         layout_geometry=_parse_simple_gate_enabled(path, "gates.layout_geometry", gates_raw.get("layout_geometry")),
         repos=_parse_gate_repo_overrides(path, gates_raw.get("repos") or {}, repos),
@@ -3082,10 +3225,12 @@ class ResolvedGateConfig:
             ``"auto_derive_registry"`` for ``shared_file_impact``) or merged
             by a gate-specific step in this function (``"entry_points"``
             for ``reachability``, spec 4.4 bullet 2; ``"fan_in_threshold"``
-            for ``shared_file_impact``, spec 4.6). Every value is a
-            ``bool`` except ``reachability``'s ``entry_points`` (a
-            ``tuple[str, ...]``) and ``shared_file_impact``'s
-            ``fan_in_threshold`` (an ``int``).
+            for ``shared_file_impact``, spec 4.6; ``"paths"`` for
+            ``newly_reachable_paths``, spec 4.1, 4.9a, decision C-03).
+            Every value is a ``bool`` except ``reachability``'s
+            ``entry_points``, ``shared_file_impact``'s ``fan_in_threshold``
+            (an ``int``), and ``newly_reachable_paths``'s ``paths`` (both
+            of the former, and ``paths``, are ``tuple[str, ...]``).
         provenance: The layer that set each field in ``values`` -- one of
             ``constants.GATE_PROVENANCE_BUILTIN`` / ``_PROJECT`` /
             ``_REPO`` / ``_ENV`` (spec 4.1; rendered as the ``devbench
@@ -3265,6 +3410,52 @@ def _merge_shared_file_impact_fan_in_threshold(
         provenance["fan_in_threshold"] = GATE_PROVENANCE_BUILTIN
 
 
+def _merge_newly_reachable_paths(
+    runtime_config: RuntimeConfig,
+    repo: str,
+    values: dict[str, bool | int | tuple[str, ...]],
+    provenance: dict[str, str],
+) -> None:
+    """Merge project- and repo-level layers for newly_reachable_paths' ``paths`` field, in place (spec 4.1, 4.9a; C-03).
+
+    Not folded into the generic ``GATE_FIELD_DEFAULTS``-driven merge in
+    :func:`_merge_gate_project_layer` (bool-only); mirrors
+    :func:`_merge_reachability_entry_points`'s narrow-merge-step pattern for
+    a structural (``tuple[str, ...]``) tunable with no built-in default
+    beyond the empty tuple. Unlike ``entry_points``, ``paths`` also carries
+    a real per-repo override (``GateNewlyReachablePathsOverride.paths``),
+    so this step additionally applies that layer field-wise (D-15) --
+    a repo-level ``paths`` list, when non-empty, replaces the project-level
+    list wholesale for that repo; an empty/absent repo-level list inherits
+    the project-level list unchanged.
+
+    Args:
+        runtime_config: Loaded runtime configuration.
+        repo: Fully-qualified repository name (``org/repo``) whose
+            per-repo override layer to apply.
+        values: The already project/repo/env-merged ``values`` dict for the
+            ``enabled`` field, updated in place with ``paths``.
+        provenance: Companion provenance dict, updated in place.
+    """
+    project_value = runtime_config.gates.newly_reachable_paths.paths
+    if project_value:
+        values["paths"] = project_value
+        provenance["paths"] = GATE_PROVENANCE_PROJECT
+    else:
+        values["paths"] = ()
+        provenance["paths"] = GATE_PROVENANCE_BUILTIN
+
+    repo_overrides = runtime_config.gates.repos.get(repo)
+    if repo_overrides is None:
+        return
+    gate_override = repo_overrides.newly_reachable_paths
+    if gate_override is None:
+        return
+    if gate_override.paths:
+        values["paths"] = gate_override.paths
+        provenance["paths"] = GATE_PROVENANCE_REPO
+
+
 def resolve_gate_config(
     gate: str,
     repo: str,
@@ -3306,7 +3497,12 @@ def resolve_gate_config(
     way (AC-FUNC-006). ``shared_file_impact``'s ``fan_in_threshold`` field
     (spec 4.6, issue #13 AC4) is merged by the equivalent gate-specific step
     (:func:`_merge_shared_file_impact_fan_in_threshold`), also after the
-    four generic layers.
+    four generic layers. ``newly_reachable_paths``'s ``paths`` field (spec
+    4.1, 4.9a; decision C-03 -- the migrated cross-cutting-primitives
+    registry) is merged by :func:`_merge_newly_reachable_paths`, the same
+    way, EXCEPT it additionally applies the per-repo override layer
+    field-wise (unlike ``entry_points``/``fan_in_threshold``, which have no
+    per-repo override field to read).
 
     Pure function -- no I/O, no env reads; directly testable with an
     in-memory ``RuntimeConfig`` and a plain ``bool | None``.
@@ -3343,6 +3539,8 @@ def resolve_gate_config(
         _merge_reachability_entry_points(runtime_config, values, provenance)
     if gate == "shared_file_impact":
         _merge_shared_file_impact_fan_in_threshold(runtime_config, values, provenance)
+    if gate == "newly_reachable_paths":
+        _merge_newly_reachable_paths(runtime_config, repo, values, provenance)
 
     return ResolvedGateConfig(gate=gate, values=values, provenance=provenance)
 

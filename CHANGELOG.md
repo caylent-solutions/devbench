@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+### Changed
+
+- **The newly-reachable-paths requirement is now keyed off the `## Task Type:`
+  taxonomy and emitted as an acceptance criterion, and its path registry
+  moved into the unified gates config** (spec `integration-reality-gates-hardening.md`
+  section 4.9(a), 4.1; decision D-8, C-03; E8-F1-S1-T1). `generate_draft_md`
+  (`src/devbench/backlog/proposal.py`) no longer auto-appends a
+  Definition-of-Done checkbox for a drafted `behavior-fix` task (spec 1.3 S1,
+  findings 320-D04 and C-06: a DoD checkbox is auto-ticked on the done
+  transition and is never a gate); instead it appends an acceptance
+  criterion naming the `log-newly-reachable` verb, only for `behavior-fix`
+  drafts, so a `docs`/`chore`/`test-only`/`refactor`/`feature` task never
+  inherits a verification obligation it cannot satisfy. `_is_bug_fix_shaped`
+  and the `"fix "` title heuristic (rejected at the E1 cherry-pick,
+  spec 4.14 reject-list) were never carried over and remain absent. The
+  cross-cutting-primitives path registry gains a config-backed home,
+  `gates.newly_reachable_paths.paths` (`src/devbench/config_loader.py`,
+  `src/devbench/config-schema.json`, `sample-config.yaml`), resolved
+  exclusively through `resolve_gate_config` (AC-27) with a real per-repo
+  override layer (`gates.repos.<org/repo>.newly_reachable_paths.paths`)
+  field-wise merged over the project level (D-15) -- the migrated,
+  schema-validated replacement for the free-text
+  `backlog/config/cross-cutting-primitives.md` convention. See
+  `docs/devbench-yaml-reference.md`'s `gates:` section for the full
+  precedence model and tunable reference.
+
 - **`check-write-path` now attributes its itemized findings to the calling
   unit's own Changes-Manifest scope, while the verdict and status line stay
   repo-wide** (spec `integration-reality-gates-hardening.md` section 4.3,

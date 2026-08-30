@@ -51,6 +51,7 @@ from devbench.constants import (
     TASK_TYPE_BEHAVIOR_FIX,
     TASK_TYPE_CHORE,
     TASK_TYPE_DOCS,
+    TASK_TYPE_FEATURE,
     TASK_TYPE_REFACTOR,
     TASK_TYPE_TEST_ONLY,
     VALID_TASK_TYPES,
@@ -530,34 +531,14 @@ class TestGenerateDraftMd:
         md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
         assert "- **Branch:** `backlog/wg_004/e0-f1-s1-t9`" in md
 
-    def test_behavior_fix_task_type_gets_newly_reachable_paths_dod_item(self) -> None:
-        task = ProposedTask(
-            suggested_id="E0-F1-S1-T9",
-            title="Fix the exporter crash",
-            files_to_own=["src/a.py"],
-            linked_scenarios=[],
-            suggested_acs=["AC-FIX-001 exporter no longer crashes"],
-            suggested_approach="Do the fix.",
-            task_type=TASK_TYPE_BEHAVIOR_FIX,
-        )
-        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
-        assert "Newly-reachable code paths enumerated and live-verified" in md
-        assert "[NEWLY_REACHABLE]" in md
-        assert "docs/newly-reachable-paths.md" in md
-
-    def test_docs_task_type_omits_newly_reachable_paths_dod_item(self) -> None:
-        task = ProposedTask(
-            suggested_id="E0-F1-S1-T9",
-            title="Document the exporter behavior",
-            files_to_own=["docs/exporter.md"],
-            linked_scenarios=[],
-            suggested_acs=["AC-DOC-001 exporter behavior documented"],
-            suggested_approach="Write the docs.",
-            task_type=TASK_TYPE_DOCS,
-        )
-        md = generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
-        assert "Newly-reachable code paths enumerated and live-verified" not in md
-        assert "[NEWLY_REACHABLE]" not in md
+    # The old DoD-auto-append behaviour these two tests covered
+    # (test_behavior_fix_task_type_gets_newly_reachable_paths_dod_item /
+    # test_docs_task_type_omits_newly_reachable_paths_dod_item) was deleted
+    # outright (spec 1.3 S1, findings 320-D04/C-06): a DoD checkbox is
+    # auto-ticked on the done transition and is never a gate. The replacement
+    # acceptance-criterion auto-append, keyed the same way off `task_type`, is
+    # covered by `TestNewlyReachableTaskTypeKeying` below, over the full
+    # task-type taxonomy rather than just the behavior-fix/docs pair.
 
     def test_invalid_task_type_raises_value_error_naming_value_and_valid_set(self) -> None:
         task = ProposedTask(
@@ -571,6 +552,102 @@ class TestGenerateDraftMd:
         )
         with pytest.raises(ValueError, match="not-a-real-task-type"):
             generate_draft_md(task, repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW")
+
+
+class TestNewlyReachableTaskTypeKeying:
+    """The newly-reachable-paths acceptance-criterion auto-append is keyed
+    off the drafted task's ``## Task Type:`` (spec 4.9a, decision D-8),
+    replacing the Definition-of-Done auto-append the E1 cherry-pick shim
+    left behind (spec 1.3 S1, findings 320-D04/C-06: a DoD checkbox is
+    auto-ticked on the done transition and is never a gate)."""
+
+    _ALL_TASK_TYPES = (
+        TASK_TYPE_BEHAVIOR_FIX,
+        TASK_TYPE_FEATURE,
+        TASK_TYPE_REFACTOR,
+        TASK_TYPE_TEST_ONLY,
+        TASK_TYPE_DOCS,
+        TASK_TYPE_CHORE,
+    )
+
+    def _task(self, task_type: str) -> ProposedTask:
+        return ProposedTask(
+            suggested_id="E0-F1-S1-T9",
+            title="Fix the exporter crash",
+            files_to_own=["src/a.py"],
+            linked_scenarios=[],
+            suggested_acs=["AC-FIX-001 exporter no longer crashes"],
+            suggested_approach="Do the fix.",
+            task_type=task_type,
+        )
+
+    @pytest.mark.parametrize(
+        ("task_type", "expect_line"),
+        [
+            (TASK_TYPE_BEHAVIOR_FIX, True),
+            (TASK_TYPE_FEATURE, False),
+            (TASK_TYPE_REFACTOR, False),
+            (TASK_TYPE_TEST_ONLY, False),
+            (TASK_TYPE_DOCS, False),
+            (TASK_TYPE_CHORE, False),
+        ],
+    )
+    def test_ac_line_keyed_by_task_type_across_full_taxonomy(self, task_type: str, expect_line: bool) -> None:
+        md = generate_draft_md(
+            self._task(task_type), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+        )
+        assert ("log-newly-reachable" in md) is expect_line
+
+    @pytest.mark.parametrize("task_type", _ALL_TASK_TYPES)
+    def test_no_definition_of_done_line_for_any_task_type(self, task_type: str) -> None:
+        md = generate_draft_md(
+            self._task(task_type), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+        )
+        dod_section = md.split("## Definition of Done")[1].split("## TDD Cycle Log")[0]
+        assert "newly-reachable" not in dod_section.lower()
+        assert "log-newly-reachable" not in dod_section
+
+    def test_behavior_fix_ac_line_names_the_log_newly_reachable_verb_and_doc(self) -> None:
+        md = generate_draft_md(
+            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+        )
+        assert "uv run devbench log-newly-reachable" in md
+        assert "docs/newly-reachable-paths.md" in md
+        assert "Newly-reachable code paths enumerated and live-verified" in md
+
+    def test_behavior_fix_ac_line_resolves_configured_registry_through_resolve_gate_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-27: the drafted AC line names the configured cross-cutting-primitives
+        paths (the migrated home of PR #320's retired free-text registry under
+        backlog/config/, decision C-03) only when resolve_gate_config resolves a
+        non-empty gates.newly_reachable_paths.paths for the target repo."""
+        import devbench.config as config_module
+        from devbench.config_loader import GateNewlyReachablePathsConfig, GatesConfig, RuntimeConfig
+
+        monkeypatch.setattr(
+            config_module,
+            "RUNTIME_CONFIG",
+            RuntimeConfig(
+                gates=GatesConfig(newly_reachable_paths=GateNewlyReachablePathsConfig(paths=("src/ui/zindex.ts",)))
+            ),
+        )
+        md = generate_draft_md(
+            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+        )
+        assert "src/ui/zindex.ts" in md
+
+    def test_behavior_fix_ac_line_omits_primitives_clause_when_no_registry_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import devbench.config as config_module
+        from devbench.config_loader import RuntimeConfig
+
+        monkeypatch.setattr(config_module, "RUNTIME_CONFIG", RuntimeConfig())
+        md = generate_draft_md(
+            self._task(TASK_TYPE_BEHAVIOR_FIX), repo="acme/example", source_task_id="E0-F1-S1-T1", generated_at="NOW"
+        )
+        assert "Configured cross-cutting primitives" not in md
 
 
 # ---------------------------------------------------------------------------

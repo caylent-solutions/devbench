@@ -5598,6 +5598,303 @@ class TestGatesReachabilityEntryPoints:
 
 
 # ---------------------------------------------------------------------------
+# gates.newly_reachable_paths.paths (spec 4.1, 4.9a; decision C-03)
+# ---------------------------------------------------------------------------
+
+
+class TestGatesNewlyReachablePaths:
+    """``gates.newly_reachable_paths.paths`` config parsing and resolution
+    (spec 4.1, 4.9a; decision C-03; AC-5, AC-27): the migrated, config-backed
+    home of the retired free-text primitives registry under
+    ``backlog/config/`` that PR #320 read from disk. Mirrors
+    ``TestGatesReachabilityEntryPoints``'s structure -- same shared
+    ``_parse_repo_relative_path_list`` validator underneath -- but this
+    field also carries a real per-repo override layer, which
+    ``entry_points`` does not.
+    """
+
+    _REPO = "org/repo"
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_valid_list_parses_and_resolves_with_project_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths:
+                  - src/ui/zindex.ts
+                  - src/forms/useDirtyField.ts
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.gates.newly_reachable_paths.paths == ("src/ui/zindex.ts", "src/forms/useDirtyField.ts")
+
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, rt)
+        assert result.values["paths"] == ("src/ui/zindex.ts", "src/forms/useDirtyField.ts")
+        assert result.provenance["paths"] == "project"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected", "match"),
+        [
+            pytest.param(
+                ["src/ui/zindex.ts"],
+                ("src/ui/zindex.ts",),
+                None,
+                id="valid_list",
+            ),
+            pytest.param(
+                "not-a-list",
+                None,
+                r"gates\.newly_reachable_paths\.paths must be a list.*not-a-list",
+                id="scalar_value",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", 1],
+                None,
+                r"gates\.newly_reachable_paths\.paths must contain only strings.*1",
+                id="list_containing_an_integer",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", ""],
+                None,
+                r"gates\.newly_reachable_paths\.paths must not contain an empty string",
+                id="list_containing_an_empty_string",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", "/etc/hostname"],
+                None,
+                r"gates\.newly_reachable_paths\.paths must contain only repo-relative paths.*etc/hostname",
+                id="absolute_path",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", "../escape.py"],
+                None,
+                r"gates\.newly_reachable_paths\.paths must not contain parent traversal.*escape\.py",
+                id="parent_traversal_dotdot",
+            ),
+        ],
+    )
+    def test_paths_validation_matrix_direct(
+        self, tmp_path: Path, raw: object, expected: tuple[str, ...] | None, match: str | None
+    ) -> None:
+        from devbench.config_loader import _parse_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        if match is None:
+            assert _parse_newly_reachable_paths(fake_path, raw) == expected
+        else:
+            with pytest.raises(ValueError, match=match):
+                _parse_newly_reachable_paths(fake_path, raw)
+
+    def test_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.newly_reachable_paths must be a mapping"):
+            _parse_gate_newly_reachable_paths(fake_path, ["not", "a", "mapping"])
+
+    def test_gate_raw_none_returns_defaults_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GateNewlyReachablePathsConfig, _parse_gate_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        assert _parse_gate_newly_reachable_paths(fake_path, None) == GateNewlyReachablePathsConfig()
+
+    def test_non_list_paths_fails_full_load_pipeline_naming_key(self, tmp_path: Path) -> None:
+        """AC-5: a non-list ``gates.newly_reachable_paths.paths`` value fails
+        the full ``load_runtime_config`` pipeline, caught by the JSON schema
+        layer (``type: array``), naming the offending key."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths: "not-a-list"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.newly_reachable_paths\.paths.*array"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_key_inside_newly_reachable_paths_block_raises_naming_key(self, tmp_path: Path) -> None:
+        """AC-5: an unrecognised key nested inside gates.newly_reachable_paths
+        fails load naming it, caught by the JSON schema's
+        additionalProperties: false at that level."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*bogus_key"):
+            load_runtime_config(cfg, {})
+
+    def test_absent_paths_resolves_to_empty_tuple_builtin_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.newly_reachable_paths.paths == ()
+
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, rt)
+        assert result.values["paths"] == ()
+        assert result.provenance["paths"] == "builtin"
+
+    def test_resolved_newly_reachable_paths_carries_both_enabled_and_paths(self) -> None:
+        """Proves the newly_reachable_paths-specific merge step runs
+        ALONGSIDE the generic 'enabled' layer rather than replacing its
+        output (mirrors TestGatesReachabilityEntryPoints's equivalent
+        pin)."""
+        from devbench.config_loader import GateNewlyReachablePathsConfig, GatesConfig, resolve_gate_config
+
+        gates = GatesConfig(
+            newly_reachable_paths=GateNewlyReachablePathsConfig(enabled=True, paths=("src/ui/zindex.ts",))
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "paths": ("src/ui/zindex.ts",)}
+        assert result.provenance == {"enabled": "project", "paths": "project"}
+
+    # -- per-repo override merging field-wise over the project level (spec 4.1 precedence) --
+
+    def test_repo_override_paths_replaces_project_level_list_wholesale(self, tmp_path: Path) -> None:
+        """Unlike entry_points/fan_in_threshold, newly_reachable_paths.paths
+        carries a real per-repo override: a non-empty repo-level list
+        replaces the project-level list wholesale for that repo (D-15
+        field-wise merge), while 'enabled' is independently inherited from
+        the project level (proving the merge is field-wise, not
+        block-wise)."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  newly_reachable_paths:
+                    paths:
+                      - src/forms/useDirtyField.ts
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/forms/useDirtyField.ts",)
+        assert result.provenance["paths"] == "repo"
+        assert result.values["enabled"] is True
+        assert result.provenance["enabled"] == "project"
+
+    def test_repo_override_omitting_paths_inherits_project_level_list(self, tmp_path: Path) -> None:
+        """A per-repo override that only flips 'enabled' inherits the
+        project-level 'paths' list rather than resetting it to empty
+        (mirrors the existing AC-E2-F1-S1-T2-2 inheritance guarantee for
+        other gate tunables)."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  newly_reachable_paths:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/ui/zindex.ts",)
+        assert result.provenance["paths"] == "project"
+        assert result.values["enabled"] is True
+        assert result.provenance["enabled"] == "repo"
+
+    def test_repo_override_present_for_a_different_gate_leaves_paths_at_project_level(self, tmp_path: Path) -> None:
+        """A repo carrying an override block, but not FOR newly_reachable_paths
+        specifically (the override object for this gate is None), leaves
+        'paths' resolved purely from the project/built-in layers -- the
+        `gate_override is None` early-return branch in
+        `_merge_newly_reachable_paths`."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  ancestry:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/ui/zindex.ts",)
+        assert result.provenance["paths"] == "project"
+
+    def test_gate_override_paths_absent_defaults_to_empty_tuple_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        result = _parse_gate_override_newly_reachable_paths(fake_path, "gates.repos.org/repo.newly_reachable_paths", {})
+        assert result.enabled is None
+        assert result.paths == ()
+
+    def test_gate_override_enabled_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        key = "gates.repos.org/repo.newly_reachable_paths"
+        match = r"gates\.repos\.org/repo\.newly_reachable_paths\.enabled must be a boolean"
+        with pytest.raises(ValueError, match=match):
+            _parse_gate_override_newly_reachable_paths(fake_path, key, {"enabled": "yes"})
+
+
+# ---------------------------------------------------------------------------
 # resolve_gate_config -- four-layer field-wise precedence (spec 4.1, D-15; AC-27)
 # ---------------------------------------------------------------------------
 # orchestrate: reasoning effort and per-turn thinking budget

@@ -5,6 +5,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+- **`check-write-path` now attributes its itemized findings to the calling
+  unit's own Changes-Manifest scope, while the verdict and status line stay
+  repo-wide** (spec `integration-reality-gates-hardening.md` section 4.3,
+  AC-9, AC-WP-025; E7-F2-S1-T3). `audit_write_path` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` gains a new
+  keyword-only `scope` parameter, and the resulting `WritePathAudit` gains a
+  new `attributed_sites` attribute holding only the assignment/setter sites
+  that fall inside the calling unit's own resolved scope. The underlying
+  scan stays repo-wide: `verdict`, `mentions`, `assignment_sites`, the
+  `findings` count, and the spec 5.2 status line itself are all repo-wide
+  RESULTS, computed exactly as before this scope dependency existed and
+  never narrowed by scope -- only the itemized findings lines printed below
+  the `[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header are scope-limited BLAME,
+  matching the pattern the machine-blocking gates already use to attribute
+  their own findings. A live write outside that scope still drives the same
+  repo-wide verdict a fully unscoped run would reach; it is simply never
+  named in the printed findings. A new third rendering fallback line,
+  `(no assignment/setter sites found within this unit's scope; N found
+  outside scope)`, prints when the repo-wide scan finds real sites but none
+  of them fall inside the calling unit's own scope. `devbench
+  check-write-path` also gains a new zero-stdout exit-1 terminal: when the
+  calling unit's own scope resolution fails (via the shared
+  `_resolve_scope_or_report` helper, before `audit_write_path` is ever
+  called), the run writes ZERO bytes to stdout and reports the error on
+  stderr only, with no spec 5.2 status line at all.
+
 - **Review-time re-run closes 321-D21: a delivered write-path task whose flag
   still classifies `default` now fails code review** (spec
   `integration-reality-gates-hardening.md` section 4.8, AC-20; E7-F2-S1-T1).

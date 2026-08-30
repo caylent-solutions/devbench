@@ -7,6 +7,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The composition-root testing requirement is now keyed off the task
+  `## Acceptance Criteria` line instead of the `## Definition of Done`**
+  (spec `integration-reality-gates-hardening.md` section 4.9(b); decision
+  D-13, finding S1; caylent-solutions/devbench-internal-backlog#11;
+  E9-F1-S1-T1). `docs/composition-root-testing.md` now states normatively
+  that an auto-ticked `## Definition of Done` checkbox is never accepted
+  as satisfaction of the composition-root requirement, because devbench
+  auto-ticks Definition of Done checkboxes on the done transition, making
+  a DoD-based satisfaction record a false record; a sixteenth canonical
+  task section was considered and rejected as the alternative (D-13). The
+  `spec-to-backlog` SKILL's Step 1b item 13 sub-bullet and Step 5b item 15
+  now instruct authors to draft the composition-root requirement as an
+  `## Acceptance Criteria` item, and `test-reviewer`'s rubric item 57 now
+  checks that AC line and the test behind it rather than a DoD checkbox.
+  The smallest-real-ancestor exception remains documented in a task's
+  `### Approach` section, which survives the judge Evidence fetch
+  (`read-unit --strip-comments`, spec 4.3) -- `## Comments` is never an
+  acceptable location.
+
 - **The newly-reachable-paths requirement is now keyed off the `## Task Type:`
   taxonomy and emitted as an acceptance criterion, and its path registry
   moved into the unified gates config** (spec `integration-reality-gates-hardening.md`

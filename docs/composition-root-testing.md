@@ -7,7 +7,7 @@ one is required. It is the shared reference for two enforcement points:
   "COMPOSITION-ROOT / REAL-ENTRY-POINT VERIFICATION" section).
 - The `spec-to-backlog` skill's canonical task-file skeleton
   (`plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md`, Step 1b
-  item 13, `## Definition of Done`).
+  item 13, `## Acceptance Criteria`).
 
 devbench is stack-agnostic -- it is pointed at many different target
 repos across many different frameworks and languages. Everything below is
@@ -48,12 +48,22 @@ across stacks:
 
 ## When a composition-root test is required
 
-A task's Definition of Done MUST include a composition-root verification
-item, and `test-reviewer` MUST enforce it, when the task **adds or
-modifies a UI component (or equivalent presentation-layer unit) that
-consumes shared or application-level state** -- a global store, a
-dependency-injection container, routing context, or any shared
-provider/composition tree the real app assembles at startup.
+A task's `## Acceptance Criteria` MUST include a composition-root
+verification item, and `test-reviewer` checks the test behind that item,
+when the task **adds or modifies a UI component (or equivalent
+presentation-layer unit) that consumes shared or application-level
+state** -- a global store, a dependency-injection container, routing
+context, or any shared provider/composition tree the real app assembles
+at startup.
+
+An auto-ticked `## Definition of Done` checkbox is never accepted as
+satisfaction of this requirement (spec `integration-reality-gates-hardening.md`
+section 4.9(b), decision D-13, finding S1): devbench auto-ticks
+Definition of Done checkboxes on the done transition, so a DoD-based
+satisfaction record is a false record. A sixteenth canonical task
+section was considered and rejected as the alternative (decision D-13);
+the requirement is drafted, and checked, exclusively against the task's
+`## Acceptance Criteria` line and the test behind it.
 
 It is NOT required, and must not be flagged, for units that are
 genuinely self-contained:
@@ -89,10 +99,11 @@ Either of the following satisfies the requirement:
    feature container, real tab panel, or real routed page the component
    is actually rendered under in production, using the app's real
    store/provider setup (not a hand-rolled substitute). This exception
-   MUST be documented in the task's `### Approach` section with a
-   one-line justification for why the literal entry point was
-   impractical and why the chosen ancestor still reproduces the real
-   nesting.
+   MUST be documented in the task's `### Approach` section (never
+   `## Comments`, which `read-unit --strip-comments` removes before a
+   judge's Evidence fetch ever sees it -- spec 4.3) with a one-line
+   justification for why the literal entry point was impractical and why
+   the chosen ancestor still reproduces the real nesting.
 
 What does **not** satisfy the requirement, regardless of test count or
 pass rate:
@@ -126,17 +137,20 @@ test infrastructure.
 
 ## Enforcement summary
 
-- `test-reviewer` rubric item (see `test-reviewer.md`) fails a task
+- `test-reviewer` rubric item (see `test-reviewer.md`) is a judge-evidence
+  check (`constants.GATE_TIERS['composition_root']`) that flags a task
   whose only coverage for a state-consuming UI component is an isolated
   render with hand-supplied props/mocked store/DI container, and emits
   the structured rejection code `test_review:COMPOSITION_ROOT_MISSING`
   (see `docs/review-feedback-vocabulary.md`).
 - `spec-to-backlog` (Step 1b item 13 and Step 5b item 15) requires the
-  generated task's `## Definition of Done` to include an explicit
+  generated task's `## Acceptance Criteria` to include an explicit
   composition-root item whenever the task's Changes Manifest adds or
   modifies a state-consuming UI component, so `test-reviewer` is
-  checking against a DoD item the task already committed to rather than
-  inferring the requirement after the fact.
+  checking against an AC line the task already committed to rather than
+  inferring the requirement after the fact. An auto-ticked
+  `## Definition of Done` item is never accepted in its place (spec
+  4.9(b), decision D-13, finding S1).
 
 ## Related
 

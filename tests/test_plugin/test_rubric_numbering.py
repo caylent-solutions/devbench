@@ -231,7 +231,7 @@ class TestAllocationTablePlacement:
         text = _section_text(SKILL_PATH.read_text(encoding="utf-8"), "5b -- Self-critique at per-Task granularity")
         assert "AC-FINAL tier-suffix on non-Python tasks" in _line_for_item(text, 13)
         assert "Write-path task is distinct and seam-referenced" in _line_for_item(text, 14)
-        assert "Composition-root DoD item present when required" in _line_for_item(text, 15)
+        assert "Composition-root AC item present when required" in _line_for_item(text, 15)
 
     def test_skill_step_7_rubric_occupies_12_to_13(self) -> None:
         text = _section_text(SKILL_PATH.read_text(encoding="utf-8"), "Self-critique rubric for spec-to-backlog")
@@ -314,7 +314,7 @@ class TestCrossFileDocCitationStaysInSync:
         skill_text = SKILL_PATH.read_text(encoding="utf-8")
         section_text = _section_text(skill_text, "5b -- Self-critique at per-Task granularity")
         expected_number = _resolve_item_number_by_content(
-            section_text, "Composition-root DoD item present when required"
+            section_text, "Composition-root AC item present when required"
         )
         doc_text = COMPOSITION_ROOT_DOC_PATH.read_text(encoding="utf-8")
         assert_doc_cites_rubric_item(doc_text, citation_prefix="Step 5b", item_number=expected_number)

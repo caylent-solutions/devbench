@@ -2180,7 +2180,7 @@ class TestRender:
     def test_render_escapes_a_hostile_flag_name_in_the_header_line(self, tmp_path: Path) -> None:
         """SECURITY (doc_review round 7, this unit): `flag_name` is
         spec-derived text (SKILL.md Step 3b-ii's `<existing-flag-name>`),
-        not purely operator-typed, and `cli._parse_check_write_path_argv`
+        not purely operator-typed, and `cli._parse_unit_id_and_required_flag_argv`
         applies no control-character rejection to it before it reaches
         `audit_write_path`. An unescaped `flag_name` in the
         `[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header line is the same

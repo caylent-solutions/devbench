@@ -387,7 +387,7 @@ Print the work-unit content (the `.md` file body) plus the resolved repo path as
 
 ## Gates
 
-Read-only introspection and structured-waiver tooling for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver`, `log-newly-reachable`, the `git-ops-finalize --provenance` flag, `wire-gate`, and `check-write-path` -- the other per-gate check commands live elsewhere until a follow-up unit relocates them here: `check-reachability`, `check-shared-file-impact` and `check-fixture-consistency` (and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents), while `check-ancestry` lives under [Git operations](#git-operations).
+Read-only introspection, structured-waiver tooling, and one file-generating verb for the eight integration-reality gates (spec `integration-reality-gates-hardening.md` section 4.1; D-2, D-15, D-17). This section is the home for every gate-related verb; today it documents `gates`, `log-waiver`, `log-newly-reachable`, the `git-ops-finalize --provenance` flag, `wire-gate`, `check-write-path` and `scaffold-store-factory` -- the other per-gate check commands live elsewhere until a follow-up unit relocates them here: `check-reachability`, `check-shared-file-impact` and `check-fixture-consistency` (and the ones later units add) continue to live under [Orchestrator helpers](#orchestrator-helpers-invoked-by-agents), while `check-ancestry` lives under [Git operations](#git-operations).
 
 ### `gates`
 
@@ -563,6 +563,40 @@ Example, wiring `E0-F1-S1-T1` (a generated ancestry-gate task) to every root of 
 ```
 $ uv run devbench wire-gate E0-F1-S1-T1 --blocks-roots
 {"gate_task": "E0-F1-S1-T1", "wired_roots": ["E1-F1-S1-T1", "E1-F2-S1-T1", "E2-F1-S1-T1"]}
+```
+
+### `scaffold-store-factory`
+
+```
+uv run devbench scaffold-store-factory <id> --out <path>
+```
+
+Emit a composition-root store-factory test skeleton: scaffold-store-factory <id> --out <path>
+
+Spec `integration-reality-gates-hardening.md` section 4.9(b) (issue `caylent-solutions/devbench-internal-backlog#11` AC2 item 3; from PR `caylent-solutions/devbench#316`; decision D-9, full root-cause closure). This verb, together with `docs/composition-root-testing.md`'s ["Store-factory convention (v2): recommended companion convention plus a generator"](composition-root-testing.md#store-factory-convention-v2-recommended-companion-convention-plus-a-generator) section, is the store-factory convention #316 deferred: `<id>` is a work-unit id and `--out <path>` names the file to write; the verb resolves `<id>`'s changed files through the SAME shared scope helper every other gate/verb uses (`devbench.work_unit_scope.resolve_changed_files`, spec 4.3) -- it introduces no second scope-resolution path -- detects the store shape from the CONTENT of those files among the resolved scope's plausible JS/TS source files (`.ts`, `.tsx`, `.js`, `.jsx`; a marker occurring only in a non-source scope file, e.g. a `.md` file, is never treated as evidence of a real store), and writes a comment-annotated skeleton naming the detected shape. Today's detector recognises two shapes: `redux` (a scanned source file containing `configureStore(`, `combineReducers(`, or `createStore(`) and `angular-di` (a scanned source file containing `@NgModule` or `TestBed.configureTestingModule`); each renders a skeleton documenting the real composition root the emitted test must be wired through, with a TODO anchor for the repo-specific import path devbench cannot itself know. The skeleton text itself uses `//`-prefixed comment lines, matching both recognised shapes' own JS/TS ecosystem -- it is still meant to be pasted into (or used to seed) the target repo's own test file, not written out verbatim as a complete, runnable test (there is no test function or assertion body, only comment lines). See [`docs/composition-root-testing.md`](composition-root-testing.md) for the full convention; the emitted skeleton RELATES TO, but does NOT by itself satisfy, the composition-root acceptance criterion -- `test-reviewer`'s rubric item still requires the FINISHED, wired-up test to exercise the real composition root.
+
+`--force` does not exist on this verb, by design: `<path>` must not already exist, so a generated skeleton can never silently overwrite hand-written test code. There is no flag to opt out of that refusal; the refusal is enforced twice, once by an early existence check and again by an exclusive-create write, so a file created between the two is still refused rather than clobbered. Any missing parent directories of `--out` are created (`mkdir(parents=True, exist_ok=True)`) before the write.
+
+No placeholder skeleton is ever written: when no scope file's content matches a recognised shape (including when `<id>`'s Changes Manifest is empty, e.g. a verification-only unit), the verb exits 1 and never falls back to a generic template. The failure message names only the files it actually opened under "Files scanned" -- a scope file excluded from scanning because its extension is outside the `.ts`/`.tsx`/`.js`/`.jsx` allowlist, because it is absent on disk, or because it is not UTF-8 decodable, is named SEPARATELY under its own "Excluded from scanning" line, never folded into "Files scanned" (a scope file named there was genuinely read and found to carry no recognised marker, not merely present in scope).
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The skeleton for the detected store shape was written to `--out`. Stdout: `Wrote <path> (detected store shape: <shape>)`. |
+| 1 | `<id>` is unknown in the backlog, the repo has no configured local path, scope resolution fails (`devbench.work_unit_scope.resolve_changed_files`, spec 4.3), a scope file could not be read, `--out`'s path already exists (refused, nothing written; `--force` is absent by design), or no recognised store shape was detected in `<id>`'s resolved scope (the files actually scanned, and every excluded file with its reason, are named on stderr). |
+| 2 | A usage error naming the offending argument: missing or duplicated `<id>`, an unknown flag, or a missing/empty `--out` value. |
+
+Example, illustrative -- assumes `<id>`'s resolved scope contains real Redux source (e.g. a `src/store/index.ts` file with a `configureStore(` call); devbench's own repo carries no JS/TS source at all, so this exact transcript does not reproduce against a real devbench backlog unit, only against a target repo whose named unit's scope genuinely matches:
+
+```
+$ uv run devbench scaffold-store-factory <id> --out tests/support/store_factory_skeleton.ts
+Wrote tests/support/store_factory_skeleton.ts (detected store shape: redux)
+```
+
+Example, an `--out` path that already exists:
+
+```
+$ uv run devbench scaffold-store-factory <id> --out tests/support/store_factory_skeleton.ts
+ERROR: scaffold-store-factory: output path 'tests/support/store_factory_skeleton.ts' already exists; refusing to overwrite (--force is absent by design; spec 4.9).
 ```
 
 ### `check-write-path`

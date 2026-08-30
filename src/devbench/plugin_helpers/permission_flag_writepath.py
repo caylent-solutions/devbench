@@ -199,7 +199,7 @@ def _escape_untrusted_path_for_rendering(text: str) -> str:
     is derived from spec prose by the ``spec-to-backlog`` SKILL's Step
     3b-ii (an ``<existing-flag-name>`` token lifted out of the spec
     document, not typed fresh by a human at a prompt) and
-    ``cli._parse_check_write_path_argv`` applies no control-character
+    ``cli._parse_unit_id_and_required_flag_argv`` applies no control-character
     rejection to it before it reaches :func:`audit_write_path`;
     ``FileLoadError.error`` can carry a locale-translated
     ``OSError.strerror`` (:func:`_describe_os_error`), which is non-ASCII

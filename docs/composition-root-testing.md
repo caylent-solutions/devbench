@@ -118,22 +118,65 @@ pass rate:
   module-scope-mocking a data-grid library so its real row-validation
   logic is bypassed).
 
-## Recommended companion convention (optional, not enforced by devbench)
+## Store-factory convention (v2): recommended companion convention plus a generator
 
 Where practical, target repos are encouraged to expose a single,
 shared, production-derived test-store/test-provider factory (built from
 the app's real root reducer/provider tree) that component tests use
 instead of ad hoc local store/mock-provider helpers, so test
 infrastructure cannot silently diverge from the real runtime shape. This
-is a target-repo-side testing convention, not a devbench mechanism --
-devbench does not generate or enforce this factory, but a task's
-`### Approach` may propose introducing or reusing one when the target
-repo already has (or would benefit from) such a factory. See
-caylent-solutions/devbench-internal-backlog#11 proposed-change item 3
-for the source rationale; this is deliberately
-left as guidance rather than a hard requirement because introducing a
-shared test-double factory is itself a nontrivial refactor of existing
-test infrastructure.
+is a target-repo-side testing convention, not a devbench GATE -- there is
+no rubric item, and no `test-reviewer` check, that requires a task to
+adopt it. It remains guidance, not a hard requirement, because
+introducing a shared test-double factory is itself a nontrivial refactor
+of existing test infrastructure; a task's `### Approach` may propose
+introducing or reusing one when the target repo already has (or would
+benefit from) such a factory. See
+caylent-solutions/devbench-internal-backlog#11 proposed-change item 3 for
+the source rationale.
+
+**`scaffold-store-factory` (root-cause closure, decision D-9).** PR
+`caylent-solutions/devbench#316` deferred a mechanical way to produce this
+factory; `uv run devbench scaffold-store-factory <unit-id> --out <path>`
+(see [`docs/cli-reference.md`](cli-reference.md#scaffold-store-factory))
+closes that gap. It resolves `<unit-id>`'s changed files through the
+shared ADR-12 scope helper (spec 4.3,
+`devbench.work_unit_scope.resolve_changed_files`), detects the store
+shape from the CONTENT of those files among the resolved scope's
+plausible JS/TS source files (today: `redux`, recognised from a
+`configureStore(`/`combineReducers(`/`createStore(` call; `angular-di`,
+recognised from `@NgModule`/`TestBed.configureTestingModule`; detection is
+constrained to source-file extensions so a marker mentioned only in
+prose, e.g. inside a `.md` file, is never mistaken for a real store -- see
+[`docs/cli-reference.md`](cli-reference.md#scaffold-store-factory) for the
+exact allowlist), and writes a comment-only skeleton for that shape to
+`--out`, refusing to overwrite an existing path (`--force` does not exist
+on this verb, by design). The skeleton is entirely `//`-prefixed comment
+text -- it contains no test function and no assertion body at all -- that
+documents the real composition root the finished test must be wired
+through and leaves the repo-specific import path as a TODO anchor --
+devbench does not know the target repo's real root reducer/module path,
+so the emitted skeleton never guesses one. It is meant to be pasted into
+(or used to seed) the target repo's own test file, not written out
+verbatim as a complete, runnable test. When no scope file's content
+matches a recognised shape, the command exits 1 naming the files it
+actually scanned (opened and read) separately from any scope file it
+excluded from scanning -- and why, e.g. an extension outside the
+allowlist -- rather than folding both into one list; it never emits a
+generic placeholder skeleton (spec 4.9(b)).
+
+**The generator is a convenience, not a satisfaction mechanism.** Running
+`scaffold-store-factory` and committing its output unmodified does NOT,
+by itself, satisfy a task's composition-root acceptance criterion: the
+emitted skeleton is comment-only text with no executable test body at all
+(every TODO anchor is a comment line, not a stubbed assertion), so it
+mounts nothing and asserts nothing on its own. `test-reviewer`'s rubric
+item still checks that the FINISHED test actually exercises the real
+composition root -- the literal entry point, or a documented
+smallest-real-ancestor exception (see above) -- per the "What counts as an
+acceptable composition-root test" section; the generator only removes the
+repetitive scaffolding step of setting up a factory file shaped correctly
+for the target repo's store shape.
 
 ## Enforcement summary
 

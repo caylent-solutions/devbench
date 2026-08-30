@@ -16194,8 +16194,9 @@ class TestCmdCheckWritePathDisabled(_WritePathCmdFixtures):
     def test_empty_positional_argument_is_silently_skipped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """`_parse_check_write_path_argv`'s `if not arg: i += 1; continue`
-        (cli.py) treats an empty-string argv entry as a no-op: it is
+        """`_parse_unit_id_and_required_flag_argv`'s `if not arg: i += 1; continue`
+        (cli.py; shared by `check-write-path` and `scaffold-store-factory`,
+        E9-F1-S1-T2 round 2) treats an empty-string argv entry as a no-op: it is
         neither counted toward the required single positional unit id nor
         rejected as an unknown/invalid token. This is a DELIBERATE
         decision for this round, matching the empty-value tolerance an
@@ -16414,7 +16415,12 @@ class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
     swept to name a sixth caller, :func:`cli.cmd_check_write_path`, in the
     same diff that added the ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX``
     pin below, but neither of the two tests here was extended to assert it --
-    added here so the write-path gate is pinned in both enumerations too."""
+    added here so the write-path gate is pinned in both enumerations too.
+
+    code_review round 1 (E9-F1-S1-T2, Blocking): both enumerations were
+    swept again to name a seventh caller, :func:`cli.cmd_scaffold_store_factory`,
+    so a future new caller of either helper still cannot land without this
+    list being swept too."""
 
     def test_resolve_scope_mode_names_the_fixture_consistency_gate(self) -> None:
         import inspect
@@ -16428,6 +16434,12 @@ class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
         source = inspect.getsource(cli._resolve_scope_mode)
         assert "cmd_check_write_path" in source
 
+    def test_resolve_scope_mode_names_cmd_scaffold_store_factory(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "cmd_scaffold_store_factory" in source
+
     def test_resolve_scope_or_report_names_the_fixture_consistency_gate(self) -> None:
         import inspect
 
@@ -16439,6 +16451,12 @@ class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
 
         source = inspect.getsource(cli._resolve_scope_or_report)
         assert "cmd_check_write_path" in source
+
+    def test_resolve_scope_or_report_names_cmd_scaffold_store_factory(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "cmd_scaffold_store_factory" in source
 
 
 @pytest.mark.unit
@@ -16452,7 +16470,22 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
     fields). Pinned here, following the same pattern as
     ``TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate`` above,
     so a future new caller of any of these four helpers cannot land without
-    this list being swept too."""
+    this list being swept too.
+
+    code_review round 1 (E9-F1-S1-T2, Blocking): ``cmd_scaffold_store_factory``
+    became a new caller of all five of these helpers (four here plus the
+    ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX`` comment pinned below), so
+    every count/enumeration in this class was swept from six/three/three to
+    seven/four/four, and a dedicated pin for the new caller was added
+    alongside each tightened count assertion.
+
+    code_review round 2 (E9-F1-S1-T2, Blocking, DRY): ``scaffold-store-factory``'s
+    own argv parser shipped as a line-for-line copy of ``check-write-path``'s;
+    both were replaced by one shared function, ``_parse_unit_id_and_required_flag_argv``,
+    so ``_consume_gate_verb_flag_value`` and ``_gate_verb_usage_error`` now
+    have THREE callers/functions of their own respectively (not four), and
+    the pins below were swept to name the shared function instead of the
+    two now-deleted per-verb parsers."""
 
     def test_resolve_unit_repo_and_path_names_check_write_path_as_a_sixth_caller(self) -> None:
         import inspect
@@ -16461,18 +16494,36 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
         assert "cmd_check_write_path" in source
         # W3 (test_review): bare "six" is a substring of "sixth" and would
         # pass even if the docstring's claim drifted to name a different
-        # count; "six callers" pins the exact claim the docstring makes.
-        assert "six callers" in source
+        # count; "seven callers" pins the exact claim the docstring makes
+        # after E9-F1-S1-T2 added a seventh caller.
+        assert "seven callers" in source
 
-    def test_consume_gate_verb_flag_value_names_parse_check_write_path_argv(self) -> None:
+    def test_resolve_unit_repo_and_path_names_cmd_scaffold_store_factory_as_a_seventh_caller(
+        self,
+    ) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_unit_repo_and_path)
+        assert "cmd_scaffold_store_factory" in source
+
+    def test_consume_gate_verb_flag_value_names_parse_unit_id_and_required_flag_argv(self) -> None:
         import inspect
 
         source = inspect.getsource(cli._consume_gate_verb_flag_value)
-        assert "_parse_check_write_path_argv" in source
-        # W3 (test_review): tightened from bare "three" (its sibling test
-        # below was already tightened to "three verbs"); this docstring's
-        # own wording is "three callers", not "three verbs".
+        assert "_parse_unit_id_and_required_flag_argv" in source
+        # W3 (test_review): tightened from bare "three"; this docstring's
+        # own wording is "three callers" again after E9-F1-S1-T2 round 2
+        # merged check-write-path's and scaffold-store-factory's separate,
+        # duplicated parsers into this one shared caller (DRY fix for the
+        # round-1/round-2 line-for-line-copy finding).
         assert "three callers" in source
+
+    def test_consume_gate_verb_flag_value_names_both_verbs_the_shared_parser_serves(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._consume_gate_verb_flag_value)
+        assert "check-write-path" in source
+        assert "scaffold-store-factory" in source
 
     def test_gate_verb_usage_error_names_check_write_path_and_its_scope_correctly(self) -> None:
         import inspect
@@ -16481,7 +16532,14 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
         assert "check-write-path" in source
         assert "is a gate CHECK verb" in source
         assert "gate-MARKER verbs" in source
-        assert "three verbs" in source
+        assert "four verbs" in source
+
+    def test_gate_verb_usage_error_names_scaffold_store_factory_and_the_shared_parser(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_verb_usage_error)
+        assert "scaffold-store-factory" in source
+        assert "_parse_unit_id_and_required_flag_argv" in source
 
     def test_gate_status_line_extra_fields_names_write_path_audit_fields(self) -> None:
         import inspect
@@ -16511,7 +16569,12 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
         asserts the exact ordinal phrases the comment makes rather than the bare
         substring "three" -- the loose-ordinal-assertion pattern this same file's
         test_review rounds already rejected twice (see the sibling tests' "W3
-        (test_review): tightened from bare ..." comments above)."""
+        (test_review): tightened from bare ..." comments above).
+
+        code_review round 1 (E9-F1-S1-T2, Blocking): ``cmd_scaffold_store_factory``
+        became the comment's fourth caller, so the pinned ordinals were swept
+        from "three" to "four" and a dedicated assertion for the new caller
+        was added below."""
         import inspect
 
         module_lines = inspect.getsource(cli).splitlines()
@@ -16527,8 +16590,9 @@ class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
             comment_lines.insert(0, line)
         preceding_comment = "\n".join(comment_lines)
         assert "cmd_check_write_path" in preceding_comment
-        assert "the three :func:`_resolve_scope_or_report`" in preceding_comment
-        assert "the three call sites" in preceding_comment
+        assert "cmd_scaffold_store_factory" in preceding_comment
+        assert "the four :func:`_resolve_scope_or_report`" in preceding_comment
+        assert "the four call sites" in preceding_comment
 
 
 class _FixtureGateCmdFixtures:
@@ -22783,6 +22847,537 @@ class TestCmdWireGate:
 
     def test_wire_gate_is_variadic(self) -> None:
         assert "wire-gate" in cli._VARIADIC_COMMANDS
+
+
+class _ScaffoldStoreFactoryCmdFixtures:
+    """Shared fixture helpers for ``cmd_scaffold_store_factory`` test classes
+    (E9-F1-S1-T2, spec `integration-reality-gates-hardening.md` section 4.9(b)).
+
+    Mirrors ``_WritePathCmdFixtures``'s scope-fixture pattern (this module,
+    above): ``_patch_common`` seeds a real, on-disk Changes Manifest via the
+    shared ``_seed_scope_backlog`` helper and points BOTH
+    ``devbench.cli.BacklogParser`` (this command's own unit/repo lookup,
+    ``_resolve_unit_repo_and_path``) and
+    ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` (the
+    independent lookup ``resolve_changed_files`` performs) at the SAME
+    fixture data -- a mocked ``devbench.cli.BacklogParser`` alone never
+    satisfies ``resolve_changed_files``'s own, separate ``BacklogParser``
+    lookup (spec 4.3).
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Scaffold store factory task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    @contextlib.contextmanager
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        *,
+        manifest_files: tuple[str, ...] = (),
+        manifest_body: str | None = None,
+    ) -> Iterator[None]:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_root, backlog_index = _seed_scope_backlog(
+            repo_path.parent, unit_id=unit.id, files=manifest_files, manifest_body=manifest_body
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            yield
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCmdScaffoldStoreFactory(_ScaffoldStoreFactoryCmdFixtures):
+    """AC-E9-F1-S1-T2-1..8: ``scaffold-store-factory <id> --out <path>``
+    (spec 4.9(b), issue #11 AC2 item 3, decision D-9)."""
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-4: usage errors, exit 2
+    # ------------------------------------------------------------------
+
+    def test_missing_unit_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("--out", "skeleton.py")
+        assert result == 2
+        assert "unit id" in capsys.readouterr().err
+
+    def test_missing_out_value_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out")
+        assert result == 2
+        assert "--out" in capsys.readouterr().err
+
+    def test_missing_out_flag_entirely_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1")
+        assert result == 2
+        assert "--out" in capsys.readouterr().err
+
+    def test_unknown_flag_exits_2_naming_it(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", "skeleton.py", "--force")
+        assert result == 2
+        assert "--force" in capsys.readouterr().err
+
+    def test_duplicated_unit_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "E1-F1-S1-T2", "--out", "skeleton.py")
+        assert result == 2
+        assert capsys.readouterr().err.startswith("ERROR:")
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-4: unknown unit id, exit 1
+    # ------------------------------------------------------------------
+
+    def test_unknown_unit_id_exits_1_naming_it(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        out_path = tmp_path / "skeleton.py"
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+        assert result == 1
+        assert "E1-F1-S1-T1" in capsys.readouterr().err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-2, AC-E9-F1-S1-T2-5: happy path -- shape detected from
+    # the unit's resolved scope, skeleton written, exit 0.
+    # ------------------------------------------------------------------
+
+    def test_redux_shape_detected_and_skeleton_written(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "import { configureStore } from '@reduxjs/toolkit';\nexport const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "store_factory_skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert f"Wrote {out_path}" in captured.out
+        assert "redux" in captured.out
+        assert out_path.exists()
+        written = out_path.read_text(encoding="utf-8")
+        assert "redux" in written
+        assert "E1-F1-S1-T1" in written
+        assert "composition-root-testing.md" in written
+        # code_review + doc_review round 1 (E9-F1-S1-T2, Blocking): the
+        # emitted skeleton must not claim it satisfies the composition-root
+        # acceptance criterion (contradicts docs/composition-root-testing.md).
+        assert "skeleton satisfies" not in written
+        assert "does NOT by itself" in written
+
+    def test_angular_di_shape_detected_and_skeleton_written(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "app.module.ts",
+            "@NgModule({\n  providers: [RealFeatureService],\n})\nexport class AppModule {}\n",
+        )
+        out_path = tmp_path / "out" / "angular_skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/app.module.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "angular-di" in captured.out
+        written = out_path.read_text(encoding="utf-8")
+        assert "angular-di" in written
+        assert "TestBed" in written
+        # code_review + doc_review round 1 (E9-F1-S1-T2, Blocking): same
+        # non-satisfaction pin as the redux skeleton above.
+        assert "skeleton satisfies" not in written
+        assert "does NOT by itself" in written
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-3: refuse to overwrite an existing --out path.
+    # ------------------------------------------------------------------
+
+    def test_existing_out_path_exits_1_and_leaves_file_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "existing.py"
+        original_content = "# hand-written test, do not clobber\n"
+        out_path.write_text(original_content, encoding="utf-8")
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert str(out_path) in captured.err
+        assert "--force" in captured.err
+        assert out_path.read_text(encoding="utf-8") == original_content
+
+    def test_no_force_flag_exists(self) -> None:
+        _, _, usage = cli._COMMANDS["scaffold-store-factory"]
+        assert "--force" not in usage
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-2: undetectable store shape, exit 1, no placeholder
+    # skeleton ever written.
+    # ------------------------------------------------------------------
+
+    def test_undetectable_shape_exits_1_naming_scanned_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "plain.py", "def add(a, b):\n    return a + b\n")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/plain.py",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "src/plain.py" in captured.err
+        assert "composition-root-testing.md" in captured.err
+        assert not out_path.exists()
+
+    def test_undetected_shape_message_distinguishes_scanned_from_extension_excluded(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review round 3 (E9-F1-S1-T2, Blocking): `_detect_store_shape_or_report`
+        previously named the FULL resolved scope under "Files scanned",
+        even though `_detect_store_shape` never opens a file whose
+        extension is outside `_STORE_SHAPE_SOURCE_EXTENSIONS` -- masking
+        the real cause (nothing in scope had a JS/TS extension) behind a
+        message implying every listed file was read and had no markers.
+        A pure-Python scope's failure message must name zero files under
+        "Files scanned" (none were actually read) and name the excluded
+        `.py` file separately, under a distinct "excluded" label."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "plain.py", "def add(a, b):\n    return a + b\n")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/plain.py",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Files scanned (.ts, .tsx, .js, .jsx only): (none)." in captured.err
+        assert "src/plain.py" in captured.err
+        assert "excluded" in captured.err.lower()
+        assert not out_path.exists()
+
+    def test_undetected_shape_message_reports_scanned_missing_and_undecodable_categories(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exercises every category `_undetected_store_shape_message` can
+        report in one undetected-shape failure: a `.ts` file that WAS read
+        but carries no recognised marker (`scanned`, non-empty), a
+        Manifest-declared `.ts` file absent from disk (`excluded_missing`),
+        and a `.ts` file that is not UTF-8 decodable (`excluded_undecodable`).
+        None of the three scope entries yields a recognised shape, so the
+        command exits 1 naming all three categories under their own
+        separate labels."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "unmatched.ts", "export const x = 1;\n")
+        binary_path = repo_path / "src" / "binary.ts"
+        binary_path.parent.mkdir(parents=True, exist_ok=True)
+        binary_path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_files=("src/unmatched.ts", "src/deleted.ts", "src/binary.ts"),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Files scanned (.ts, .tsx, .js, .jsx only): src/unmatched.ts." in captured.err
+        assert "not present on disk): src/deleted.ts." in captured.err
+        assert "not UTF-8 decodable): src/binary.ts." in captured.err
+        assert not out_path.exists()
+
+    def test_marker_in_markdown_file_is_not_detected_as_a_store_shape(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review round 2 (E9-F1-S1-T2, Blocking): unqualified substring
+        matching over EVERY scope file previously false-positived a `redux`
+        detection when the marker `configureStore(` appeared only in
+        Markdown prose (verified live against this very repo, whose own
+        docs mention the marker once this unit lands). A marker occurring
+        ONLY inside a non-source scope file (here, `.md`) must not be
+        treated as evidence of a real store: the shape stays undetected and
+        the command exits 1 naming the scanned file, exactly as it would if
+        the file contained no marker text at all."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "docs" / "notes.md",
+            "This document mentions configureStore( in prose, not in source.\n",
+        )
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("docs/notes.md",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "docs/notes.md" in captured.err
+        assert "redux" not in captured.out
+        assert not out_path.exists()
+
+    def test_empty_scope_exits_1_and_writes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=()):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "no files in unit scope" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-1: registration + variadic dispatch.
+    # ------------------------------------------------------------------
+
+    def test_registered_in_commands_with_snapshotted_description(self) -> None:
+        func, min_args, usage = cli._COMMANDS["scaffold-store-factory"]
+        assert func is cli.cmd_scaffold_store_factory
+        # min_args must be 0: scaffold-store-factory is variadic (see
+        # test_is_variadic below) and owns ALL of its own usage validation
+        # via _parse_unit_id_and_required_flag_argv, which returns exit 2 for
+        # a missing/duplicated id, an unknown flag, or a missing --out
+        # value. A nonzero min_args here would let main()'s pre-dispatch
+        # arity check reject a short invocation with a generic exit-1
+        # message BEFORE cmd_scaffold_store_factory ever runs.
+        assert min_args == 0
+        assert "scaffold-store-factory <id> --out <path>" in usage
+
+    def test_is_variadic(self) -> None:
+        assert "scaffold-store-factory" in cli._VARIADIC_COMMANDS
+
+    def test_flag_and_value_both_reach_the_handler_through_main(self) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch(
+                "sys.argv",
+                ["devbench", "scaffold-store-factory", "E1-F1-S1-T1", "--out", "skeleton.py"],
+            ),
+            patch.dict(
+                cli._COMMANDS,
+                {
+                    "scaffold-store-factory": (
+                        mock_fn,
+                        0,
+                        "Emit a composition-root store-factory test skeleton: scaffold-store-factory <id> --out <path>",
+                    )
+                },
+            ),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("E1-F1-S1-T1", "--out", "skeleton.py")
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-5: single scope-resolution path (grep-verified in-task).
+    # ------------------------------------------------------------------
+
+    def test_no_second_scope_resolution_path_introduced(self) -> None:
+        """`cmd_scaffold_store_factory` must resolve scope only through
+        `_resolve_scope_or_report` (i.e. `work_unit_scope.resolve_changed_files`),
+        never a second, hand-rolled scope scan (spec 4.3, AC-E9-F1-S1-T2-5)."""
+        import inspect
+
+        source = inspect.getsource(cli.cmd_scaffold_store_factory)
+        assert "_resolve_scope_or_report(" in source
+        assert "resolve_changed_files(" not in source
+
+    # ------------------------------------------------------------------
+    # Scope-resolution failure propagation (spec 4.3): a malformed Changes
+    # Manifest fails `_resolve_scope_or_report` before detection ever runs.
+    # ------------------------------------------------------------------
+
+    def test_scope_resolution_failure_exits_1_before_detection(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        out_path = tmp_path / "skeleton.py"
+
+        malformed_body = "| File | Change |\n|------|--------|\n| badrow |\n"
+        with self._patch_common(unit, repo_path, manifest_body=malformed_body):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # `_detect_store_shape` skips a Manifest-declared file that is absent
+    # from disk, and a scope file it cannot decode as UTF-8, without
+    # aborting detection for the rest of the scope.
+    # ------------------------------------------------------------------
+
+    def test_missing_and_undecodable_scope_files_are_skipped_during_detection(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        # `src/deleted.ts` is declared in the Manifest but never written to
+        # disk (a Manifest-declared delete, or a same-run race) -- exercises
+        # the `not abs_path.is_file(): continue` branch. `src/binary.ts`
+        # carries a `.ts` extension (in `_STORE_SHAPE_SOURCE_EXTENSIONS`) so
+        # it still reaches `read_text` and exercises the
+        # `except UnicodeDecodeError: continue` branch, rather than being
+        # skipped earlier by the extension allowlist (code_review round 2,
+        # E9-F1-S1-T2).
+        binary_path = repo_path / "src" / "binary.ts"
+        binary_path.parent.mkdir(parents=True, exist_ok=True)
+        binary_path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_files=("src/deleted.ts", "src/binary.ts", "src/store/index.ts"),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "redux" in captured.out
+        assert out_path.exists()
+
+    # ------------------------------------------------------------------
+    # `_parse_unit_id_and_required_flag_argv` (E9-F1-S1-T2 round 2: shared
+    # with `check-write-path` to close a DRY violation, see
+    # TestSharedGateHelperCallerEnumerationsNameCheckWritePath) skips a
+    # blank/empty argv token rather than treating it as a positional or an
+    # unknown flag.
+    # ------------------------------------------------------------------
+
+    def test_empty_argv_token_is_skipped_by_the_parser(self) -> None:
+        parsed = cli._parse_unit_id_and_required_flag_argv(
+            ("", "E1-F1-S1-T1", "--out", "skeleton.py"),
+            verb="scaffold-store-factory",
+            flag="--out",
+            value_placeholder="<path>",
+        )
+        assert parsed == ("E1-F1-S1-T1", "skeleton.py")
+
+    # ------------------------------------------------------------------
+    # code_review round 1 (E9-F1-S1-T2, Advisory): an OSError reading a
+    # scope file that DOES exist (e.g. a permission failure) must be
+    # reported by name, exit 1, never silently treated as "no markers" by
+    # ``_detect_store_shape`` (CLAUDE.md "no silent failures").
+    # ------------------------------------------------------------------
+
+    def test_unreadable_scope_file_os_error_exits_1_naming_unit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "skeleton.py"
+
+        with (
+            self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)),
+            patch("devbench.cli._detect_store_shape", side_effect=OSError("Permission denied")),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert "E1-F1-S1-T1" in captured.err
+        assert "Permission denied" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # code_review round 1 (E9-F1-S1-T2, Advisory): the refuse-to-overwrite
+    # guarantee is enforced by the filesystem itself (exclusive create),
+    # not only by the earlier ``out_path.exists()`` check -- a file
+    # created in the TOCTOU window between that check and the write must
+    # still be refused with the SAME message, and not clobbered.
+    # ------------------------------------------------------------------
+
+    def test_file_created_after_exists_check_is_not_clobbered(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "skeleton.py"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        real_path_open = Path.open
+
+        def _racing_open(
+            self: Path,
+            mode: str = "r",
+            buffering: int = -1,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+        ) -> object:
+            if self == out_path and mode == "x":
+                out_path.write_text("hand-written test code\n", encoding="utf-8")
+                raise FileExistsError(17, "File exists", str(out_path))
+            return real_path_open(self, mode, buffering, encoding, errors, newline)
+
+        with (
+            self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)),
+            patch.object(Path, "open", _racing_open),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert "already exists" in captured.err
+        assert out_path.read_text(encoding="utf-8") == "hand-written test code\n"
 
 
 class TestProposalCommandsRegistered:

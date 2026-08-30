@@ -4435,11 +4435,12 @@ def _resolve_scope_mode() -> str:
     ``MODE_PER_TASK_BRANCH``. Every scope-resolving gate/verb
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
     reachability gate, :func:`cmd_check_shared_file_impact`, the
-    fixture-consistency gate, and the write-path audit gate,
-    :func:`cmd_check_write_path`, E7-F2-S1-T3) calls this single helper
-    instead of re-deriving the same two-branch ternary, so the
-    mode-selection rule can never drift between call sites (spec 4.3,
-    ADR-12).
+    fixture-consistency gate, the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3, and the store-factory
+    scaffold generator, :func:`cmd_scaffold_store_factory`, E9-F1-S1-T2)
+    calls this single helper instead of re-deriving the same two-branch
+    ternary, so the mode-selection rule can never drift between call sites
+    (spec 4.3, ADR-12).
     """
     from devbench.config import DEFER_PR
 
@@ -4452,8 +4453,10 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
     Shared by every gate/verb that needs the unit's ADR-12 mode-aware scope
     (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
     reachability gate, :func:`cmd_check_shared_file_impact`, the
-    fixture-consistency gate, and the write-path audit gate,
-    :func:`cmd_check_write_path`, E7-F2-S1-T3; spec 4.3, AC-9) so every
+    fixture-consistency gate, the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3, and the store-factory
+    scaffold generator, :func:`cmd_scaffold_store_factory`, E9-F1-S1-T2;
+    spec 4.3, AC-9) so every
     consumer resolves scope through the single mode-aware implementation
     and reports a
     resolution failure through one shared error path, never a divergent
@@ -4484,13 +4487,14 @@ def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, messag
         return None
 
 
-# Shared ``message_prefix`` template for the three :func:`_resolve_scope_or_report`
+# Shared ``message_prefix`` template for the four :func:`_resolve_scope_or_report`
 # callers (:func:`_prepare_shared_file_impact_scope_and_registry`,
-# :func:`_finalize_fixture_consistency_result`, :func:`cmd_check_write_path`) that
+# :func:`_finalize_fixture_consistency_result`, :func:`cmd_check_write_path`,
+# :func:`cmd_scaffold_store_factory`) that
 # have no gate-specific wording of their own to preserve, so the identical prefix
-# text can never drift between the three call sites (doc_review round-2 W4,
+# text can never drift between the four call sites (doc_review round-2 W4,
 # E6-F2-S1-T2; extended to a third caller by E7-F2-S1-T3, code_review round 1
-# Blocking).
+# Blocking; extended to a fourth caller by E9-F1-S1-T2).
 _GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str = "cannot resolve scope for unit {unit_id}"
 
 
@@ -4500,8 +4504,9 @@ def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | No
     Shared by :func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`,
     :func:`cmd_check_reachability`, :func:`_prepare_shared_file_impact_run`
     (on behalf of :func:`cmd_check_shared_file_impact`),
-    :func:`cmd_check_write_path` and :func:`cmd_request_amendment` so all
-    six callers report "unit not found" / "no local path configured"
+    :func:`cmd_check_write_path`, :func:`cmd_request_amendment` and
+    :func:`cmd_scaffold_store_factory` (E9-F1-S1-T2) so all
+    seven callers report "unit not found" / "no local path configured"
     identically. Prints the ERROR itself; the caller's job is only to
     propagate a non-zero exit code.
     """
@@ -9011,32 +9016,57 @@ def _fixture_finding_is_attributable(finding: "FixtureFinding", scope_files: fro
 _WRITE_PATH_AUDIT_GATE_NAME: str = "write_path_audit"
 
 
-def _parse_check_write_path_argv(argv: tuple[str, ...]) -> tuple[str, str] | int:
-    """Parse the ``check-write-path`` flag grammar: ``<unit-id> --flag <name>`` (spec 4.8, Section 14).
+def _parse_unit_id_and_required_flag_argv(
+    argv: tuple[str, ...], *, verb: str, flag: str, value_placeholder: str
+) -> tuple[str, str] | int:
+    """Parse the shared ``<unit-id> <flag> <value>`` grammar: one positional unit id
+    plus one required flag value (spec 4.8, 4.9(b), Section 14).
 
-    Returns ``(unit_id, flag_name)`` on success. On a usage failure -- a
-    missing or duplicated positional unit id, an unknown flag, or a
-    missing/empty ``--flag`` value -- returns the ``2`` usage-error exit
-    code (already printed to stderr via :func:`_gate_verb_usage_error`),
-    reusing the SAME shared usage-error shape and flag-value consumption
-    ``log-waiver``/``log-newly-reachable`` already own
-    (:func:`_gate_verb_usage_error`, :func:`_consume_gate_verb_flag_value`)
-    instead of a third hand-typed copy (spec Section 7, AC-WP-007).
+    Shared by :func:`cmd_check_write_path` (``verb="check-write-path"``,
+    ``flag="--flag"``, spec 4.8) and :func:`cmd_scaffold_store_factory`
+    (``verb="scaffold-store-factory"``, ``flag="--out"``, spec 4.9(b),
+    E9-F1-S1-T2). Extracted in E9-F1-S1-T2 round 2 (code_review Blocking,
+    DRY): before this extraction, ``scaffold-store-factory`` shipped a
+    second, line-for-line copy of ``check-write-path``'s parser -- same
+    ``args=list(argv)`` scan, same positional list, same empty-token skip,
+    same flag branch via :func:`_consume_gate_verb_flag_value`, same
+    ``arg.startswith("--")`` unknown-flag branch, same
+    ``len(positional) != 1`` check, same empty-value check -- with only the
+    flag literal, one local variable name and two usage strings differing.
+    A THIRD verb needing this identical ``<id> <flag> <value>`` grammar
+    reuses this function directly instead of typing a third copy.
+
+    Args:
+        argv: The verb's raw argv (after the verb token itself).
+        verb: The verb name, used in the two usage-error messages, e.g.
+            ``"check-write-path"``.
+        flag: The required flag's literal spelling, e.g. ``"--flag"``.
+        value_placeholder: The flag value's placeholder in the usage-error
+            messages, e.g. ``"<name>"``.
+
+    Returns:
+        ``(unit_id, value)`` on success. On a usage failure -- a missing or
+        duplicated positional unit id, an unknown flag, or a missing/empty
+        *flag* value -- returns the ``2`` usage-error exit code (already
+        printed to stderr via :func:`_gate_verb_usage_error`), reusing the
+        SAME shared usage-error shape and flag-value consumption
+        ``log-waiver``/``log-newly-reachable`` already own
+        (:func:`_gate_verb_usage_error`, :func:`_consume_gate_verb_flag_value`).
     """
     args = list(argv)
     positional: list[str] = []
-    flag_name = ""
+    value = ""
     i = 0
     while i < len(args):
         arg = args[i]
         if not arg:
             i += 1
             continue
-        if arg == "--flag":
-            consumed = _consume_gate_verb_flag_value(args, i, "--flag")
+        if arg == flag:
+            consumed = _consume_gate_verb_flag_value(args, i, flag)
             if isinstance(consumed, int):
                 return consumed
-            flag_name, i = consumed
+            value, i = consumed
             continue
         if arg.startswith("--"):
             return _gate_verb_usage_error(f"unknown flag: {arg}")
@@ -9044,12 +9074,10 @@ def _parse_check_write_path_argv(argv: tuple[str, ...]) -> tuple[str, str] | int
         i += 1
 
     if len(positional) != 1:
-        return _gate_verb_usage_error(
-            "check-write-path requires exactly one unit id: check-write-path <id> --flag <name>"
-        )
-    if not flag_name:
-        return _gate_verb_usage_error("--flag is required: check-write-path <id> --flag <name>")
-    return positional[0], flag_name
+        return _gate_verb_usage_error(f"{verb} requires exactly one unit id: {verb} <id> {flag} {value_placeholder}")
+    if not value:
+        return _gate_verb_usage_error(f"{flag} is required: {verb} <id> {flag} {value_placeholder}")
+    return positional[0], value
 
 
 def cmd_check_write_path(*argv: str) -> int:
@@ -9122,7 +9150,9 @@ def cmd_check_write_path(*argv: str) -> int:
         usage error (missing/duplicated unit id, unknown flag, or a
         missing/empty ``--flag`` value).
     """
-    parsed = _parse_check_write_path_argv(argv)
+    parsed = _parse_unit_id_and_required_flag_argv(
+        argv, verb="check-write-path", flag="--flag", value_placeholder="<name>"
+    )
     if isinstance(parsed, int):
         return parsed
     unit_id, flag_name = parsed
@@ -9588,23 +9618,31 @@ def _gate_verb_usage_error(message: str) -> int:
     mirrors these semantics for its fields"): every usage failure -- an
     unknown judge/gate name, an empty required field, or a machine-blocking
     gate waived without ``--operator`` -- exits 2 naming the offending
-    argument. :func:`_parse_check_write_path_argv` (spec 4.8, Section 14) is
-    a THIRD caller: ``check-write-path`` is a gate CHECK verb, not one of the
-    structured gate-MARKER verbs section 4.9 scopes this shape to -- its use
-    here is an incidental reuse of the same exit-2 shape for its own
-    (unrelated) usage grammar, not a claim that it is a gate-marker verb.
-    Centralising the shape here means all three verbs' usage errors can
+    argument. :func:`_parse_unit_id_and_required_flag_argv` (spec 4.8,
+    4.9(b), Section 14) is a THIRD caller, shared by BOTH
+    ``check-write-path`` (spec 4.8) and ``scaffold-store-factory`` (spec
+    4.9(b), E9-F1-S1-T2): ``check-write-path`` is a gate CHECK verb and
+    ``scaffold-store-factory`` is a generator verb -- neither is one of the
+    structured gate-MARKER verbs section 4.9 scopes this shape to -- their
+    use here is an incidental reuse of the same exit-2 shape for their own
+    (unrelated) usage grammars, not a claim that either is a gate-marker
+    verb.
+    Centralising the shape here means all four verbs' usage errors can
     never drift (their argument sets differ, but the exit code and stderr
-    shape must not). "Three" counts VERBS (log-waiver, log-newly-reachable,
-    check-write-path), not calling functions -- counting call sites by grep
+    shape must not). "Four" counts VERBS (log-waiver, log-newly-reachable,
+    check-write-path, scaffold-store-factory), not calling functions --
+    counting call sites by grep
     yields a larger, unrelated number, and the count-per-verb is not
     uniform: ``log-waiver`` and ``log-newly-reachable`` each reach this
     helper from TWO functions of their own (a ``_parse_*_argv`` grammar
     function and a separate ``_validate_*_semantics`` function),
-    while ``check-write-path`` reaches it from exactly ONE function of its
-    own (:func:`_parse_check_write_path_argv`) -- its only other route here
+    while ``check-write-path`` and ``scaffold-store-factory`` SHARE exactly
+    ONE function, :func:`_parse_unit_id_and_required_flag_argv`
+    (E9-F1-S1-T2 round 2, code_review Blocking DRY fix: extracted after
+    ``scaffold-store-factory`` shipped as a line-for-line copy of
+    ``check-write-path``'s own parser) -- their only other route here
     is through the SHARED :func:`_consume_gate_verb_flag_value` helper, not
-    a second dedicated function of its own, since it has no semantics
+    a second dedicated function of their own, since neither has a semantics
     validation step beyond argument parsing.
 
     Args:
@@ -9626,13 +9664,18 @@ def _consume_gate_verb_flag_value(args: list[str], i: int, flag: str) -> tuple[s
     (``--gate``/``--target``/``--reason``) and
     :func:`_scan_log_newly_reachable_flags` (``--path``/``--method``/``--result``)
     behind the two structured gate-marker verbs, and
-    :func:`_parse_check_write_path_argv` (``--flag``, spec 4.8) behind the
-    ``check-write-path`` gate CHECK verb -- so the value-consumption logic
+    :func:`_parse_unit_id_and_required_flag_argv` behind BOTH the
+    ``check-write-path`` gate CHECK verb (``--flag``, spec 4.8) and the
+    ``scaffold-store-factory`` generator verb (``--out``, spec 4.9(b)) -- so
+    the value-consumption logic
     has exactly one definition across all three callers instead of being
     duplicated per verb (E2-F4-S1-T2 REFACTOR: was
     ``_consume_log_waiver_flag_value``, generalised once
     ``log-newly-reachable`` needed the identical behaviour; a third,
-    unrelated-verb caller followed in E7-F1-S1-T1).
+    unrelated-verb caller followed in E7-F1-S1-T1 and was itself
+    generalised in E9-F1-S1-T2 round 2 to serve a second, unrelated verb --
+    ``scaffold-store-factory`` -- instead of that verb duplicating its own
+    26-line grammar parser).
 
     Returns:
         ``(value, i + 2)`` on success, or the ``2`` usage-error exit code
@@ -18576,6 +18619,400 @@ def _print_reject_proposal_outcome(task_id: str, unmaterialised_source_id: str, 
     print(json.dumps(payload))
 
 
+# ---------------------------------------------------------------------------
+# `scaffold-store-factory` (E9-F1-S1-T2, issue #11 AC2 item 3, spec 4.9(b),
+# decision D-9): emits a composition-root store-factory test skeleton from
+# the store shape detected in a work unit's resolved Changes-Manifest scope.
+# See docs/composition-root-testing.md for the store-factory convention this
+# verb implements.
+# ---------------------------------------------------------------------------
+
+# Recognised store shapes. Adding a new shape means adding one entry to
+# `_STORE_SHAPE_MARKERS` and one matching entry to
+# `_STORE_FACTORY_SKELETON_TEMPLATES` -- `_detect_store_shape` and
+# `_render_store_factory_skeleton` never need to change (OCP).
+_STORE_SHAPE_REDUX: str = "redux"
+_STORE_SHAPE_ANGULAR_DI: str = "angular-di"
+
+# Marker substrings that identify each store shape when found in the
+# content of a file in the unit's resolved scope. Order is iteration order
+# (dict preserves insertion order), so the first shape whose markers match
+# ANY scope file wins when a scope could plausibly match more than one
+# shape's markers.
+_STORE_SHAPE_MARKERS: dict[str, tuple[str, ...]] = {
+    _STORE_SHAPE_REDUX: ("configureStore(", "combineReducers(", "createStore("),
+    _STORE_SHAPE_ANGULAR_DI: ("@NgModule", "TestBed.configureTestingModule"),
+}
+
+# Extensions plausibly containing real JS/TS source for the shapes
+# `_STORE_SHAPE_MARKERS` recognises today (code_review round 2, E9-F1-S1-T2,
+# Blocking: unqualified substring matching over EVERY scope file -- with no
+# extension constraint at all -- let Markdown prose and unrelated Python
+# source that merely MENTION a marker count as evidence of a real store.
+# Verified against this very repo: once this unit's own docs and source
+# mention "configureStore(" (in prose, comments and templates), an
+# unconstrained scan false-positively "detects" redux for a pure-Python
+# scope. Both recognised shapes today are JS/TS ecosystems, so detection is
+# constrained to plausible JS/TS source extensions; a marker occurring only
+# in a non-source scope file, e.g. a `.md` file, is not evidence of a real
+# store).
+_STORE_SHAPE_SOURCE_EXTENSIONS: tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx")
+
+# Per-shape skeleton text, ``{unit_id}``-formatted at render time. Every
+# skeleton documents the real composition root it must be wired through
+# (docs/composition-root-testing.md) and leaves the repo-specific import
+# path as a TODO anchor -- devbench does not know the target repo's real
+# root reducer/module path, so it never guesses one (no fallback skeleton,
+# spec 4.9(b)). Comment lines use `//` (both recognised shapes today are
+# JS/TS ecosystems, code_review round 2 Advisory, E9-F1-S1-T2) rather than
+# `#`, so the emitted text is idiomatic for the worked example's `.ts`
+# output path even though it is still meant to be pasted into (or used to
+# seed) the target repo's own test file, not written out verbatim as a
+# complete, runnable test.
+_STORE_FACTORY_SKELETON_TEMPLATES: dict[str, str] = {
+    _STORE_SHAPE_REDUX: (
+        "// Composition-root store-factory test skeleton\n"
+        "// Generated by: uv run devbench scaffold-store-factory {unit_id} --out <path>\n"
+        "// Detected store shape: redux\n"
+        "//\n"
+        "// See docs/composition-root-testing.md for the full store-factory\n"
+        "// convention. This skeleton relates to, but does NOT by itself\n"
+        "// satisfy, the composition-root acceptance criterion -- every TODO\n"
+        "// below must be completed and the finished test must exercise the\n"
+        "// real composition root before test-reviewer's rubric item passes.\n"
+        "//\n"
+        "// TODO: import the application's REAL root reducer / store factory\n"
+        "// (the same module the production entry point assembles), not a\n"
+        "// configureStore()/combineReducers() call built solely for this test.\n"
+        "//\n"
+        "// TODO: mount the component under test through the real top-level\n"
+        "// <Provider store={{realStore}}> tree (or the smallest real ancestor,\n"
+        "// documented in this task's ### Approach per the smallest-real-ancestor\n"
+        "// exception) -- never an isolated render with a hand-built store.\n"
+    ),
+    _STORE_SHAPE_ANGULAR_DI: (
+        "// Composition-root store-factory test skeleton\n"
+        "// Generated by: uv run devbench scaffold-store-factory {unit_id} --out <path>\n"
+        "// Detected store shape: angular-di\n"
+        "//\n"
+        "// See docs/composition-root-testing.md for the full store-factory\n"
+        "// convention. This skeleton relates to, but does NOT by itself\n"
+        "// satisfy, the composition-root acceptance criterion -- every TODO\n"
+        "// below must be completed and the finished test must exercise the\n"
+        "// real composition root before test-reviewer's rubric item passes.\n"
+        "//\n"
+        "// TODO: configure TestBed with the application's REAL root NgModule /\n"
+        "// route tree and its actual DI providers, not hand-picked stand-ins\n"
+        "// for every dependency.\n"
+        "//\n"
+        "// TODO: mount the component under test through that real module tree\n"
+        "// (or the smallest real ancestor, documented in this task's\n"
+        "// ### Approach per the smallest-real-ancestor exception) -- never a\n"
+        "// TestBed configured with hand-picked stand-ins for every dependency.\n"
+    ),
+}
+
+
+class _StoreShapeScopeScan(NamedTuple):
+    """Categorised result of reading a work unit's scope for store-shape detection.
+
+    ``scanned`` is every scope file whose content was ACTUALLY READ --
+    extension in ``_STORE_SHAPE_SOURCE_EXTENSIONS``, present on disk, and
+    UTF-8 decodable -- with that content available in ``contents`` (keyed
+    by relative path). ``excluded_extension``, ``excluded_missing`` and
+    ``excluded_undecodable`` record every scope file that was NOT read,
+    and why, so a caller reporting a failure can name the files it
+    actually scanned without conflating them with files it never opened
+    (code_review round 3, E9-F1-S1-T2, Blocking: the prior single-list
+    "Files scanned" message named the WHOLE resolved scope, even though
+    most of it -- anything outside the extension allowlist -- was never
+    opened at all).
+    """
+
+    scanned: tuple[str, ...]
+    contents: dict[str, str]
+    excluded_extension: tuple[str, ...]
+    excluded_missing: tuple[str, ...]
+    excluded_undecodable: tuple[str, ...]
+
+
+def _scan_store_shape_scope_files(repo_path: Path, files: list[str]) -> _StoreShapeScopeScan:
+    """Read every scope file plausibly containing store-shape source, categorising the rest.
+
+    ``files`` is the unit's already-resolved Changes-Manifest scope (spec
+    4.3, :func:`devbench.work_unit_scope.resolve_changed_files`) -- this
+    function never scans the wider repo, only the files this unit actually
+    touches. Only files whose suffix is in ``_STORE_SHAPE_SOURCE_EXTENSIONS``
+    are read at all (code_review round 2, E9-F1-S1-T2, Blocking): a Markdown
+    file or an unrelated Python module that merely MENTIONS a marker
+    substring in prose or a comment is not evidence of a real store, and
+    unqualified substring matching over every scope file previously
+    false-positived a `redux` detection against this repo's own docs and
+    source. A file that no longer exists on disk (e.g. a Manifest-declared
+    delete) is categorised as excluded rather than raising; a non-UTF-8
+    file is also categorised as excluded rather than aborting detection
+    for the whole scope. An ``OSError`` (e.g. a permission failure)
+    reading a file that DOES exist is NOT swallowed here -- silently
+    treating an unreadable file as marker-free would report that file as
+    "scanned" on an eventual undetected-shape failure even though it was
+    never actually read, masking the real cause. It propagates to the
+    caller, which reports it explicitly and exits 1 (CLAUDE.md "no silent
+    failures").
+
+    Returns:
+        A :class:`_StoreShapeScopeScan` categorising every file in ``files``.
+
+    Raises:
+        OSError: A scope file exists but could not be read (e.g. a
+            permission failure).
+    """
+    scanned: list[str] = []
+    contents: dict[str, str] = {}
+    excluded_extension: list[str] = []
+    excluded_missing: list[str] = []
+    excluded_undecodable: list[str] = []
+    for relative_path in files:
+        abs_path = repo_path / relative_path
+        if abs_path.suffix not in _STORE_SHAPE_SOURCE_EXTENSIONS:
+            excluded_extension.append(relative_path)
+            continue
+        if not abs_path.is_file():
+            excluded_missing.append(relative_path)
+            continue
+        try:
+            contents[relative_path] = abs_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            excluded_undecodable.append(relative_path)
+            continue
+        scanned.append(relative_path)
+    return _StoreShapeScopeScan(
+        scanned=tuple(scanned),
+        contents=contents,
+        excluded_extension=tuple(excluded_extension),
+        excluded_missing=tuple(excluded_missing),
+        excluded_undecodable=tuple(excluded_undecodable),
+    )
+
+
+def _detect_store_shape(repo_path: Path, files: list[str]) -> str | None:
+    """Return the first store shape from ``_STORE_SHAPE_MARKERS`` found in ``files``.
+
+    Delegates the read/categorisation work to
+    :func:`_scan_store_shape_scope_files` (single read path, DRY), then
+    checks each recognised shape's markers, in ``_STORE_SHAPE_MARKERS``
+    iteration order, against every file that scan actually read.
+
+    Returns:
+        The detected shape name, or ``None`` when no scope file's content
+        matches any recognised shape's markers.
+
+    Raises:
+        OSError: A scope file exists but could not be read (e.g. a
+            permission failure).
+    """
+    scan = _scan_store_shape_scope_files(repo_path, files)
+    for shape, markers in _STORE_SHAPE_MARKERS.items():
+        for relative_path in scan.scanned:
+            if any(marker in scan.contents[relative_path] for marker in markers):
+                return shape
+    return None
+
+
+def _render_store_factory_skeleton(unit_id: str, shape: str) -> str:
+    """Render the store-factory test skeleton text for ``shape``, naming ``unit_id``."""
+    return _STORE_FACTORY_SKELETON_TEMPLATES[shape].format(unit_id=unit_id)
+
+
+def _undetected_store_shape_message(unit_id: str, scan: _StoreShapeScopeScan) -> str:
+    """Build the exit-1 message for an undetected store shape, naming only files actually read.
+
+    Extracted so the "no shape detected" message can distinguish the files
+    :func:`_detect_store_shape` actually opened (``scan.scanned``) from
+    every scope file it excluded, and why (code_review round 3,
+    E9-F1-S1-T2, Blocking): naming the WHOLE resolved scope under "Files
+    scanned" -- when most of it was never opened because its extension is
+    outside ``_STORE_SHAPE_SOURCE_EXTENSIONS`` -- masks the real cause the
+    same way the module's own ``OSError``-is-not-swallowed rationale
+    warns against for an unreadable file.
+    """
+    total_scope_files = (
+        len(scan.scanned) + len(scan.excluded_extension) + len(scan.excluded_missing) + len(scan.excluded_undecodable)
+    )
+    if scan.scanned:
+        scanned = ", ".join(scan.scanned)
+    elif total_scope_files == 0:
+        scanned = "(no files in unit scope)"
+    else:
+        scanned = "(none)"
+    extensions = ", ".join(_STORE_SHAPE_SOURCE_EXTENSIONS)
+    parts = [
+        f"ERROR: scaffold-store-factory: no recognised store shape detected for unit '{unit_id}'. "
+        f"Files scanned ({extensions} only): {scanned}."
+    ]
+    if scan.excluded_extension:
+        parts.append(
+            f"Excluded from scanning (extension not in the allowlist above): {', '.join(scan.excluded_extension)}."
+        )
+    if scan.excluded_missing:
+        parts.append(f"Excluded from scanning (not present on disk): {', '.join(scan.excluded_missing)}.")
+    if scan.excluded_undecodable:
+        parts.append(f"Excluded from scanning (not UTF-8 decodable): {', '.join(scan.excluded_undecodable)}.")
+    parts.append(
+        "See docs/composition-root-testing.md for the supported store shapes and the store-factory convention."
+    )
+    return " ".join(parts)
+
+
+def _detect_store_shape_or_report(repo_path: Path, files: list[str], unit_id: str) -> str | int:
+    """Detect ``unit_id``'s store shape, or report the failure and return exit code 1.
+
+    Extracted out of :func:`cmd_scaffold_store_factory` to keep that
+    function's return-statement count within ruff's threshold (PLR0911),
+    mirroring the existing ``_prepare_shared_file_impact_scope_and_registry``
+    -style helpers this module already uses for the same reason. Wraps
+    :func:`_detect_store_shape`, translating both of its failure modes --
+    an ``OSError`` reading a scope file that exists, and no scope file
+    matching any recognised shape -- into an already-printed ``ERROR: ...``
+    line and exit code ``1`` (spec 4.9(b)).
+
+    Returns:
+        The detected shape name on success, or ``1`` on either failure.
+    """
+    try:
+        shape = _detect_store_shape(repo_path, files)
+    except OSError as exc:
+        print(
+            f"ERROR: scaffold-store-factory: could not read scope file while detecting store shape "
+            f"for unit '{unit_id}': {exc}.",
+            file=sys.stderr,
+        )
+        return 1
+    if shape is None:
+        scan = _scan_store_shape_scope_files(repo_path, files)
+        print(_undetected_store_shape_message(unit_id, scan), file=sys.stderr)
+        return 1
+    return shape
+
+
+def _write_store_factory_skeleton_exclusive(out_path: Path, skeleton: str, shape: str, overwrite_refusal: str) -> int:
+    """Write ``skeleton`` to ``out_path`` via exclusive creation, or report the refusal.
+
+    Extracted out of :func:`cmd_scaffold_store_factory` to keep that
+    function's return-statement count within ruff's threshold (PLR0911).
+    ``--out``'s missing parent directories are created first
+    (``mkdir(parents=True, exist_ok=True)``); the write itself uses
+    exclusive creation (``Path.open(mode="x")``) so a file created in the
+    (narrow) TOCTOU window after :func:`cmd_scaffold_store_factory`'s
+    earlier ``out_path.exists()`` check is still refused by the filesystem
+    itself, never silently clobbered.
+
+    Returns:
+        ``0`` on a successful write (after printing the success line).
+        ``1`` when ``out_path`` already exists at write time (after
+        printing ``overwrite_refusal``).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with out_path.open("x", encoding="utf-8") as handle:
+            handle.write(skeleton)
+    except FileExistsError:
+        print(overwrite_refusal, file=sys.stderr)
+        return 1
+    print(f"Wrote {out_path} (detected store shape: {shape})")
+    return 0
+
+
+def cmd_scaffold_store_factory(*argv: str) -> int:
+    """Emit a composition-root store-factory test skeleton (spec 4.9(b), issue #11 AC2 item 3).
+
+    Usage::
+
+        scaffold-store-factory <unit-id> --out <path>
+
+    Root-cause closure (decision D-9) of the store-factory convention PR
+    #316 deferred: resolves ``unit-id``'s changed files through the SAME
+    shared scope helper every other gate/verb uses
+    (:func:`_resolve_scope_or_report`, i.e.
+    :func:`devbench.work_unit_scope.resolve_changed_files`, spec 4.3) --
+    this command introduces no second scope-resolution path -- detects the
+    store shape from those files' content
+    (:func:`_detect_store_shape_or_report`), and writes the matching
+    skeleton (:func:`_render_store_factory_skeleton`,
+    :func:`_write_store_factory_skeleton_exclusive`) to ``--out`` only when
+    that path does not already exist.
+
+    Every failure path is loud (spec 4.9): a missing unit id, a missing
+    ``--out`` value, or an unrecognised flag is a usage error naming the
+    offending argument; an unknown unit id fails through the same
+    ``_resolve_unit_repo_and_path`` "not found" path every other gate/verb
+    uses; an ``--out`` path that already exists is refused without writing
+    (``--force`` is absent by design so a generated skeleton can never
+    silently overwrite hand-written test code); an undetectable store shape
+    names the files scanned and never falls back to a generic placeholder
+    skeleton; an unreadable scope file (``OSError``, e.g. a permission
+    failure) is reported by name rather than silently treated as
+    marker-free.
+
+    The refuse-to-overwrite guarantee is enforced twice. The
+    ``out_path.exists()`` check runs AFTER unit and scope resolution (so a
+    typo'd unit id or a scope-resolution failure -- e.g. a malformed
+    Changes Manifest -- is reported through its own normal error path
+    first, before the write is even considered) but BEFORE the shape
+    detection and write steps, giving a fast, friendly exit relative to
+    those two -- not relative to scope resolution (doc_review/code_review
+    round 2, E9-F1-S1-T2: a prior version of this docstring incorrectly
+    claimed the check ran before scope resolution). The final write
+    (:func:`_write_store_factory_skeleton_exclusive`) uses exclusive
+    creation so a file created in the (narrow) window between that check
+    and the write is still refused by the filesystem itself, never
+    silently clobbered (TOCTOU). ``--out``'s missing parent directories
+    are created (``mkdir(parents=True, exist_ok=True)``) before the
+    exclusive-create write.
+
+    Returns:
+        0 on a successful write. 1 when the unit id is unknown, the repo
+        has no configured local path, scope resolution fails, the ``--out``
+        path already exists, a scope file could not be read, or no
+        recognised store shape is detected. 2 on a usage error
+        (missing/duplicated unit id, unknown flag, or a missing/empty
+        ``--out`` value).
+    """
+    parsed = _parse_unit_id_and_required_flag_argv(
+        argv, verb="scaffold-store-factory", flag="--out", value_placeholder="<path>"
+    )
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, out_path_str = parsed
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _unit, _canonical_repo, repo_path = resolved
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+
+    out_path = Path(out_path_str)
+    overwrite_refusal = (
+        f"ERROR: scaffold-store-factory: output path '{out_path}' already exists; refusing to "
+        "overwrite (--force is absent by design; spec 4.9)."
+    )
+    if out_path.exists():
+        print(overwrite_refusal, file=sys.stderr)
+        return 1
+
+    shape = _detect_store_shape_or_report(repo_path, scope.files, unit_id)
+    if isinstance(shape, int):
+        return shape
+
+    skeleton = _render_store_factory_skeleton(unit_id, shape)
+    return _write_store_factory_skeleton_exclusive(out_path, skeleton, shape, overwrite_refusal)
+
+
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     """Find a work unit by ID (case-insensitive)."""
     for unit in units:
@@ -19021,6 +19458,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         0,
         "Fan an ancestry-gate task into every DAG root: wire-gate <gate-task-id> --blocks-roots",
     ),
+    "scaffold-store-factory": (
+        cmd_scaffold_store_factory,
+        0,
+        "Emit a composition-root store-factory test skeleton: scaffold-store-factory <id> --out <path>",
+    ),
     "materialise-proposal": (
         cmd_materialise_proposal,
         1,
@@ -19064,6 +19506,9 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         # E7-F1-S1-T1 (spec 4.8): owns its own <id> / --flag <name> parsing,
         # same rationale as wire-gate above.
         "check-write-path",
+        # E9-F1-S1-T2 (spec 4.9(b)): owns its own <id> / --out <path> parsing,
+        # same rationale as check-write-path above.
+        "scaffold-store-factory",
         "decline",
         # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
         "green-green-check",

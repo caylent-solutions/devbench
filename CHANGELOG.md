@@ -5,6 +5,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] -- v-next
 
+### Added
+
+- **`scaffold-store-factory` CLI verb: a composition-root store-factory test
+  skeleton generator** (spec `integration-reality-gates-hardening.md`
+  section 4.9(b), issue `caylent-solutions/devbench-internal-backlog#11`
+  AC2 item 3; decision D-9; E9-F1-S1-T2). Root-cause closure of the
+  store-factory convention PR `caylent-solutions/devbench#316` deferred:
+  `uv run devbench scaffold-store-factory <unit-id> --out <path>` resolves
+  the unit's changed files through the shared ADR-12 scope helper (spec
+  4.3), detects the store shape (`redux` or `angular-di`) from those
+  files' content, and writes a matching test skeleton to `--out`, refusing
+  to overwrite an existing path (`--force` is absent by design). An
+  undetectable store shape exits 1 naming the files scanned, never a
+  placeholder skeleton. `docs/composition-root-testing.md` gains a v2
+  "Store-factory convention" section documenting the generator and how the
+  emitted skeleton relates to (but does not by itself satisfy) the
+  composition-root acceptance criterion; `docs/cli-reference.md` gains the
+  `### scaffold-store-factory` entry under `## Gates`, pinned against
+  drift by `tests/test_docs/test_cli_reference_scaffold_store_factory.py`.
+
 ### Changed
 
 - **The composition-root testing requirement is now keyed off the task
@@ -129,8 +149,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on a `load_error` line, still reached stdout raw: `flag_name` is
   spec-derived (the `spec-to-backlog` SKILL's Step 3b-ii lifts it out of
   spec prose as `<existing-flag-name>`), not purely operator-typed, and
-  `cli._parse_check_write_path_argv` applies no control-character rejection
-  to it, while a `load_error`'s `<error>` text can carry a
+  `cli._parse_unit_id_and_required_flag_argv` applies no control-character
+  rejection to it, while a `load_error`'s `<error>` text can carry a
   locale-translated, non-ASCII `OSError.strerror`. `docs/cli-reference.md`'s
   `check-write-path` stdout enumeration is corrected to state this, pinned
   by a new `TestCheckWritePathRelativePathEscapingDocumented` case -- the

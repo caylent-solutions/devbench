@@ -212,7 +212,7 @@ Section 9); the `enabled` field's four-layer precedence is unaffected.
 
 A list of repo-relative paths naming shared, stateful primitives' defining file(s) -- a shared
 z-index tier module, a shared dirty-flag/`setField` write path, a shared close/dismiss callback --
-that a newly-reachable-paths bug-fix task should be cross-checked against. This is the migrated,
+that a newly-reachable-paths behavior-fix task should be cross-checked against. This is the migrated,
 config-backed home of the retired free-text primitives registry under `backlog/config/`
 (`docs/newly-reachable-paths.md`'s "Optional: the cross-cutting-primitives registry" section): the
 same convention, now schema-validated and resolved through the same four-layer precedence model

@@ -214,7 +214,7 @@ A list of repo-relative paths naming shared, stateful primitives' defining file(
 z-index tier module, a shared dirty-flag/`setField` write path, a shared close/dismiss callback --
 that a newly-reachable-paths behavior-fix task should be cross-checked against. This is the migrated,
 config-backed home of the retired free-text primitives registry under `backlog/config/`
-(`docs/newly-reachable-paths.md`'s "Optional: the cross-cutting-primitives registry" section): the
+(`docs/newly-reachable-paths.md`'s "Gate config: `gates.newly_reachable_paths`" section): the
 same convention, now schema-validated and resolved through the same four-layer precedence model
 every other gate tunable uses, instead of a hand-maintained markdown table two prompt-driven agents
 read via `cat`.

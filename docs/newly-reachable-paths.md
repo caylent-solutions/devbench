@@ -1,4 +1,4 @@
-# Newly-Reachable Code Paths: Bug-Fix Definition of Done
+# Newly-Reachable Code Paths: the `behavior-fix` Verification Obligation
 
 ## The problem
 
@@ -20,8 +20,8 @@ found broken one level at a time.
 
 ## The rule
 
-**A bug-fix task's Definition of Done is not satisfied by the original repro passing
-alone.** It additionally requires:
+**A `behavior-fix` task is not verified merely because the original repro passes.** It
+additionally requires:
 
 1. **Enumeration** -- an explicit list of the code paths this fix newly makes
    reachable (paths that could not execute, render, or receive user interaction while
@@ -29,28 +29,50 @@ alone.** It additionally requires:
 2. **Live verification** -- a real, smoke-test-level check of each enumerated path,
    not a read-through of the code asserting it "should" work.
 
-## What counts as a "bug-fix task"
+This is expressed as an **acceptance criterion**, never a Definition-of-Done checklist
+item (spec `integration-reality-gates-hardening.md` Section 1.3 S1, findings 320-D04
+and C-06): a Definition-of-Done checkbox is auto-ticked by the orchestrator on the
+`done` transition, so it is a record of completion, not something any judge evaluates
+before completion -- it can never function as a gate. An acceptance criterion is a
+surface the review judges actually read and can reject against, so the requirement
+lives there instead.
 
-Two related mechanisms decide this today, on different signals (see "Known
-limitations" below for why they are not yet unified):
+## What triggers this obligation: the `## Task Type:` taxonomy
 
-- **`generate_draft_md`'s Definition-of-Done auto-append** (`proposal.py`) is keyed
-  on the drafted task's Task Type: it appends the newly-reachable-paths item whenever
+The work unit's own `## Task Type: behavior-fix` declaration (the taxonomy
+`devbench.backlog.manager.BacklogManager` validates on every leaf task,
+`constants.VALID_TASK_TYPES`) keys the executor's, the code-reviewer's and the
+blocker-resolver's obligations described below. It does NOT apply to `docs`, `chore`,
+`test-only`, `refactor`, or `feature`-typed units. One surface is the exception:
+`generate_draft_md`'s acceptance-criterion auto-append (first bullet below) keys off a
+related but distinct field, `ProposedTask.task_type`, not the rendered `## Task Type:`
+header -- see that bullet for how the two can diverge.
+
+- **`generate_draft_md`'s acceptance-criterion auto-append** (`proposal.py`,
+  E8-F1-S1-T1) appends the newly-reachable-paths AC line whenever the drafted task's
   `ProposedTask.task_type` resolves to `constants.TASK_TYPE_BEHAVIOR_FIX` -- the same
-  `## Task Type:` taxonomy `manager.py` already validates on every leaf task.
+  default (`constants.DEFAULT_TASK_TYPE`) every proposal carries unless a caller
+  overrides it.
 - **The executor's and code-reviewer's BUG-FIX COMPLETENESS obligation** (see
-  `executor.md` / `code-reviewer.md`) applies whenever a work unit's title starts with
-  "Fix" (the imperative-title convention `blocker-resolver.md` already requires for
-  defect-correction proposals), or its Description / Approach explicitly frames the
-  work as correcting a defect: a crash, a permanently-disabled control, an exception
-  that was silently short-circuiting downstream logic, a component that never
-  mounted, a condition that always took the early-return branch.
+  `executor.md` / `code-reviewer.md`) applies whenever the work unit being executed or
+  reviewed declares `## Task Type: behavior-fix`.
+- **`blocker-resolver.md`**'s proposal-authoring guidance uses the same field: a
+  proposal's `task_type` defaults to `behavior-fix`, so an imperative `Fix ...` title
+  documents intent for a human reader but is not itself what wires the requirement.
 
-It does NOT apply to greenfield feature work, refactors with no reported defect, or
-documentation-only tasks. Judgment call: when in doubt, err toward treating a task as
-bug-fix-shaped rather than skipping the step -- the cost of an unnecessary "none, this
-fix is self-contained" line is one sentence; the cost of skipping a genuinely
-gated-path fix is another multi-round remediation chain.
+Prior to E8-F1-S1-T1/T2 these four surfaces each carried an independent "is this
+bug-fix-shaped" title/description heuristic (`its title starts with "Fix"...`). That
+heuristic is retired from the executor, the code-reviewer, the blocker-resolver and this
+doc; `## Task Type: behavior-fix` is the single source of truth across all four. A fifth
+surface, the authoring skill `plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md`,
+carried the same retired heuristic and the same retired Definition-of-Done carrier; the
+follow-up task E8-F1-S1-T3 rewrote both spots (Step 1b item 13 now reads "Newly-reachable-paths
+requirement is NOT a Definition of Done item" and keys off `## Task Type: behavior-fix`,
+and the validation checklist item was renamed from "Bug-fix DoD completeness" to
+"Newly-reachable-paths AC completeness"), so all five surfaces now agree.
+When in doubt while drafting a task, declare `behavior-fix` rather than a weaker type --
+the cost of an unnecessary "none, this fix is self-contained" marker is one CLI call; the
+cost of skipping a genuinely gated-path fix is another multi-round remediation chain.
 
 ## What counts as adequate enumeration
 
@@ -77,7 +99,7 @@ gate the fix removed.
 If, after genuine consideration, the fix unlocks no new code path (the defect was
 fully self-contained -- e.g. a typo in a log message, an off-by-one in a value nothing
 downstream reads), say so explicitly with a one-sentence justification rather than
-omitting the step.
+omitting the step (see "When no path is newly reachable" below).
 
 ## What counts as live verification
 
@@ -92,27 +114,29 @@ bug discovered during TDD GREEN (fixed under the minimal-scope amendment path if
 scope, or escalated as a follow-up proposal if not). See `executor.md`'s "BUG-FIX
 COMPLETENESS" section for the exact procedure.
 
-## The audit trail: `[NEWLY_REACHABLE]`
+## The audit trail: `[NEWLY_REACHABLE] <path> <method> <result>`
 
 Before logging completion, the executor logs one structured marker per newly-reachable
-path:
+path (spec Section 5.3):
 
 ```bash
 uv run devbench log-newly-reachable <task-id> --path <p> --method <m> --result <r>
 ```
 
-This writes `[NEWLY_REACHABLE] <path> <method> <result>` (spec section 5.3 field
-order) into the unit's `## TDD Cycle Log` section -- the audit surface that survives
-every review judge's `read-unit --strip-comments` Evidence fetch (the PM-6
-evidence-horizon rule, E2-F3-S1-T2). Call it once per newly-reachable path; each
-invocation appends exactly one marker line.
+This writes `[NEWLY_REACHABLE] <path> <method> <result>` into the unit's
+`## TDD Cycle Log` section -- the audit surface that survives every review judge's
+`read-unit --strip-comments` Evidence fetch (the PM-6 evidence-horizon rule,
+E2-F3-S1-T2). `## Comments` itself is stripped by that fetch; `log-newly-reachable`
+never writes there. Call it once per newly-reachable path; each invocation appends
+exactly one marker line.
 
-- `<p>` -- the specific code path (file, route, component) made newly reachable. A
-  single non-empty token with no whitespace.
-- `<m>` -- how the path was verified: `manual`, `unit_test`, `integration_test`, or
-  `functional_test` (`cli.NEWLY_REACHABLE_METHODS`).
-- `<r>` -- the verification outcome: `verified` (the path behaves correctly) or
-  `broken` (verification surfaced a new, independent defect).
+- `<p>` (`--path`) -- the specific code path (file, route, component) made newly
+  reachable. A single non-empty token with no whitespace.
+- `<m>` (`--method`) -- how the path was verified: `manual`, `unit_test`,
+  `integration_test`, or `functional_test` (`cli.NEWLY_REACHABLE_METHODS`).
+- `<r>` (`--result`) -- the verification outcome: `verified` (the path behaves
+  correctly) or `broken` (verification surfaced a new, independent defect)
+  (`cli.NEWLY_REACHABLE_RESULTS`).
 
 Example:
 
@@ -122,10 +146,13 @@ $ uv run devbench log-newly-reachable E9-F1-S1-T1 \
 {"unit_id": "E9-F1-S1-T1", "path": "src/ui/LegacyPanel.tsx", "method": "manual", "result": "verified"}
 ```
 
-See `docs/cli-reference.md`'s `log-newly-reachable` entry for the full argument list
-and exit-code contract (`0`/`1`/`2`).
+Exit codes: `0` on success (the marker was written); `1` when the unit does not exist;
+`2` (usage error, naming the offending argument) when a required field is missing or
+empty, or `--method`/`--result` names an unknown value. A non-zero exit is a hard stop
+for the executor -- see `executor.md`'s Main sequence. See `docs/cli-reference.md`'s
+`log-newly-reachable` entry for the full argument list and exit-code contract.
 
-**Migration note (superseded convention).** This section previously instructed the
+**Migration note (superseded convention).** This document previously instructed the
 executor to log free-text `[NEWLY_REACHABLE] ...` prose via `log-comment` into a work
 unit's `## Comments` section. That convention is superseded by `log-newly-reachable`
 (E2-F4-S1-T2) and must not be used going forward: `## Comments` is stripped by every
@@ -157,79 +184,129 @@ structured schema for the no-path case today (see "Known limitations" below).
 This is a two-sided control: a self-reported step alone (executor-only) is weaker than
 having an independent check that the self-report actually happened and holds up.
 
-- **`executor.md`** ("BUG-FIX COMPLETENESS" section) -- the executing agent enumerates
-  and live-verifies as part of doing the fix, before logging completion.
-- **`blocker-resolver.md`** (STEP 5, `suggested_acs` guidance) -- when a proposed
-  follow-up task is itself a bug fix, the proposal seeds an explicit AC requiring the
-  eventual executor to do this, so the requirement travels with the task from creation.
-- **`proposal.py` (`generate_draft_md`)** -- proposals whose `task_type` resolves to
-  `constants.TASK_TYPE_BEHAVIOR_FIX` automatically get an extra Definition of Done
-  checklist item requiring the enumeration + live-verification step, so materialised
-  drafts carry the requirement even before a human edits them.
-- **`code-reviewer.md`** ("BUG-FIX COMPLETENESS" rubric) -- the independent check.
-  A bug-fix-shaped task with no `[NEWLY_REACHABLE]` marker in its `## TDD Cycle Log`
-  fails review, even if the original repro now passes and every other rubric item is
-  clean. This is the gate that makes the requirement more than self-reported: the
-  executor's own claim is not sufficient for the task to close.
+- **`executor.md`** ("BUG-FIX COMPLETENESS: newly-reachable paths" section) -- the
+  executing agent enumerates and live-verifies as part of doing the fix, then runs
+  `log-newly-reachable` once per path (Main sequence), before logging completion.
+- **`blocker-resolver.md`** (PROPOSAL EMISSION, `suggested_acs` guidance) -- when a
+  proposed follow-up task is itself a fix that was gating off a code path, the proposal
+  seeds an explicit AC naming `log-newly-reachable`, so the requirement travels with
+  the task from creation. A missing or failing marker on a `behavior-fix` unit is
+  escalated as a real finding -- never hand-written into a comment as a substitute, and
+  never claimed in a proposal without having been observed.
+- **`proposal.py` (`generate_draft_md`)** -- a drafted task whose `task_type` resolves
+  to `constants.TASK_TYPE_BEHAVIOR_FIX` automatically gets an extra acceptance
+  criterion requiring the enumeration + live-verification step, so materialised drafts
+  carry the requirement even before a human edits them. This auto-append happens
+  regardless of whether the `newly_reachable_paths` gate below is enabled for the
+  target repo -- see "Gate config vs. the drafted AC" below for how the executor
+  reconciles the two.
+- **`code-reviewer.md`** ("BUG-FIX COMPLETENESS" rubric, rubric 53) -- the independent
+  check, conditioned on the gate's resolved status for the repo. While the
+  `newly_reachable_paths` row of the `uv run devbench gates` table resolves `status`
+  `enabled`, a `behavior-fix` unit with no `[NEWLY_REACHABLE]` marker in its
+  `## TDD Cycle Log` fails review (a GREEN `log-tdd` "nothing unlocked" entry is an
+  acceptable substitute for the marker, since `log-newly-reachable` has no `none`
+  sentinel); "the original repro now passes" alone is never accepted. When the
+  resolved `status` instead reads `disabled` (`constants.GATE_ENABLED_DEFAULT` is
+  `false` at every level, so this is the common case), the executor correctly skips
+  the `log-newly-reachable` CLI call and rubric 53 does not fail for the missing
+  marker -- it instead requires the GREEN `log-tdd` entry to record the
+  enumeration/live-verification evidence directly. Either way, the executor's own
+  claim alone is not sufficient for the task to close: rubric 53 is the independent
+  check that the self-report actually happened.
 
-## Optional: the cross-cutting-primitives registry
+`newly_reachable_paths` is declared a **judge-evidence** gate
+(`constants.GATE_TIERS`, spec Section 4.2, D-6), not machine-blocking: the
+`[NEWLY_REACHABLE]` marker(s) are evidence the code-reviewer weighs when forming its
+verdict, not a condition `mark-done` itself checks. A disabled or unconfigured gate for
+a repo is neither a pass nor a fail signal -- it means the repo has not opted in, so
+the code-reviewer treats an absent marker on that repo's units as informational only.
 
-A subset of "newly-reachable path" failures are not just newly-exposed pre-existing
-bugs -- the fix itself introduces the break by reusing a shared, stateful primitive
-(a shared z-index tier, a shared dirty-flag/`setField` write path, a shared
-close/dismiss callback) without accounting for that primitive's other consumers.
+## Gate config: `gates.newly_reachable_paths`
 
-Workspaces that want a lightweight reminder for this can create an optional registry
-file at `backlog/config/cross-cutting-primitives.md` (workspace-relative, next to
-`backlog/config/devbench.yaml`). There is no schema validation or CLI enforcement for
-this file today -- it is a plain markdown convention that `executor.md` and
-`code-reviewer.md` read (via `cat`, when present) and cross-reference against the
-diff's changed files. Format:
+The cross-cutting-primitives registry (below) and the gate's `enabled` switch both live
+in the unified gates config (`backlog/config/devbench.yaml`, spec 4.1, decision C-03),
+resolved exclusively through `config_loader.resolve_gate_config` -- never read directly
+off `RuntimeConfig.gates` by any caller other than the resolver itself (AC-27):
 
-```markdown
-# Cross-Cutting Primitives
-
-| Primitive | Defining file(s) | Known consumers |
-|-----------|-------------------|------------------|
-| Modal z-index tier | `src/ui/zindex.ts` | `Modal`, `Toast`, `Tooltip`, `CommandPalette` |
-| Form dirty-flag write path | `src/forms/useDirtyField.ts` | every screen under `src/forms/screens/` |
-| Shared close/dismiss callback | `src/ui/useDismissable.ts` | `Modal`, `Drawer`, `Popover` |
+```yaml
+gates:
+  newly_reachable_paths:
+    enabled: false             # judge-evidence tier; disabled by default at every level (D-17)
+    paths: []                  # repo-relative paths; empty/absent means no registry configured
+  repos:
+    caylent-solutions/devbench:
+      newly_reachable_paths:
+        enabled: true
+        paths:
+          - "src/ui/zindex.ts"
 ```
 
-When a diff touches a defining file (or a file plausibly implementing one of the
-listed primitives), the executor and the code-reviewer both treat it as a prompt to
-check the primitive's other named consumers as part of the enumeration/verification
-step above -- not just the consumer that was the subject of the fix.
+- **`enabled`** -- whether the gate is opted into for a repo. Resolves through the
+  standard four-layer precedence (built-in `false` -> project -> per-repo override ->
+  `DEVBENCH_GATE_NEWLY_REACHABLE_PATHS_ENABLED` environment override), same as every
+  other gate. See `docs/devbench-yaml-reference.md`'s `gates:` section for the full
+  precedence model.
+- **`paths`** -- repo-relative paths naming the shared, stateful primitives' defining
+  file(s) (a z-index tier module, a shared dirty-flag write path, a shared
+  close/dismiss callback) that a `behavior-fix` unit should be cross-checked against.
+  This is the migrated, schema-validated home of the retired free-text
+  `backlog/config/cross-cutting-primitives.md` convention: no such file exists in this
+  workspace layout anymore, and none should be created. Unlike most gate tunables,
+  `paths` also carries a real per-repo override -- a non-empty repo-level list replaces
+  the project-level list wholesale for that repo (D-15 field-wise merge); an
+  empty/absent repo-level list inherits the project-level list unchanged. Absolute
+  paths and `..` traversal segments are rejected at config-load time
+  (`config_loader._parse_repo_relative_path_list`).
 
-**This is intentionally a v1, not a static-analysis tool.** No devbench code parses or
-diffs against this file automatically; it is plain text a workspace maintains by hand
-and two agents read as extra evidence. See "Known limitations" below for what a fuller
-version would need.
+When a diff touches a file named in the resolved `paths` list (or a file plausibly
+implementing one of the named primitives), the executor and the code-reviewer both
+treat it as a prompt to check the primitive's other consumers as part of the
+enumeration/verification step above -- not just the consumer that was the subject of
+the fix. To read the resolved value: run `uv run devbench gates` and check the
+`newly_reachable_paths` row's `status`/`provenance` columns -- that row resolves against
+whichever repo's override actually sets `enabled` (the first sorted repo carrying one),
+which is NOT guaranteed to be this repo once more than one repo carries an override; when
+in doubt confirm this repo's actual enabled/disabled value directly via
+`gates.repos.<org/repo>.newly_reachable_paths.enabled` in `backlog/config/devbench.yaml`.
+Then read the `gates.newly_reachable_paths.paths` and
+`gates.repos.<org/repo>.newly_reachable_paths.paths` entries directly from
+`backlog/config/devbench.yaml` for the configured path list -- `devbench gates` itself
+renders status/provenance only, not the `paths` list.
+
+## Gate config vs. the drafted AC
+
+`generate_draft_md`'s acceptance-criterion auto-append (above) fires on every
+`behavior-fix`-typed draft, independent of whether `newly_reachable_paths.enabled` is
+`true` for the target repo -- the AC append is a Task-Type decision, not a gate-config
+decision. This means an operator who has not opted into the gate for a repo can still
+receive a drafted unit carrying the newly-reachable-paths AC.
+
+The executor does not skip that AC on a disabled gate. Enumeration and live
+verification (the two requirements under "The rule" above) are basic engineering
+hygiene independent of gate configuration, so the executor still performs them and
+records the evidence -- via the GREEN `log-tdd` entry when nothing new is unlocked, or
+via `log-newly-reachable` when it is. Only the `log-newly-reachable` CLI call itself
+is conditioned on `newly_reachable_paths.enabled` being `true` for the repo, because
+that machine-readable marker exists specifically to feed the code-reviewer's
+judge-evidence rubric, and invoking the gate-specific CLI verb for a repo that has not
+opted into the gate would ask for tooling the review rubric never actually consults.
 
 ## Known limitations / follow-ups
 
-- `generate_draft_md`'s auto-append is keyed on the `## Task Type:` taxonomy
-  (`constants.TASK_TYPE_BEHAVIOR_FIX`) rather than a title heuristic. The broader
-  "is this task bug-fix-shaped" judgment used by `executor.md`'s BUG-FIX COMPLETENESS
-  section, `blocker-resolver.md`'s AC-seeding, and `code-reviewer.md`'s rubric scoping
-  still relies on the title/description heuristic described above. Unifying all of
-  these onto the Task-Type taxonomy, plus merging PR #320's file-existence registry
-  into the gates config, is E8-F1-S1-T1's scope (spec 4.9a, C-03).
-- The cross-cutting-primitives registry is read as free text by two prompt-driven
-  agents; it is not schema-validated, not wired into `backlog/config/devbench.yaml`,
-  and no CLI command diffs a work unit's Changes Manifest against it automatically. A
-  follow-up could add a `cmd_check_cross_cutting_primitives` CLI helper that does a
-  deterministic path-match and surfaces a `[CROSS_CUTTING_PRIMITIVE_TOUCHED]` audit
-  line, removing the dependence on the agent noticing the overlap unprompted.
+- The `paths` registry is read as configuration, not diffed automatically: no CLI
+  command compares a work unit's Changes Manifest against `gates.newly_reachable_paths.paths`
+  and surfaces a structured finding. A follow-up could add a
+  `cmd_check_cross_cutting_primitives` CLI helper that does a deterministic path-match
+  and prints a `[CROSS_CUTTING_PRIMITIVE_TOUCHED]` audit line, removing the dependence
+  on the agent noticing the overlap unprompted.
 - The `[NEWLY_REACHABLE] <path> <method> <result>` marker is delivered, not
   hypothetical: `log-newly-reachable` (E2-F4-S1-T2) writes it as a structured,
-  judge-visible record of the path, verification method, and outcome, replacing the
-  free-text `[NEWLY_REACHABLE]`-into-`## Comments` prose convention this document
-  previously described (see the migration note under "The audit trail" above). It
-  still carries no field for the verification *evidence* itself (the command run, the
-  output observed): that evidence remains prose, cited alongside the marker in a
+  judge-visible record of the path, verification method, and outcome. It still carries
+  no field for the verification *evidence* itself (the command run, the output
+  observed): that evidence remains prose, cited alongside the marker in a
   `log-tdd`/`log-comment` entry, and the code-reviewer's BUG-FIX COMPLETENESS rubric
   judges that prose qualitatively, the same way `AC-FINAL` evidence is judged today
-  (issue #156's `MISSING_AC_EVIDENCE` pattern). A stricter follow-up could add a
-  fourth `--evidence` field to the marker's grammar to make the verification-evidence
-  claim itself structured.
+  (issue #156's `MISSING_AC_EVIDENCE` pattern). A stricter follow-up could add a fourth
+  `--evidence` field to the marker's grammar to make the verification-evidence claim
+  itself structured.

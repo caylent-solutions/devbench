@@ -31,6 +31,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/devbench-yaml-reference.md`'s `gates:` section for the full
   precedence model and tunable reference.
 
+- **The executor, code-reviewer and blocker-resolver prompts, and
+  `docs/newly-reachable-paths.md`, now key the newly-reachable-paths
+  verification obligation off the `## Task Type: behavior-fix` taxonomy and
+  read the structured `log-newly-reachable` marker instead of the retired
+  title-heuristic and `## Comments`-based convention** (spec
+  `integration-reality-gates-hardening.md` sections 1.3 S1/S2, 4.3, 4.9(a),
+  5.3; AC-8, AC-10, AC-21; E8-F1-S1-T2). `plugin/devbench-orchestrate/agents/executor.md`
+  gains a Main-sequence step that runs `uv run devbench log-newly-reachable
+  <unit-id> --path <p> --method <m> --result <r>` once per newly-reachable
+  path on a `behavior-fix` unit and treats a non-zero exit as a hard stop.
+  `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md` no
+  longer directs the judge at `## Comments` (removed by `read-unit
+  --strip-comments` before the Evidence fetch); it reads
+  `[NEWLY_REACHABLE] <path> <method> <result>` markers from the
+  `## TDD Cycle Log` audit section and raises `NEWLY_REACHABLE_PATH_UNVERIFIED`
+  when a `behavior-fix` unit carries none. `plugin/devbench-orchestrate/agents/blocker-resolver.md`
+  now requires escalation, never a hand-written substitute, when a marker is
+  missing or `log-newly-reachable` fails. `docs/newly-reachable-paths.md` is
+  rewritten as v2 around the spec 5.3 marker grammar, the
+  `gates.newly_reachable_paths` config block and its precedence, the
+  `## Task Type: behavior-fix` keying, the judge-evidence tier, and the rule
+  that Definition-of-Done checkboxes are auto-ticked records, never gates.
+
 - **`check-write-path` now attributes its itemized findings to the calling
   unit's own Changes-Manifest scope, while the verdict and status line stay
   repo-wide** (spec `integration-reality-gates-hardening.md` section 4.3,

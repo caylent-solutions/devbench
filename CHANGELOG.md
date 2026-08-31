@@ -7,6 +7,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Live-smoke checklist quantifier corrected and its CLI-verb pin widened
+  to the whole document** (E12-F1-S2-T2). Step 3's rationale in
+  `docs/release-notes/live-smoke-evidence.md` no longer says "both
+  required judge records do not exist yet"; it now names all five,
+  matching the shipped `constants.ALL_REQUIRED_JUDGE_NAMES`. The CLI-verb
+  extraction pin in `tests/test_docs/test_live_smoke_evidence.py` now
+  keys on the literal `uv run devbench <verb>` invocation prefix instead
+  of scoping to fenced bash code blocks, tolerates a hard-wrapped
+  invocation where the verb falls on the following line, and discovers
+  every genuine invocation anywhere in the document rather than only
+  inside the checklist's runnable command blocks. This removes the one
+  false-positive prose token the fenced-block scoping previously dodged
+  (`devbench process's`), widens coverage to the previously-unpinned
+  `unhold` and `validate-backlog` verbs, and newly discovers the
+  checklist's hard-wrapped `set-status` mention -- the audit-sensitive
+  verb the operator-gating section explicitly warns against misusing,
+  and the one verb this document most needed pinned. The
+  `check-<name-with-hyphens>` placeholder, which collapses under a naive
+  widening to the real verb `check`, remains excluded, now via explicit
+  rejection of any raw capture truncated mid-word rather than via
+  fenced-block scoping.
+
 - **Live-smoke checklist content and its zero-to-ready cross-reference are
   now pinned against silent drift** (E12-F1-S2-T1). New
   `tests/test_docs/test_live_smoke_evidence.py` closes a gap that was

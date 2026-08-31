@@ -1,6 +1,6 @@
 """Structural and machine-verified pins for
 ``docs/release-notes/live-smoke-evidence.md`` (AC-TEST-001 through
-AC-TEST-004; E12-F1-S2-T1).
+AC-TEST-004; E12-F1-S2-T1, widened by E12-F1-S2-T2).
 
 This closes a demonstrated coverage gap, not a theorised one:
 ``docs/release-notes/live-smoke-evidence.md`` is a 12-step operator
@@ -27,15 +27,29 @@ Two verification strategies are used here, deliberately:
    ``gates:`` fragment is loaded through the REAL config loader
    (``devbench.config_loader.load_runtime_config``) and asserted to
    validate against the shipped JSON Schema, and every CLI verb named in
-   the checklist's runnable command blocks is resolved against the real
-   CLI dispatch table (``devbench.cli._COMMANDS``) rather than a
-   hand-maintained list this module would have to keep in sync by hand.
+   an ``uv run devbench <verb>`` invocation ANYWHERE in the document
+   (E12-F1-S2-T2 widened this from "inside fenced ```bash blocks only" to
+   the whole document, keyed on the literal invocation prefix) is
+   resolved against the real CLI dispatch table
+   (``devbench.cli._COMMANDS``) rather than a hand-maintained list this
+   module would have to keep in sync by hand.
 
 ``TestStubMutationControls`` demonstrates, permanently, that the
 structural extraction helpers actually fail against a gutted copy of the
 document (the same three-line ``TODO.`` stub that slipped through the
 prior state) -- this is the RED evidence AC-TEST-001 requires, kept alive
 as a regression control rather than only a one-time TDD-log demonstration.
+
+``TestCliVerbExtractionWidening`` (E12-F1-S2-T2) pins the widened
+extraction's four load-bearing guarantees: it still excludes the
+``check-<name-with-hyphens>`` placeholder (which collapses to the real
+verb ``check`` under a naive widening -- a trap, not a false positive to
+shrug off) and the ``devbench process's`` prose mention; it now discovers
+``unhold`` and ``validate-backlog``, both previously unpinned; and it
+discovers the checklist's hard-wrapped ``set-status`` invocation, the
+audit-sensitive verb the operator-gating section explicitly warns against
+misusing, which was unreachable by the extraction at any prior scope
+width because the verb fell on the line after ``uv run devbench``.
 """
 
 from __future__ import annotations
@@ -60,8 +74,31 @@ _OPERATOR_GATED_HEADING = "## Operator-gated: automation must not touch this run
 _PRECONDITIONS_HEADING = "## Preconditions"
 
 _YAML_FENCE_RE = re.compile(r"```yaml\n(.*?)```", re.DOTALL)
-_BASH_FENCE_RE = re.compile(r"```bash\n(.*?)```", re.DOTALL)
-_CLI_VERB_RE = re.compile(r"\bdevbench ([a-z][a-z0-9-]*[a-z0-9])")
+
+# Keys on the literal ``uv run devbench`` invocation prefix (not a bare
+# ``devbench <word>`` scan), so prose mentions of the word "devbench" that
+# are not actually invocations -- e.g. "the devbench process's current
+# working directory" -- never match: no "uv run" immediately precedes
+# "process's". The whitespace between the prefix and the verb is bounded
+# to AT MOST one line break: either same-line spaces/tabs
+# (``[ \t]+``), or an optional line break with optional leading/trailing
+# indentation (``[ \t]*\n[ \t]*``). This is what makes the match hard-wrap
+# tolerant -- an invocation split across exactly two lines (the
+# checklist's `` `uv run devbench\n  set-status ...` `` mention) is still
+# discovered -- without also bridging a full blank line: text that ends a
+# paragraph on the words "uv run devbench" followed by a blank line and
+# then unrelated prose does NOT capture the next paragraph's first word,
+# because the pattern only ever consumes one literal ``\n``.
+# The captured group is intentionally permissive (``[a-z0-9-]+``, allowed
+# to end in a hyphen) so ``_is_well_formed_verb_token`` below can detect,
+# and reject, a token truncated mid-word by a non-verb character. One
+# known, accepted consequence of that permissiveness: a verb hyphenated
+# across a line break (e.g. ``set-\nstatus``) is indistinguishable from a
+# truncated fragment and is silently dropped rather than discovered. This
+# does not occur anywhere in the shipped document today, and dropping a
+# verb is the fail-closed direction relative to the false positive this
+# guard exists to prevent, so it is accepted rather than special-cased.
+_CLI_INVOCATION_RE = re.compile(r"uv run devbench(?:[ \t]+|[ \t]*\n[ \t]*)([a-z0-9-]+)")
 _NUMBERED_STEP_RE = re.compile(r"^\d+\.\s+\*\*", re.MULTILINE)
 _EVIDENCE_ROW_RE = re.compile(r"^\|\s*(\d+)\s*\|(.*)$", re.MULTILINE)
 
@@ -72,6 +109,18 @@ _FIXTURE_HOLD_TASK_ID = "E12-F1-S1-T2"
 # TestStubMutationControls so the mutation control reproduces the exact
 # historical gap.
 _GUTTED_STUB_DOC = "# Live Smoke Evidence: Integration-Reality Gates\n\nTODO.\n"
+
+# Anchors the widened extraction's regression guard to explicit document
+# facts instead of a hand-tuned magic integer (see
+# test_discovered_document_cli_verbs_include_required_set). Each member is
+# individually justified: 'report' and 'git-ops-finalize' were already
+# reachable at E12-F1-S2-T1's fenced-block-only scope and are kept here as
+# a non-regression anchor; 'unhold' and 'validate-backlog' are the two
+# previously-unpinned prose mentions E12-F1-S2-T2's widening added
+# coverage for; 'set-status' is the hard-wrapped, audit-sensitive verb
+# AC-TEST-002 requires -- the one verb this document most needs pinned,
+# since the operator-gating section explicitly warns against misusing it.
+_REQUIRED_DOCUMENT_CLI_VERBS = frozenset({"report", "git-ops-finalize", "unhold", "validate-backlog", "set-status"})
 
 
 def _read_text(path: Path) -> str:
@@ -138,16 +187,78 @@ def _operator_evidence_cells(evidence_section: str) -> list[str]:
     return cells
 
 
-def _checklist_cli_verbs(checklist_section: str) -> set[str]:
-    """Every ``devbench <verb>`` token found in the checklist's runnable
-    ```bash command blocks (not prose mentions elsewhere in the document,
-    and not the ``check-<name-with-hyphens>`` placeholder in step 3's
-    prose, which lives outside any ```bash block).
+def _is_well_formed_verb_token(token: str) -> bool:
+    """A raw ``_CLI_INVOCATION_RE`` capture is only a genuine CLI verb if it
+    starts with a lowercase letter AND ends in an alphanumeric character --
+    the same shape the superseded ``_CLI_VERB_RE`` (``[a-z][a-z0-9-]*[a-z0-9]``)
+    required, restored here as an explicit two-sided check rather than
+    folded back into the capture regex.
+
+    The trailing check is the load-bearing one for the document as
+    shipped: a capture ending in a hyphen means the greedy ``[a-z0-9-]+``
+    character class ran into a non-verb character (e.g. the literal ``<``
+    that opens the ``check-<name-with-hyphens>`` placeholder in step 3's
+    prose) partway through the token, leaving a truncated fragment
+    (``check-``) behind. Discarding that fragment outright -- rather than
+    trimming its trailing hyphen and keeping the remainder -- is the
+    load-bearing choice: trimming would silently resolve the placeholder
+    to ``check``, which IS a real registered verb, turning an inert
+    placeholder into a false positive.
+
+    The leading check has no live trigger in the document today, but is
+    not decorative: without it this helper returns ``True`` for captures
+    such as ``--help``, ``--version``, ``-x`` or ``2`` (``_CLI_INVOCATION_RE``'s
+    capture group permits digits and hyphens in the first position), none
+    of which is a well-formed CLI verb name.
+    """
+    return bool(token) and token[0].isalpha() and token[-1] != "-"
+
+
+def _document_cli_verbs(text: str) -> set[str]:
+    """Every ``uv run devbench <verb>`` invocation discovered anywhere in
+    *text*, keyed on the literal ``uv run devbench`` invocation prefix
+    rather than on fenced ```bash blocks (E12-F1-S2-T2 widening).
+
+    This is intentionally NOT scoped to runnable command blocks: the
+    checklist's hard-wrapped ``set-status`` mention and its ``unhold`` /
+    ``validate-backlog`` mentions all live in prose, outside any ```bash
+    fence, and each is a genuine ``uv run devbench <verb>`` invocation the
+    operator is meant to notice. The prefix anchor alone already excludes
+    the one false positive fenced-block-scoping used to dodge (``the
+    devbench process's current working directory`` is not preceded by "uv
+    run"), and ``_is_well_formed_verb_token`` excludes the other (the
+    ``check-<name-with-hyphens>`` placeholder).
     """
     verbs: set[str] = set()
-    for block in _BASH_FENCE_RE.findall(checklist_section):
-        verbs.update(_CLI_VERB_RE.findall(block))
+    for match in _CLI_INVOCATION_RE.finditer(text):
+        token = match.group(1)
+        if _is_well_formed_verb_token(token):
+            verbs.add(token)
     return verbs
+
+
+def _assert_verb_registered_in_dispatch_table(verb: str, context: str) -> None:
+    """Assert *verb* is a real, registered CLI command name.
+
+    Resolves against the REAL CLI dispatch table
+    (``devbench.cli._COMMANDS``) rather than a hand-maintained list, so
+    this check cannot drift from what ``uv run devbench <verb>`` would
+    actually invoke. Shared between the parametrized resolution test
+    (real, document-discovered verbs) and
+    ``TestCliVerbExtractionWidening``'s mutation control (an injected
+    bogus verb), so both exercise the identical assertion path.
+
+    *context* is a caller-supplied string naming where *verb* came from
+    (e.g. the document path and how it was discovered, or "synthetic
+    mutation-control fixture"), threaded into the failure message so a
+    future failure names the source to fix rather than only the verb.
+
+    Raises:
+        AssertionError: when *verb* is not a key in ``_COMMANDS``.
+    """
+    assert verb in _COMMANDS, (
+        f"'{verb}' ({context}) is not registered in devbench.cli._COMMANDS. Available commands: {sorted(_COMMANDS)}"
+    )
 
 
 def _gates_fragment_mapping(yaml_fragment: str) -> dict:
@@ -163,16 +274,17 @@ def _gates_fragment_mapping(yaml_fragment: str) -> dict:
     return parsed
 
 
-def _discovered_checklist_verbs() -> list[str]:
-    """Every ``devbench <verb>`` token discovered in the real checklist's
-    runnable command blocks, module-scoped so the parametrize list below
-    is built once from the real document rather than re-derived per test."""
+def _discovered_document_verbs() -> list[str]:
+    """Every ``uv run devbench <verb>`` invocation discovered anywhere in
+    the real document (not scoped to the checklist section or to fenced
+    ```bash blocks -- E12-F1-S2-T2 widening), module-scoped so the
+    parametrize list below is built once from the real document rather
+    than re-derived per test."""
     text = _read_text(LIVE_SMOKE_DOC)
-    checklist_section = _extract_checklist_section(text)
-    return sorted(_checklist_cli_verbs(checklist_section))
+    return sorted(_document_cli_verbs(text))
 
 
-_DISCOVERED_CHECKLIST_VERBS: list[str] = _discovered_checklist_verbs()
+_DISCOVERED_DOCUMENT_VERBS: list[str] = _discovered_document_verbs()
 
 
 def _load_fragment_through_real_config_loader(yaml_fragment: str, tmp_path: Path) -> RuntimeConfig:
@@ -274,19 +386,21 @@ class TestStructuralInvariants:
     def test_report_step_present(self) -> None:
         text = _read_text(LIVE_SMOKE_DOC)
         checklist_section = _extract_checklist_section(text)
-        verbs = _checklist_cli_verbs(checklist_section)
+        verbs = _document_cli_verbs(checklist_section)
         assert "report" in verbs, (
-            "the checklist must include at least one runnable 'uv run devbench report' step "
-            f"(steps 7 and 9 capture the baseline/final report evidence); discovered verbs: {sorted(verbs)}"
+            "the checklist section must include at least one 'uv run devbench report' "
+            "invocation, fenced or prose (steps 7 and 9 capture the baseline/final report "
+            f"evidence); discovered verbs: {sorted(verbs)}"
         )
 
     def test_finalize_step_present(self) -> None:
         text = _read_text(LIVE_SMOKE_DOC)
         checklist_section = _extract_checklist_section(text)
-        verbs = _checklist_cli_verbs(checklist_section)
+        verbs = _document_cli_verbs(checklist_section)
         assert "git-ops-finalize" in verbs, (
-            "the checklist must include a runnable 'uv run devbench git-ops-finalize' step "
-            f"(step 12 captures the finalize PR-body evidence); discovered verbs: {sorted(verbs)}"
+            "the checklist section must include a 'uv run devbench git-ops-finalize' "
+            "invocation, fenced or prose (step 12 captures the finalize PR-body evidence); "
+            f"discovered verbs: {sorted(verbs)}"
         )
 
 
@@ -334,22 +448,51 @@ class TestMachineVerification:
             "gates.shared_file_impact.auto_derive_registry=True from the documented fragment"
         )
 
-    def test_discovers_at_least_five_checklist_cli_verbs(self) -> None:
+    def test_discovers_at_least_ten_document_cli_verbs(self) -> None:
         """Guards against the verb-discovery regex silently collecting zero
         (or too few) cases, which would make the parametrized resolution
-        test below pass vacuously."""
+        test below pass vacuously. This floor value is honest about what
+        it does and does not detect: E12-F1-S2-T1's fenced-block-only
+        scope found exactly 9 distinct verbs, so a floor of 10 -- one
+        above that count -- DOES bite if the extraction ever regresses to
+        that narrower scope, independently of which specific verbs are
+        lost, unlike the prior floor of 9 which would have passed
+        unchanged under that exact regression. This is a supplementary,
+        coarse-grained guard; the precise, name-anchored regression check
+        is test_discovered_document_cli_verbs_include_required_set below,
+        which does not depend on picking the right integer at all."""
         text = _read_text(LIVE_SMOKE_DOC)
-        checklist_section = _extract_checklist_section(text)
-        verbs = _checklist_cli_verbs(checklist_section)
-        assert len(verbs) >= 5, f"expected >=5 distinct CLI verbs discovered in the checklist, found: {sorted(verbs)}"
+        verbs = _document_cli_verbs(text)
+        assert len(verbs) >= 10, f"expected >=10 distinct CLI verbs discovered in the document, found: {sorted(verbs)}"
 
-    @pytest.mark.parametrize("verb", _DISCOVERED_CHECKLIST_VERBS)
+    def test_discovered_document_cli_verbs_include_required_set(self) -> None:
+        """AC-TEST-003: the discovered verb set can never silently collapse
+        back to a scope that drops a document-critical verb, verified by
+        asserting a superset of an explicitly named, individually
+        justified required-verb set (see ``_REQUIRED_DOCUMENT_CLI_VERBS``)
+        rather than by a bare cardinality floor. A floor set at any single
+        integer only approximates the real invariant and must be
+        hand-re-tuned on every document edit; this assertion is anchored
+        to document facts instead, so it is self-documenting about why
+        each verb matters and bites on exactly the collapse this
+        acceptance criterion cares about. Falsifiable: reverting
+        ``_document_cli_verbs`` to E12-F1-S2-T1's fenced-block-only scope
+        drops 'unhold', 'validate-backlog' and the hard-wrapped
+        'set-status' (none of the three lives inside a fenced ```bash
+        block), so this assertion goes RED under that exact regression --
+        unlike the old floor of 9, which passed under it."""
+        text = _read_text(LIVE_SMOKE_DOC)
+        verbs = _document_cli_verbs(text)
+        missing = sorted(_REQUIRED_DOCUMENT_CLI_VERBS - verbs)
+        assert not missing, (
+            f"expected the discovered verb set to be a superset of "
+            f"{sorted(_REQUIRED_DOCUMENT_CLI_VERBS)}; missing: {missing}. Discovered: {sorted(verbs)}"
+        )
+
+    @pytest.mark.parametrize("verb", _DISCOVERED_DOCUMENT_VERBS)
     def test_checklist_cli_verb_exists_in_dispatch_table(self, verb: str) -> None:
-        assert verb in _COMMANDS, (
-            f"docs/release-notes/live-smoke-evidence.md's checklist names 'devbench {verb}' "
-            f"in a runnable command block, but '{verb}' is not registered in "
-            "devbench.cli._COMMANDS. Available commands: "
-            f"{sorted(_COMMANDS)}"
+        _assert_verb_registered_in_dispatch_table(
+            verb, context=f"discovered via 'uv run devbench {verb}' in {LIVE_SMOKE_DOC}"
         )
 
 
@@ -403,3 +546,100 @@ class TestStubMutationControls:
             "disagree, proving the equality assertion in TestStructuralInvariants is "
             "falsifiable"
         )
+
+
+@pytest.mark.unit
+class TestCliVerbExtractionWidening:
+    """E12-F1-S2-T2 (AC-TEST-001 through AC-TEST-004): the widened
+    ``uv run devbench <verb>`` extraction's four load-bearing guarantees,
+    each pinned against the REAL document except the mechanism/mutation
+    controls, which use synthetic fixtures the same way
+    ``TestStubMutationControls`` does above.
+    """
+
+    def test_check_placeholder_does_not_collapse_to_registered_verb(self) -> None:
+        """AC-TEST-001: the ``check-<name-with-hyphens>`` placeholder in
+        step 3's prose must NOT resolve to the real registered verb
+        ``check`` -- the trap a naive widening (trim the trailing hyphen
+        instead of discarding the truncated token) would fall into."""
+        assert "check" in _COMMANDS, (
+            "test fixture invariant violated: 'check' must be a real registered CLI command "
+            "for this to be a meaningful trap test"
+        )
+        text = _read_text(LIVE_SMOKE_DOC)
+        verbs = _document_cli_verbs(text)
+        assert "check" not in verbs, (
+            "the check-<name-with-hyphens> placeholder in step 3's prose must not collapse "
+            f"to the real verb 'check'; discovered verbs: {sorted(verbs)}"
+        )
+
+    def test_devbench_process_prose_does_not_fire(self) -> None:
+        """AC-TEST-001: 'the devbench process's current working directory'
+        (step 12's prose, no 'uv run' prefix) must never be mistaken for a
+        'uv run devbench process' invocation."""
+        text = _read_text(LIVE_SMOKE_DOC)
+        assert "devbench process's" in text, (
+            "test fixture invariant violated: expected prose mention 'devbench process's' "
+            "not found in the live document -- update this test if step 12's wording changed"
+        )
+        verbs = _document_cli_verbs(text)
+        assert "process" not in verbs, f"discovered verbs must not include 'process': {sorted(verbs)}"
+
+    def test_widened_pin_discovers_unhold_and_validate_backlog(self) -> None:
+        """AC-TEST-001: widening the extraction to the whole document (not
+        just fenced ```bash blocks) must newly discover 'unhold' (the
+        operator-gated section's release path) and 'validate-backlog'
+        (precondition 3), both previously unpinned."""
+        text = _read_text(LIVE_SMOKE_DOC)
+        verbs = _document_cli_verbs(text)
+        for verb in ("unhold", "validate-backlog"):
+            assert verb in verbs, f"expected {verb!r} among the widened discovered verbs: {sorted(verbs)}"
+
+    def test_hard_wrapped_set_status_invocation_is_discovered(self) -> None:
+        """AC-TEST-002: the checklist hard-wraps its 'set-status' mention
+        (`` `uv run devbench`` ends one line, ``  set-status ...` `` starts
+        the next). 'set-status' is the audit-sensitive verb the
+        operator-gating section explicitly warns against misusing, so it
+        is the verb this document most needs pinned; before this widening
+        it was unreachable by the extraction at any scope width."""
+        text = _read_text(LIVE_SMOKE_DOC)
+        assert "uv run devbench\n" in text, (
+            "test fixture invariant violated: expected the live document to still hard-wrap "
+            "an 'uv run devbench' invocation across a line break -- update this test if the "
+            "document's wrapping changed"
+        )
+        verbs = _document_cli_verbs(text)
+        assert "set-status" in verbs, f"expected 'set-status' among the discovered verbs: {sorted(verbs)}"
+
+    def test_extraction_mechanism_tolerates_hard_wrapped_invocation(self) -> None:
+        """AC-TEST-002 mechanism control: pins the hard-wrap tolerance
+        directly against a fixture shaped like the real document's wrap
+        (an invocation prefix ending a line, its verb starting the next),
+        independent of the real document's own wrapping. Complements
+        ``test_hard_wrapped_set_status_invocation_is_discovered`` above,
+        which pins the same guarantee against real content."""
+        hard_wrapped_fixture = (
+            "A second command, `uv run devbench\n  totally-fake-hardwrap-verb E12-F1-S1-T2 in-queue`, exists.\n"
+        )
+        verbs = _document_cli_verbs(hard_wrapped_fixture)
+        assert "totally-fake-hardwrap-verb" in verbs, (
+            f"hard-wrapped invocation was not discovered; extraction found: {sorted(verbs)}"
+        )
+
+    def test_dispatch_table_resolution_fails_on_injected_bogus_verb(self) -> None:
+        """AC-TEST-001/AC-TEST-004 mutation control: proves the
+        dispatch-table resolution check the parametrized
+        ``test_checklist_cli_verb_exists_in_dispatch_table`` test performs
+        is not vacuous, by showing the SAME shared helper actually raises
+        for an injected verb that is not a real CLI command. Mirrors
+        ``TestStubMutationControls``'s pattern of proving a pin can fail,
+        not merely that it can pass."""
+        bogus_verb = "not-a-real-devbench-verb"
+        assert bogus_verb not in _COMMANDS, (
+            f"test fixture invariant violated: {bogus_verb!r} unexpectedly collides with a "
+            "real registered CLI command; choose a different bogus token"
+        )
+        with pytest.raises(AssertionError, match=re.escape(bogus_verb)):
+            _assert_verb_registered_in_dispatch_table(
+                bogus_verb, context="synthetic mutation-control fixture, not a real document reference"
+            )

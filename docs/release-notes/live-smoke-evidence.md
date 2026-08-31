@@ -197,9 +197,9 @@ you run them.
    ```
 
    Expected: exit 1. Because `<FIXTURE_ID>` carries a non-gated `## Task
-   Type: chore` (step 1) and both required judge records do not exist yet
-   (step 6 seeds those later), the first invariant `mark_done` reaches that
-   is actually unmet is the gate-pass check: the refusal names the first
+   Type: chore` (step 1) and none of the five required judge records exist
+   yet (step 6 seeds those later), the first invariant `mark_done` reaches
+   that is actually unmet is the gate-pass check: the refusal names the first
    unmet machine-blocking gate (`reachability` or `shared_file_impact`,
    whichever `constants.GATE_TIERS` orders first -- `reachability`, per
    `constants.GATE_NAMES`'s declared order) and prints the exact remediation

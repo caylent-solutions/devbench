@@ -2140,6 +2140,62 @@ Output JSON:
 
 The exit code is what a script should branch on, not the printed `WARNING:` status line: the warning fires only on the soft, non-fatal "not currently blocked" case above and never changes the exit code, while every `wired: false` outcome exits non-zero with `reason` populated on the same JSON payload (same keys as the success path).
 
+### `remove-dep`
+
+```bash
+uv run devbench remove-dep <blocked-task-id> <blocker-task-id> [--reason "<audit message>"]
+```
+
+The inverse of `add-dep`, and the reason it exists: `add-dep` is
+additive-only, so an edge wired in the wrong direction could not be
+corrected. Re-wiring the reverse fails the cycle guard while the erroneous
+row is still present, and the previously documented remedy was an operator
+hand-edit of the work-unit file -- which `guard-work-unit-write.sh` blocks
+for executor-tier sessions. A backlog carrying one reversed edge therefore
+stalled every unit behind it with no automation path.
+
+Clears all three channels `add-dep` writes, because any one left behind still
+encodes the edge:
+
+1. the `## Dependencies` row on the blocked unit's file (restoring the
+   canonical `| none | | |` row when the removal empties the table);
+2. the `Dependencies` cell of the blocked unit's `BACKLOG.md` index row
+   (writing `None` when the last token is removed);
+3. the `[BLOCKED_PENDING_PROPOSAL] <blocker>` marker, via the same helper
+   `reject-proposal` uses.
+
+A `[WU_UNWIRED]` audit comment records the removal, since the row that would
+otherwise evidence the edge is gone.
+
+**Status is deliberately untouched.** Whether the unit has become claimable
+depends on the rest of the graph and is `reconcile-cascade`'s decision;
+flipping it here would re-queue a unit still blocked for another reason.
+
+**Fail-fast:** the two IDs must differ, both must match the
+`E<N>-F<N>-S<N>-T<N>` format, the blocked task must exist in the index, and
+its file must have a `## Dependencies` section.
+
+Unlike `add-dep`, the blocker is **not** required to exist. A marker pointing
+at an unknown ID is exactly the fault `validate-backlog` reports so an
+operator can clear it, so requiring the target to exist would make the
+command unusable for the case that most needs it.
+
+**Exit codes:**
+
+| Outcome | rc | `unwired` |
+|---------|----|-----------|
+| A row, index token, or marker was removed. | 0 | `true` |
+| The edge was already absent in every channel (honest no-op; a `WARNING:` is printed). | 0 | `false` |
+| A fail-fast precondition is not met. | 1 | `false` |
+
+Correcting a reversed edge is therefore a two-step operation:
+
+```bash
+uv run devbench remove-dep E3-F2-S2-T1 E3-F2-S2-T3 --reason "edge wired in the wrong direction"
+uv run devbench add-dep    E3-F2-S2-T3 E3-F2-S2-T1
+```
+
+
 ### `reject-proposal`
 
 ```

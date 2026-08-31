@@ -247,6 +247,16 @@ Per-operation timeout values in seconds. All fields are optional; absent fields 
 #### `timeouts.gh_api` -- GitHub API call timeout
 
 Timeout in seconds for github api call timeout. Overridable via the `DEVBENCH_GH_API_TIMEOUT` env var.
+> "Section: timeouts (all values in seconds; leave blank to use the environment-variable / built-in default)
+>
+>   gh_api       -- GitHub API call timeout [default: env DEVBENCH_GH_API_TIMEOUT or 30]
+>   test         -- Test suite run timeout [default: env DEVBENCH_TEST_TIMEOUT or 300]
+>   security_fetch -- Security advisory fetch timeout [default: env DEVBENCH_SECURITY_FETCH_TIMEOUT or 120]
+>   llm          -- LLM API call timeout [default: env DEVBENCH_LLM_TIMEOUT or 300]
+>   command      -- Shell command execution timeout [default: env DEVBENCH_COMMAND_TIMEOUT or 120]
+>   orchestrator_poll_interval -- Orchestrator polling interval [default: 10]
+>   github_check -- GitHub check status polling timeout [default: env DEVBENCH_GH_TIMEOUT or 600]
+>   orchestrator_inactivity -- Orchestrator SDK message inactivity timeout [default: env DEVBENCH_ORCHESTRATOR_INACTIVITY_TIMEOUT or 1800]"
 
 - **Recommended:** `30` -- matches the built-in constant so operators only need to set this to change from the shipped default.
 - **Alternatives:** `60` (doubles the timeout for a slower network or CI environment.); `15` (tightens the timeout to fail fast on a known-fast environment.)
@@ -1856,6 +1866,33 @@ Current value shown to the operator: the existing config's value for this key if
 ## Step 21 -- Final validation and write
 
 Assemble the complete YAML from all collected sections. In addition to the operator-supplied sections above, the assembled YAML must also emit every remaining FR-3.6 tuning section at its resolved built-in default, so a freshly configured workspace is self-documenting (issue #260, spec FR-3.6, AC-40, Journey J-7): `timeouts`, `limits`, `stop_hook`, `hook_tail`, `orchestrate`, `report` (including `models`, `default_model`, and every multiplier field), `backlog`, `validate`, `skills`, `max_executor_retries`, `max_executor_retries_per_judge`, and `log_file`. Unlike the pre-rewrite skill, every one of those sections is now also interactively interviewed in Steps 3-20 above (including the new `gates` and `quota_handling` sections), so "emit at resolved default" now means "emit the value the operator actually chose (or accepted as the recommended default) in its own Step," not a value the operator was never asked about. An operator who later wants to tune a knob sees it in the file with its resolved value and annotated comment already present, instead of discovering the knob only by reading `config_loader.py`.
+> **`orchestrate.*` transport-restart knobs -- what to tell the operator.**
+> These are emitted at their built-in defaults like every other FR-3.6 tuning
+> section, and most workspaces should leave them alone. Raise them only if the
+> operator explicitly asks, and explain the trade-off rather than just setting
+> the number:
+>
+> - `max_transport_restarts` (default `14`) bounds consecutive restarts after
+>   an SDK **transport** failure. It is deliberately NOT the quota ceiling
+>   (`max_quota_resumes`, default `1000`). Those two must not be conflated: a
+>   quota window must elapse before a resume can succeed, so quota resumes
+>   self-throttle, whereas a transport fault recurs as fast as the SDK can
+>   reject a session. Pairing a four-figure budget with transport faults is
+>   what previously let a single persistent fault burn ~1000 restarts in 39
+>   minutes and end an unattended run.
+> - `transport_restart_backoff_base_seconds` (default `1.0`) and
+>   `transport_restart_backoff_max_seconds` (default `60.0`) space those
+>   restarts as `base * 2 ** restarts_already_done`, clamped to the ceiling.
+>   Both must be `> 0`; the schema rejects zero or negative at load time.
+> - Operational caveat worth stating out loud: the ceiling also bounds how
+>   long an in-flight backoff wait can delay a `devbench stop`. An operator who
+>   raises the ceiling to many minutes is also making shutdown that much less
+>   responsive.
+> - If the operator is running unattended (`--daemon`) and wants to survive a
+>   longer upstream outage, the right lever is usually a **higher ceiling**
+>   (fewer, more spaced attempts), not a much higher cap -- a high cap with a
+>   low ceiling just retries a dead transport more often.
+
 > **`orchestrate.*` transport-restart knobs -- what to tell the operator.**
 > These are emitted at their built-in defaults like every other FR-3.6 tuning
 > section, and most workspaces should leave them alone. Raise them only if the

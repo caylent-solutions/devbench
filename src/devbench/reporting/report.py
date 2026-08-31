@@ -3505,6 +3505,22 @@ def generate_report(
         report_started_at=report_started_at,
     )
 
+    # Current-session boundary, resolved ONCE here and reused by both the
+    # transport-restart row below and the windowed table further down, so the
+    # row and the table's "Session" column can never disagree.
+    detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
+    session_start = detected_session if detected_session is not None else log_start_for_window
+
+    # Transport-restart row (issue #331 FR-4), counted per window against the
+    # same boundaries the table uses. Rendered only when the log holds at least
+    # one restart, so a clean workspace stays byte-identical to today
+    # (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(
+        log_path,
+        session_start=session_start,
+        report_started_at=report_started_at,
+    )
+
     # Issue #326 (FR-5): compute the full session segmentation ONCE, from the
     # same non-noise timestamp source the current-session detector already
     # reads, and thread it into every ``_compute_window_stats`` call below.

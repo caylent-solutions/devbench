@@ -1180,6 +1180,71 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tests pin each consumer's continued dependence on the shared module's
   symbols so a future reversal of the migration is caught rather than
   silently accepted.
+## [0.6.0] -- 2026-08-20
+
+### Added
+
+- **`devbench remove-dep`, the inverse `add-dep` never had, without which a
+  reversed dependency edge could not be corrected by any agent** (#349).
+  `add-dep` is additive-only. Re-wiring an edge in the correct direction fails
+  the cycle guard while the erroneous row is still present, and the documented
+  remedy -- `docs/adr/10-multi-target-proposal-wiring.md`, and the brownfield
+  example at `how-it-was-made.md` line 611 -- was an operator hand-edit of the
+  work-unit file. That remedy is unreachable from inside a run, because
+  `guard-work-unit-write.sh` blocks executor-tier writes to `backlog/**/*.md`
+  and executor sessions carry no orchestrator role, so the work was
+  structurally impossible for every agent tier. Observed on a 76-task backlog:
+  two independent units blocked on exactly this with 47 further units waiting
+  behind them, and the run exited `NO_ACTIONABLE` with one task in-queue and
+  nothing claimable. `remove-dep` clears all three channels `add-dep` writes,
+  because any one left behind still encodes the edge: the `## Dependencies`
+  row, restoring the canonical `| none | | |` row when the removal empties the
+  table; the `BACKLOG.md` Dependencies cell, writing `None` when the last token
+  goes; and the `[BLOCKED_PENDING_PROPOSAL]` marker, through
+  `_strip_pending_proposal_marker`, the same helper `reject-proposal` already
+  uses rather than a second implementation. A `[WU_UNWIRED]` audit comment
+  records the removal, since the row that would otherwise evidence the edge is
+  gone. Two asymmetries with `add-dep` are deliberate: status is left untouched,
+  because whether a unit became claimable depends on the whole graph and is
+  `reconcile-cascade`'s decision, and flipping it here would re-queue a unit
+  still blocked for another reason; and the blocker is not required to exist,
+  because a marker pointing at an unknown ID is precisely the fault
+  `validate-backlog` reports for an operator to clear, so demanding the target
+  exist would make the command unusable for the case that most needs it.
+
+### Fixed
+
+- **`reconcile-cascade` re-queued units blocked on a human, which the
+  orchestrator re-blocked seconds later** (#350). Marker state and dependency
+  state were the only inputs, and neither can see that a unit is waiting on an
+  operator, so a unit blocked with `[OPERATOR_INPUT_REQUIRED]` was re-queued on
+  every sweep, claimed, found to need the same missing input, and blocked
+  again. Measured in one run: the cascade flipped three units to `in-queue` at
+  07:39:59, the orchestrator set all three back to `blocked` at 07:40:09, and
+  the run exited `NO_ACTIONABLE` at 07:40:26 -- two audit rows per unit per
+  sweep, nothing advanced, and the real blocking reason buried deeper in the
+  Comments each time. The cascade now skips a unit carrying an unanswered
+  `[OPERATOR_INPUT_REQUIRED]` row and names that in its `skipped` envelope. The
+  guard is keyed to that explicit tag rather than to the
+  `OPERATOR_ACTION_REQUIRED` classification, and the first implementation got
+  this wrong: that classification also covers a unit blocked with no marker, no
+  unmet dependency and no recovery signal, which is exactly the crash-mid-write
+  case `reconcile-cascade` exists to repair (#150), so keying on it defeated the
+  command's own purpose. An existing test caught it, and a new test pins the
+  crash case as still repairable. A later `[UNBLOCKED]` row clears the tag;
+  `[CASCADE_RECONCILED]` deliberately does not, because the cascade is not the
+  operator and treating its own audit row as the answer is the loop itself.
+
+- **`remove-dep` lost its `--reason` to fixed-arity dispatch.** The dispatcher
+  slices trailing arguments for non-variadic commands, so `remove-dep A B
+  --reason "x"` dropped the value and then failed with `--reason requires a
+  value`. `add-dep` takes the identical grammar and was already in
+  `_VARIADIC_COMMANDS`; the new verb had to join it. Found by running the
+  command for real rather than only through its unit tests, which call
+  `cmd_remove_dep` directly and never cross the dispatcher.
+
+## [0.5.0] -- 2026-08-19
+
 - **A review-rejection loop had no bound in code, so one task could be rejected
   and reworked indefinitely while every health signal read green.** Issue #122
   shipped `max_executor_retries_per_judge` with a config field, a runtime
@@ -2542,6 +2607,107 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   terminal" to "a PR exists" path so the defect cannot regress silently again. `docs/cli-
   reference.md` documents `reconcile-cascade`'s repair pass and summary-line format;
   `docs/backlog-contract.md` documents the terminal-rollup contract.
+
+- **An interrupted work unit lost everything it had produced, and the run had
+  no way to give it back.** A quota limit or a stop parked the in-flight unit
+  as `blocked`; the next unit's claim then displaced its uncommitted files into
+  a `devbench-quarantine:<owner>` stash, and nothing ever read that stash back
+  -- the audit comment said so in as many words, instructing the next executor
+  to re-execute from the Changes Manifest. Observed cost of one pass: a unit
+  that had run four hours and passed every review round was re-queued to start
+  again from an empty checkout. Each link is now cut. `restore_quarantine`
+  hands a displaced unit its work back when that unit is itself the one
+  claiming, bounded by its own Manifest and refusing to overwrite a newer
+  attempt, with the entry consumed on success so it cannot apply twice; a
+  refusal fails the claim rather than discarding an expensive attempt.
+  `_force_block_in_flight_wu` becomes `_requeue_in_flight_wu`, returning the
+  unit to `in-queue` with an `[INTERRUPTED_ON_STOP]` audit line -- `blocked`
+  encodes "waiting on a dependency", and when the stop happened after every
+  dependency was already terminal, no such event is ever coming. Before work
+  becomes unreachable, at the stop handler and again before any quarantine, the
+  checkout is snapshotted to `refs/devbench/checkpoint/<unit-id>` via `git
+  stash create`, which touches neither worktree nor index; a ref stays
+  reachable where a stash entry does not survive `git stash clear`. Both
+  snapshot call sites are best-effort, because raising inside a SIGTERM handler
+  would strand the unit `in-progress` with no run left to advance it.
+  `git_ops.isolate_worktrees` additionally offers per-unit checkouts so nothing
+  need be displaced at all; it requires per-unit branches and is rejected at
+  config load alongside `single_branch`, since git allows a branch in exactly
+  one worktree at a time.
+
+- **The orchestrator session inherited whatever reasoning effort the ambient
+  configuration carried, and an unbounded thinking budget silently multiplied
+  the cost of every turn.** An unattended run reached `xhigh` without anyone
+  choosing it. Effort is not a free dial: a turn that reasons for longer than
+  the prompt-cache lifetime returns to a cold cache, so the whole prompt is
+  re-uploaded and re-cached rather than read back. Measured on a live run, one
+  executor turn ran 634 seconds and returned 64000 output tokens -- the cap --
+  and the turn after it read 0 cached tokens while creating 68002. Token burn
+  per turn climbs sharply, the run reaches its quota limit sooner, and quota
+  exhaustion is what interrupts units mid-flight. `orchestrate.effort` and
+  `orchestrate.max_thinking_tokens` now resolve env > YAML > default at `high`
+  and 16000 and are passed explicitly to the SDK session.
+
+- **The task factory materialised drafts with no `## Task Type:` section, so
+  any test-only remediation was born unable to validate** (#345).
+  `DRAFT_TEMPLATE` rendered straight from `## Status:` to `## Target
+  Repository`. Rule 21 defaults an absent declaration to `behavior-fix`, and
+  rule 22 requires a `behavior-fix` task to carry at least one
+  production-source row, so a proposal whose fix was test-only, docs-only or
+  chore-only produced a work unit that could never pass `validate-backlog` --
+  and nothing in devbench writes that section afterwards, only reads it, so it
+  stayed stuck until a human edited the file. Observed twice in one run, each
+  time halting a 137-unit backlog with 56 units transitively blocked behind
+  the pair; one of them had already passed its full pipeline at 266 tests and
+  100% coverage before the gate rejected it on the missing line alone.
+  `infer_task_type` derives the declaration from the Manifest the factory is
+  about to write, reusing `BacklogManager`'s classifiers and
+  `_TASK_TYPE_ROW_INVARIANTS` rather than restating the rules, so the two
+  cannot drift; because those classifiers read
+  `validate.production_source_paths`, the result follows whatever layout the
+  workspace declares. A production row keeps the gated default, so inference
+  never moves a task out of the RED gate; otherwise the first non-gated type
+  whose invariant accepts every row wins; and a sentinel-only Manifest gets
+  `refactor`, the one type with no Manifest invariant and so the only
+  declaration that survives the amendment workflow concretising those paths.
+
+- **Work-unit timestamps ignored `display_timezone`, which every other
+  timestamp-rendering surface honours** (#344). `report`, `hook-tail` and
+  `watch` all resolved the setting; audit comments and TDD Cycle Log entries
+  hard-coded UTC, so a run's own audit trail read in a different zone from the
+  output an operator has open beside it, and every comparison needed a mental
+  offset that DST makes easy to misread as a stall. Comments now resolve the
+  zone through hook-tail's own resolver and `COMMENT_TIMESTAMP_FORMAT` carries
+  `%Z` so the header names the zone it used; Cycle Log entries keep full
+  ISO-8601 and carry a numeric offset, which is what makes them unambiguous
+  and round-trippable. The default stays UTC rather than the OS local zone --
+  deliberately diverging from the terminal-rendering commands -- because a
+  work-unit file is committed and read on other machines, so following the
+  runner's zone would make one file's timestamps depend on who wrote each
+  line, and would retroactively change the meaning of every comment already
+  written. Unset, the rendered text is byte-identical to before. The read side
+  moved with it: `_AUDIT_PROGRESS_RE` and `_BLOCKED_AUDIT_RE` captured the
+  zone token instead of pinning the literal `UTC`, and
+  `audit_timestamp_to_utc` interprets it, since a relaxed regex alone would
+  have read local times as UTC and reported durations off by the offset.
+  Guard tests walk the installed package and fail on any writer that inlines a
+  UTC-pinned format or any parser that assumes one -- the first pass migrated
+  only the sites referencing the format constant and missed eight that inlined
+  the literal string, including the writer behind every `[WU_CLAIMED]` line.
+
+- **`reconcile-cascade` wrote an audit tag its own reader ignored, so a
+  re-queued unit reported as operator-blocked forever** (#347).
+  `_BLOCKED_AUDIT_LINE_RE` matched `BLOCKED`, `UNBLOCKED` and
+  `CASCADE_RESOLVED`, but the cascade records its re-queue as
+  `[CASCADE_RECONCILED]`. The unit reached `in-queue` while every blocked-audit
+  consumer kept treating the original `[BLOCKED]` row as live: `devbench
+  report` listed it under "Blocked tasks (operator action required)" with "No
+  automation path; operator must inspect and resolve manually", and the
+  classification-transition notifier could ping Slack about a unit that was in
+  fact queued and actionable. The two halves of devbench disagreed and the
+  half an operator reads was the wrong one. A guard test now asserts every tag
+  devbench writes to mean "this block is over" is recognised by the reader
+  that consumes blocks.
 
 ### Changed
 

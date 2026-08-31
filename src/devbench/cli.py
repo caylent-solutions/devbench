@@ -7577,7 +7577,14 @@ _SHARED_FILE_IMPACT_VERDICT_STATUSES: frozenset[str] = frozenset(
 # stable across ONE invocation's own writes" (see that function's own
 # docstring); it is never compared across process boundaries without the
 # PID component also matching.
-_SHARED_FILE_IMPACT_INVOCATION_COUNTER: itertools.count[int] = itertools.count()
+# The annotation is quoted deliberately: `itertools.count` is not
+# subscriptable at runtime on any CPython version. Python 3.14 defers
+# annotation evaluation (PEP 649) so an unquoted form appears to work
+# locally, but 3.12 -- the floor in `requires-python` and the version CI
+# runs -- evaluates module-level annotations eagerly and raises
+# TypeError at import. Quoting keeps the type visible to mypy without
+# evaluating it.
+_SHARED_FILE_IMPACT_INVOCATION_COUNTER: "itertools.count[int]" = itertools.count()
 
 
 def _shared_file_impact_invocation_id() -> str:

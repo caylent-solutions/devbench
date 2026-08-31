@@ -93,6 +93,25 @@ test-unit:
 ## test-coverage: Run tests with coverage report (fails below 98%)
 ## --cov-precision=2 so the fail-under compares the real value (e.g. 97.70 < 98)
 ## instead of the default precision=0 which rounds 97.70 -> 98 and never fails.
+#
+# COVERAGE_CORE=sysmon selects coverage.py's PEP 669 sys.monitoring core.
+# That is already the default on CPython 3.14, but not on 3.12 -- the
+# `requires-python` floor and the version CI runs -- where coverage falls
+# back to the C trace function. The tracer inflates wall-clock time by
+# roughly 7x (measured on this suite: the permission_flag_writepath file
+# alone takes 38.4s traced vs 6.1s under sysmon), which pushes the ReDoS
+# linear-time regression guards in
+# tests/test_plugin_helpers/test_permission_flag_writepath.py past their
+# budgets even though the code under test is linear -- a measurement
+# artefact, not a regression. Coverage totals are identical either way
+# (17982 statements / 300 missing / 98.33% under both cores), and this
+# project does not use branch coverage, which sysmon does not support
+# before 3.14. Overridable: `make test-coverage COVERAGE_CORE=ctrace`.
+# coverage.py reads this only from the environment; it has no
+# pyproject.toml equivalent in coverage 7.13.
+COVERAGE_CORE ?= sysmon
+export COVERAGE_CORE
+
 test-coverage:
 	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98 --cov-precision=2
 

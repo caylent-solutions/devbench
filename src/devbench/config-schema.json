@@ -216,6 +216,10 @@
           "type": "boolean",
           "description": "When true, the orchestrate skill automatically invokes 'gh pr merge --<merge_strategy>' once the post-E7 CI watcher reports GREEN. Requires auto_finalize: true AND defer_pr: true. Incompatible with local_only: true. When the E7 watcher is absent, emits [AUTO_MERGE_SKIPPED] no_ci_watcher and skips. A marker file at <workspace>/.devbench/auto-merge-fired-<repo>.marker prevents duplicate invocations. Default: false."
         },
+        "provenance_path": {
+          "type": "string",
+          "description": "Path to a JSON provenance map that git-ops-finalize reads to compose the batch PR body: title, per-epic summary, and one closing-keyword line ('Fixes <org>/<repo>#<n>' or 'Fixes #<n>') per mapped issue. Overridden per-invocation by 'git-ops-finalize --provenance <path>'; the flag beats this key. Default: unset, which preserves the plain PR body git-ops-finalize has always produced. No DEVBENCH_* environment override (YAML-only, like single_branch and branch_prefix). A relative value resolves against the TARGET REPO working tree (the repos.<org/repo> checkout git-ops-finalize runs against), never the workspace root or the process CWD; an absolute path is used as-is. This is a GLOBAL block while git-ops-finalize runs per repo, so one relative value resolves to a different file inside each repo's checkout in a multi-repo workspace."
+        },
         "pr_review_resolution": {
           "type": "object",
           "description": "PR review-comment polling settings (issue #116). Disabled by default. When enabled, cmd_git_ops polls gh pr view for asynchronous bot review feedback (Copilot, Q-Dev, internal review bots) before merging.",
@@ -623,6 +627,260 @@
             "minLength": 1
           },
           "description": "File extensions this workspace treats as production source, consumed with production_source_paths by the task-type invariant (rule 21) and source-test atomicity (rule 14). Absent keeps the built-in Python-only behaviour. Declare it when behaviour lives in non-Python artefacts, for example an infrastructure repo whose service specs are YAML and whose modules are HCL, so those changes are RED-gated instead of being forced to task type 'chore'."
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "description": "Unified opt-in configuration for the eight integration-reality gates (spec section 4.1; caylent-solutions/devbench-internal-backlog#10..#17). Every gate is disabled by default at the built-in level (D-17); each block below is individually enabled and carries its own tunables, each with a built-in default. `additionalProperties: false` at every level means an unrecognised key (a typo, or a key from either retired pre-release opt-in surface -- PR #318's per-repo glob key or PR #322's bare top-level block) is a load-time error rather than a silently ignored key (D-2). See docs/devbench-yaml-reference.md for the full four-layer precedence model (built-in -> project -> per-repo override -> env).",
+      "additionalProperties": false,
+      "properties": {
+        "reachability": {
+          "type": "object",
+          "description": "check-reachability gate (caylent-solutions/devbench-internal-backlog#10). entry_points seeds the transitive reachability walk (issue #10 AC2).",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the reachability gate for this workspace. Default false."
+            },
+            "entry_points": {
+              "type": "array",
+              "description": "Repo-relative paths seeding the transitive reachability walk (issue #10 AC2, spec 4.4 bullet 2). Absent or empty defaults to the built-in source_classification-derived entry-point stem set (main, app, index, __init__, setup, conftest, wsgi, asgi) matched against each candidate importer's own basename stem. Each path must be repo-relative: no leading '/' (absolute) and no '..' parent-traversal segment, or config load fails fast naming the offending value.",
+              "items": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$" }
+            }
+          }
+        },
+        "ancestry": {
+          "type": "object",
+          "description": "check-ancestry gate (caylent-solutions/devbench-internal-backlog#12). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the ancestry gate for this workspace. Default false."
+            }
+          }
+        },
+        "shared_file_impact": {
+          "type": "object",
+          "description": "check-shared-file-impact gate (caylent-solutions/devbench-internal-backlog#13). Supersedes PR #318's retired per-repo glob key: per-repo glob patterns now live under gates.repos.<org/repo>.shared_file_impact.patterns.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the shared-file-impact gate for this workspace. Default false."
+            },
+            "auto_derive_registry": {
+              "type": "boolean",
+              "description": "When true, check-shared-file-impact computes the shared-file set as the files imported/required by more than fan_in_threshold distinct modules (spec 4.6, issue #13 AC4), via language-appropriate import scanning driven by devbench.source_classification. Unioned ADDITIVELY with the hand-maintained per-repo glob list (gates.repos.<org/repo>.shared_file_impact.patterns) -- auto-derivation never replaces the hand list. Default false."
+            },
+            "fan_in_threshold": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The distinct-importer fan-in count a file must exceed (strictly greater than, not 'at least') for auto-derivation to include it in the shared-file set. Only consumed when auto_derive_registry is true. Default 3."
+            }
+          }
+        },
+        "fixture_consistency": {
+          "type": "object",
+          "description": "check-fixture-consistency gate (caylent-solutions/devbench-internal-backlog#17). Supersedes the retired top-level fixture_consistency: block, now nested here. Devbench cannot infer a target repo's fixture-file layout on its own, so absent canonical_sources makes the check a no-op even when enabled: true.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the fixture-consistency gate for this workspace. Default false."
+            },
+            "canonical_sources": {
+              "type": "array",
+              "minItems": 1,
+              "description": "One or more designated canonical fixture/dataset files. Every scan target's identifier literals must cross-reference the identifier values found in the canonical source it targets.",
+              "items": {
+                "type": "object",
+                "required": ["path", "identifier_field"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path to the canonical fixture file (JSON or YAML)."
+                  },
+                  "identifier_field": {
+                    "type": "string",
+                    "description": "Key name within each canonical record (SKU, product id, PO number, or whatever the workspace's canonical identifier type is) whose values other fixtures must reference. Every dict found anywhere in the parsed file that has this key contributes its value."
+                  },
+                  "expected_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional: exact expected number of distinct identifier_field values in this canonical source. Set on a backfill task to assert full coverage (e.g. 'must cover N of N records'); the check fails when the actual distinct-value count differs."
+                  }
+                }
+              }
+            },
+            "scan": {
+              "type": "array",
+              "minItems": 1,
+              "description": "Mock/fixture files to scan for identifier literals that must cross-reference a canonical_sources entry. A key found in a scan target that is absent from its canonical source fails the check with a clear, actionable message naming the file and the missing key(s).",
+              "items": {
+                "type": "object",
+                "required": ["path", "identifier_field"],
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "Repo-relative path to the mock/fixture file to scan (JSON or YAML)."
+                  },
+                  "identifier_field": {
+                    "type": "string",
+                    "description": "Key name within each scanned record holding the identifier literal(s) to cross-reference against the canonical source."
+                  },
+                  "canonical_source": {
+                    "type": "string",
+                    "description": "The `path` of the canonical_sources entry this scan target checks against. Optional and inferred when exactly one canonical_sources entry is configured; required (and validated against the configured canonical_sources paths) when more than one is configured."
+                  }
+                }
+              }
+            },
+            "extract_source_literals": {
+              "type": "boolean",
+              "description": "Config-gated source-literal extraction scan mode (spec 4.7 bullet 4, issue #17 AC-19). When true, check-fixture-consistency additionally scans the classified source files in the repo (pruning a fixed set of dependency/build/vendor directories, and excluding any file symlink resolving outside the repo root; a symlinked directory is never descended into) for identifier literals matching a configured identifier_field and flags one absent from its canonical source; findings carry file:line, redacted unconditionally regardless of length. Heuristic, so off by default -- see docs/devbench-yaml-reference.md for the documented accuracy bounds, including the pruned-directory and symlink scanning boundaries. Default false."
+            }
+          }
+        },
+        "write_path_audit": {
+          "type": "object",
+          "description": "write-path-audit gate (caylent-solutions/devbench-internal-backlog#16). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the write-path-audit gate for this workspace. Default false."
+            }
+          }
+        },
+        "newly_reachable_paths": {
+          "type": "object",
+          "description": "newly-reachable-paths gate (caylent-solutions/devbench-internal-backlog#15; spec 4.9a, decision C-03). `paths` is the migrated home of the retired free-text primitives registry under backlog/config/.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the newly-reachable-paths gate for this workspace. Default false."
+            },
+            "paths": {
+              "type": "array",
+              "description": "Repo-relative paths naming shared, stateful primitives' defining file(s) a newly-reachable-paths fix should be cross-checked against, resolved exclusively through config_loader.resolve_gate_config. Default empty (no registry configured).",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "composition_root": {
+          "type": "object",
+          "description": "composition-root gate (caylent-solutions/devbench-internal-backlog#11). No gate-specific tunables beyond enabled.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the composition-root gate for this workspace. Default false."
+            }
+          }
+        },
+        "layout_geometry": {
+          "type": "object",
+          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#14; spec 4.9c). No gate-specific tunables beyond enabled. Judge-evidence tier (constants.GATE_TIERS, spec 4.2); waived via log-waiver with a mandatory --reason and no --operator requirement. See docs/devbench-yaml-reference.md's gates.layout_geometry section for the full exception-route reference.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable the layout-geometry gate for this workspace. Default false."
+            }
+          }
+        },
+        "repos": {
+          "type": "object",
+          "description": "Optional per-repo override map (D-15 precedence: field-wise merged OVER the project-level gates.* values above). Keys must be 'org/repo' and must already be present in the top-level repos: mapping -- an override naming an unconfigured repo is a load-time error.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[^/]+/[^/]+$": {
+              "type": "object",
+              "description": "Per-repo gate overrides for this org/repo.",
+              "additionalProperties": false,
+              "properties": {
+                "reachability": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "ancestry": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "shared_file_impact": {
+                  "type": "object",
+                  "description": "Per-repo shared-file-impact override. `patterns` is the migrated home of PR #318's retired per-repo glob key.",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "patterns": {
+                      "type": "array",
+                      "description": "Glob patterns (fnmatch-style, matched against POSIX paths relative to the repo root) identifying shared/high-fan-in composition-root files for this repo.",
+                      "items": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                },
+                "fixture_consistency": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "write_path_audit": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "newly_reachable_paths": {
+                  "type": "object",
+                  "description": "Per-repo newly-reachable-paths override. `paths`, when non-empty, replaces the project-level list wholesale for this repo.",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "paths": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  }
+                },
+                "composition_root": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                },
+                "layout_geometry": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

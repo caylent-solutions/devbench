@@ -7,6 +7,8 @@ Provides:
   liveness check via ``os.kill(pid, 0)``.
 - :func:`flock_backlog` -- context manager that acquires an exclusive ``fcntl.flock``
   on ``<workspace>/.devbench/BACKLOG.lock`` with a configurable timeout.
+- :func:`flock_path` -- generic ``fcntl.flock`` context manager over an arbitrary
+  lock path (shared or exclusive), the primitive ``flock_backlog`` is built on.
 - :class:`ClaimRaceError` -- raised when a work unit's status changes underneath
   the BACKLOG.lock (another session won the race).
 - :func:`detect_scope_overlap` -- returns IDs that appear in both the new scope and
@@ -365,33 +367,64 @@ class SessionRegistry:
 
 
 # ---------------------------------------------------------------------------
-# flock_backlog
+# flock_path / flock_backlog
 # ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
-def flock_backlog(
-    workspace_root: Path,
-    timeout_seconds: int = SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS,
+def flock_path(
+    lock_path: Path,
+    timeout_seconds: int,
+    *,
+    shared: bool = False,
 ) -> Generator[None, None, None]:
-    """Acquire an exclusive ``fcntl.flock`` on the BACKLOG.lock file.
+    """Acquire an ``fcntl.flock`` on an arbitrary *lock_path* -- the generic primitive
+    ``flock_backlog`` is built on.
 
-    The lock file is ``<workspace_root>/.devbench/BACKLOG.lock``.  The
-    directory is created if absent.  The lock is released when the context
-    manager exits (normal or exceptional).
+    Sibling helper, parameterised by lock path, so any caller that needs
+    ``flock_backlog``'s mutual-exclusion contract (non-blocking ``LOCK_NB``
+    attempt inside a poll loop bounded by *timeout_seconds*, lock released on
+    context-manager exit whether normal or exceptional) can reuse it directly
+    instead of re-implementing the poll/timeout logic against a different
+    file. ``flock_backlog`` itself is a thin wrapper over this function with
+    the workspace's ``BACKLOG.lock`` path bound in.
 
-    The implementation uses a non-blocking ``LOCK_EX | LOCK_NB`` attempt
-    inside a poll loop with sleeps of at most
+    *lock_path*'s parent directory is created if absent; *lock_path* itself
+    is created if absent and is never deleted (only ever opened for the
+    duration of the lock). The lock file's content is not meaningful --
+    only its inode is used for ``flock`` -- so it deliberately holds no
+    payload; callers that need to persist data under the lock (e.g. a
+    baseline record) write to a *different* file while holding this lock,
+    which is what makes this helper composable with a temp-then-rename
+    atomic write: a second racing caller opens the same *lock_path* inode
+    (not the target file's, so a rename of the target never orphans a
+    lock-holder) and blocks on ``flock`` until the first caller's ``with``
+    block exits.
+
+    The implementation uses a non-blocking ``LOCK_NB`` attempt inside a poll
+    loop with sleeps of at most
     :data:`~devbench.constants.SESSION_FLOCK_POLL_INTERVAL_SECONDS` so that
-    ``timeout_seconds`` is a hard upper bound on how long the caller waits.
+    *timeout_seconds* is a hard upper bound on how long the caller waits --
+    never an unbounded blocking wait.
 
     Args:
-        workspace_root: Root directory of the devbench workspace.
-        timeout_seconds: Maximum seconds to wait for the lock.
-            Defaults to :data:`~devbench.constants.SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`.
+        lock_path: Path to the lock file (created if absent; parent
+            directory created if absent).
+        timeout_seconds: Maximum seconds to wait for the lock. Must be
+            positive -- callers pass an explicit, configuration-derived
+            value rather than relying on a hidden default, since the
+            appropriate wait bound differs per caller (interactive backlog
+            operations vs. a background baseline capture).
+        shared: ``False`` (default) takes ``LOCK_EX`` -- exclusive against
+            every other holder, reader or writer. ``True`` takes
+            ``LOCK_SH`` -- multiple concurrent shared holders are allowed,
+            but a shared holder still blocks/waits on a concurrent
+            exclusive holder, so a reader taking ``shared=True`` can never
+            observe a write in progress.
 
     Yields:
-        ``None`` -- callers use ``with flock_backlog(root):`` without capturing the value.
+        ``None`` -- callers use ``with flock_path(path, timeout):`` without
+        capturing the value.
 
     Raises:
         ValueError: *timeout_seconds* is not positive.
@@ -399,34 +432,59 @@ def flock_backlog(
         OSError: An unexpected OS error from ``fcntl.flock``.
     """
     if timeout_seconds <= 0:
-        raise ValueError(
-            f"timeout_seconds must be positive, got {timeout_seconds}. "
-            f"Pass a value > 0 or omit to use the default "
-            f"({SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS}s)."
-        )
-    lock_dir = workspace_root / ".devbench"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / SESSION_BACKLOG_LOCK_NAME
+        raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}. Pass a value > 0.")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_op = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
 
     with lock_path.open("w") as lock_fd:
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
-                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_fd.fileno(), lock_op | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"Could not acquire BACKLOG.lock within {timeout_seconds}s. "
-                        f"Another devbench session is holding the lock at "
-                        f"{lock_path}. Retry or investigate the holding process."
+                        f"Could not acquire lock at {lock_path} within {timeout_seconds}s. "
+                        f"Another process is holding the lock. Retry or investigate the holding process."
                     ) from None
                 time.sleep(min(SESSION_FLOCK_POLL_INTERVAL_SECONDS, remaining))
         try:
             yield None
         finally:
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+
+def flock_backlog(
+    workspace_root: Path,
+    timeout_seconds: int = SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS,
+) -> contextlib.AbstractContextManager[None]:
+    """Acquire an exclusive ``fcntl.flock`` on the BACKLOG.lock file.
+
+    The lock file is ``<workspace_root>/.devbench/BACKLOG.lock``.  The
+    directory is created if absent.  The lock is released when the context
+    manager exits (normal or exceptional).
+
+    Thin wrapper over :func:`flock_path` with the BACKLOG.lock path bound
+    in -- see that function for the underlying poll/timeout implementation.
+
+    Args:
+        workspace_root: Root directory of the devbench workspace.
+        timeout_seconds: Maximum seconds to wait for the lock.
+            Defaults to :data:`~devbench.constants.SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`.
+
+    Returns:
+        A context manager; callers use ``with flock_backlog(root):`` without
+        capturing the yielded value (``None``).
+
+    Raises:
+        ValueError: *timeout_seconds* is not positive.
+        TimeoutError: The lock could not be acquired within *timeout_seconds*.
+        OSError: An unexpected OS error from ``fcntl.flock``.
+    """
+    lock_path = workspace_root / ".devbench" / SESSION_BACKLOG_LOCK_NAME
+    return flock_path(lock_path, timeout_seconds)
 
 
 # ---------------------------------------------------------------------------

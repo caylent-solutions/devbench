@@ -66,6 +66,15 @@ _GIT_CREDENTIAL_HELPER = '!f() { test "$1" = get && printf "username=x-access-to
 #: even when no token is configured.
 _REMOTE_GIT_SUBCOMMANDS: frozenset[str] = frozenset({"push", "fetch", "pull", "ls-remote", "clone"})
 
+#: E2-F9-S1-T1 / spec 4.13 / D-17: the plain PR body ``git-ops-finalize`` has
+#: always produced. :meth:`GitOpsService.compose_finalize_pr_body` returns
+#: this string byte-for-byte when no provenance map is configured (neither
+#: ``git_ops.provenance_path`` nor ``--provenance``), so upgrading to this
+#: feature never changes existing behaviour (spec Section 6).
+_PLAIN_FINALIZE_PR_BODY_TEMPLATE = (
+    "Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{repo}`"
+)
+
 
 def _first_failing_job_link(checks: object, failing_states: AbstractSet[str]) -> str:
     """Return the link URL of the first failing check entry, or the empty string.
@@ -101,6 +110,128 @@ def _extract_distinct_task_ids(log_text: str) -> list[str]:
             seen.add(task_id)
             distinct.append(task_id)
     return distinct
+
+
+def _render_closing_keyword_line(target_repo: str, issue: object, provenance_path: Path) -> str:
+    """Render one GitHub closing-keyword line for a mapped provenance-map issue.
+
+    Single code path for both closing-keyword forms required by spec 4.13
+    (AC-E2-F9-S1-T1-2): a cross-repo issue (``repo`` present and different
+    from *target_repo*) renders ``Fixes <org>/<repo>#<n>``; a same-repo
+    issue (no ``repo`` key, or ``repo`` equal to *target_repo*) renders
+    ``Fixes #<n>``.
+
+    Args:
+        target_repo: The ``owner/name`` repo the composed PR is opened
+            against. An issue entry whose ``repo`` matches this value is
+            treated as same-repo.
+        issue: One entry from a provenance-map epic's ``issues`` list;
+            expected to be a mapping with an integer ``number`` and an
+            optional ``repo`` string.
+        provenance_path: The source map's path, named in the error message
+            so a malformed entry points back at the file to fix.
+
+    Returns:
+        The rendered ``Fixes ...`` line.
+
+    Raises:
+        ValueError: If *issue* is not a mapping, its ``number`` field is
+            missing or not an integer, or its ``repo`` field (when present)
+            is not a string matching the GitHub ``owner/name`` shape.
+    """
+    if not isinstance(issue, dict):
+        raise ValueError(f"provenance map at '{provenance_path}' has a non-object issue entry: {issue!r}")
+    number = issue.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise ValueError(
+            f"provenance map at '{provenance_path}' has an issue entry missing an integer 'number': {issue!r}"
+        )
+    issue_repo = issue.get("repo")
+    if issue_repo is None:
+        return f"Fixes #{number}"
+    if not isinstance(issue_repo, str) or not _OWNER_REPO_RE.match(issue_repo):
+        raise ValueError(
+            f"provenance map at '{provenance_path}' has an issue entry with an invalid 'repo' value "
+            f"(expected an 'owner/name' string): {issue!r}"
+        )
+    if issue_repo != target_repo:
+        return f"Fixes {issue_repo}#{number}"
+    return f"Fixes #{number}"
+
+
+def _validate_provenance_epic(epic: object, provenance_path: Path) -> dict:
+    """Validate one provenance-map epic entry (spec 4.13; D-17).
+
+    Every malformed epic shape must fail loudly naming *provenance_path*
+    and the offending entry, never silently default or reach an
+    un-type-checked ``len()``/iteration downstream.
+
+    Args:
+        epic: One entry from the provenance map's ``epics`` list.
+        provenance_path: The source map's path, named in the error message
+            so a malformed entry points back at the file to fix.
+
+    Returns:
+        *epic*, typed as ``dict`` once validated.
+
+    Raises:
+        ValueError: If *epic* is not a mapping; is missing a non-empty
+            string ``name`` or ``summary`` (AC-E2-F9-S1-T1-1 requires a
+            per-epic summary in the composed body, so a silent empty-string
+            default would violate it); or carries an ``issues`` value that
+            is present but not a list (the un-type-checked case previously
+            reached ``len()`` and raised an uncaught ``TypeError``).
+    """
+    if not isinstance(epic, dict):
+        raise ValueError(f"provenance map at '{provenance_path}' has a non-object epic entry: {epic!r}")
+    name = epic.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"provenance map at '{provenance_path}' has an epic missing a non-empty 'name': {epic!r}")
+    summary = epic.get("summary")
+    if not isinstance(summary, str) or not summary:
+        raise ValueError(f"provenance map at '{provenance_path}' has an epic missing a non-empty 'summary': {epic!r}")
+    issues = epic.get("issues")
+    if issues is not None and not isinstance(issues, list):
+        raise ValueError(f"provenance map at '{provenance_path}' has an epic with a non-list 'issues' value: {epic!r}")
+    return epic
+
+
+def _load_provenance_map(provenance_path: Path) -> dict:
+    """Load and parse the JSON provenance map at *provenance_path*.
+
+    Args:
+        provenance_path: Path to the provenance map (the resolved
+            ``--provenance`` flag or ``git_ops.provenance_path`` config
+            value).
+
+    Returns:
+        The parsed JSON object.
+
+    Raises:
+        ValueError: If the path does not exist, is unreadable, is not
+            valid JSON, or does not decode to a JSON object. Every message
+            names *provenance_path* (spec Section 7: loud failures name
+            the offending path, never a silent fallback to the plain body).
+    """
+    if not provenance_path.is_file():
+        raise ValueError(
+            f"provenance map not found at '{provenance_path}'; configure git_ops.provenance_path "
+            "or pass --provenance with an existing file, or omit both for the plain PR body"
+        )
+    try:
+        raw_text = provenance_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"provenance map at '{provenance_path}' is unreadable: {exc}") from exc
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"provenance map at '{provenance_path}' is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"provenance map at '{provenance_path}' must decode to a JSON object with an 'epics' "
+            f"list, got {type(payload).__name__}"
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -221,6 +352,15 @@ class ReviewResolution:
 # Consecutive special chars (e.g. '//', '..', '/-') are rejected to match
 # git ref naming rules (git-check-ref-format).
 _BRANCH_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_]|[.\-/][a-zA-Z0-9_])*$")
+
+#: Shape validator for a provenance-map issue's optional ``repo`` field
+#: (spec 4.13; D-17). GitHub closing keywords only honour the
+#: ``owner/name`` cross-repo form; a ``repo`` value that fails
+#: this pattern (or is not a string at all) is rejected by
+#: :func:`_render_closing_keyword_line` rather than rendered into a dead
+#: keyword line like ``Fixes 42#1`` that silently never auto-closes the
+#: mapped issue on merge.
+_OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 class GitOpsService:
@@ -656,6 +796,99 @@ class GitOpsService:
         pr_url = stdout.strip()
         self.logger.info("Created PR: %s", pr_url)
         return pr_url
+
+    def compose_finalize_pr_body(
+        self,
+        *,
+        repo: str,
+        branch: str,
+        title: str,
+        provenance_path: Path | None,
+    ) -> str:
+        """Compose the ``git-ops-finalize`` batch PR body (spec 4.13; D-17).
+
+        With no provenance map configured (*provenance_path* is ``None``,
+        the case when neither ``git_ops.provenance_path`` nor
+        ``--provenance`` is set), returns the plain body ``git-ops-finalize``
+        has always produced, byte-for-byte (spec Section 6: no config
+        change alters existing behaviour).
+
+        With a resolved *provenance_path*, reads the JSON provenance map
+        and composes: *title*, one ``###``-headed per-epic summary section,
+        then a closing-keyword block with one ``Fixes ...`` line per mapped
+        issue (cross-repo: ``Fixes <org>/<repo>#<n>``; same-repo:
+        ``Fixes #<n>`` -- both rendered by :func:`_render_closing_keyword_line`,
+        AC-E2-F9-S1-T1-2). This closes issue #334: without it, a combined
+        PR carries no closing-keyword block, so mapped issues never
+        auto-close on merge.
+
+        Provenance map shape (JSON)::
+
+            {
+              "epics": [
+                {
+                  "name": "E1: Cherry-pick integration",
+                  "summary": "One-line summary of what this epic delivered.",
+                  "issues": [
+                    {"repo": "org/other-repo", "number": 10},
+                    {"number": 335}
+                  ]
+                }
+              ]
+            }
+
+        Args:
+            repo: The ``owner/name`` repo the PR is opened against; issues
+                whose ``repo`` matches this value render the same-repo
+                keyword form.
+            branch: The branch the plain body names (unused when a
+                provenance map resolves).
+            title: The PR title (also passed as ``gh pr create --title``);
+                rendered as the first line of the composed body.
+            provenance_path: Resolved effective path (``--provenance`` flag
+                if set, else ``git_ops.provenance_path`` config, else
+                ``None``).
+
+        Returns:
+            The composed PR body.
+
+        Raises:
+            ValueError: If *provenance_path* is set but missing, unreadable,
+                not valid JSON, resolves to zero mapped issues, or contains
+                a malformed epic (non-object, missing a non-empty
+                ``name``/``summary``, or a non-list ``issues`` value) or a
+                malformed issue entry (non-object, missing an integer
+                ``number``, or a ``repo`` that is not a valid
+                ``owner/name`` string) -- never silently degrades to the
+                plain body (spec Section 7).
+        """
+        if provenance_path is None:
+            return _PLAIN_FINALIZE_PR_BODY_TEMPLATE.format(branch=branch, repo=repo)
+
+        payload = _load_provenance_map(provenance_path)
+        epics = payload.get("epics")
+        if not isinstance(epics, list):
+            raise ValueError(f"provenance map at '{provenance_path}' must contain an 'epics' list")
+
+        validated_epics = [_validate_provenance_epic(epic, provenance_path) for epic in epics]
+
+        total_issues = sum(len(epic.get("issues") or []) for epic in validated_epics)
+        if total_issues == 0:
+            raise ValueError(
+                f"provenance map at '{provenance_path}' contains no mapped issues; refusing to emit "
+                "an empty closing-keyword block"
+            )
+
+        lines: list[str] = [title, ""]
+        for epic in validated_epics:
+            lines.append(f"### {epic['name']}")
+            lines.append(epic["summary"])
+            lines.append("")
+        lines.append("### Closes")
+        for epic in validated_epics:
+            for issue in epic.get("issues") or []:
+                lines.append(_render_closing_keyword_line(repo, issue, provenance_path))
+        return "\n".join(lines)
 
     def merge_pr(self, repo: str, pr_number: int, *, repo_path: Path | None = None) -> None:
         """Merge a pull request using the effective merge strategy for *repo*.

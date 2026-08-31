@@ -2405,19 +2405,23 @@ def _stats_to_rows_single(stats: WindowStats, display_tz: tzinfo | None = None) 
     return list(zip(_METRIC_LABELS, values, strict=True))
 
 
-def _resolve_window_endpoints(log_timestamps: list[datetime]) -> tuple[datetime, datetime, datetime | None]:
+def _resolve_window_endpoints(
+    log_timestamps: list[datetime], now: datetime | None = None
+) -> tuple[datetime, datetime, datetime | None]:
     """Return (log_start_for_window, window_end, log_started) for an empty or non-empty log.
 
-    ``window_end`` is the report-generation moment, bounded below by
-    ``datetime.now(UTC)``. Without that bound, a "This run" window whose
-    ``start`` post-dates every log entry (common in watch mode when no new
-    log lines have arrived yet) yields a negative span and an n/a cascade
-    across every derived metric.
+    ``window_end`` is the report-generation moment, bounded below by ``now``
+    (defaults to ``datetime.now(UTC)`` when not provided -- this is a test-
+    injection point, mirroring ``_orchestrator_liveness_banner``'s own ``now``
+    parameter elsewhere in this module). Without that bound, a "This run"
+    window whose ``start`` post-dates every log entry (common in watch mode
+    when no new log lines have arrived yet) yields a negative span and an
+    n/a cascade across every derived metric.
 
-    For an empty log, both window endpoints fall back to ``datetime.now(UTC)``
-    and ``log_started`` is None.
+    For an empty log, both window endpoints fall back to the resolved
+    ``now`` and ``log_started`` is None.
     """
-    now = datetime.now(UTC)
+    now = now if now is not None else datetime.now(UTC)
     if log_timestamps:
         log_started = min(log_timestamps)
         return log_started, max(*log_timestamps, now), log_started
@@ -2496,6 +2500,11 @@ class _BacklogTotals:
     tasks_blocked_on_held: int = 0  # BLOCKED_ON_HELD
     tasks_blocked_runtime_degradation: int = 0  # RUNTIME_DEGRADATION (auto-recovers on orchestrator restart)
     tasks_blocked_operator: int = 0  # OPERATOR_ACTION_REQUIRED
+    # spec 4.9, PM-5 (E2-F4-S1-T1): count of well-formed [GATE_WAIVER] audit
+    # markers currently in the backlog, split by attribution -- "so an
+    # operator sees at a glance how much of the run is riding on [waivers]".
+    tasks_waived_operator: int = 0
+    tasks_waived_executor: int = 0
 
     @property
     def tasks_blocked_recovery(self) -> int:
@@ -2512,6 +2521,41 @@ class _BacklogTotals:
         Used by _compute_window_stats for the ETA projection denominator.
         """
         return self.tasks_blocked_auto_clearing
+
+
+def _gate_waiver_counts(tasks: list) -> tuple[int, int]:
+    """Return ``(operator_count, executor_count)`` of well-formed ``[GATE_WAIVER]`` markers across *tasks*.
+
+    Scans each task's backing file content once (spec 4.9, PM-5): "an
+    operator sees at a glance how much of the run is riding on [waivers]"
+    (E2-F4-S1-T1 description). Uses
+    ``devbench.backlog.manager.count_gate_waiver_markers`` -- the single
+    grammar authority ``validate-backlog``'s own grammar rule enforces --
+    so a malformed marker (already flagged by ``validate-backlog``) is
+    silently excluded from the count rather than crashing report
+    rendering. A task whose backing file does not exist on disk
+    contributes zero rather than raising, matching every other
+    file-content scan in this module (e.g. ``_extract_session_from_wu``).
+
+    Args:
+        tasks: ``WorkUnit`` instances of type ``WorkUnitType.TASK``.
+
+    Returns:
+        A ``(operator_count, executor_count)`` tuple summed across every
+        task.
+    """
+    from devbench.backlog.manager import count_gate_waiver_markers
+
+    operator_total = 0
+    executor_total = 0
+    for task in tasks:
+        if not task.file_path.exists():
+            continue
+        content = task.file_path.read_text(encoding="utf-8")
+        op, exe = count_gate_waiver_markers(content)
+        operator_total += op
+        executor_total += exe
+    return operator_total, executor_total
 
 
 def _backlog_totals_from_units(units: list) -> _BacklogTotals:
@@ -2586,6 +2630,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
                     "update _BacklogTotals + this if/elif chain."
                 )
 
+    tasks_waived_operator, tasks_waived_executor = _gate_waiver_counts(tasks)
+
     return _BacklogTotals(
         tasks_total=len(tasks),
         tasks_done=len(tasks_done),
@@ -2610,6 +2656,8 @@ def _backlog_totals_from_units(units: list) -> _BacklogTotals:
         tasks_blocked_on_held=cnt_on_held,
         tasks_blocked_runtime_degradation=cnt_runtime_degradation,
         tasks_blocked_operator=cnt_operator,
+        tasks_waived_operator=tasks_waived_operator,
+        tasks_waived_executor=tasks_waived_executor,
     )
 
 
@@ -2640,6 +2688,10 @@ def _backlog_state_rows(b: _BacklogTotals, lifetime: WindowStats | None = None) 
         (
             "Stories / Features / Epics auto-rolled to done",
             f"{b.stories_done} / {b.features_done} / {b.epics_done}",
+        ),
+        (
+            "Gate waivers (operator / executor)",
+            f"{b.tasks_waived_operator} / {b.tasks_waived_executor}",
         ),
     ]
 
@@ -3283,6 +3335,7 @@ def generate_report(
     session_name: str | None = None,
     *,
     by_role: bool = False,
+    now: datetime | None = None,
 ) -> str:
     """Generate a formatted progress report.
 
@@ -3310,6 +3363,12 @@ def generate_report(
             listed in the report.  Pass ``None`` (default) to aggregate across
             all sessions.  Composes with ``scope_filter``: both filters are
             applied in sequence (session filter first, then scope filter).
+        now: Override for the current wall-clock used to bound
+            ``window_end`` in ``_resolve_window_endpoints`` (test-injection
+            point, mirroring ``_orchestrator_liveness_banner``'s own ``now``
+            parameter). ``None`` (default) reads ``datetime.now(UTC)``, so
+            every existing caller (``cmd_report``, watch mode) keeps its
+            current behaviour byte-for-byte.
 
     Returns:
         Formatted report string ready for terminal output.
@@ -3340,6 +3399,11 @@ def generate_report(
         pid_path=pid_file_path(WORKSPACE_ROOT),
         display_tz=banner_display_tz,
     )
+
+    # Transport-restart count row (issue #331 FR-4). Rendered only when
+    # non-None so a clean run (no in-process SDK-transport restarts logged)
+    # stays byte-identical to today (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(log_path)
 
     # Issue #162 Phase 6 (rendered-body snapshot) is deferred.
     # A snapshot keyed on log mtime + size is fast but unsafe:
@@ -3423,7 +3487,23 @@ def generate_report(
         WORKSPACE_ROOT, log_path, "in-progress"
     )
     all_timestamps: list[datetime] = event_index.all_log_timestamps_for_workspace(WORKSPACE_ROOT, log_path)
-    log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps)
+    log_start_for_window, window_end, log_started = _resolve_window_endpoints(all_timestamps, now=now)
+
+    # Current-session boundary, resolved ONCE here and reused by both the
+    # transport-restart row below and the windowed table further down, so the
+    # row and the table's "Session" column can never disagree.
+    detected_session = _find_current_session_start_from_index(event_index, log_path, workspace_root=WORKSPACE_ROOT)
+    session_start = detected_session if detected_session is not None else log_start_for_window
+
+    # Transport-restart row (issue #331 FR-4), counted per window against the
+    # same boundaries the table uses. Rendered only when the log holds at least
+    # one restart, so a clean workspace stays byte-identical to today
+    # (spec D-6, AC-11).
+    transport_restarts_row = transport_restarts_line(
+        log_path,
+        session_start=session_start,
+        report_started_at=report_started_at,
+    )
 
     # Current-session boundary, resolved ONCE here and reused by both the
     # transport-restart row below and the windowed table further down, so the

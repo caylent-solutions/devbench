@@ -2,24 +2,46 @@
 
 from __future__ import annotations
 
+import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from test_tdd_gate import (
+    commit_scratch_repo,
+    init_scratch_repo,
+    run_scratch_git,
+    write_scratch_file,
+)
 
 from devbench.backlog.manager import BacklogManager, count_review_fails_for_judge
 from devbench.backlog.parser import BacklogParser
 from devbench.backlog.work_unit import WorkUnitType
-from devbench.config_loader import RepoConfig, RuntimeConfig, ValidateConfig
+from devbench.config_loader import (
+    FixtureConsistencyConfig,
+    GateEnabledConfig,
+    GateReachabilityConfig,
+    GatesConfig,
+    GateSharedFileImpactConfig,
+    RepoConfig,
+    RuntimeConfig,
+    ValidateConfig,
+)
 from devbench.constants import (
     ALL_REQUIRED_JUDGE_NAMES,
     BACKLOG_INDEX_CELL_COUNT,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
     REVIEW_JUDGE_NAMES,
     SECURITY_JUDGE_NAMES,
     STATUS_DRAFT,
     VALID_STATUSES,
 )
+from devbench.gate_records import compose_gate_pass_record, compute_scope_hash
 from devbench.scope import ScopeFilter
+
+_MACHINE_BLOCKING_GATES: list[str] = sorted(g for g, t in GATE_TIERS.items() if t == GATE_TIER_MACHINE_BLOCKING)
 
 
 @pytest.fixture
@@ -995,6 +1017,655 @@ class TestMarkDoneGate:
         judge = BacklogManager()
         judge.mark_done(wu, idx, "E0-F1-S1-T1")
         assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestMarkDoneGateRecords:
+    """mark_done enforces the machine-blocking gate-record invariant (spec
+    4.2, G4; AC-E2-F2-S1-T2-1..5): an ENABLED machine-blocking gate requires
+    either a fresh [GATE_PASS <gate>] record or an operator-attributed
+    [GATE_WAIVER <gate>] marker before a unit can reach done."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_index(self, tmp_path: Path, unit_id: str) -> Path:
+        idx = tmp_path / "BACKLOG.md"
+        idx.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|-----------|\n"
+            f"| {unit_id} | Task | Task | in-review | None | {self._REPO} | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return idx
+
+    def _make_wu(
+        self,
+        tmp_path: Path,
+        unit_id: str,
+        *,
+        with_repo_section: bool = True,
+        manifest_file: str = "src/foo.py",
+        extra_comments: str = "",
+    ) -> Path:
+        repo_section = f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n" if with_repo_section else ""
+        wu = tmp_path / f"{unit_id}.md"
+        wu.write_text(
+            f"# {unit_id}\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"{repo_section}"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            f"| `{manifest_file}` | update |\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            f"{_all_five_judges_pass_block()}{extra_comments}",
+            encoding="utf-8",
+        )
+        return wu
+
+    @staticmethod
+    def _gates_config(enabled_gates: set[str]) -> GatesConfig:
+        """Build a project-level ``GatesConfig`` enabling exactly *enabled_gates*.
+
+        Project-level (not per-repo override) so every gate's dataclass
+        shape is uniform apart from ``shared_file_impact``/
+        ``fixture_consistency``'s extra tunables. Covers exactly the four
+        machine-blocking gates (``_MACHINE_BLOCKING_GATES``) with explicit,
+        correctly-typed fields -- this test class never needs to enable a
+        judge-evidence gate.
+        """
+        return GatesConfig(
+            reachability=GateReachabilityConfig(enabled="reachability" in enabled_gates),
+            ancestry=GateEnabledConfig(enabled="ancestry" in enabled_gates),
+            shared_file_impact=GateSharedFileImpactConfig(enabled="shared_file_impact" in enabled_gates),
+            fixture_consistency=FixtureConsistencyConfig(enabled="fixture_consistency" in enabled_gates),
+        )
+
+    def _runtime_config(self, *, enabled_gates: set[str], repo_path: Path | None = None) -> RuntimeConfig:
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)},
+            gates=self._gates_config(enabled_gates),
+        )
+
+    @staticmethod
+    def _check_command(gate: str) -> str:
+        return f"check-{gate.replace('_', '-')}"
+
+    # -- (a) missing record: refused, naming gate/repo/remediation (AC-1) --
+
+    @pytest.mark.parametrize("gate", _MACHINE_BLOCKING_GATES)
+    def test_missing_record_blocks_with_g4_remediation_message(self, tmp_path: Path, gate: str) -> None:
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={gate})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert f"gate {gate!r} is enabled for repo {self._REPO!r}" in message
+        assert f"has no [GATE_PASS {gate}] record for {unit_id}" in message
+        assert f"Run: uv run devbench {self._check_command(gate)} {unit_id}" in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: in-review" in content
+        assert "## Status: done" not in content
+
+    # -- (b) fresh record: proceeds to done (AC-2) --
+
+    def test_fresh_record_allows_done(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hello')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "--", "src/foo.py"], repo_path).stdout.strip()
+        scope_hash = compute_scope_hash({"src/foo.py": blob_hash})
+        record_line = compose_gate_pass_record("reachability", scope_hash)
+        wu = self._make_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=f"[2026-01-01 00:00 UTC] [agent/orchestrator] {record_line}\n",
+        )
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"}, repo_path=repo_path)
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    # -- (c) stale record: refused with the spec 4.2 wording (AC-3, AC-7) --
+
+    def test_stale_record_blocks_with_spec_wording(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hello')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "--", "src/foo.py"], repo_path).stdout.strip()
+        scope_hash = compute_scope_hash({"src/foo.py": blob_hash})
+        record_line = compose_gate_pass_record("reachability", scope_hash)
+        wu = self._make_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=f"[2026-01-01 00:00 UTC] [agent/orchestrator] {record_line}\n",
+        )
+        idx = self._make_index(tmp_path, unit_id)
+        # Edit the in-scope file AFTER the record was captured: the
+        # recomputed scope hash must now differ (AC-7).
+        write_scratch_file(repo_path, "src/foo.py", "print('hello world')\n")
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"}, repo_path=repo_path)
+
+        mgr = BacklogManager()
+        with (
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+            pytest.raises(RuntimeError, match=r"gate 'reachability' record is stale \(scope changed since it ran\)"),
+        ):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" not in wu.read_text(encoding="utf-8")
+
+    # -- (d) waiver adoption: operator satisfies, executor does not (AC-4) --
+
+    def test_operator_waiver_satisfies_with_no_record(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py operator pre-existing dead artifact, tracked separately\n"
+        )
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_executor_waiver_alone_is_insufficient(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/foo.py executor pre-existing dead artifact, tracked separately\n"
+        )
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert "executor-attributed" in message
+        assert "operator-attributed waiver" in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in content
+
+    def test_malformed_waiver_marker_blocks_and_names_the_unit_and_offending_line(self, tmp_path: Path) -> None:
+        """A malformed ``[GATE_WAIVER reachability]`` marker (missing
+        target) is never silently treated as "no waiver" (spec Section 7
+        fail-loud rule): ``mark_done`` refuses, and -- unlike
+        ``_latest_gate_waiver_attribution``'s own content-only message --
+        the refusal names both the offending unit and the offending marker
+        line, matching ``check-reachability``'s "malformed ... marker in
+        <unit-id>" wording."""
+        unit_id = "E0-F1-S1-T1"
+        malformed_line = "[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 operator some-reason"
+        waiver = f"[2026-01-01 00:00 UTC] [agent/executor] {malformed_line}\n"
+        wu = self._make_wu(tmp_path, unit_id, extra_comments=waiver)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg), pytest.raises(RuntimeError) as exc_info:
+            mgr.mark_done(wu, idx, unit_id)
+
+        message = str(exc_info.value)
+        assert unit_id in message
+        assert malformed_line in message
+        content = wu.read_text(encoding="utf-8")
+        assert "## Status: done" not in content
+
+    # -- (e) every gate disabled: behaves exactly as before (AC-5) --
+
+    def test_all_gates_disabled_behaves_as_before(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates=set())
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+    def test_no_target_repository_section_skips_check_entirely(self, tmp_path: Path) -> None:
+        """A unit with no ``## Target Repository`` section is untouched by
+        this invariant (``_extract_repo`` returns None), preserving today's
+        behaviour for every pre-existing caller/test that never declared a
+        repo -- even when a machine-blocking gate is enabled project-wide."""
+        unit_id = "E0-F1-S1-T1"
+        wu = self._make_wu(tmp_path, unit_id, with_repo_section=False)
+        idx = self._make_index(tmp_path, unit_id)
+        rt_cfg = self._runtime_config(enabled_gates={"reachability"})
+
+        mgr = BacklogManager()
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            mgr.mark_done(wu, idx, unit_id)
+
+        assert "## Status: done" in wu.read_text(encoding="utf-8")
+
+
+class TestLatestGateWaiverAttributionDelegation:
+    """``_latest_gate_waiver_attribution`` delegates to
+    ``devbench.gate_records.gate_waiver_records`` (spec 4.9/5.3; the
+    ``code_review`` SOLID_VIOLATION remediation on
+    .devbench/review-failures/E3-F2-S1-T1-code_review-1.json) instead of
+    re-scanning content with its own copy of the ``[GATE_WAIVER]`` tag
+    regex. Two readers of the same marker grammar drifted: the loose,
+    attribution-only ``_GATE_WAIVER_TAG_RE`` line-scan this class supersedes
+    silently accepted a marker with an empty reason or a missing target as a
+    well-formed, "operator"-attributed waiver, because it never routed
+    through ``parse_gate_waiver_record``, the sole grammar authority. This
+    class pins the delegation itself (via monkeypatch) and the two malformed
+    shapes the old loose regex left silently open.
+    """
+
+    def test_delegates_to_gate_records_gate_waiver_records(self) -> None:
+        """The production call site is a direct delegation, not a
+        parallel re-implementation: monkeypatching
+        ``gate_records.gate_waiver_records`` intercepts every call."""
+        from devbench.backlog import manager as manager_module
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_gate_waiver_records(content: str, gate: str) -> list[manager_module.GateWaiverRecord]:
+            calls.append((content, gate))
+            return [
+                manager_module.GateWaiverRecord(
+                    gate=gate,
+                    timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+                    target="src/x.py",
+                    attribution="operator",
+                    reason="reviewed manually",
+                )
+            ]
+
+        marker_text = "some unrelated content"
+        with patch("devbench.gate_records.gate_waiver_records", side_effect=fake_gate_waiver_records):
+            attribution = manager_module._latest_gate_waiver_attribution(marker_text, "reachability")
+
+        assert attribution == "operator"
+        assert calls == [(marker_text, "reachability")]
+
+    def test_no_marker_for_gate_returns_none(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "operator", "reviewed manually")
+        content = f"## Comments\n\n[2026-01-01T00:00:00Z] [agent/operator] {marker}\n"
+
+        assert _latest_gate_waiver_attribution(content, "reachability") is None
+
+    def test_last_record_wins_across_targets_and_attributions(self) -> None:
+        """Append-only audit trail semantics: the LAST marker for *gate*
+        wins, regardless of which target it names or the attribution of
+        earlier markers for the same gate."""
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        first = compose_gate_waiver_record("reachability", "src/a.py", "executor", "self-certified")
+        second = compose_gate_waiver_record("reachability", "src/b.py", "operator", "reviewed manually")
+        content = (
+            "## Comments\n\n"
+            f"[2026-01-01T00:00:00Z] [agent/executor] {first}\n"
+            f"[2026-01-02T00:00:00Z] [agent/operator] {second}\n"
+        )
+
+        assert _latest_gate_waiver_attribution(content, "reachability") == "operator"
+
+    def test_other_gate_markers_are_ignored(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution, compose_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/a.py", "operator", "reviewed manually")
+        content = f"## Comments\n\n[2026-01-01T00:00:00Z] [agent/operator] {marker}\n"
+
+        assert _latest_gate_waiver_attribution(content, "reachability") is None
+
+    def test_marker_with_empty_reason_raises_runtime_error(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution
+
+        content = "## Comments\n\n[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 src/a.py operator \n"
+
+        with pytest.raises(RuntimeError, match=r"malformed \[GATE_WAIVER reachability\] marker"):
+            _latest_gate_waiver_attribution(content, "reachability")
+
+    def test_marker_with_missing_target_raises_runtime_error(self) -> None:
+        from devbench.backlog.manager import _latest_gate_waiver_attribution
+
+        content = "## Comments\n\n[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 operator some-reason\n"
+
+        with pytest.raises(RuntimeError, match=r"malformed \[GATE_WAIVER reachability\] marker"):
+            _latest_gate_waiver_attribution(content, "reachability")
+
+
+class TestRecomputeGateScopeHashErrorPaths:
+    """Error paths of BacklogManager._git_blob_hash /
+    _recompute_gate_scope_hash: every failure is a specific, actionable
+    RuntimeError (Error Handling Contract), never a raw git/ManifestParseError/
+    ValueError escaping to a caller that only catches RuntimeError."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def test_git_blob_hash_raises_when_git_exits_non_zero(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with pytest.raises(RuntimeError, match="git hash-object failed"):
+            BacklogManager._git_blob_hash(repo_path, "src/does_not_exist.py")
+
+    def test_git_blob_hash_raises_on_timeout(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with patch(
+            "devbench.backlog.manager.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git hash-object", timeout=30),
+        ):
+            with pytest.raises(RuntimeError, match="git hash-object timed out"):
+                BacklogManager._git_blob_hash(repo_path, "src/foo.py")
+
+    def test_recompute_scope_hash_wraps_missing_manifest_section(self, tmp_path: Path) -> None:
+        content = "# E0-F1-S1-T1\n\n## Status: in-review\n\n## Comments\n\n"
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig()})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content)
+
+    def test_recompute_scope_hash_wraps_empty_manifest(self, tmp_path: Path) -> None:
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n## Comments\n\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig()})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content)
+
+    def test_recompute_scope_hash_for_ancestry_gate_folds_in_target_ref_sha(self, tmp_path: Path) -> None:
+        """gate='ancestry' resolves the persisted [GATE_ANCESTRY_TARGET_REF]
+        marker's ref and folds its CURRENT sha into the digest (spec 4.5,
+        internal issue #12 AC3), leaving the non-ancestry default (gate='')
+        recompute untouched -- the two must differ for the identical content
+        whenever a target-ref marker is present."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker, compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        run_scratch_git(["branch", "-M", "main"], repo_path)
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n"
+            f"## Comments\n\n{compose_ancestry_target_ref_marker('HEAD')}\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            ancestry_hash = BacklogManager._recompute_gate_scope_hash(self._REPO, content, "ancestry")
+            with pytest.raises(RuntimeError, match="Cannot recompute gate scope hash"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content, "")
+
+        assert ancestry_hash == compute_scope_hash({}, target_ref_sha=head_sha)
+
+    def test_recompute_scope_hash_for_ancestry_gate_without_marker_fails_loud(self, tmp_path: Path) -> None:
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n## Comments\n\n"
+        )
+        rt_cfg = RuntimeConfig(repos={self._REPO: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            with pytest.raises(RuntimeError, match=r"no \[GATE_ANCESTRY_TARGET_REF\] marker recorded"):
+                BacklogManager._recompute_gate_scope_hash(self._REPO, content, "ancestry")
+
+
+class TestResolveAncestryTargetRef:
+    """BacklogManager._resolve_ancestry_target_ref: a PURE function (no git
+    I/O of its own) that reads the persisted [GATE_ANCESTRY_TARGET_REF]
+    marker's ref STRING back, never the repo's default branch (spec 4.5,
+    internal issue #12 AC3) -- the fix for the real defect an explicit
+    `check-ancestry <unit-id> <dependency-ref> <target-ref>` override would
+    otherwise trigger. Resolving that ref string to a commit sha is now the
+    shared `cli._compute_ancestry_scope_hash`'s job (see
+    TestComputeAncestryScopeHash), not this function's."""
+
+    def test_raises_when_no_marker_is_present(self) -> None:
+        with pytest.raises(RuntimeError, match=r"no \[GATE_ANCESTRY_TARGET_REF\] marker recorded"):
+            BacklogManager._resolve_ancestry_target_ref("## Comments\n\nnothing here\n")
+
+    def test_returns_the_persisted_ref_string_verbatim(self) -> None:
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        content = f"## Comments\n\n{compose_ancestry_target_ref_marker('pinned')}\n"
+
+        assert BacklogManager._resolve_ancestry_target_ref(content) == "pinned"
+
+    def test_returns_the_last_marker_when_multiple_are_present(self) -> None:
+        """The audit trail is append-only: a later check-ancestry run using
+        a different explicit target-ref must win over an earlier one."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        content = (
+            "## Comments\n\n"
+            f"{compose_ancestry_target_ref_marker('origin/main')}\n"
+            f"{compose_ancestry_target_ref_marker('origin/release')}\n"
+        )
+
+        assert BacklogManager._resolve_ancestry_target_ref(content) == "origin/release"
+
+    def test_raises_runtimeerror_not_valueerror_on_a_malformed_marker(self) -> None:
+        """`gate_records.latest_ancestry_target_ref` raises ValueError on a
+        marker that IS present but malformed; `cmd_mark_done` catches
+        RuntimeError only (cli.py), so an untranslated ValueError would
+        surface as an uncaught traceback instead of a clean ERROR
+        (doc_review FAIL, round 1)."""
+        content = "## Comments\n\n[GATE_ANCESTRY_TARGET_REF] abc def\n"
+
+        with pytest.raises(RuntimeError, match="malformed"):
+            BacklogManager._resolve_ancestry_target_ref(content)
+
+
+class TestComputeAncestryScopeHash:
+    """devbench.cli._compute_ancestry_scope_hash: the SINGLE shared
+    four-step assembly (per-Manifest-file git hash-object, git rev-parse of
+    the target ref, gate_records.compute_scope_hash) both
+    cli._write_ancestry_gate_pass_record and
+    BacklogManager._recompute_gate_scope_hash call for gate="ancestry", so
+    the two can never independently drift (code_review FAIL, round 1)."""
+
+    def test_resolves_the_named_target_ref_not_the_default_branch(self, tmp_path: Path) -> None:
+        """The checkout's default branch (main) and an explicit pinned tag
+        resolve to DIFFERENT shas -- this must hash against the tag's sha,
+        proving it resolves the ref it was GIVEN rather than re-deriving
+        "main"."""
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        run_scratch_git(["branch", "-M", "main"], repo_path)
+        run_scratch_git(["tag", "pinned"], repo_path)
+        pinned_sha = run_scratch_git(["rev-parse", "pinned"], repo_path).stdout.strip()
+        write_scratch_file(repo_path, "src/bar.py", "print('bye')\n")
+        commit_scratch_repo(repo_path, "advance main past the pin")
+        main_sha = run_scratch_git(["rev-parse", "main"], repo_path).stdout.strip()
+        assert pinned_sha != main_sha
+
+        result = _compute_ancestry_scope_hash(repo_path, [], "pinned")
+
+        assert result == compute_scope_hash({}, target_ref_sha=pinned_sha)
+        assert result != compute_scope_hash({}, target_ref_sha=main_sha)
+
+    def test_folds_in_manifest_file_blob_hashes(self, tmp_path: Path) -> None:
+        """The same assembly ALSO hashes each declared Manifest file's live
+        git blob hash -- proven here over a NON-EMPTY Manifest, which no
+        existing cli-level ancestry test previously exercised
+        (test_review FAIL, round 1: the git-hash-object success path was
+        uncovered because every prior fixture used an empty Manifest)."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        blob_hash = run_scratch_git(["hash-object", "src/foo.py"], repo_path).stdout.strip()
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="src/foo.py", change="modify")], "HEAD")
+
+        assert result == compute_scope_hash({"src/foo.py": blob_hash}, target_ref_sha=head_sha)
+
+    def test_raises_when_target_ref_cannot_be_resolved(self, tmp_path: Path) -> None:
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+
+        with pytest.raises(RuntimeError, match="git rev-parse failed"):
+            _compute_ancestry_scope_hash(repo_path, [], "does-not-exist")
+
+    def test_absent_manifest_file_does_not_raise_and_folds_in_a_defined_marker(self, tmp_path: Path) -> None:
+        """doc_review FAIL, round 2 (BLOCKING): a Manifest row naming a
+        path that is simply ABSENT from the checkout (the normal shape of
+        a generated ancestry-gate task's own report-file row on its FIRST
+        execution) must NOT raise -- it folds a defined, deterministic
+        marker into the digest instead of hard-failing or silently
+        skipping the row."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _ABSENT_MANIFEST_FILE_SCOPE_MARKER, _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(
+            repo_path, [ManifestRow(file="docs/gate-reports/E1-F1-S1-T1-ancestry.md", change="add")], "HEAD"
+        )
+
+        assert result == compute_scope_hash(
+            {"docs/gate-reports/E1-F1-S1-T1-ancestry.md": _ABSENT_MANIFEST_FILE_SCOPE_MARKER},
+            target_ref_sha=head_sha,
+        )
+
+    def test_absent_manifest_file_digest_changes_once_the_file_is_created(self, tmp_path: Path) -> None:
+        """The absent-file marker must be a DEFINED function of "this file
+        does not exist yet", so it changes the instant the file is
+        created -- otherwise a stale record could stay valid forever
+        across the file's creation."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        row = [ManifestRow(file="docs/gate-reports/E1-F1-S1-T1-ancestry.md", change="add")]
+
+        before = _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+        write_scratch_file(repo_path, "docs/gate-reports/E1-F1-S1-T1-ancestry.md", "report\n")
+        after = _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+
+        assert before != after
+
+    def test_sentinel_manifest_row_is_filtered_like_every_other_manifest_scope_reader(self, tmp_path: Path) -> None:
+        """A legacy literal ``(none)`` row -- which `parse_manifest` still
+        returns as a real row -- must be filtered the same way
+        `BacklogManager._is_real_manifest_path` filters it everywhere else
+        in the codebase, contributing nothing to the digest."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+        from devbench.gate_records import compute_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        result = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="(none)", change="n/a")], "HEAD")
+
+        assert result == compute_scope_hash({}, target_ref_sha=head_sha)
+
+    def test_raises_when_a_present_manifest_file_cannot_be_hashed(self, tmp_path: Path) -> None:
+        """A Manifest file that DOES exist in the checkout but still fails
+        `git hash-object` (e.g. an unreadable file) is a genuine error --
+        never conflated with the absent-file case above."""
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        unreadable = repo_path / "src" / "unreadable.py"
+        unreadable.write_text("print('secret')\n", encoding="utf-8")
+        unreadable.chmod(0o000)
+        row = [ManifestRow(file="src/unreadable.py", change="modify")]
+        try:
+            with pytest.raises(RuntimeError, match="git hash-object failed"):
+                _compute_ancestry_scope_hash(repo_path, row, "HEAD")
+        finally:
+            unreadable.chmod(0o644)
+
+    def test_recompute_gate_scope_hash_and_direct_call_agree_on_a_real_manifest(self, tmp_path: Path) -> None:
+        """Binding proof (code_review FAIL, round 1): BacklogManager
+        ._recompute_gate_scope_hash("ancestry") must produce the EXACT same
+        digest _compute_ancestry_scope_hash does when called directly with
+        the same repo/manifest/target-ref inputs -- because the recompute
+        delegates to this exact function rather than re-implementing the
+        assembly."""
+        from devbench.gate_records import compose_ancestry_target_ref_marker
+
+        repo_path = init_scratch_repo(tmp_path, dir_name="checkout")
+        write_scratch_file(repo_path, "src/foo.py", "print('hi')\n")
+        commit_scratch_repo(repo_path, "baseline")
+        head_sha = run_scratch_git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+
+        repo = "caylent-solutions/devbench"
+        content = (
+            "# E0-F1-S1-T1\n\n## Status: in-review\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | modify |\n\n"
+            f"## Comments\n\n{compose_ancestry_target_ref_marker('HEAD')}\n"
+        )
+        rt_cfg = RuntimeConfig(repos={repo: RepoConfig(resolved_checkout_path=repo_path)})
+
+        with patch("devbench.config.RUNTIME_CONFIG", rt_cfg):
+            recomputed = BacklogManager._recompute_gate_scope_hash(repo, content, "ancestry")
+
+        from devbench.backlog.manifest import ManifestRow
+        from devbench.cli import _compute_ancestry_scope_hash
+
+        direct = _compute_ancestry_scope_hash(repo_path, [ManifestRow(file="src/foo.py", change="modify")], "HEAD")
+
+        assert recomputed == direct
+        assert head_sha  # sanity: the checkout actually has a resolvable HEAD
 
 
 def _extract_summary_lines(content: str) -> list[str]:
@@ -3847,6 +4518,8 @@ class _ValidateRuleHarness:
         deps_rows: str = "| none | | |",
         status: str = "in-queue",
         task_type: str | None = None,
+        description_body: str = "Test task.\n",
+        dod_block: str = "- [ ] Done\n",
     ) -> Path:
         wu = backlog_dir / f"{unit_id}.md"
         task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
@@ -3856,7 +4529,7 @@ class _ValidateRuleHarness:
             f"{task_type_section}"
             f"## Target Repository\n\n"
             f"- **Repo:** `{repo}`\n\n"
-            f"## Description\n\nTest task.\n\n"
+            f"## Description\n\n{description_body}\n"
             f"## Dependencies\n\n"
             f"| ID | Title | Status |\n"
             f"|----|-------|--------|\n"
@@ -3866,7 +4539,7 @@ class _ValidateRuleHarness:
             f"| File | Change |\n"
             f"|------|--------|\n"
             f"{manifest_rows}\n"
-            f"## Definition of Done\n\n- [ ] Done\n",
+            f"## Definition of Done\n\n{dod_block}",
             encoding="utf-8",
         )
         return wu
@@ -4210,6 +4883,439 @@ class TestValidateLanguageAcAlignment:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("requires the N/A suffix" in e for e in errors)
+
+
+class TestLayoutAcGrammar:
+    """Tests for _check_layout_ac_grammar (spec 4.9c; 319-D critical).
+
+    Exercised off the real ``LAYOUT_AC_TAG`` / ``LAYOUT_GEOMETRY_KEYWORDS``
+    constants imported from ``devbench.constants`` -- never a re-typed
+    keyword list (Approach step 1). The import is deliberately local to each
+    test body (never module-level) so this class remains collectible, and
+    every non-layout test in this module remains runnable, even in states
+    where ``constants.py`` has not yet defined these two names (e.g. under
+    ``tdd-gate``'s RED-verification stash of the in-Manifest ``src/`` files).
+    """
+
+    H = _ValidateRuleHarness
+
+    def test_tagged_ac_line_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG, LAYOUT_GEOMETRY_KEYWORDS
+
+        for i, keyword in enumerate(sorted(LAYOUT_GEOMETRY_KEYWORDS)):
+            unit_id = f"EX-F1-S1-T{i + 1}"
+            ac_block = f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify behavior involving {keyword} at 320px.\n"
+            self.H.make_task(backlog_dir, unit_id, "ex/foo", "| `docs/notes.md` | new |\n", ac_block=ac_block)
+        index_rows = "".join(
+            f"| EX-F1-S1-T{i + 1} | T{i + 1} | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T{i + 1}.md` |\n"
+            for i in range(len(LAYOUT_GEOMETRY_KEYWORDS))
+        )
+        self.H.make_index(tmp_path, index_rows)
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tagged_ac_line_naming_no_keyword_emits_exactly_one_error_with_id_and_line(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify totally unrelated numeric parsing behavior."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_backticked_tag_on_ac_line_naming_no_keyword_is_still_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 1 (this unit): both shipped surfaces
+        (`test-reviewer.md`, the `spec-to-backlog` SKILL) print the tag
+        literal wrapped in backticks (`` `[LAYOUT-AC]` ``). Stripping
+        inline-code spans from the AC bullet line itself before checking
+        for the tag's presence silently reclassified a backticked tag as
+        untagged -- the exact surface-divergence class this unit exists to
+        close. A backticked tag naming no real keyword must still be
+        detected and rejected."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 `{LAYOUT_AC_TAG}` Verify totally unrelated numeric parsing behavior."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_backticked_tag_on_ac_line_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion to the rejection case above: a backticked tag that DOES
+        name a real keyword must validate cleanly, proving the fix detects
+        the tag (not merely rejects everything backticked)."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = f"- [ ] AC-TEST-001 `{LAYOUT_AC_TAG}` Verify sticky positioning at 320px.\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tag_mentioned_mid_sentence_in_ac_prose_is_not_treated_as_an_application(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Regression (this unit): an AC bullet that DISCUSSES the tagging
+        mechanism -- naming the tag literal several words into the
+        sentence, as this very work unit's own AC-TEST-002/003 bullets do
+        -- must not be treated as an application of the tag to that AC.
+        `uv run devbench validate-backlog` regressed against the real
+        backlog tree exactly this way while this unit's own fix for the
+        backticked-tag detection gap (test_backticked_tag_on_ac_line_...
+        above) was in flight: a raw, position-unaware substring check
+        flagged every self-referential AC bullet across the tree that
+        merely quotes `[LAYOUT-AC]` in prose."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = (
+            f"- [ ] AC-TEST-002 (spec 4.9c) A `{LAYOUT_AC_TAG}` tag placed anywhere "
+            "other than an AC line is an error.\n"
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_unbackticked_tag_after_a_parenthetical_spec_reference_naming_no_keyword_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 2 (this unit): 87 of the 265 `- [ ] AC-...`
+        bullets in this repo's own `backlog/` tree carry a parenthetical
+        spec reference immediately after the AC id -- the prevailing house
+        style, not an edge case. Round 1's position-anchored regex silently
+        dropped an unbackticked tag placed after that parenthetical (zero
+        errors, no diagnostic), reintroducing the 319-D silent-ignore
+        defect this unit exists to close. An unbackticked tag must apply
+        regardless of where on the bullet line it sits."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-LAYOUT-001 (spec 4.9c) {LAYOUT_AC_TAG} Verify totally unrelated numeric parsing."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_unbackticked_tag_mid_sentence_naming_no_keyword_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 2 (this unit): an unbackticked tag wrapped
+        several words into the AC bullet's prose (not immediately after
+        the AC id) must apply and be rejected for naming no keyword, not
+        silently dropped."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 Verify the header stays put {LAYOUT_AC_TAG} when scrolled."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_unbackticked_tag_mid_sentence_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion positive control to the two rejection cases above: an
+        unbackticked tag placed anywhere on the bullet line that DOES name
+        a real keyword must validate cleanly, proving the position-
+        independent fix detects the tag rather than rejecting everything
+        off-anchor."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = f"- [ ] AC-TEST-001 (spec 4.9c) Verify sticky positioning {LAYOUT_AC_TAG} at 320px.\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_backticked_tag_not_immediately_after_ac_id_is_not_treated_as_an_application(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion to test_tag_mentioned_mid_sentence_in_ac_prose_is_not_
+        treated_as_an_application above, restated explicitly for the
+        round-2 fix: a BACKTICKED tag is only recognized immediately after
+        the AC id. A backticked tag placed after a parenthetical spec
+        reference is prose quoting the mechanism, not an application, and
+        must remain silently untouched -- this is what distinguishes the
+        round-2 fix (unbackticked tags apply anywhere) from a regression
+        back to a raw, position-unaware substring check (which would also
+        catch backticked mentions and reintroduce the false-positive class
+        this unit's round-1 fix closed)."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = (
+            f"- [ ] AC-LAYOUT-001 (spec 4.9c) A `{LAYOUT_AC_TAG}` tag mentioned in prose discussing the mechanism.\n"
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tag_on_a_non_ac_bullet_inside_acceptance_criteria_emits_one_error(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] Some non-AC checklist note {LAYOUT_AC_TAG} misplaced here."
+        ac_block = f"- [ ] AC-TEST-001 A real AC line unrelated to layout.\n{offending_line}\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "not on an AC bullet line" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_tag_placed_in_description_body_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            description_body=f"Some prose that misplaces {LAYOUT_AC_TAG} directly in Description.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Description" in layout_errors[0]
+
+    def test_tag_placed_in_nested_approach_subsection_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        description_body = f"### Approach\n\n1. Do the thing, watch for {LAYOUT_AC_TAG} misuse.\n\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            description_body=description_body,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Description" in layout_errors[0]
+
+    def test_tag_placed_in_definition_of_done_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            dod_block=f"- [ ] Misplaced {LAYOUT_AC_TAG} in the Definition of Done.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Definition of Done" in layout_errors[0]
+
+    def test_untagged_task_is_untouched_by_the_rule(self, tmp_path: Path, backlog_dir: Path) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `docs/notes.md` | new |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any(LAYOUT_AC_TAG in e for e in errors)
+
+    def test_one_correct_and_one_misplaced_tag_task_in_a_single_run(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-CYCLE-001 (spec 4.9c, AC-22): a scratch backlog containing one
+        correctly tagged Task and one misplaced-tag Task must report zero
+        errors for the first and a named error for the second in a single
+        `validate()` invocation."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify sticky positioning at 320px.\n",
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T2",
+            "ex/foo",
+            "| `docs/other.md` | new |\n",
+            description_body=f"Prose that misplaces {LAYOUT_AC_TAG} directly in Description.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert not any("EX-F1-S1-T1" in e for e in layout_errors)
+        misplaced = [e for e in layout_errors if "EX-F1-S1-T2" in e]
+        assert len(misplaced) == 1
+        assert "Description" in misplaced[0]
+
+    def test_missing_acceptance_criteria_section_is_skipped_without_crash(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """test_review round 1 (this unit): the docstring's two-part
+        contract is "does not crash AND does not emit a second,
+        contradictory `[LAYOUT-AC]` finding for the same missing-section
+        defect (owned by Check 7)" -- asserting only the no-crash half left
+        a spurious `[LAYOUT-AC]` error on an AC-less Task unable to fail
+        this test. Both halves are now asserted."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        # Check 7 owns the missing-section error; this rule must not crash
+        # or emit a second, contradictory finding for the same defect.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `ex/foo`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `docs/notes.md` | new |\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        # Must not raise.
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any(LAYOUT_AC_TAG in e for e in errors)
 
 
 class TestValidateSourceTestPairs:
@@ -8540,3 +9646,316 @@ class TestMarkerScannerIgnoresQuotedMarkers:
             "\n[2026-05-01 12:00 UTC] [agent/operator] [WU_WIRED] x. [BLOCKED_PENDING_PROPOSAL] E0-F1-S1-T9   \n",
         )
         assert BacklogManager()._extract_pending_proposal_markers(wu) == {"E0-F1-S1-T9"}
+
+
+# ---------------------------------------------------------------------------
+# E2-F4-S1-T1: log-waiver's [GATE_WAIVER] writer/reader grammar, its
+# audit-section insertion point, the report waiver-count helper, and the
+# validate-backlog grammar rule.
+# ---------------------------------------------------------------------------
+
+
+class TestComposeGateWaiverRecord:
+    """compose_gate_waiver_record: the sole authorized [GATE_WAIVER] marker builder (spec 5.3).
+
+    Imports are deferred inside each test body (rather than a module-level
+    import) so that stashing only ``src/devbench/backlog/manager.py`` (the
+    RED-gate's production-source-only stash scope, ``devbench tdd-gate``)
+    never breaks collection of this whole test module for an unrelated
+    node id: a module-level import of a brand-new symbol would raise
+    ``ImportError`` at collection time (a false, rejected RED) rather than
+    letting the individual test that actually calls the missing symbol fail
+    on its own.
+    """
+
+    def test_valid_call_produces_spec_5_3_field_order(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+        marker = compose_gate_waiver_record(
+            "reachability", "src/ui/Foo.tsx", "operator", "mounted via route-split registry", timestamp=ts
+        )
+        assert marker == (
+            "[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 "
+            "src/ui/Foo.tsx operator mounted via route-split registry"
+        )
+
+    def test_default_timestamp_is_utc_now(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        before = datetime.now(tz=UTC)
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "y")
+        after = datetime.now(tz=UTC)
+        record = parse_gate_waiver_record(marker)
+        assert before <= record.timestamp <= after
+
+    def test_non_utc_timezone_is_converted(self) -> None:
+        from datetime import timedelta, timezone
+
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        tz_offset = timezone(timedelta(hours=-5))
+        ts = datetime(2026, 1, 1, 12, 0, tzinfo=tz_offset)
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "y", timestamp=ts)
+        record = parse_gate_waiver_record(marker)
+        assert record.timestamp == ts.astimezone(UTC)
+
+    def test_undeclared_gate_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="Unknown gate"):
+            compose_gate_waiver_record("not_a_real_gate", "x", "executor", "y")
+
+    def test_invalid_attribution_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="attribution must be"):
+            compose_gate_waiver_record("layout_geometry", "x", "manager", "y")
+
+    @pytest.mark.parametrize("bad_target", ["", "a b", "a\tb"])
+    def test_target_with_whitespace_or_empty_raises(self, bad_target: str) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="target must be"):
+            compose_gate_waiver_record("layout_geometry", bad_target, "executor", "y")
+
+    @pytest.mark.parametrize("bad_reason", ["", "   "])
+    def test_empty_or_whitespace_reason_raises(self, bad_reason: str) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        with pytest.raises(ValueError, match="reason must be non-empty"):
+            compose_gate_waiver_record("layout_geometry", "x", "executor", bad_reason)
+
+    def test_naive_timestamp_raises(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        naive_timestamp = datetime(2026, 1, 1, tzinfo=UTC).replace(tzinfo=None)
+        with pytest.raises(ValueError, match="timezone-aware"):
+            compose_gate_waiver_record("layout_geometry", "x", "executor", "y", timestamp=naive_timestamp)
+
+
+class TestParseGateWaiverRecord:
+    """parse_gate_waiver_record: strict reader for the spec 5.3 grammar.
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_round_trip_compose_then_parse(self) -> None:
+        from devbench.backlog.manager import GateWaiverRecord, compose_gate_waiver_record, parse_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "operator", "reviewed manually")
+        record = parse_gate_waiver_record(marker)
+        assert record == GateWaiverRecord(
+            gate="ancestry",
+            timestamp=record.timestamp,
+            target="src/x.py",
+            attribution="operator",
+            reason="reviewed manually",
+        )
+
+    def test_leading_prefix_is_isolated_by_caller_slice(self) -> None:
+        """Mirrors how validate-backlog/count_gate_waiver_markers slice from the tag onward."""
+        from devbench.backlog.manager import compose_gate_waiver_record, parse_gate_waiver_record
+
+        marker = compose_gate_waiver_record("ancestry", "src/x.py", "executor", "ok")
+        line = f"- {marker}"
+        tag_idx = line.find("[GATE_WAIVER")
+        record = parse_gate_waiver_record(line[tag_idx:])
+        assert record.gate == "ancestry"
+
+    def test_malformed_grammar_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match=r"does not match the spec 5\.3 grammar"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] not-a-timestamp")
+
+    def test_undeclared_gate_in_marker_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="Unknown gate"):
+            parse_gate_waiver_record("[GATE_WAIVER not_a_real_gate] 2026-01-01T00:00:00+00:00 x executor y")
+
+    def test_invalid_timestamp_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="not valid ISO-8601"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] not-iso x executor y")
+
+    def test_naive_timestamp_in_marker_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match="not timezone-aware"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] 2026-01-01T00:00:00 x executor y")
+
+    def test_missing_attribution_raises(self) -> None:
+        from devbench.backlog.manager import parse_gate_waiver_record
+
+        with pytest.raises(ValueError, match=r"does not match the spec 5\.3 grammar"):
+            parse_gate_waiver_record("[GATE_WAIVER reachability] 2026-01-01T00:00:00+00:00 x manager y")
+
+
+class TestCountGateWaiverMarkers:
+    """count_gate_waiver_markers: the report PM-5 waiver-count consumer.
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_counts_split_by_attribution(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        content = (
+            f"{compose_gate_waiver_record('reachability', 'a', 'operator', 'r1')}\n"
+            f"{compose_gate_waiver_record('layout_geometry', 'b', 'executor', 'r2')}\n"
+            f"{compose_gate_waiver_record('ancestry', 'c', 'operator', 'r3')}\n"
+        )
+        assert count_gate_waiver_markers(content) == (2, 1)
+
+    def test_no_markers_returns_zero_zero(self) -> None:
+        from devbench.backlog.manager import count_gate_waiver_markers
+
+        assert count_gate_waiver_markers("## TDD Cycle Log\n\n## Comments\n") == (0, 0)
+
+    def test_malformed_marker_is_skipped_not_raised(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        content = (
+            f"{compose_gate_waiver_record('reachability', 'a', 'operator', 'r1')}\n"
+            "[GATE_WAIVER bogus] not-a-timestamp\n"
+        )
+        assert count_gate_waiver_markers(content) == (1, 0)
+
+    def test_tag_embedded_after_a_prefix_still_counts(self) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record, count_gate_waiver_markers
+
+        marker = compose_gate_waiver_record("reachability", "a", "executor", "r1")
+        content = f"- {marker}\n"
+        assert count_gate_waiver_markers(content) == (0, 1)
+
+
+class TestAppendAuditMarkerBeforeComments:
+    """_append_audit_marker_before_comments: the judge-visible insertion point (spec 4.3, 4.9).
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    def test_marker_lands_before_comments_header(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        comments_idx = content.index("## Comments")
+        marker_idx = content.index("[GATE_WAIVER")
+        assert marker_idx < comments_idx
+
+    def test_marker_survives_strip_comments_boundary(self, tmp_path: Path) -> None:
+        """The exact boundary cli.cmd_read_unit's --strip-comments truncates at."""
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        stripped = content[: content.find("\n## Comments")]
+        assert "[GATE_WAIVER" in stripped
+
+    def test_no_comments_section_appends_at_eof(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text("# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n", encoding="utf-8")
+        marker = compose_gate_waiver_record("layout_geometry", "x", "executor", "reason text")
+
+        BacklogManager()._append_audit_marker_before_comments(wu, marker)
+
+        content = wu.read_text(encoding="utf-8")
+        assert content.rstrip("\n").endswith(marker)
+
+    def test_empty_markers_sequence_raises_loud_instead_of_writing_a_blank_line(self, tmp_path: Path) -> None:
+        """doc_review WARN, round 2: the docstring's 'Must be non-empty'
+        precondition was previously unenforced -- an empty sequence
+        silently wrote a blank audit line. Must now fail loud (ValueError)
+        and never touch the file."""
+        original = "# E0-F1-S1-T1\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n## Comments\n"
+        wu = tmp_path / "E0-F1-S1-T1.md"
+        wu.write_text(original, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="markers must be non-empty"):
+            BacklogManager()._append_audit_markers_before_comments(wu, [])
+
+        assert wu.read_text(encoding="utf-8") == original, "a rejected call must never touch the file"
+
+
+class TestGateWaiverGrammarRule:
+    """Check 27: validate-backlog rejects a malformed [GATE_WAIVER] marker (spec 5.3).
+
+    Imports are deferred inside each test body -- see
+    ``TestComposeGateWaiverRecord``'s class docstring for why.
+    """
+
+    H = _ValidateRuleHarness
+
+    @staticmethod
+    def _append_tdd_cycle_log_marker(wu_path: Path, marker_line: str) -> None:
+        content = wu_path.read_text(encoding="utf-8")
+        content += f"\n## TDD Cycle Log\n\n{marker_line}\n"
+        wu_path.write_text(content, encoding="utf-8")
+
+    def test_malformed_marker_reports_unit_and_line(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `src/foo.py` | new |\n")
+        self._append_tdd_cycle_log_marker(wu, "[GATE_WAIVER reachability] not-a-timestamp")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        matches = [e for e in errors if "EX-F1-S1-T1" in e and "malformed [GATE_WAIVER] marker" in e]
+        assert len(matches) == 1
+        assert "not-a-timestamp" in matches[0]
+
+    def test_well_formed_marker_is_accepted(self, tmp_path: Path, backlog_dir: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T2", "ex/foo", "| `src/foo.py` | new |\n")
+        marker = compose_gate_waiver_record("layout_geometry", "src/foo.py", "executor", "reviewed by hand")
+        self._append_tdd_cycle_log_marker(wu, marker)
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T2 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert not any("EX-F1-S1-T2" in e and "GATE_WAIVER" in e for e in errors)
+
+    def test_no_marker_present_is_a_no_op(self, tmp_path: Path, backlog_dir: Path) -> None:
+        wu = self.H.make_task(backlog_dir, "EX-F1-S1-T3", "ex/foo", "| `src/foo.py` | new |\n")
+        self._append_tdd_cycle_log_marker(wu, "no waiver markers here")
+        idx = self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T3 | T | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T3.md` |\n",
+        )
+
+        errors = BacklogManager().validate(idx, tmp_path)
+
+        assert not any("GATE_WAIVER" in e for e in errors)
+
+    def test_missing_file_path_row_skipped(self, tmp_path: Path) -> None:
+        """Defensive guard: rows with empty file_path should not crash the rule."""
+        manager = BacklogManager()
+        errors: list[str] = []
+        rows = [("EX-F1-S1-T1", "in-queue", "")]
+        manager._check_gate_waiver_grammar(rows, tmp_path, errors)
+        assert errors == []

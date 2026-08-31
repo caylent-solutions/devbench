@@ -3,6 +3,1183 @@
 All notable changes to devbench are documented in this file. Format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] -- v-next
+
+### Added
+
+- **Live-smoke checklist quantifier corrected and its CLI-verb pin widened
+  to the whole document** (E12-F1-S2-T2). Step 3's rationale in
+  `docs/release-notes/live-smoke-evidence.md` no longer says "both
+  required judge records do not exist yet"; it now names all five,
+  matching the shipped `constants.ALL_REQUIRED_JUDGE_NAMES`. The CLI-verb
+  extraction pin in `tests/test_docs/test_live_smoke_evidence.py` now
+  keys on the literal `uv run devbench <verb>` invocation prefix instead
+  of scoping to fenced bash code blocks, tolerates a hard-wrapped
+  invocation where the verb falls on the following line, and discovers
+  every genuine invocation anywhere in the document rather than only
+  inside the checklist's runnable command blocks. This removes the one
+  false-positive prose token the fenced-block scoping previously dodged
+  (`devbench process's`), widens coverage to the previously-unpinned
+  `unhold` and `validate-backlog` verbs, and newly discovers the
+  checklist's hard-wrapped `set-status` mention -- the audit-sensitive
+  verb the operator-gating section explicitly warns against misusing,
+  and the one verb this document most needed pinned. The
+  `check-<name-with-hyphens>` placeholder, which collapses under a naive
+  widening to the real verb `check`, remains excluded, now via explicit
+  rejection of any raw capture truncated mid-word rather than via
+  fenced-block scoping.
+
+- **Live-smoke checklist content and its zero-to-ready cross-reference are
+  now pinned against silent drift** (E12-F1-S2-T1). New
+  `tests/test_docs/test_live_smoke_evidence.py` closes a gap that was
+  demonstrated, not theorised: replacing
+  `docs/release-notes/live-smoke-evidence.md` with a three-line stub left
+  the whole suite green, because the only prior assertion touching the
+  file was that its path resolves. The new module pins the document's
+  structural invariants (both gate names present in the fenced gates
+  fragment, numbered-step count equal to evidence-table row count, every
+  operator-evidence cell empty, the operator-gating statement naming
+  `E12-F1-S1-T2` as held present, the report and finalize steps present)
+  and, for machine verification rather than prose assertion, loads the
+  fenced `gates:` fragment through the real config loader
+  (`devbench.config_loader.load_runtime_config`) and asserts it validates
+  against the shipped JSON Schema, and resolves every CLI verb named in
+  the checklist's runnable command blocks against the real dispatch
+  table (`devbench.cli._COMMANDS`) instead of a hand-maintained list. A
+  permanent `TestStubMutationControls` class reproduces the historical
+  three-line-stub gutting and proves every extraction helper now fails
+  against it. `tests/test_docs/test_zero_to_ready_link_integrity.py`
+  gains `live-smoke-evidence.md` to its expected-cross-reference
+  parametrize list, closing a probe-proven gap where the existing pin
+  guarded link resolution but not link presence.
+
+- **Release-notes preamble reconciled to the filed Section 15 follow-ups,
+  plus a pinned, fail-fast closing-keyword count invariant** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-24;
+  E11-F1-S2-T3). `docs/release-notes/candidate-release-integration-reality-gates.md`
+  no longer asserts the five Section 15 follow-up rows are `TBD (filed at
+  E11)` or promises `E11-F1-S1-T3` will add their lines to the closing-keyword
+  block -- both went stale once `E11-F1-S1-T3` filed them as
+  `caylent-solutions/devbench#356` through `#360` -- and no longer
+  misclassifies `#335`/`#336` as cross-repo issues while explaining why the
+  five follow-ups stay excluded; the block still records exactly ten
+  closing-keyword lines with no line added for any of the five, which stay
+  deliberately OPEN. `tests/test_docs/test_issue_provenance.py` gains
+  `TestClosingKeywordCountInvariant`, pinning that the block carries exactly
+  one recognised GitHub closing-keyword line (the full case-insensitive
+  `close(s/d)`/`fix(es/ed)`/`resolve(s/d)` set, not only exact-case `Fixes`)
+  per numbered mapped issue with the OPEN follow-ups excluded, raising on any
+  unrecognised line or code fence found under the heading instead of
+  silently skipping it, with the Section 15 exclusion set derived from
+  parsed map rows rather than transcribed. `extract_devbench_repo_issue_tokens`
+  is wired into a real campaign-file walk resolving `caylent-solutions/devbench#<N>`
+  citations against the map's Devbench Issues column unioned with its Source
+  PR column (plus a small, named pre-campaign allowlist), closing a gap
+  inherited from `E2-F7-S1-T2` where that citation form was never resolved
+  against any real file at all.
+
+- **All eight `caylent-solutions/devbench-internal-backlog` gate issues
+  (`#10`-`#17`) closed with an auditable branch-note comment** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-23;
+  E11-F1-S1-T1). Because these issues live in a different repository from
+  the code that fixes them, no closing keyword in the combined
+  `candidate-release/integration-reality-gates` PR can ever auto-close
+  them (section 13, D-11); each was still OPEN at the time this unit ran,
+  so each received `gh issue comment` with the Section 4.13 template
+  naming the terminal work-unit ids that implemented its gate, then
+  `gh issue close`. `docs/issue-provenance.md` gains a `## Closure log`
+  section recording, per issue, the state observed before acting, the
+  live comment URL and the closing timestamp, all transcribed from actual
+  `gh` command output; a follow-up idempotency pass confirmed all eight
+  issues already CLOSED and posted zero further comments.
+
+- **The `caylent-solutions/devbench`-repo half of Section 4.13 closure lands,
+  plus the release-notes PR-body closing-keyword block** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-23, AC-24;
+  E11-F1-S1-T2). Live `gh issue view` calls found `caylent-solutions/devbench#335`
+  and `#336` already CLOSED (fixed by commit `8ac9c07` on `feat/bug-closure`,
+  inherited at this campaign's branch-cut per decision D-12), so neither needed
+  a comment or a close call; `docs/issue-provenance.md`'s `## Closure log`
+  gains a skip-reasoned row for each. New
+  `docs/release-notes/candidate-release-integration-reality-gates.md` carries
+  the PR title line, a per-epic summary and a closing-keyword block (one
+  `Fixes caylent-solutions/devbench-internal-backlog#<n>` line per `#10`-`#17`,
+  one bare `Fixes #<n>` line per `#335`/`#336`) for the operator to apply to
+  the combined PR body at Phase 5 handoff, because the running harness
+  predates the `git-ops-finalize --provenance` / `git_ops.provenance_path`
+  product fix (section 6; `E2-F9-S1-T1`) that automates this for future runs.
+
+- **Corrected the cross-repo auto-close overstatement in the `git-ops-finalize
+  --provenance` CLI reference entry** (spec `integration-reality-gates-hardening.md`
+  section 4.13, AC-DOC-001; E11-F1-S2-T1). `docs/cli-reference.md`'s
+  `git-ops-finalize --provenance` entry previously concluded that the composed
+  closing-keyword block makes the combined PR "auto-close every issue it fixes
+  on merge" regardless of repository. That claim is false for cross-repository
+  mapped issues: GitHub's closing-keyword auto-close mechanism only fires for
+  an issue in the SAME repository as the merging pull request, and a
+  cross-repository `Fixes owner/repo#n` line only creates a cross-reference on
+  the target issue, never a state change, which is exactly why the eight
+  `caylent-solutions/devbench-internal-backlog` issues in `E11-F1-S1-T1` had
+  to be closed by hand. The entry now states both effects distinctly,
+  consistent with `docs/release-notes/candidate-release-integration-reality-gates.md`'s
+  "Closing keywords" section and the two bullets above. No production code
+  changed; `GitOpsService.compose_finalize_pr_body` already rendered the
+  correct closing-keyword lines.
+
+- **Corrected the cross-repo auto-close overstatement in the
+  `configure-devbench` authoring skill's `git_ops.provenance_path` guidance**
+  (spec `integration-reality-gates-hardening.md` section 4.13, AC-DOC-001;
+  E11-F1-S2-T2). The `git_ops.provenance_path` entry's Alternatives bullet in
+  `plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`
+  previously recommended the provenance map as "useful for unattended
+  `auto_finalize` runs that need issues to auto-close on merge" with no
+  same-repository qualifier, immediately after telling the reader that both
+  cross-repo and same-repo `Fixes` forms come from a single rendering path.
+  That is false for cross-repository mapped issues: GitHub's closing-keyword
+  auto-close mechanism only fires for an issue in the SAME repository as the
+  merging pull request, and a cross-repository `Fixes owner/repo#n` line only
+  creates a cross-reference on the target issue, never a state change, which
+  is exactly why the eight `caylent-solutions/devbench-internal-backlog`
+  issues in `E11-F1-S1-T1` had to be closed by hand. The bullet now states
+  both effects distinctly, consistent with `docs/cli-reference.md`'s
+  `git-ops-finalize --provenance` entry and
+  `docs/release-notes/candidate-release-integration-reality-gates.md`'s
+  "Closing keywords" section. A sweep of `plugin-authoring/` and `plugin/`
+  found no other instance of the claim class. No production code changed;
+  `GitOpsService.compose_finalize_pr_body` already rendered the correct
+  closing-keyword lines.
+
+- **Filed the five spec Section 15 follow-up issues and folded them into the
+  provenance map** (spec `integration-reality-gates-hardening.md` section 15,
+  section 12, AC-FUNC-001 through AC-FUNC-004; E11-F1-S1-T3). One
+  `caylent-solutions/devbench` issue now exists for each deferred item --
+  `assert-tests-pass.sh` fail-open rework (`#356`), guard-git-stage rule-1
+  cwd/-C quirks (`#357`), real-browser layout machine-verification design
+  (`#358`), build-time generation of rubric bodies (`#359`) and auto-registry
+  fan-in tuning telemetry (`#360`) -- each body naming the deferring spec
+  section and the motivating finding or issue; a re-run of the filing pass
+  matched all five titles to their existing issue and created zero new
+  issues. `docs/issue-provenance.md` gains each number in the Devbench Issues
+  column of its placeholder row (plus a cross-reference on the
+  `layout_geometry`, `shared_file_impact` and harness-guard-fixes rows where
+  Section 15 ties a follow-up to an existing row) and a new
+  `## Follow-up issues` subsection recording item, issue, state OPEN and
+  deferring spec section per row; every number was verified live against
+  `gh issue view` before being recorded.
+
+- **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
+  with a named keyword constant** (spec `integration-reality-gates-hardening.md`
+  section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`
+  319-D critical; E10-F1-S1-T1). PR #319 shipped `[LAYOUT-AC]` tagging as
+  prompt-only prose that told authors to place the tag in a position
+  `validate-backlog` never parsed, and shipped zero tests, so nothing in the
+  toolchain could distinguish a correctly tagged unit from a silently
+  ignored one. `src/devbench/constants.py` now declares `LAYOUT_AC_TAG` and
+  `LAYOUT_GEOMETRY_KEYWORDS` (the geometry keyword heuristic, promoted from
+  hand-copied prose to a single named constant); `src/devbench/backlog/manager.py`
+  gains `_check_layout_ac_grammar` (Check 29 in `validate()`), which rejects
+  a tagged AC line that names no keyword from the constant, rejects a
+  `[LAYOUT-AC]` tag placed in `## Description` (including a nested
+  `### Approach` subsection) or `## Definition of Done`, and rejects a tag
+  found on a non-AC bullet line inside `## Acceptance Criteria` itself, each
+  with an actionable message naming the work-unit id and the offending
+  line/section. Required tag position on the AC bullet line: an
+  UNBACKTICKED `[LAYOUT-AC]` tag is recognized anywhere on that line
+  (immediately after the AC id, after a parenthetical spec reference, or
+  mid-sentence); a BACKTICKED `` `[LAYOUT-AC]` `` tag is recognized only
+  immediately after the AC id, so a backtick-wrapped mention elsewhere on
+  the line is treated as prose discussing the tag rather than an
+  application of it.
+  `plugin/devbench-orchestrate/agents/review_team/test-reviewer.md`'s LAYOUT
+  / VISUAL AC VERIFICATION rubric and the `spec-to-backlog` SKILL's Step 3a
+  authoring instruction both render the keyword list from
+  `LAYOUT_GEOMETRY_KEYWORDS` between a `<!-- generated:layout-ac-keywords -->`
+  guard-marker pair, actually written by the new
+  `devbench.backlog.manager.regenerate_layout_ac_keyword_surfaces` (run via
+  `REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND`) and pinned byte-identical
+  to the constant by
+  `tests/test_constants.py::TestLayoutGeometryKeywordSurfacesMatchConstant`,
+  so the list exists exactly once in the tree.
+
+- **`gates.layout_geometry` documented as a first-class judge-evidence gate,
+  with a structural drift pin on its documentation surfaces** (spec
+  `integration-reality-gates-hardening.md` sections 4.1, 4.9c, 4.2, 4.9 PM-5;
+  issue `caylent-solutions/devbench-internal-backlog#14`; E10-F1-S1-T2). The
+  `gates.layout_geometry` node in the `GatesConfig` tree, `config-schema.json`
+  and `sample-config.yaml` were already generically shipped for all eight
+  gates by E2-F1-S1-T1/E2-F1-S1-T2; this task closes the two things E10-F1-S1-T1
+  left open: `docs/devbench-yaml-reference.md` now carries a dedicated
+  `gates.layout_geometry` subsection (purpose, default, judge-evidence tier,
+  `DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED` env override, and the `log-waiver`
+  exception route -- a mandatory non-empty `--reason`, and `--operator` NOT
+  required since a judge-evidence gate accepts either attribution, unlike a
+  machine-blocking gate), mirrored into `GatesConfig`'s `layout_geometry`
+  attribute docstring and pinned drift-free by
+  `tests/test_config_loader.py::TestGatesConfigDocstringDocumentsLayoutGeometryWaiverRoute`.
+  New `tests/test_plugin/test_layout_ac_pins.py` independently checks both
+  shipped keyword surfaces' raw guard-block text against
+  `LAYOUT_GEOMETRY_KEYWORDS` directly (complementing, not duplicating, the
+  byte-identical generator pin `TestLayoutGeometryKeywordSurfacesMatchConstant`
+  already provides) and asserts the yaml reference documents the gate and its
+  waiver route -- every check asserts rather than skips when a pinned file is
+  missing. `tests/test_config_loader.py` also gains named regression pins
+  (`TestLayoutGeometryGateConfigNamedRegressionPins`) for the four-layer
+  precedence, the unknown-key/wrong-type fail-fast paths, and the schema/
+  sample-config coverage, explicitly by gate name for the first time.
+
+- **`scaffold-store-factory` CLI verb: a composition-root store-factory test
+  skeleton generator** (spec `integration-reality-gates-hardening.md`
+  section 4.9(b), issue `caylent-solutions/devbench-internal-backlog#11`
+  AC2 item 3; decision D-9; E9-F1-S1-T2). Root-cause closure of the
+  store-factory convention PR `caylent-solutions/devbench#316` deferred:
+  `uv run devbench scaffold-store-factory <unit-id> --out <path>` resolves
+  the unit's changed files through the shared ADR-12 scope helper (spec
+  4.3), detects the store shape (`redux` or `angular-di`) from those
+  files' content, and writes a matching test skeleton to `--out`, refusing
+  to overwrite an existing path (`--force` is absent by design). An
+  undetectable store shape exits 1 naming the files scanned, never a
+  placeholder skeleton. `docs/composition-root-testing.md` gains a v2
+  "Store-factory convention" section documenting the generator and how the
+  emitted skeleton relates to (but does not by itself satisfy) the
+  composition-root acceptance criterion; `docs/cli-reference.md` gains the
+  `### scaffold-store-factory` entry under `## Gates`, pinned against
+  drift by `tests/test_docs/test_cli_reference_scaffold_store_factory.py`.
+
+- **Operator-gated live-smoke checklist authored** (spec
+  `integration-reality-gates-hardening.md` section 10, "Live smoke
+  (operator-gated)" bullet, AC-25; E12-F1-S1-T1). New
+  `docs/release-notes/live-smoke-evidence.md` gives the operator a numbered,
+  copy-pasteable checklist that scripts a short real `devbench` run against
+  a seeded fixture workspace with the `reachability` and `shared_file_impact`
+  gates enabled: seed a non-gated (`chore`-typed) fixture work unit and its
+  `BACKLOG.md` index rows, verify both gates resolve `enabled`, observe
+  `mark-done` refuse with its remediation command before either gate has
+  run, satisfy both gates, hand-seed the five required judges'
+  `[REVIEW_PASS]` records via `log-verdict` (gate satisfaction alone is not
+  sufficient for `mark-done` to succeed), observe `mark-done` succeed, then
+  capture `report`, a `git-ops`-produced commit, and the `git-ops-finalize`
+  composed PR body as evidence. The evidence table ships with every
+  operator-evidence cell empty; the companion task `E12-F1-S1-T2` is
+  released `## Status: hold` and is the only path that fills those cells
+  in, never the orchestrator.
+  `docs/zero-to-ready.md` gains a cross-reference to the new document under
+  its `## Cross-references` section.
+
+### Changed
+
+- **The composition-root testing requirement is now keyed off the task
+  `## Acceptance Criteria` line instead of the `## Definition of Done`**
+  (spec `integration-reality-gates-hardening.md` section 4.9(b); decision
+  D-13, finding S1; caylent-solutions/devbench-internal-backlog#11;
+  E9-F1-S1-T1). `docs/composition-root-testing.md` now states normatively
+  that an auto-ticked `## Definition of Done` checkbox is never accepted
+  as satisfaction of the composition-root requirement, because devbench
+  auto-ticks Definition of Done checkboxes on the done transition, making
+  a DoD-based satisfaction record a false record; a sixteenth canonical
+  task section was considered and rejected as the alternative (D-13). The
+  `spec-to-backlog` SKILL's Step 1b item 13 sub-bullet and Step 5b item 15
+  now instruct authors to draft the composition-root requirement as an
+  `## Acceptance Criteria` item, and `test-reviewer`'s rubric item 57 now
+  checks that AC line and the test behind it rather than a DoD checkbox.
+  The smallest-real-ancestor exception remains documented in a task's
+  `### Approach` section, which survives the judge Evidence fetch
+  (`read-unit --strip-comments`, spec 4.3) -- `## Comments` is never an
+  acceptable location.
+
+- **The newly-reachable-paths requirement is now keyed off the `## Task Type:`
+  taxonomy and emitted as an acceptance criterion, and its path registry
+  moved into the unified gates config** (spec `integration-reality-gates-hardening.md`
+  section 4.9(a), 4.1; decision D-8, C-03; E8-F1-S1-T1). `generate_draft_md`
+  (`src/devbench/backlog/proposal.py`) no longer auto-appends a
+  Definition-of-Done checkbox for a drafted `behavior-fix` task (spec 1.3 S1,
+  findings 320-D04 and C-06: a DoD checkbox is auto-ticked on the done
+  transition and is never a gate); instead it appends an acceptance
+  criterion naming the `log-newly-reachable` verb, only for `behavior-fix`
+  drafts, so a `docs`/`chore`/`test-only`/`refactor`/`feature` task never
+  inherits a verification obligation it cannot satisfy. `_is_bug_fix_shaped`
+  and the `"fix "` title heuristic (rejected at the E1 cherry-pick,
+  spec 4.14 reject-list) were never carried over and remain absent. The
+  cross-cutting-primitives path registry gains a config-backed home,
+  `gates.newly_reachable_paths.paths` (`src/devbench/config_loader.py`,
+  `src/devbench/config-schema.json`, `sample-config.yaml`), resolved
+  exclusively through `resolve_gate_config` (AC-27) with a real per-repo
+  override layer (`gates.repos.<org/repo>.newly_reachable_paths.paths`)
+  field-wise merged over the project level (D-15) -- the migrated,
+  schema-validated replacement for the free-text
+  `backlog/config/cross-cutting-primitives.md` convention. See
+  `docs/devbench-yaml-reference.md`'s `gates:` section for the full
+  precedence model and tunable reference.
+
+- **The executor, code-reviewer and blocker-resolver prompts, and
+  `docs/newly-reachable-paths.md`, now key the newly-reachable-paths
+  verification obligation off the `## Task Type: behavior-fix` taxonomy and
+  read the structured `log-newly-reachable` marker instead of the retired
+  title-heuristic and `## Comments`-based convention** (spec
+  `integration-reality-gates-hardening.md` sections 1.3 S1/S2, 4.3, 4.9(a),
+  5.3; AC-8, AC-10, AC-21; E8-F1-S1-T2). `plugin/devbench-orchestrate/agents/executor.md`
+  gains a Main-sequence step that runs `uv run devbench log-newly-reachable
+  <unit-id> --path <p> --method <m> --result <r>` once per newly-reachable
+  path on a `behavior-fix` unit and treats a non-zero exit as a hard stop.
+  `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md` no
+  longer directs the judge at `## Comments` (removed by `read-unit
+  --strip-comments` before the Evidence fetch); it reads
+  `[NEWLY_REACHABLE] <path> <method> <result>` markers from the
+  `## TDD Cycle Log` audit section and raises `NEWLY_REACHABLE_PATH_UNVERIFIED`
+  when a `behavior-fix` unit carries none. `plugin/devbench-orchestrate/agents/blocker-resolver.md`
+  now requires escalation, never a hand-written substitute, when a marker is
+  missing or `log-newly-reachable` fails. `docs/newly-reachable-paths.md` is
+  rewritten as v2 around the spec 5.3 marker grammar, the
+  `gates.newly_reachable_paths` config block and its precedence, the
+  `## Task Type: behavior-fix` keying, the judge-evidence tier, and the rule
+  that Definition-of-Done checkboxes are auto-ticked records, never gates.
+
+- **`check-write-path` now attributes its itemized findings to the calling
+  unit's own Changes-Manifest scope, while the verdict and status line stay
+  repo-wide** (spec `integration-reality-gates-hardening.md` section 4.3,
+  AC-9, AC-WP-025; E7-F2-S1-T3). `audit_write_path` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` gains a new
+  keyword-only `scope` parameter, and the resulting `WritePathAudit` gains a
+  new `attributed_sites` attribute holding only the assignment/setter sites
+  that fall inside the calling unit's own resolved scope. The underlying
+  scan stays repo-wide: `verdict`, `mentions`, `assignment_sites`, the
+  `findings` count, and the spec 5.2 status line itself are all repo-wide
+  RESULTS, computed exactly as before this scope dependency existed and
+  never narrowed by scope -- only the itemized findings lines printed below
+  the `[PERMISSION_FLAG_WRITE_PATH_AUDIT]` header are scope-limited BLAME,
+  matching the pattern the machine-blocking gates already use to attribute
+  their own findings. A live write outside that scope still drives the same
+  repo-wide verdict a fully unscoped run would reach; it is simply never
+  named in the printed findings. A new third rendering fallback line,
+  `(no assignment/setter sites found within this unit's scope; N found
+  outside scope)`, prints when the repo-wide scan finds real sites but none
+  of them fall inside the calling unit's own scope. `devbench
+  check-write-path` also gains a new zero-stdout exit-1 terminal: when the
+  calling unit's own scope resolution fails (via the shared
+  `_resolve_scope_or_report` helper, before `audit_write_path` is ever
+  called), the run writes ZERO bytes to stdout and reports the error on
+  stderr only, with no spec 5.2 status line at all.
+
+- **Review-time re-run closes 321-D21: a delivered write-path task whose flag
+  still classifies `default` now fails code review** (spec
+  `integration-reality-gates-hardening.md` section 4.8, AC-20; E7-F2-S1-T1).
+  Authoring-time detection in the `spec-to-backlog` skill's Step 3b already
+  caught the copy-pattern clause, but nothing re-ran the audit at delivery
+  time, so a write-path task could reach review with its flag still
+  classifying `default`/`no_write_path`/`not_found` and no judge would ever
+  see it. `code-reviewer.md`'s `## Evidence` section now instructs a
+  conditional re-run: for a unit whose Acceptance Criteria name a permission
+  or eligibility flag, run `uv run devbench check-write-path <unit-id>
+  --flag <flag-name>` and treat a `default`, `no_write_path` or `not_found`
+  verdict as a new `WRITE_PATH_UNVERIFIED` rejection. The code is registered
+  in the `code_review` set in
+  `src/devbench/backlog/review_feedback_vocabulary.py` (and no other
+  judge's), with a membership test proving both halves of the ownership
+  rule, and its docs-table row and inline prompt sentence are generated
+  from `JUDGE_CATEGORIES` via `make generate-vocabulary` rather than
+  hand-edited.
+
+- **SECURITY: `WritePathAudit.render()` and `render_blocking_finding()` now
+  also escape the audited `flag_name` and a `load_error`'s `<error>` text,
+  the same way `relative_path` was already escaped, closing the same
+  log-injection / evidence-forgery hole on two more untrusted fields**
+  (doc_review round 7, E7-F1-S1-T2). `relative_path` was already routed
+  through `_escape_untrusted_path_for_rendering` (round 4/5), but the
+  `flag_name` interpolated into the `[PERMISSION_FLAG_WRITE_PATH_AUDIT]`
+  header line and the `[BLOCKING_FINDING]` sentence, and the `<error>` text
+  on a `load_error` line, still reached stdout raw: `flag_name` is
+  spec-derived (the `spec-to-backlog` SKILL's Step 3b-ii lifts it out of
+  spec prose as `<existing-flag-name>`), not purely operator-typed, and
+  `cli._parse_unit_id_and_required_flag_argv` applies no control-character
+  rejection to it, while a `load_error`'s `<error>` text can carry a
+  locale-translated, non-ASCII `OSError.strerror`. `docs/cli-reference.md`'s
+  `check-write-path` stdout enumeration is corrected to state this, pinned
+  by a new `TestCheckWritePathRelativePathEscapingDocumented` case -- the
+  previous wording attributed the stdout-wide "printable single-line ASCII"
+  guarantee to `relative_path` escaping alone, which was false while these
+  two fields stayed unescaped.
+
+- **SECURITY: `render_blocking_finding()` now also escapes its
+  `new_field_name` parameter, closing the same log-injection /
+  evidence-forgery hole on the one remaining untrusted field this module
+  rendered raw** (code_review round 8, E7-F1-S1-T2). `new_field_name` has
+  identical provenance to `flag_name` above -- the `spec-to-backlog`
+  SKILL's Step 3b-iii one-liner passes both `<new-field-name>` and
+  `<existing-flag-name>` as placeholders lifted verbatim from spec prose in
+  the same instruction -- but round 7's fix escaped `flag_name` and
+  `relative_path` while leaving `new_field_name` interpolated raw in the
+  same f-string, letting a hostile `new_field_name` forge a standalone
+  second `[BLOCKING_FINDING] RESOLVED: ...` acknowledgement line.
+  `flag_name`, `relative_path`, a `load_error`'s `<error>` text and
+  `new_field_name` are now all routed through
+  `_escape_untrusted_path_for_rendering`, making "one escaping contract for
+  every untrusted value this module renders" true for every value this
+  module interpolates into rendered output, not just three of the four.
+
+- **SECURITY: every surface that renders an untrusted repo-sourced filename
+  -- `WritePathAudit.render()`'s `load_error` and assignment-site lines, AND
+  `render_blocking_finding()`'s assignment-site sentence -- now escapes it,
+  closing a log-injection / evidence-forgery hole** (security_review HIGH,
+  round 4; code_review + changes_manifest, round 5; E7-F1-S1-T2).
+  `relative_path` on both `FlagAssignmentSite` and `FileLoadError` is derived
+  from a filename INSIDE the audited repo -- the untrusted artefact this
+  gate exists to examine, not agent- or operator-authored text -- and a
+  POSIX filename may embed any byte except `/` and NUL. Rendered unescaped, a
+  crafted filename could forge a second `[PERMISSION_FLAG_WRITE_PATH_AUDIT]`
+  header line or a forged assignment-site line via an embedded newline,
+  duplicate the machine-readable spec 5.2 status line JSON so a consumer
+  that greps rather than parsing line 1 reads the forged line, emit `\r`
+  plus ANSI erase-line/colour escape sequences that erase already-rendered
+  evidence in a terminal, or -- on `render_blocking_finding()` specifically,
+  the `spec-to-backlog` SKILL's Step 3b-iii blocking-finding line -- forge a
+  second `[BLOCKING_FINDING] RESOLVED: ...` line claiming the operator had
+  already acknowledged the finding; security_review, code_review and
+  changes_manifest each reproduced one or more of these end to end. Round 4
+  fixed `WritePathAudit.render()`'s two lines but left
+  `render_blocking_finding()` -- a THIRD surface consuming the same
+  `relative_path` field, reachable directly from
+  `SKILL.md`'s own Step 3b-iii narrative -- interpolating it raw; round 5
+  closes that remaining surface with the same helper. All three now pass
+  `relative_path` through `_escape_untrusted_path_for_rendering`
+  (`unicode_escape`, then decoded as ASCII) before rendering: every C0/C1
+  control character, DEL, non-ASCII byte/character, and the Unicode
+  line/paragraph separators U+2028/U+2029 some line-oriented consumers treat
+  as a line break become a literal backslash-escape sequence, guaranteeing
+  printable-ASCII, single-line output that can never forge structure --
+  while the filename stays fully legible and recoverable for an operator to
+  act on, and the finding is still reported (escaping, not
+  `cli._reject_control_characters`-style rejection, so a hostile filename
+  can never make its own finding silently disappear from the audit). The
+  escaping contract is now also documented on the operator-facing
+  `docs/cli-reference.md` `check-write-path` stdout enumeration, pinned by
+  `TestCheckWritePathRelativePathEscapingDocumented` (doc_review +
+  changes_manifest, round 5), not only in the source docstring.
+  `VERDICT_DESCRIPTIONS[VERDICT_DEFAULT]`'s description is also corrected
+  twice more: it previously read as requiring the default/constants path
+  signal only on sites whose value could not be resolved, but
+  `_classify_path_tiebreak` requires EVERY site -- including one already
+  resolved to a literal `default` -- to carry the signal (doc_review, round
+  4); and its "every site is a hardcoded literal" disjunct did not cover a
+  site whose value is a CALL carrying a literal keyword-default argument
+  (e.g. Django's `BooleanField(default=False)`), which also verdicts
+  `default` with no default-signal path at all (doc_review, round 5). The
+  generated `spec-to-backlog` SKILL Step 3b block is regenerated to match
+  both corrections. `render_verdict_reference()` now raises `ValueError`
+  naming `VERDICT_DESCRIPTIONS` (rather than a bare `IndexError`) if that
+  mapping ever held no verdict other than `live` (code_review, round 4;
+  unreachable against the shipped five-entry mapping), and also now rejects
+  -- raising `devbench.vocabulary_generation.GuardMarkerError` naming the
+  offending key -- any `VERDICT_DESCRIPTIONS` value that itself contains a
+  guard-marker literal, closing a non-idempotent-regeneration hole that
+  became reachable once descriptions started rendering into the generated
+  block (code_review, round 5). `VERDICT_DESCRIPTIONS` is wrapped in
+  `types.MappingProxyType` so it is genuinely immutable, not merely
+  unrebindable (`Final` is a static-only annotation; code_review mutated it
+  at runtime during review) (code_review, round 5). The `FileLoadError`
+  docstring's description of `UnicodeDecodeError.__str__`'s shape is
+  corrected a second time: the hex vs. byte-range form is determined by the
+  offending byte SPAN (`exc.end - exc.start == 1`), not by the count of
+  remaining unread bytes -- a real binary file (a PNG, a JPEG, or any
+  content starting with an invalid UTF-8 lead byte, the modal `load_error`
+  case) reports a single hex byte even with many bytes remaining, not a
+  range (doc_review, round 5). The Step 3b guard-marker find/splice logic,
+  previously a copy-paste fork of `devbench.vocabulary_generation`'s shared
+  `_find_guard_block`/`replace_guarded_block` implementation, now delegates
+  to that shared implementation (parameterised with this module's own
+  marker literals, remediation command, and a `reject_duplicate` flag) --
+  the module-local `SkillGuardMarkerError` class and
+  `_locate_skill_guard_block` function are removed (code_review, round 6).
+
+- **Write-path audit: unreadable files become `load_error` findings, the
+  assertion-free `test_unreadable_binary_file_is_skipped_not_fatal` is rewritten
+  to assert outcomes, and the `spec-to-backlog` SKILL's Step 3b verdict prose is
+  now generated from the module's constants** (spec `integration-reality-gates-hardening.md`
+  section 4.8, Section 7; issue #16; from #321; E7-F1-S1-T2). `audit_write_path` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` used to silently
+  `continue` past a file it could not decode or read (`except (UnicodeDecodeError,
+  OSError): continue`), so a repo with one unreadable source file produced a
+  verdict computed from a silently truncated scan -- the fail-open shape spec
+  Section 7 bans. Every unreadable file now becomes a `FileLoadError` finding
+  naming the file's relative path and the underlying decode/read error, carried
+  on `WritePathAudit.load_errors` and rendered alongside the assignment-site
+  findings; the verdict itself is still computed from the readable files only.
+  The recorded error text never carries an absolute filesystem path (an
+  `OSError`'s `strerror` is used, never its `filename` attribute) and never
+  echoes the surrounding, attacker-influenced byte content itself (it may
+  report a position, and for a single offending byte its hex value, but
+  never the byte content). The verdict vocabulary is now also
+  exposed as a public, ordered `VERDICT_DESCRIPTIONS` mapping with a
+  `render_verdict_reference()` renderer; the `spec-to-backlog` SKILL's Step 3b
+  verdict sentence and a sample `audit_write_path(...).render()` output are
+  generated from it inside `<!-- generated:write-path-verdicts -->` guard
+  markers (the same grammar `devbench.vocabulary_generation` established), fixing
+  the SKILL prose that still named the pre-rework verdict `default_only` after
+  E7-F1-S1-T1's classifier rework retired that spelling in favour of `default`.
+  `regenerate_skill_step_3b` regenerates the block in place; a hand-edit to the
+  generated block now fails the pin test in
+  `tests/test_plugin_helpers/test_permission_flag_writepath.py`, naming the
+  regeneration command.
+
+- **New CLI verb `check-write-path <id> --flag <name>` replaces the write-path audit's
+  skill-invoked `python -c` one-liner, and the classifier it runs is rebuilt around
+  assignment-context analysis** (spec `integration-reality-gates-hardening.md` section
+  4.8; issue #16; from #321; `judge-evidence` tier; E7-F1-S1-T1). `_classify` in
+  `src/devbench/plugin_helpers/permission_flag_writepath.py` used to decide `live`
+  purely from path-name vocabulary, so a flag hardcoded in an `initialState` literal
+  under a `store`/`slice`-named directory was reported `live` (321-D03, the flagship
+  false-`live`) and any shape the vocabulary did not recognise auto-blocked, producing
+  an every-repo-blocks defect. The classifier now decides primarily from the ASSIGNED
+  VALUE: a write classifies `live` when the value is an attribute/subscript access on a
+  request/action/payload/param-like identifier (`action`, `payload`, `request`, `req`,
+  `event`, `args`, `kwargs`, `params`, `context`, `ctx`) or is a non-literal argument
+  passed to a `set<Flag>(...)` setter call -- except a parenthesised or call-wrapped
+  setter argument (`set_is_premium_eligible(bool(request.x))`), which is captured as a
+  truncated fragment carrying an unmatched opening parenthesis, or a `)` character
+  inside a QUOTED setter argument (`set_isPremiumEligible("a)b")`, security fix M-1),
+  which truncates the capture into a fragment carrying an odd count of `"` or `'`
+  characters -- both classify `indeterminate` rather than `live`, since a truncated
+  fragment cannot be reliably classified either way, or a setter argument longer than
+  512 characters (security fix,
+  ReDoS: many unclosed `set<Flag>(` prefixes on one line previously cost time quadratic
+  in the line's length), which no longer matches the setter shape at all and falls
+  through to `no_write_path` (blocking) rather than `live` when it is the flag's only
+  site; literal-only assignments classify `default`
+  even inside live-named directories, with Rails and Django layouts in the parametrised
+  matrix (321-D28), and literal recognition tolerates idiomatic noise around the value
+  (wrapping parens, leading `!`/`!!` negation, a trailing line/block comment, a trailing
+  `as <Type>`/`satisfies <Type>` assertion, a trailing comma). A shape expression
+  analysis cannot resolve classifies `indeterminate` and falls back to a
+  path-vocabulary tiebreak, consulted ONLY for these unresolved shapes; the tiebreak
+  can still resolve one to `default` from the file's path but can NEVER resolve one to
+  `live` -- the tiebreak's `live` branch was removed entirely, so it can no longer
+  return `live` under any input, closing a fail-open path that would have reproduced 321-D03 for any shape
+  expression analysis could not resolve. Every verdict is reported with its evidence
+  lines and none of them auto-blocks except `default`, `no_write_path` and
+  `not_found`; a site's matched source line is never printed, only its
+  `relative_path:line_number` and `expression_verdict`, so a credential-shaped
+  assignment is never echoed into gate output. `audit_write_path` stays importable for
+  the `spec-to-backlog` skill's Step 3b narrative (AC-WP-001). The file enumerator also
+  excludes any symlink whose resolved real location escapes the audited repo root.
+
+- **`check-fixture-consistency` is wired into the `mark-done` done-path gate and proven
+  end to end by a journey suite** (spec `integration-reality-gates-hardening.md` section
+  4.2, 4.7 done-path sentence, 4.3 attribution rule; issue #17; E6-F2-S1-T2). A passing
+  run now persists `[GATE_PASS fixture_consistency] <iso-utc> <scope-hash>` to the
+  calling unit's audit trail from the command itself (never agent prose), closing the
+  deadlock where `mark-done` already required a fresh `[GATE_PASS fixture_consistency]`
+  record that no command could write, leaving an operator waiver as the only route to
+  `done` for a unit whose repo resolves this gate enabled (a unit whose repo resolves it
+  disabled reaches `done` without either); a failing or erroring run persists no record.
+  `mark-done` already
+  enforced this for every `constants.GATE_TIERS` machine-blocking gate generically
+  (`BacklogManager._check_gate_pass_done_invariant`) -- `fixture_consistency` was
+  declared machine-blocking since E2-F2 but had no writer until now, so this closes the
+  invariant's last real gap without adding a gate-specific branch anywhere in that
+  method. The persisted record's scope hash is computed over the calling unit's own
+  Changes Manifest via the shared `work_unit_scope.resolve_changed_files` helper (the
+  same one `check-reachability`/`check-shared-file-impact` use) so `mark-done`'s
+  existing stale-record recompute (spec 4.2 AC-7) can validate it identically to every
+  other non-`ancestry` gate, even though this gate's own catalog SCAN remains genuinely
+  repo-wide and the JSON status line still carries no `scope_hash` field. Attribution
+  (spec 4.3): a `missing_key` finding only blocks when the fixture/source file it names
+  is a member of the calling unit's own scope -- a mismatch outside that scope is still
+  reported (repo-wide, exactly as before) but never counted toward `status` or
+  persisted-record eligibility; `coverage_shortfall`/`load_error` findings are unaffected
+  by scope and always block, since neither describes a problem attributable to one
+  particular file. The new hermetic journey suite,
+  `tests/test_integration/test_gate_fixture_e2e.py`, drives the real CLI over scratch git
+  fixture repos for the full AC-14 matrix (block, pass, disabled, waiver, stale-record,
+  attribution) plus the four adversarial fixture shapes spec Section 10 names for this
+  gate: a typo'd `identifier_field`, an empty canonical catalog, an in-fixture waiver
+  visible in `git diff`, and a seeded source literal reported with `file:line`.
+
+- **Fixed: an apostrophe (or any other special character) in a fixture's filename could
+  defeat spec 4.3 attribution and let an inconsistent fixture reach `done`** (security
+  fix; E6-F2-S1-T2). Attribution used to recover a `missing_key` finding's offending file
+  path by re-parsing the finding's free-text `message` with a regex anchored on the
+  message template's leading `Fixture '<location>'`/`Source file '<location>'` fragment.
+  That message interpolates the path into a single-quoted slot with no escaping, so a
+  scan target or classified source file legitimately named with an apostrophe (e.g.
+  `o'brien.json`) truncated the regex capture at the first `'`, producing a path that was
+  never a member of the calling unit's own resolved scope even when the real file was --
+  silently misattributing an IN-SCOPE finding as out-of-scope, so it stopped blocking, a
+  `[GATE_PASS fixture_consistency]` record was persisted, and `mark-done` reached `done`
+  on an inconsistent fixture catalog. `fixture_consistency.FixtureFinding` now carries a
+  structured `location` field, populated directly by the two `missing_key` producers
+  (`_check_scan_targets`/`_check_source_literals`) at construction time -- there is no
+  longer any free text for the attribution rule to parse, so no path shape (apostrophe,
+  colon, newline, a `..` component, or any other legal character) can mis-split it. The
+  two prior regex helpers (`cli._FIXTURE_MISSING_KEY_LOCATION_RE`,
+  `_FIXTURE_LOCATION_LINE_SUFFIX_RE`) and the free-text parser they backed
+  (`_fixture_finding_location_path`) are deleted outright, not kept as a fallback.
+  `plugin/devbench-orchestrate/agents/review_team/test-reviewer.md` rubric item 54's
+  fixture-catalog guidance is also tightened: a `[missing_key]` finding printed under the
+  `OK:` banner is no longer dismissed unconditionally -- the reviewer must first cross-
+  check the finding's quoted path against the unit's own Changes Manifest, since
+  attribution is only as trustworthy as that self-attested Manifest and `mark-done` does
+  not independently verify it against the real diff. The evidence header presented to
+  that reviewer for this check now also documents that a passing run with a non-empty
+  scope persists a `[GATE_PASS fixture_consistency]` record.
+
+- **Fixed: an independently-spelled repo-relative path (a leading `./`, an internal
+  `a/../` component, or a trailing `/`) could also defeat spec 4.3 attribution, reaching
+  the same end state as the apostrophe bug above** (security fix; E6-F2-S1-T2). Attribution
+  compared a scan target's configured `path` against the calling unit's resolved
+  Changes-Manifest scope with NO canonicalisation on either side, so a scan target
+  declared `./mock.json` or `sub/../mock.json` compared unequal to that SAME file's
+  canonical `mock.json` Manifest spelling -- an IN-SCOPE finding was silently
+  misattributed as out-of-scope, a `[GATE_PASS fixture_consistency]` record was
+  persisted, and `mark-done` reached `done` on an inconsistent catalog. Both the
+  finding's `location` and every Manifest scope path are now run through the new
+  `fixture_consistency.normalize_repo_relative_path` helper before comparison -- a
+  purely lexical operation (`posixpath.normpath`) that never touches the filesystem
+  (so it cannot resolve a symlink and change which unit a finding is attributed to) and
+  never case-folds (so a path differing only in case is never treated as equivalent to
+  a genuine repo-relative Manifest entry). An absolute path or a path that escapes the
+  repo root via `..` is likewise never treated as equivalent to a genuine repo-relative
+  Manifest entry, because `posixpath.normpath` never fabricates a root-relative
+  interpretation for either shape, not because of the case-folding behaviour above.
+
+- **`check-fixture-consistency` gains a config-gated source-literal extraction mode**
+  (spec `integration-reality-gates-hardening.md` section 4.7 bullet 4; issue #17
+  AC-19; E6-F2-S1-T1). `gates.fixture_consistency.extract_source_literals`
+  (default `false`) additionally scans the classified source files in the
+  repo checkout -- enumerated via
+  `devbench.source_classification.iter_classified_source_files`, the single
+  owner of extension classification (PM-3), which prunes a fixed set of
+  dependency/build/vendor directories during the walk -- for identifier
+  literals whose key matches a configured `identifier_field`. A literal is
+  resolved against the union of every canonical source sharing that
+  `identifier_field` name (never cross-producted against an unrelated
+  canonical source), flagging one absent from all of them with a
+  `missing_key` finding carrying `file:line` (a 1-based line number). This
+  catches catalog drift hiding in a hard-coded route table, enum-like
+  constant list, or seed script that a reviewer would otherwise have to
+  notice by eye. The mode is heuristic (a regex-based per-line scan, not a
+  real parser) and defaults off for exactly that reason -- see
+  `docs/devbench-yaml-reference.md`'s
+  `gates.fixture_consistency.extract_source_literals` section for the full
+  documented accuracy bounds, including that a single-line triple-quoted or
+  genuinely empty string value is never matched rather than misreported with
+  an empty literal value. Enabling the mode when the repo checkout resolves
+  zero classified source files is a loud, pre-scan error naming the resolved
+  scope and the config key (mirroring the existing empty-`scan`-list and
+  zero-match-`identifier_field` loud-error shapes; this includes a repo whose
+  only classified sources live entirely under a pruned directory); a
+  directory that cannot be listed produces exactly one `load_error` finding
+  naming the unreadable directory rather than silently skipping that subtree;
+  a source file that raises `UnicodeDecodeError` or `OSError` while being
+  read produces exactly one `load_error` finding naming the file, and every
+  other classified source file is still scanned. There is no waiver
+  mechanism for a source-literal finding -- the in-fixture `allow_missing`
+  marker applies only to the structured scan-target cross-reference below.
+
+- **`check-shared-file-impact`'s auto-derived-registry scan now shares its file
+  enumeration with `check-fixture-consistency`'s new source-literal mode**
+  (E6-F2-S1-T1 round-2 code_review Blocking 6 DRY finding). `cli.py`'s
+  `_iter_shared_file_scan_candidates` delegates to
+  `devbench.source_classification.iter_classified_source_files` instead of
+  hand-copying that walk's body, so the two gates' pruned-directory set can
+  never silently drift apart. That delegation also means an unreadable
+  directory under the scanned repo -- previously silently skipped, returning
+  a partial derived registry that looked identical to a clean, complete scan
+  -- now raises `ERROR: import scan failed for directory <path>: <reason>`,
+  the same loud error shape `_derive_shared_file_registry` already uses for
+  an unreadable file, caught by `check-shared-file-impact`'s existing
+  import-scan-failure handling rather than escaping as an unhandled
+  traceback. Its own directory-not-found error message now names the
+  unreadable directory repo-relatively (matching the file-level message
+  next to it), rather than an absolute, tmp-path-prefixed form.
+
+- **SECURITY: `iter_classified_source_files` no longer follows a symlink
+  whose target resolves outside the walked root** (security_review round-3
+  MEDIUM finding, E6-F2-S1-T1). A candidate file's repo-relative NAME
+  previously determined whether it was enumerated, while a caller reading
+  its content follows any symlink in the path to whatever it actually
+  points at -- so a symlink committed inside a repo checkout, pointing
+  outside it, was a read primitive for arbitrary filesystem content under a
+  path that looked like it belonged to the scanned repo, shared by both
+  `check-fixture-consistency`'s `extract_source_literals` mode and
+  `check-shared-file-impact`'s auto-derived-registry scan. The boundary is
+  now checked against the resolved real path (`os.path.realpath`), with
+  both the candidate and the walked root resolved before comparing (so a
+  root itself reached through a symlink, e.g. `/tmp` on macOS, is not
+  spuriously treated as excluding everything under it). A symlink whose
+  target ALSO resolves inside the root -- including a DANGLING one -- is
+  still included, unchanged from prior behaviour; only a target resolving
+  outside the root, live or dangling, is now excluded.
+
+- **SECURITY: a `check-fixture-consistency` source-literal `missing_key`
+  finding never echoes any part of an extracted value, regardless of
+  length** (security_review AND code_review round-4, convergent findings;
+  CLAUDE.md "Sensitive Data Handling"; E6-F2-S1-T1). A prior length
+  threshold of 32 characters, below which a value was shown in full, plus a
+  disclosed 4-character prefix on longer values, both leaked real
+  credential shapes: a Stripe live secret key and a 32-character session
+  identifier sat exactly on the old threshold and were echoed in full, and
+  a 4-character prefix is exactly the length of common credential-type
+  prefixes (`ghp_`, `AKIA`, `AIza`, `eyJh`), disclosing credential type and
+  issuer with no review value `file:line` did not already provide.
+  Redaction is now unconditional: the finding prints
+  `<redacted, N chars total; see file:line above to inspect it directly>`
+  naming only the value's original length, never any of its content,
+  applied uniformly regardless of the value's shape or length. The finding
+  still carries `file:line` and the matched field name. Documented
+  alongside the mode's other accuracy bounds in
+  `docs/devbench-yaml-reference.md` and mirrored in the `configure-devbench`
+  skill's wizard entry.
+
+- **The `allow_missing` fixture-catalog waiver moves into the fixture artifact**
+  (spec `integration-reality-gates-hardening.md` section 4.7 bullet 5, PM-5's
+  in-diff exception; issue #17, E6-F1-S1-T2). A waiver that scopes an
+  intentional not-found/empty-state edge-case fixture used to live in
+  workspace config (`gates.fixture_consistency.scan[].allow_missing`),
+  invisible to a reviewer who never opens `devbench.yaml` for the unit under
+  review. It now lives IN the scanned fixture file itself, as a structured
+  `{"allow_missing": {"reason": "<non-empty reason>"}}` marker attached
+  directly to the waived record -- visible in the same diff the reviewer is
+  already looking at. Complete replacement, not an addition:
+  `gates.fixture_consistency.scan[].allow_missing` is a removed config key
+  (it shipped only in unmerged draft PR #322, so no migration path is owed
+  per spec Section 6) -- `config_loader.py` fails config load fast on a
+  residual key, naming the in-fixture replacement. A malformed marker (wrong
+  shape, or a record missing a non-empty `reason`) raises rather than
+  silently suppressing, and so does a well-formed marker attached to a
+  record whose identifier field never resolves (a typo'd/absent field name,
+  or a marker at the fixture's envelope level) -- validated unconditionally,
+  never only on a dict that also happens to resolve an identifier, since a
+  waiver that can never be matched to a record is dead configuration.
+  Every applied waiver is itself surfaced as a
+  `waiver_applied` finding in `check-fixture-consistency`'s own report --
+  on BOTH the pass and the fail path, since visibility must not depend on
+  whether the run also happens to contain an unrelated blocking finding.
+  A validly waived record does not itself fail the gate:
+  `cmd_check_fixture_consistency` computes `status`/exit code from the
+  BLOCKING finding kinds only (`fixture_consistency.BLOCKING_FINDING_KINDS`
+  -- `missing_key`, `coverage_shortfall`, `load_error`), so a scan whose
+  only finding is `waiver_applied` still reports `status: "pass"` and
+  exits 0.
+
+- **`check-fixture-consistency` no longer degrades a misconfigured gate into a
+  passing or misleading result** (spec `integration-reality-gates-hardening.md`
+  section 4.7, register findings 322-D02/D03/D05; issue #17). At HEAD, two
+  distinct degenerate-but-configured shapes each silently produced the wrong
+  outcome. First: a typo'd `identifier_field` and a canonical source that is
+  genuinely empty of that field were INDISTINGUISHABLE (both reduced to an
+  empty resolved canonical identifier set), and both mass-false-positived
+  every scanned reference as a `missing_key` finding (322-D02 typo, 322-D03
+  genuinely-empty; an exit-1 failure, never a silent self-disable). Second,
+  and separately: an enabled gate (non-empty `canonical_sources`) with a
+  resolved `scan` list of zero targets DID silently self-disable, printing a
+  passing result despite inspecting nothing (322-D05). Both shapes now raise
+  before any misleading output is produced -- the empty-`scan` case before
+  any file is even read -- and `cmd_check_fixture_consistency` catches the
+  raise, exits 1, and prints the one-line diagnostic
+  `ERROR: identifier field '<f>' matched zero records in <path>` or
+  `ERROR: gate enabled but scan list is empty` to stderr (these name the
+  misconfiguration, not a prescribed fix -- the field/file names in the
+  message are themselves the actionable detail). Scan and canonical file
+  parsing also moves off the old implicit-JSON-fallback: a
+  `.json`/`.yaml`/`.yml` extension dispatches explicitly, and any other
+  configured extension is now exactly one `load_error` finding naming the
+  file, never a silent (and possibly wrong) JSON-parse attempt on unrelated
+  content. The command now prints the spec 5.2 gate status line as the FIRST
+  stdout line on every path that reaches gate resolution (an unresolvable
+  unit id or a repo with no configured local path still write nothing to
+  stdout, exactly as before this change):
+  `{"gate": "fixture_consistency", "status": "disabled"}` when unconfigured,
+  and otherwise `{"gate": "fixture_consistency", "tier": "machine-blocking",
+  "status": "pass"|"fail"|"error", "findings": <int>}` -- `"error"` is new
+  vocabulary for the two loud pre-flight failures above, since every prior
+  gate command's status line only ever needed `"pass"`/`"fail"`; the shared
+  `constants.GATE_STATUS_ERROR` constant backs it, alongside the existing
+  `_DISABLED`/`_PASS`/`_FAIL` members. A correctly configured gate (non-empty
+  `canonical_sources`, non-empty `scan`, a resolvable `identifier_field`) is
+  unaffected: it reports the same findings as before this change. An
+  empty-or-whitespace `<unit-id>` argument is also now a usage error caught
+  before any other resolution step, printing
+  `ERROR: check-fixture-consistency requires a non-empty <unit-id>` to
+  stderr and exiting 2 -- at HEAD such a value fell through to the
+  work-unit-lookup failure and exited 1.
+
+- **`check-shared-file-impact` is wired into the done path and persists a
+  `[GATE_PASS shared_file_impact]` machine record, making an already-enabled
+  gate satisfiable for the first time** (spec
+  `integration-reality-gates-hardening.md` sections 4.1, 4.2, 4.6, 5.2, 5.3;
+  finding 318-D15). At HEAD, `constants.GATE_TIERS` already declared
+  `shared_file_impact` machine-blocking and
+  `BacklogManager._check_gate_pass_done_invariant` already required a fresh
+  `[GATE_PASS shared_file_impact]` record for any repo with the gate enabled,
+  but no code path could ever write that record (`compose_gate_pass_record`
+  had exactly two call sites: ancestry and reachability). A repo that enabled
+  the gate therefore had `mark-done` permanently deadlocked, satisfiable only
+  by an operator `[GATE_WAIVER shared_file_impact]`. This change closes that
+  deadlock by making `check-shared-file-impact` the command that produces the
+  record the invariant already demanded. The command now prints the spec 5.2
+  gate status line as the FIRST stdout line:
+  `{"gate": "shared_file_impact", "status": "disabled"}` (the exact bytes
+  `json.dumps`'s default separators emit) and exits 0 when the gate is
+  disabled or unconfigured for the repo (spec 4.1, AC-4); otherwise
+  `{"gate": "shared_file_impact", "tier": "machine-blocking",
+  "status": "pass"|"fail", "findings": <int>, "scope_hash": "<sha256>"}` followed by
+  the JSON findings payload, with `findings` counting the attributed
+  `new_failures` on a blocking run and `0` on either passing shape (a no-match
+  no-op, or a matched run with zero attributable new failures). A passing run
+  with a non-empty Changes Manifest additionally appends
+  `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` to the unit's audit
+  trail through `devbench.gate_records.compose_gate_pass_record` -- the sole
+  authorized builder of that marker text, so the record is always written by
+  the command, never by agent prose; a blocking run writes no `[GATE_PASS]`
+  record. `mark-done`'s already-generic
+  `BacklogManager._check_gate_pass_done_invariant` (spanning every
+  `constants.GATE_TIERS` machine-blocking gate since E2-F2-S1-T2) is what
+  enforces this: an enabled gate with no fresh record and no
+  operator-attributed `[GATE_WAIVER shared_file_impact]` marker refuses
+  naming the exact `uv run devbench check-shared-file-impact <unit-id>`
+  remediation, and editing a Changes-Manifest file after the record was
+  written re-derives a different scope hash and reads the record as stale.
+  Unlike `check-reachability`, `check-shared-file-impact` itself never reads
+  `[GATE_WAIVER shared_file_impact]` markers to clear individual findings --
+  the whole-gate `mark-done` bypass is its only waiver interaction.
+  `docs/cli-reference.md` gains a `check-shared-file-impact` entry (under
+  [Orchestrator helpers](docs/cli-reference.md#orchestrator-helpers-invoked-by-agents),
+  alongside `check-reachability` and `check-fixture-consistency`, per the
+  [`## Gates`](docs/cli-reference.md#gates) section's own intro note that the
+  per-gate check verbs continue to live under Orchestrator helpers until a
+  follow-up unit relocates them -- `check-ancestry` itself in fact lives under
+  `## Git operations`, not Orchestrator helpers) pinned by
+  `tests/test_docs/test_cli_reference_shared_file_impact.py`, and
+  `tests/test_integration/test_gate_shared_file_e2e.py` proves the wiring end
+  to end over real, hermetic git fixture repos: block, pass, disabled, waiver,
+  stale-record and attribution journeys, plus a pre-existing-vs-introduced
+  failure pair, a corrupt-baseline loud failure, and an auto-derived registry
+  that yields the expected shared set. The `docs/cli-reference.md` entry that
+  spec Section 8 calls for (`#318`'s missing-entry gap) also lands in this
+  change; 318-D15 itself is only the done-path requirement above.
+
+- **`check-shared-file-impact` gains an auto-derived shared-file registry from
+  import fan-in, with a tunable threshold** (spec
+  `integration-reality-gates-hardening.md` section 4.6, D-9; issue #13 AC4).
+  `gates.shared_file_impact.auto_derive_registry: true` (default `false`)
+  computes the shared-file set as the files imported/required by more than
+  `gates.shared_file_impact.fan_in_threshold` (default `3`, must be an
+  integer `>= 1`) distinct modules, via language-appropriate import scanning
+  (`devbench.source_classification.extract_import_targets`, dispatched on
+  the module's existing extension sets: Python, the JS/TS family (including
+  `export ... from`/`export * from`), Go (every grouped import block, not only
+  the first), Ruby, Java/Kotlin, Swift, C#, and PHP) and
+  `devbench.cli._derive_shared_file_registry`'s fan-in count, resolved
+  language-appropriately: for Python, the JS/TS family, Ruby and PHP, against
+  the importing file's own directory for a leading-`.` target and against the
+  repo root ONLY (never a `src/` fallback) for a leading-`/` target (this
+  leading-`/` bucket does not arise for Python in practice, since Python's own
+  extractor never emits a `/`-prefixed target); for Go, Java/Kotlin, C#, and
+  Swift, ALWAYS against the repo root and a top-level
+  `src/` directory regardless of the target's own leading character (their
+  import grammars have no relative form); and for a bare/absolute Python,
+  PHP, Go, Java/Kotlin, C#, or Swift target with neither prefix, likewise
+  against the repo root and a top-level `src/` directory -- never a bare
+  global basename index, which would credit an
+  unrelated same-named file (e.g. a stdlib `import types` crediting an
+  unrelated `mylib/types.py`); a bare/aliased JS/TS or Ruby target with
+  neither prefix is deliberately never resolved and casts no fan-in vote; a
+  directory-form import (`from mypkg
+  import X`, `import {A} from './lib'`) resolves to that package's entry file
+  (`__init__.py`/`index.<ext>`); a target resolving to more than one candidate is
+  credited to neither, with a `WARNING:` on stderr naming the ambiguity. The
+  derived set is unioned ADDITIVELY with the hand-maintained
+  `gates.repos.<org/repo>.shared_file_impact.patterns` glob list -- never a
+  replacement -- and is printed in the JSON payload on every invocation of an
+  ENABLED gate that reaches a verdict (pass or block), `auto_derive_registry`
+  enabled, matched or not; an invocation that raises before reaching a verdict,
+  and an invocation where `gates.shared_file_impact.enabled` is `false` (which
+  writes its own PASS verdict record and returns before any payload is built),
+  both print no payload at all. It is additionally cached alongside the baseline record, as
+  `<branch-point-sha>.derived-registry.json` (a sibling of the baseline
+  record's own `<branch-point-sha>.json`, never `<baseline_path>` literally
+  suffixed, which would resolve to a nonexistent
+  `<sha>.json.derived-registry.json`), on a MATCHED invocation (once a branch
+  point/baseline is actually resolved) and as soon as that baseline is loaded,
+  before the full-suite command is even resolved -- so a matched invocation
+  that later raises can still leave this cache written with no comparison ever
+  completed. This cache is write-only: no devbench command reads it back; it
+  exists so an operator can recover what registry was in effect for a given
+  verdict by inspecting the file directly on disk. `enabled`, `auto_derive_registry` and
+  `fan_in_threshold` are all read exclusively through
+  `resolve_gate_config("shared_file_impact", repo)` (spec 4.1 AC-27), via the
+  same `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability`
+  use; a non-integer or `< 1` threshold, or an unrecognised key inside the
+  `gates.shared_file_impact` block, fails config load naming the offending
+  key. An unreadable source file (including a dangling symlink) encountered
+  during the scan is a loud `ERROR: import scan failed for <path>: <reason>`
+  (exit 1), never a partial derived set.
+
+- **`check-ancestry` gains a squash-aware second probe, a fatal `git fetch`,
+  and a configured tracking remote** (spec `integration-reality-gates-hardening.md`
+  section 4.5, 317-D02; AC-17, AC-15; issue #12). A strict
+  `git merge-base --is-ancestor` probe still runs first, but a "not an
+  ancestor" answer (rc=1) no longer prints `BLOCKED` outright: a second
+  probe searches for the dependency's merged PR via `gh pr list --search
+  "<sha>" --state merged --base <default-branch>`, and a pass through it is
+  recorded in the status line as `mode: "squash-pr"` -- a squash-merged,
+  rebased, or fix-pack-landed dependency the strict probe can never see is
+  no longer misreported as blocked. Both probes' outcomes are always
+  printed together on every terminal decision. `git fetch` is now FATAL
+  (`ERROR: git fetch '<remote>' failed: <stderr>`, exit 1) instead of the
+  previous best-effort warning-and-continue, so a stale local view can
+  never produce a false answer; the remote name is resolved from the
+  repo's own `git config --get branch.<default-branch>.remote` rather than
+  assumed to be the literal `origin`. The command is also brought onto the
+  shared gate surface: gate enablement is read exclusively through
+  `resolve_gate_config("ancestry", repo)`, printing
+  `{"gate": "ancestry", "status": "disabled"}` and exiting 0 before any git
+  call when disabled, or the spec 5.2 status line as the FIRST stdout line
+  on an enabled run. An empty `dependency-ref` is now a usage error (exit
+  2, was exit 1); `git merge-base --is-ancestor` returning rc>=2 is an
+  evaluation failure, never reported as "not merged". `docs/cli-reference.md`
+  and `docs/cross-backlog-dependencies.md` document the two-probe contract;
+  no document routes a squash-merged dependency to the manual-blocker idiom
+  as its only remediation any more.
+
+- **`check-reachability` is wired into the done path and persists a
+  `[GATE_PASS reachability]` record; `mark-done` now enforces it, and an
+  operator-attributed `[GATE_WAIVER reachability]` marker is the escape
+  valve** (spec `integration-reality-gates-hardening.md` sections 4.2 and
+  4.4 final bullet, 4.9, Section 2 G4/G7; AC-6, AC-7, AC-15, AC-16; issue
+  #10). A clean enabled run with at least one Manifest file appends exactly
+  one `[GATE_PASS reachability] <iso-utc> <scope-hash>` line to the unit's
+  audit section through the new `devbench.gate_records.compose_gate_pass_record`
+  builder, `<scope-hash>` matching the status line's `scope_hash`
+  (`devbench.gate_records.compute_scope_hash` over the sorted Manifest file
+  list plus each file's git blob hash), so any later edit to an in-scope
+  file invalidates the record; a failing run or a disabled gate writes no
+  record. `mark-done` on a unit whose repo has `gates.reachability.enabled`
+  true now refuses (exit 1, no status write) unless a fresh
+  `[GATE_PASS reachability]` record exists, naming the exact remediation
+  `uv run devbench check-reachability <unit-id>`; a record whose recomputed
+  scope hash no longer matches is refused with `ERROR: gate 'reachability'
+  record is stale (scope changed since it ran)`. `devbench.gate_records`
+  gains `gate_waiver_records`/`gate_waiver_targets`, the sole scan-and-parse
+  loop for the `[GATE_WAIVER <gate>]` marker family: `check-reachability`
+  reads it before scanning, so a candidate with an OPERATOR-attributed
+  waiver on file is reported `[WAIVED] <target> -- <reason>`, excluded from
+  the blocking `findings` count, and the run exits 0 when every finding is
+  waived this way; an executor-attributed waiver alone is scanned normally
+  and never suppresses a finding or contributes to a `[GATE_PASS
+  reachability]` write, since reachability is machine-blocking (spec
+  Section 3.6/D-6) and an executor cannot self-certify. A malformed
+  `[GATE_WAIVER reachability]` marker (missing target, missing or empty
+  reason) is never silently treated as "no waiver": both `check-reachability`
+  and `mark-done`'s generic gate-record invariant fail loud, naming the unit
+  and the offending line. `docs/cli-reference.md`'s `check-reachability`
+  entry documents the record shape, the `mark-done` requirement, the
+  stale-record message and the `log-waiver` invocation that clears an
+  artifact.
+
+- **`check-reachability` gains transitive reachability and the
+  `gates.reachability.entry_points` config tunable** (spec
+  `integration-reality-gates-hardening.md` section 4.4 bullet 2; issue #10
+  AC2). A referrer found by the word-boundary matcher now clears a
+  candidate only when the referrer is itself reachable from a configured
+  entry-point set, walked backward through `_search_reachability_importers`
+  with a cycle-safe visited set (`_is_reachable_from_entry_points`); a
+  candidate whose every referrer is itself unreachable is reported
+  `[POTENTIALLY UNREACHABLE via orphan-chain]`, distinct from the
+  no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape, and both count
+  toward the spec 5.2 status line's `findings` total.
+  `gates.reachability.entry_points`, a list of repo-relative paths, is
+  parsed by `_parse_gates_config` into the new `GateReachabilityConfig`
+  dataclass
+  with fail-fast `ValueError` (naming `gates.reachability.entry_points`
+  and the offending value) on a non-list value, a non-string element, an
+  empty-string element, an absolute path, or a path containing a `..`
+  segment (rejected at both the loader and the JSON schema's `entry_points`
+  item `pattern`, since `repo_path / entry_point` would otherwise silently
+  discard `repo_path` for an absolute `entry_point`); absent or empty
+  falls back to a built-in default derived from
+  `devbench.source_classification`'s entry-point-stem convention (`main`,
+  `app`, `index`, `__init__`, ...) rather than an empty walk, resolved
+  (with per-field provenance) exclusively through
+  `resolve_gate_config("reachability", repo)`. An explicit,
+  project-configured entry point that does not exist in the repo checkout
+  fails the run loudly before any candidate is examined. A referrer met
+  during the entry-point walk that itself cannot be read (permission
+  failure or non-UTF-8 decode failure) no longer silently resolves to an
+  "unreachable" verdict; it is rendered as a counted `[LOAD_ERROR]`
+  finding naming that referrer, and the candidate under examination yields
+  no `[OK]` / unreachable / orphan-chain verdict block in that run.
+  `src/devbench/config-schema.json` and `sample-config.yaml` gain the new
+  key with `additionalProperties: false` preserved at every level.
+
+- **`check-reachability` reworked into the reachability gate: word-boundary
+  matching, source-classified scope, loud `git grep` semantics, and
+  `log-waiver` replacing the source-comment escape hatch** (spec
+  `integration-reality-gates-hardening.md` section 4.4; machine-blocking,
+  `constants.GATE_TIERS`; register findings 315-D01, 315-D02, and the
+  rc-swallowing / `[SKIPPED]` / defer-marker rows). Five defects in the PR
+  #315 cherry-pick made the command's verdict untrustworthy, all sharing the
+  same code path and fixed together: (1) the substring `--fixed-strings`
+  grep cleared an artifact exporting `Card` on any file containing
+  `Cardinal` or `discardCards` -- replaced with a word-boundary
+  `git grep --word-regexp --fixed-strings` search; (2) the grep ran
+  repo-wide, so a mention in `CHANGELOG.md` or a design doc cleared an
+  orphan -- matching now runs only over pathspecs derived from
+  `devbench.source_classification.SOURCE_EXTENSIONS`; (3) every `git grep`
+  rc besides 0 was treated as "no match" and swallowed by a `continue` --
+  rc=1 is still no-match data, but rc>=2 now exits 1 with
+  `ERROR: git grep failed: <stderr>` on stderr; (4) an unreadable candidate
+  file printed a silent `[SKIPPED]` token and passed -- it is now a counted
+  `[LOAD_ERROR]` finding that drives exit 1; (5) the `devbench-defer-reachability`
+  source-comment escape hatch is deleted everywhere in `src/devbench/cli.py`,
+  replaced by the structured `[GATE_WAIVER reachability]` marker `uv run
+  devbench log-waiver <judge> <unit-id> --gate reachability --target <t>
+  --reason <r> --operator` writes to the unit's audit trail. In the same
+  change, scope now comes from the shared
+  `devbench.work_unit_scope.resolve_changed_files` (the PR #315 near-copy
+  `_collect_reachability_new_files` is deleted with zero remaining callers),
+  a disabled/unconfigured gate prints `{"gate": "reachability", "status":
+  "disabled"}` and exits 0, and an enabled run prints the spec 5.2 status
+  line (`gate`, `tier`, `status`, `findings`, `scope_hash`) as the first
+  stdout line before any human-readable findings.
+  `plugin/devbench-orchestrate/agents/review_team/code-reviewer.md`'s
+  REACHABILITY rubric (item 57 and sub-items 57c/57e) is rewritten to match:
+  Manifest-scoped evidence, the `[GATE_WAIVER reachability]` waiver in place
+  of the deleted `[DEFERRED]` token, and `[LOAD_ERROR]` documented as a
+  blocking finding rather than an informational `[SKIPPED]`. Transitive
+  reachability and the `gates.reachability.entry_points` tunable are
+  deliberately left to a follow-up task on top of this corrected matcher.
+
+- **`git-ops-finalize` composes a provenance-driven PR body with a closing-keyword
+  block instead of a plain body** (spec `integration-reality-gates-hardening.md`
+  section 4.13, D-17; AC-E2-F9-S1-T1-1 through -6; issue #334). A new persistent
+  config key, `git_ops.provenance_path` (default absent, which preserves today's
+  plain body), plus a per-invocation `--provenance <path>` flag override, points
+  `git-ops-finalize` at a JSON provenance map. When a map resolves,
+  `GitOpsService.compose_finalize_pr_body` in `src/devbench/github/git_ops.py`
+  composes the PR title, a per-epic summary section, and one closing-keyword
+  line per mapped issue (`Fixes <org>/<repo>#<n>` cross-repo, `Fixes #<n>`
+  same-repo, both rendered by the same code path); an unattended
+  `auto_finalize` run posts this composed body with no operator step, but
+  only the same-repo `Fixes #<n>` lines auto-close on merge, because GitHub's
+  closing-keyword auto-close mechanism only fires for an issue in the SAME
+  repository as the merging pull request -- the cross-repo `Fixes
+  <org>/<repo>#<n>` lines create a cross-reference on the target issue for
+  traceability but never change its state -- except when a PR is already open
+  on the branch, per issue #129, in which case the open PR is reused as-is
+  and the freshly-composed body is computed but never posted. A missing, unreadable, invalid, or issue-empty
+  map fails loudly (exit 1, naming the path) BEFORE any push happens -- it
+  never silently falls back to the plain body. `--provenance` beats the
+  config key; both beat the plain-body default; there is no `DEVBENCH_*`
+  environment override for the config key
+  (YAML-only, like its sibling `single_branch` and `branch_prefix` settings).
+  `src/devbench/cli.py`'s `git-ops-finalize` command now parses the optional
+  flag and resolves the effective path before composing the body.
+  `src/devbench/config_loader.py` and `src/devbench/config-schema.json` carry
+  the new key; `sample-config.yaml` and `docs/devbench-yaml-reference.md`
+  document it; `docs/cli-reference.md` documents the flag under the `## Gates`
+  section alongside the other gate-related verbs.
+
+- **`bootstrap-environment` gains a Step 0 every-invocation interview over the
+  environment decisions it owns: LLM credential source, model selection, and
+  GitHub credential source** (spec `integration-reality-gates-hardening.md`
+  section 4.15, D-16, G12; AC-E2-F8-S1-T2-1 through -5).
+  `plugin-authoring/devbench-authoring/skills/bootstrap-environment/SKILL.md`
+  now opens with a Step 0 that interviews the operator, one menu per variable,
+  before the pre-existing clone / asdf / `make validate` bootstrap steps (which
+  are unchanged): `DEVBENCH_USE_BEDROCK` and `DEVBENCH_BEDROCK_REGION` (LLM
+  credential source, the env-var form of the `use_bedrock` / `bedrock_region`
+  keys `configure-devbench` already interviews), `DEVBENCH_CLAUDE_CREDENTIALS_FILE`
+  (Anthropic OAuth credentials file path, no YAML equivalent),
+  `DEVBENCH_CLAUDE_MODEL` (the orchestrate skill's own required coordination-call
+  model, distinct from the per-agent `agents:` block), and the `GH_TOKEN` /
+  `DEVBENCH_GH_TOKEN_FILE` GitHub token source and `DEVBENCH_GH_ORG` single-org
+  restriction (both pure env vars with no YAML equivalent). Each menu carries a
+  recommended value marked as such, every alternative, a free-form entry path,
+  and a full explanation of the setting and the consequence of each choice,
+  matching the `configure-devbench` interview-block format (AC-E2-F8-S1-T1-3).
+  The interview runs in full on every invocation: the
+  current session's already-exported value is shown as the current value, but
+  every question is still asked again -- there is no "skip because unchanged"
+  path. A new self-verify step confirms the chosen credential sources actually
+  work (`aws sts get-caller-identity` for Bedrock, the credentials file for the
+  Anthropic API, the GitHub token source, and that `DEVBENCH_CLAUDE_MODEL` is
+  non-empty), retrying the failing check once before escalating with a
+  diagnostic and suggested fix, mirroring the file's existing per-repo
+  retry-once/escalate idiom.
+
+  `docs/skills/bootstrap-environment.md` documents the every-invocation
+  contract, the new Step 0 entry, and the expanded output contract and
+  troubleshooting table; `docs/zero-to-ready.md`'s "Two setup paths" table,
+  Step 4 (Authenticate Claude / Bedrock), and Cross-references section now
+  point at the skill-driven interview equivalent and link
+  `docs/skills/bootstrap-environment.md` / `docs/skills/configure-devbench.md`
+  directly, keeping the manual walkthrough and the skill-driven path in sync
+  (`docs/zero-to-ready.md` was deferred from the `configure-devbench` rewrite
+  to this unit). `docs/onboarding.md` Step 4 (intro, "What happens" list, and
+  the worked-example walkthrough) now describes the same every-invocation
+  Step 0 interview and its retry-once/escalate self-verify, matching how
+  E2-F8-S1-T1 updated Step 3 for `configure-devbench`. `SKILL.md`'s
+  `DEVBENCH_BEDROCK_REGION` block now documents the full four-layer
+  precedence (env var over the YAML `bedrock_region` key over `AWS_REGION`
+  over the built-in `us-east-1` default), matching `src/devbench/config.py`,
+  and its session-value read loop uses bash indirect expansion (`${!v}`)
+  instead of `eval`.
+
+  `tests/test_plugin/test_bootstrap_environment_interview.py` is the new
+  structural pin: for each of the six owned variables it parses the
+  `#### \`VAR\`` interview block and asserts the Recommended/Alternatives/
+  Free-form markers and a current-value line are present, asserts the
+  every-invocation contract is stated in both the SKILL and its doc, asserts
+  `docs/skills/bootstrap-environment.md` carries an "## Every-invocation
+  contract" section and opens its step-by-step list with the Step 0
+  interview, and asserts `docs/onboarding.md` Step 4 states the
+  every-invocation phrase and references the Step 0 interview both when
+  introducing it and in the self-verify description -- proven by mutation
+  (deleting Step 0 from the real SKILL.md now fails the pin). The block
+  parser and marker-completeness helpers are shared with
+  `configure-devbench`'s pin via the new
+  `tests/fixtures/interview_block_helpers.py` module rather than duplicated.
+
+- **`src/devbench/source_classification.py` -- the single source/test-path/
+  entry-point classification module** (spec
+  `integration-reality-gates-hardening.md` section 4.3, D-3, PM-3;
+  AC-E2-F6-S1-T1-1 through -5). "Which file extensions are source, which
+  paths are tests, which filenames are entry points" used to have two
+  independent answers: the CLI's own reachability-evidence classification
+  and the write-path audit helper's scan vocabulary. New
+  `SOURCE_EXTENSIONS`, `ENTRY_POINT_STEMS`, `TEST_PATH_MARKERS` and
+  `TEST_FILENAME_MARKERS` frozensets, plus `is_source_extension`,
+  `is_entry_point_stem`, `is_test_path` and `classify_extension`, are the
+  one place that answers the reachability-evidence question now. `cli.py`'s
+  `_is_reachability_candidate` consumes `is_source_extension`,
+  `is_entry_point_stem` and (via `_is_reachability_test_path`)
+  `is_test_path`, matching its pre-migration behaviour, which already
+  lowercased the suffix and already used `SOURCE_EXTENSIONS`'s full
+  15-extension union; `_is_reachability_test_path` itself delegates only
+  to `is_test_path`. This half of the migration is behaviour-preserving,
+  and `cli.py`'s local extension tuples are deleted, not left dormant.
+
+  `plugin_helpers/permission_flag_writepath.py`'s write-path audit
+  historically scanned a narrower 9-extension set, so rather than widen
+  that scan to `SOURCE_EXTENSIONS`, this module keeps the audit's own
+  scan scope as a *second* named set in the same single home,
+  `WRITE_PATH_AUDIT_SCAN_EXTENSIONS`, consumed via the new
+  `is_write_path_audit_extension` predicate. `_iter_source_files` now
+  calls that predicate instead of declaring its own tuple, which matches
+  exact-case (does not lowercase the suffix), preserving the audit's
+  pre-migration case-sensitive scan byte-for-byte. One definition site
+  (this module, AC-2/AC-3), two named scopes: `SOURCE_EXTENSIONS` answers
+  "is this extension source code" for the reachability consumer;
+  `WRITE_PATH_AUDIT_SCAN_EXTENSIONS` answers the narrower, audit-specific
+  "is this one of the 9 extensions the write-path audit has always
+  scanned." Both migrations are therefore behaviour-preserving
+  (AC-E2-F6-S1-T1-5); broadening or narrowing the audit's scan set is
+  left to the gate epic that actually needs it (spec 4.8), not this
+  extraction. The pre-existing witness tests in `tests/test_cli.py` and
+  `tests/test_plugin_helpers/test_permission_flag_writepath.py` pass
+  unchanged before and after, recorded via `green-green-check`, and new
+  tests pin each consumer's continued dependence on the shared module's
+  symbols so a future reversal of the migration is caught rather than
+  silently accepted.
 ## [0.6.0] -- 2026-08-20
 
 ### Added
@@ -306,6 +1483,846 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
      committing to `devbench git-ops`), with read-only inspection still
      permitted and a guard denial explicitly not a reason to end a turn.
 
+- **`log-waiver` -- structured, judge-visible `[GATE_WAIVER]` waivers, a
+  validate-backlog grammar rule, and the report waiver count** (spec
+  `integration-reality-gates-hardening.md` section 4.9, 5.3, G7, D-5/PM-5;
+  AC-E2-F4-S1-T1-1 through -7). New CLI verb `log-waiver <judge> <id> --gate
+  <g> --target <t> --reason <r> [--operator]` writes a `[GATE_WAIVER <gate>]
+  <iso-utc> <target> <operator|executor> <reason>` marker
+  (`devbench.backlog.manager.compose_gate_waiver_record`, the sole authorized
+  builder) into the unit's `## TDD Cycle Log` section -- the audit surface
+  that survives every review judge's `read-unit --strip-comments` Evidence
+  fetch (the PM-6 evidence-horizon rule, E2-F3-S1-T2), unlike `## Comments`
+  which that fetch strips. Trust model enforced at the CLI boundary (spec
+  Section 3.6): `<judge>` must be one of the five canonical review judges
+  (`constants.ALL_REQUIRED_JUDGE_NAMES`), `--gate` one of the eight declared
+  gates, `--reason` mandatory and validated by the existing
+  `_validate_agent_free_text` em-dash / control-character / bracketed-tag
+  boundary check, and a `machine-blocking` gate requires `--operator` --
+  every usage failure exits 2 naming the offending argument; a missing unit
+  exits 1. `validate-backlog` gains Check 27, rejecting a malformed
+  `[GATE_WAIVER]` line via the same grammar authority
+  (`parse_gate_waiver_record`) the marker is built from, naming the unit and
+  the offending line. `devbench report`'s Backlog state table gains a "Gate
+  waivers (operator / executor)" row (`count_gate_waiver_markers`), so an
+  operator sees at a glance how much of the run is riding on waivers.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_log_waiver.py`.
+
+- **`log-newly-reachable` -- structured, judge-visible `[NEWLY_REACHABLE]`
+  path-verification markers** (spec `integration-reality-gates-hardening.md`
+  section 4.9(a), 5.3, S1; AC-E2-F4-S1-T2-1 through -6; AC-21). New CLI verb
+  `log-newly-reachable <id> --path <p> --method <m> --result <r>` writes a
+  `[NEWLY_REACHABLE] <path> <method> <result>` marker
+  (`devbench.cli.compose_newly_reachable_record`, the sole authorized
+  builder) into the unit's `## TDD Cycle Log` section via the same
+  `BacklogManager._append_audit_marker_before_comments` insertion point
+  `log-waiver` uses -- the audit surface that survives every review judge's
+  `read-unit --strip-comments` Evidence fetch (the PM-6 evidence-horizon
+  rule, E2-F3-S1-T2). This replaces the free-text `[NEWLY_REACHABLE]`
+  convention `docs/newly-reachable-paths.md` previously documented (written
+  via `log-comment` into `## Comments`, which that fetch strips and which was
+  therefore invisible to the judges spec 4.3 requires to weigh it); a
+  Definition-of-Done checkbox is auto-ticked on the done transition (S1), so
+  only a validated, judge-visible marker is auditable. `--method` (`manual`,
+  `unit_test`, `integration_test`, `functional_test`) and `--result`
+  (`verified`, `broken`) are validated against named importable
+  `NEWLY_REACHABLE_METHODS`/`NEWLY_REACHABLE_RESULTS` constants rather than
+  inline literals; an unknown or empty field exits 2 naming the offending
+  argument and listing the accepted values, and a missing unit exits 1
+  writing no marker -- the same 0/1/2 exit-code contract `log-waiver` uses.
+  Flag scanning reuses the newly-generalised `_consume_gate_verb_flag_value`
+  (renamed from `_consume_log_waiver_flag_value`) rather than duplicating
+  flag-parsing between the two structured gate-marker verbs.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_log_newly_reachable.py`.
+  `docs/newly-reachable-paths.md`'s audit-trail and enforcement sections
+  still describe the superseded `log-comment`/`## Comments` convention;
+  syncing that doc to the shipped verb is deferred to the named successor
+  task E2-F4-S1-T4.
+
+- **`make generate-vocabulary` -- generated vocabulary docs table and judge
+  prompt sentences replace three hand-maintained copies with one** (spec
+  `integration-reality-gates-hardening.md` section 4.10, 5.7, G5, D-4,
+  Section 0.4; AC-E2-F5-S1-T1-1 through -6, AC-11 idempotence half). New
+  module `devbench.vocabulary_generation` (run via `make generate-vocabulary`
+  / `python -m devbench.vocabulary_generation`) renders the per-judge tables
+  in `docs/review-feedback-vocabulary.md` and the per-judge vocabulary
+  sentence in the five judge prompts (`review_team/code-reviewer.md`,
+  `review_team/test-reviewer.md`, `review_team/doc-reviewer.md`,
+  `review_team/changes-manifest.md`, `security-reviewer.md`) from
+  `JUDGE_CATEGORIES` (`devbench.backlog.review_feedback_vocabulary`),
+  writing only between `<!-- generated:vocabulary -->` /
+  `<!-- /generated:vocabulary -->` guard markers so hand-written prose
+  outside them is preserved byte for byte. Generation is idempotent (a
+  second consecutive run produces zero diff); a target surface missing its
+  guard markers, or carrying an unterminated pair, raises loudly naming the
+  file (and, for an unterminated pair, the opening marker's line number)
+  rather than being silently skipped. Behaviour change for operators:
+  hand-edits inside a generated block are now overwritten by the next
+  `make generate-vocabulary` run (Section 0.4); the `manifest_amender` table
+  remains hand-maintained (different source of truth,
+  `AMENDER_REJECTION_CATEGORIES`). The drift check that fails
+  `make validate` on an un-regenerated surface is implemented as
+  `make check-vocabulary-drift`, described in the following entry.
+
+- **`make check-vocabulary-drift` -- `make validate` now fails on a
+  hand-edited generated vocabulary block** (spec
+  `integration-reality-gates-hardening.md` section 4.10, AC-11;
+  AC-E2-F5-S1-T2-1 through -3, AC-E2-F5-S1-T3-1 through -7). The drift-check
+  logic lives in `src/devbench/vocabulary_generation.py`, not the `Makefile`:
+  `all_generated_relative_paths()` is the single enumeration of every
+  guard-marked surface (the doc-surface constant plus the prompt-target
+  mapping keys -- no second, hand-maintained copy of that list exists
+  anywhere in production code; a literal fixture copy in
+  `tests/test_vocabulary_generation.py` is deliberately pinned to these same
+  constants by an equality assertion, so it cannot silently drift);
+  `find_drifted_surfaces()` regenerates each surface into a scratch
+  directory (never writing to the working tree it inspects) and diffs it
+  against the six committed surfaces; `main` in check mode
+  (`python -m devbench.vocabulary_generation --check`) reports the result,
+  naming the offending file(s) and `make generate-vocabulary` as the fix.
+  `check-vocabulary-drift` is now a single-line `Makefile` delegation to that
+  check mode, carrying no copy of the surface list, and remains a `validate`
+  prerequisite, so the pre-push hook catches a hand-edit before it is
+  pushed; CI does not invoke `make validate` directly, so it catches the
+  same hand-edit only indirectly, through `TestVocabularyDriftCheck` running
+  inside `make test-coverage`.
+
+- **Closed finding 322-D21: every `JUDGE_CATEGORIES` code is now accounted
+  for by the `_LEGACY_CODES`/`_CAMPAIGN_CODES` partition, every campaign
+  code carries an ownership plus non-membership assertion, `_LEGACY_CODES`
+  is frozen by `TestLegacyCodesAreFrozen` so a new code cannot be parked
+  there to dodge the gate, and `make validate` is proven to reach the
+  module that enforces all three** (spec
+  `integration-reality-gates-hardening.md` section 4.10;
+  AC-E2-F5-S1-T2-4 through -6). The prior coverage was uneven, not
+  uniformly absent: PR #322 shipped `FIXTURE_CATALOG_MISMATCH` proving only
+  that it belonged to `test_review`, never that it was absent from every
+  other judge's set, and `UNREACHABLE_ARTIFACT` and
+  `NEWLY_REACHABLE_PATH_UNVERIFIED` shipped with that same one-sided gap.
+  `LAYOUT_STUB_WITHOUT_LIVE_TEST` already had partial negative coverage
+  (absence from `code_review` only, not from every other judge), and
+  `COMPOSITION_ROOT_MISSING` already had full negative coverage via
+  `test_composition_root_missing_not_valid_for_other_judges`, which looped
+  over every judge but `test_review`. `tests/test_backlog/test_review_feedback_vocabulary.py`
+  now partitions every code in `JUDGE_CATEGORIES` into `_LEGACY_CODES`
+  (closed permanently, and pinned against an independently maintained
+  `_LEGACY_CODES_SNAPSHOT` literal by the new `TestLegacyCodesAreFrozen`)
+  and `_CAMPAIGN_CODES` (grows by one entry per new code, each proven by
+  `TestCampaignCodeMembership`). Its positive half is parametrized off a
+  literal `_CAMPAIGN_CODE_OWNERS` code-to-judge table, cross-checked against
+  the published mapping in `docs/review-feedback-vocabulary.md`'s
+  `code_review` and `test_review` tables (each code is documented once,
+  under its owning judge's heading) and, for `FIXTURE_CATALOG_MISMATCH`
+  specifically, `docs/cli-reference.md` line 1355, so reassigning a
+  campaign code to a different judge's frozenset fails the test directly --
+  deriving the "owning judge" from `JUDGE_CATEGORIES` itself, as an earlier
+  revision of this test did, cannot detect that reassignment because the
+  derivation and the assertion move together. `_owner`'s existing
+  single-owner precondition is kept and cross-checked against the same
+  literal table by `test_owner_matches_literal_table`. The negative half
+  remains the non-membership cross-product against every other judge in
+  `JUDGE_CATEGORIES`, parametrized so a judge added later cannot be silently
+  skipped. The seven pre-existing ad-hoc single-code tests for these five
+  codes are superseded: each pinned a literal judge mapping for one code
+  with no negative coverage for three of them and partial negative coverage
+  for a fourth (the historical detail above); `TestCampaignCodeMembership`
+  now pins that same literal mapping for all five plus the full
+  non-membership cross-product for all five uniformly.
+  Together, `TestJudgeCategoryMembershipCoverage.test_every_code_is_accounted_for`
+  (fails, naming the code, whenever a code lands in neither set) and
+  `TestLegacyCodesAreFrozen.test_legacy_codes_matches_frozen_snapshot`
+  (fails, naming the divergence, whenever `_LEGACY_CODES` is extended
+  instead of `_CAMPAIGN_CODES`) mean a new code cannot ship without
+  triggering `TestCampaignCodeMembership`'s ownership and non-membership
+  assertion. `tests/test_integration/test_make_targets.py` adds
+  `TestMembershipCoverageGateReachableFromValidate`, the direct analogue of
+  `TestVocabularyDriftCheck.test_validate_runs_the_drift_check` above, with
+  two assertions: `test_validate_pytest_invocation_collects_the_membership_module`
+  extracts `test-coverage`'s real pytest invocation from `make -n` and runs
+  it in `--collect-only` mode to prove the invocation actually collects the
+  membership-coverage module, so a future marker filter or path list that
+  narrows the invocation fails loudly instead of silently dropping this
+  gate out of `test-coverage`; `test_test_coverage_is_a_validate_prerequisite`
+  separately asserts that same invocation line appears in `make -n
+  validate`'s dry-run output, so removing `test-coverage` from the
+  `validate` prerequisite list would also fail loudly rather than leaving
+  the first assertion green in isolation. `WRITE_PATH_UNVERIFIED`, added
+  later by E7, is deliberately not asserted here: the completeness test is
+  what obliges that unit to bring its own membership assertion in the same
+  change that adds the code.
+
+- **`src/devbench/work_unit_scope.py` -- the single ADR-12 mode-aware scope
+  helper** (spec `integration-reality-gates-hardening.md` section 4.3, PM-6,
+  AC-9; AC-E2-F3-S1-T1-1 through -6). New `resolve_changed_files(unit_id,
+  repo_path, mode) -> ScopeResult` extracts the mode-aware scope-resolution
+  logic that used to live inline in `cmd_get_diff` -- which files are in
+  scope (the unit's real Changes Manifest paths), which ADR-12 mode applies,
+  this unit's own commit sha(s) in `defer_pr` mode (resolved by
+  commit-message subject, never `HEAD`), and the spec-4.2 `[GATE_PASS]` scope
+  hash (`devbench.gate_records.compute_scope_hash`, so the value later
+  gate-record freshness checks recompute can never drift from a second hash
+  definition). `devbench get-diff` and `devbench check-manifest-scope` are
+  migrated to call it in this same change, with their prior inline scope
+  code (`_load_manifest_paths_or_report`, `_render_task_commit_hunks`)
+  deleted, not left dormant. Error semantics: an unknown unit id or an
+  invalid/non-work-tree repo path raise `ValueError` naming the offending
+  value and (for the repo path) the config key to fix; git plumbing exiting
+  >= 2 raises `RuntimeError` with stderr attached; the function never
+  returns a partial `ScopeResult`. A grep-shaped pin
+  (`TestScopeSingleImplementationPin` in `tests/test_cli.py`) asserts no
+  other module reintroduces the commit-sha-by-subject resolution
+  independently.
+
+- **`tests/test_docs/test_gate_tier_vocabulary.py` -- the G3 blocking-vocabulary
+  truthfulness pin, plus the disabled-status-line prose sweep** (spec
+  `integration-reality-gates-hardening.md` section 4.2, G3, Section 0.2;
+  AC-E2-F2-S2-T1-1 through -6, AC-8). New docs test walks
+  `plugin/devbench-orchestrate/agents/` (the review-team prompts and the
+  executor prompt), `plugin/devbench-orchestrate/skills/`, and `docs/` for
+  blocking-vocabulary phrases (`blocks`/`blocking`/`blocked`,
+  `enforces`/`enforced`/`enforcing`, `cannot be marked done` -- a named
+  `BLOCKING_VOCABULARY_PATTERNS` constant, not an inline literal) that
+  co-occur, on the same line, with one of the eight declared gate names. A
+  violation is reported only when that gate's tier -- looked up directly
+  from `constants.GATE_TIERS`, never a second hand-maintained list -- is not
+  `machine-blocking`, so a machine-blocking gate may truthfully use blocking
+  vocabulary (AC-E2-F2-S2-T1-3). The shared scanner
+  (`scan_for_blocking_vocabulary_violations`) is exercised by a
+  seeded-violation test, a machine-blocking-acceptance test, and a
+  shipped-tree regression test that asserts zero violations across the real
+  surface; a fourth test pins that every judge-evidence gate rubric in the
+  three swept prompts states the Section 0.2 disabled-status-line semantics.
+  `code-reviewer.md`'s BUG-FIX COMPLETENESS rubric, `test-reviewer.md`'s
+  COMPOSITION-ROOT and LAYOUT rubrics, and `executor.md`'s BUG-FIX
+  COMPLETENESS section each gain a sentence naming the judge-evidence gate
+  they cover (`newly_reachable_paths`, `composition_root`,
+  `layout_geometry`) and stating that a `{"gate":"<name>","status":"disabled"}`
+  line means the gate is not configured -- neither a pass nor a fail signal,
+  never a finding on its own.
+
+- **Gate tier taxonomy and the `[GATE_PASS]` record module** (spec
+  `integration-reality-gates-hardening.md` section 4.2, 5.3, D-6;
+  AC-E2-F2-S1-T1-1 through -6). `constants.py` gains `GATE_TIER_MACHINE_BLOCKING`,
+  `GATE_TIER_JUDGE_EVIDENCE`, `GATE_TIER_ADVISORY` and `GATE_TIERS: Mapping[str, str]`,
+  declaring the tier of all eight gates (reachability, ancestry,
+  shared_file_impact, fixture_consistency = machine-blocking; write_path_audit,
+  newly_reachable_paths, composition_root, layout_geometry = judge-evidence),
+  built as a dict comprehension over the existing `GATE_NAMES` tuple so the
+  two collections can never drift. New module `gate_records.py` is the sole
+  authority for the `[GATE_PASS <gate>] <iso-utc> <scope-hash>` marker
+  grammar (Section 3.6: executors do not self-certify gate outcomes):
+  `compose_gate_pass_record` builds the one-line marker from an
+  already-resolved scope hash (rejecting undeclared gates, malformed scope
+  hashes and naive timestamps); `parse_gate_pass_record` re-validates a
+  marker on read, never returning a partial record on malformed input;
+  `latest_gate_pass_record` locates the most recent record for a gate within
+  arbitrary content (tolerating the marker being embedded inside a larger
+  audit-comment line, since the grammar is additive to the audit-comment
+  contract); `compute_scope_hash` is the SHA-256-over-sorted-file-list-plus-
+  blob-hashes function backing the stale-record invalidation rule (AC-7),
+  rejecting an empty scope. Mirroring `devbench.tdd_gate`, the module
+  performs no work-unit-file or git I/O of its own -- gate commands persist
+  the composed marker via the existing audit-append machinery, wired by the
+  gate-specific tasks that consume this module (E2-F2-S1-T2 onward).
+
+- **`devbench gates` -- read-only overview of every integration-reality
+  gate's status, repo overrides and provenance** (spec
+  `integration-reality-gates-hardening.md` G2, section 4.1; AC-4, AC-27).
+  New zero-argument CLI verb registered in `_COMMANDS`
+  (`"Show every gate's tier, status and repo overrides"`, matching the spec
+  Section 14 `--help` snapshot) renders one row per declared gate
+  (`constants.GATE_NAMES`), resolving each row exclusively through
+  `config_loader.resolve_gate_config` -- never reading
+  `RuntimeConfig.gates` fields directly (AC-27) -- so the table can never
+  diverge from the four-layer precedence resolver. A fresh workspace with
+  no `gates:` key renders all eight rows as `disabled` with the `-`
+  no-override placeholder (D-17); a per-repo override or the
+  `DEVBENCH_GATE_<NAME>_ENABLED` env var is reflected in both the `status`
+  and `provenance` columns. Column widths are computed from the row data
+  (`_format_gates_table`), not hard-coded, so the tier column a later unit
+  adds needs no re-layout. Reloads `devbench.yaml` fresh from disk so a
+  config load failure (missing file, invalid YAML/schema) is caught with
+  the loader's own fail-fast message on stderr and exit 1, with no partial
+  table printed (spec Section 7). Documented in `docs/cli-reference.md`'s
+  new `## Gates` section, pinned by
+  `tests/test_docs/test_cli_reference_gates.py` against the `_COMMANDS`
+  description string so the doc can never drift from the registry.
+
+- **`mark-done` wired to the machine-blocking gate-record invariant, and the
+  `gates` table's `tier` column** (spec `integration-reality-gates-hardening.md`
+  section 4.2, G2, G4; AC-E2-F2-S1-T2-1 through -6). `BacklogManager.mark_done`
+  gains `_check_gate_pass_done_invariant`, mirroring the existing
+  `_check_task_type_done_invariant` pattern so every caller (`cmd_mark_done`
+  and `_check_merge_handle_merged` alike) inherits it identically: for each
+  of the four machine-blocking gates (`constants.GATE_TIERS`) that resolves
+  `enabled` for the unit's repo (`config_loader.resolve_gate_config`), the
+  unit must carry a fresh `[GATE_PASS <gate>]` record or an
+  operator-attributed `[GATE_WAIVER <gate>]` marker; an executor-attributed
+  waiver is rejected as insufficient for a machine-blocking gate (spec
+  Section 3.6), naming the missing operator attribution. Absent both, `mark-
+  done` exits 1, writes no status, and names the exact remediation command,
+  matching the spec G4 worked example verbatim in shape (`ERROR: done-gate:
+  gate '<name>' is enabled for repo '<repo>' but has no [GATE_PASS <name>]
+  record for <unit>. Run: uv run devbench check-<name> <unit>`). A
+  `[GATE_PASS <gate>]` record's `scope_hash` is recomputed from the unit's
+  current `## Changes Manifest` file list (`gate_records.compute_scope_hash`
+  over each file's live `git hash-object` blob hash), so an edit to any
+  in-scope file after the gate ran invalidates the record, refused with
+  `ERROR: gate '<name>' record is stale (scope changed since it ran)`
+  (AC-7). A disabled gate imposes nothing, preserving today's behaviour for
+  every workspace that has not opted in. Separately, `devbench gates`
+  (`_format_gates_table`) now renders the `tier` column (`machine-blocking`
+  / `judge-evidence`, looked up from `constants.GATE_TIERS` by gate name)
+  that E2-F1-S2-T1 deliberately deferred, completing the spec G2
+  worked-example table shape. `docs/cli-reference.md`'s `## Gates` and
+  `mark-done` sections document both changes with the recomputed example
+  table and the G4 worked example.
+
+- **`resolve_gate_config` -- the single four-layer precedence resolver for
+  gate configuration** (spec `integration-reality-gates-hardening.md`
+  section 4.1, D-15, D-17; AC-27). Adds `resolve_gate_config(gate, repo,
+  runtime_config, env_enabled_override=None) -> ResolvedGateConfig` to
+  `config_loader.py`: merges built-in defaults, project-level `gates.<gate>.*`,
+  per-repo `gates.repos.<org/repo>.<gate>.*` overrides, and the
+  `DEVBENCH_GATE_<NAME>_ENABLED` env layer field-wise, in that ascending
+  precedence order, recording per-field provenance (`builtin` / `project` /
+  `repo` / `env`) so a repo that flips `enabled` inherits every other
+  project-level tunable instead of resetting it. Every built-in default
+  (gate names, per-gate field defaults, the env-var prefix/suffix, and the
+  provenance labels) is a named constant in `constants.py` -- no literal
+  defaults inline in the resolver -- and the `GatesConfig` dataclass tree's
+  own field defaults (`GateEnabledConfig`, `GateSharedFileImpactConfig`,
+  `FixtureConsistencyConfig`) now reference the same constants instead of
+  duplicated literals. Adds `config.resolve_gate_env_override(gate)`,
+  deriving the env var name and resolving it through the existing
+  `_resolve_bool` chain so the accepted boolean vocabulary and failure
+  semantics never diverge from every other env-driven boolean in that
+  module. Pins that `resolve_gate_config` is the ONLY module that reads a
+  gate's resolver-managed fields (`enabled`, `auto_derive_registry`,
+  `extract_source_literals`) directly off the raw config tree, so a later
+  gate epic cannot quietly re-introduce a second, divergent interpretation.
+
+- **Unified `gates:` config section for the eight integration-reality gates**
+  (spec `integration-reality-gates-hardening.md` section 4.1;
+  `caylent-solutions/devbench-internal-backlog#10`..`#17`). Replaces the
+  ad-hoc per-PR opt-in surfaces the eight cherry-picked PRs shipped with ONE
+  top-level `gates:` block covering `reachability`, `ancestry`,
+  `shared_file_impact`, `fixture_consistency`, `write_path_audit`,
+  `newly_reachable_paths`, `composition_root`, and `layout_geometry`, plus
+  an optional `gates.repos.<org/repo>` per-repo override map. Adds the
+  frozen `GatesConfig` dataclass tree and `RuntimeConfig.gates` field in
+  `config_loader.py`, `_parse_gates_config` with fail-fast `ValueError` on
+  an unknown gate name, a wrong-typed value, or a per-repo override naming
+  a repo absent from `repos:`, and a matching JSON Schema block with
+  `additionalProperties: false` at every level so a typo is a load-time
+  error rather than a silently ignored key. Every gate is disabled by
+  default (absent `gates:` behaves exactly as before this change); the
+  four-layer precedence resolver (`resolve_gate_config`, adding per-repo
+  and `DEVBENCH_GATE_<NAME>_ENABLED` env-override resolution) ships in a
+  follow-up task. **Migration (complete replacement):** the pre-release
+  keys that arrived on the branch ahead of any release -- a per-repo
+  glob-pattern key nested under `repos:` and a bare top-level fixture-catalog
+  opt-in block -- are REMOVED in this same change, with every consumer
+  (`cli.py`'s `check-shared-file-impact` / `check-fixture-consistency`
+  commands, `fixture_consistency.py`'s operator-facing messages, and the
+  CLI/doc/plugin references below) updated to the new `gates.*` key paths
+  and zero remaining references to either retired spelling.
+
+- **Layout/CSS-geometry AC tagging and live-render verification gate**
+  (`caylent-solutions/devbench-internal-backlog#14`). Standard jsdom-style
+  unit-test environments have no real layout, paint, or cascade engine, so
+  CSS-dependent runtime behaviour (sticky positioning, flex-shrink
+  collapse, media-query cascade, grid autosize, overlap) has been shipping
+  as "done" on jsdom-only tests -- including tests that stub the very
+  primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`)
+  responsible for the bug, which structurally cannot fail even when the
+  live defect persists. Adds a `spec-to-backlog` Step 3a keyword heuristic
+  that tags layout/geometry-sensitive acceptance criteria `[LAYOUT-AC]`
+  and requires a real-render/live-browser Definition of Done item for
+  tagged tasks, a `test-reviewer` rubric item that flags a DOM-layout
+  primitive stub for a `[LAYOUT-AC]`-tagged AC with no companion
+  live-render test, and the new controlled rejection code
+  `test_review:LAYOUT_STUB_WITHOUT_LIVE_TEST`. The vocabulary membership
+  test (`tests/test_backlog/test_review_feedback_vocabulary.py`) was
+  authored ahead of this pick because the source PR shipped zero tests.
+
+- **Composition-root test verification for state-consuming UI tasks**
+  (`caylent-solutions/devbench-internal-backlog#11`). Backlog tasks were
+  repeatedly marked done with large green test suites that only ever
+  rendered a component in isolation (hand-supplied props, a locally-built
+  store, or a module-scope-mocked dependency) and never exercised the
+  app's real composition root, letting components ship that were never
+  wired into the running app, wired in wrong, or tested against a store
+  shape that had silently diverged from production. Adds rubric items to
+  `test-reviewer` requiring at least one test through the real
+  composition root (or a documented smallest-real-ancestor exception) for
+  any task touching a UI component that consumes shared/app-level state,
+  a new controlled rejection code `test_review:COMPOSITION_ROOT_MISSING`,
+  a `spec-to-backlog` Definition-of-Done requirement for tasks in that
+  category, and `docs/composition-root-testing.md` defining the
+  composition root, its scope, and acceptable exceptions.
+
+- **Fixture-catalog cross-reference check**
+  (`caylent-solutions/devbench-internal-backlog#17`). A feature's data-fetch
+  logic can be correct while reading from a mock/fixture lookup table whose
+  keys were fabricated, keyed in the wrong namespace, or left incomplete
+  relative to the project's canonical shared fixture/demo dataset --
+  functionally dead or crash-on-save for real records even though the
+  underlying logic is sound, and invisible to the unit suite since each
+  task's own fixtures are self-consistent. Adds an opt-in `gates.fixture_consistency:`
+  block to `devbench.yaml` (`canonical_sources` designating authoritative
+  fixture/dataset files and identifier fields, `scan` targets to
+  cross-reference, and per-target `allow_missing` scoping for intentional
+  edge-case fixtures) and `devbench check-fixture-consistency <id>`, a
+  deliberate no-op unless the workspace configures `canonical_sources`. The
+  check runs as `test-reviewer` review evidence and fails with
+  `FIXTURE_CATALOG_MISMATCH` when a scanned fixture references a key absent
+  from its canonical source, or a canonical source falls short of a
+  declared `expected_count`. (E2-F1-S1-T1 re-nested this block under the
+  unified `gates:` config section; see the "Unified `gates:` config section"
+  entry below. The per-target `allow_missing` scoping described here was a
+  workspace-config allowlist; E6-F1-S1-T2 superseded it with a structured
+  in-fixture marker and removed the config key entirely -- see "The
+  `allow_missing` fixture-catalog waiver moves into the fixture artifact"
+  entry above.)
+
+- **Shared-file full-suite regression gate**
+  (`caylent-solutions/devbench-internal-backlog#13`). A task's regression
+  verification is scoped to its own Changes Manifest even when the diff
+  touches a shared/high-fan-in file (an app shell, a shared hook, a
+  widely-consumed component) that many unrelated features depend on;
+  previously such regressions surfaced only when an unrelated later task
+  happened to run the full suite. Adds `gates.repos.<repo>.shared_file_impact.patterns`
+  (a hand-maintained per-repo glob registry of shared composition-root
+  files) to `devbench.yaml`, and `devbench check-shared-file-impact <id>`,
+  a no-op unless the task's diff matches a registered pattern. On a match
+  it runs the full suite, parses per-test failure identifiers, and diffs
+  them against a stored baseline at `.devbench/test-baselines/<repo>.json`,
+  blocking (exit 1) only on newly-introduced failures, bootstrapping on
+  first run, and ratcheting the baseline down on a clean pass. A new
+  `assert-shared-file-impact.sh` `PostToolUse` guard hook (mirroring
+  `assert-tests-pass.sh`) makes the exit code load-bearing instead of
+  advisory, and `executor.md`'s Definition of Done now requires running
+  the gate before logging completion. (E5-F1-S1-T1 replaced the
+  bootstrap-and-ratchet baseline below with a pre-change, per-branch-point
+  baseline; see the "Shared-file baseline is now a pre-change,
+  per-branch-point snapshot" entry below. E5-F2-S1-T1 replaced the
+  `list_changed_files` working-tree scan below with the shared ADR-12 scope
+  helper and rewrote the guard hook to fail closed; see the
+  "`check-shared-file-impact` resolves its changed-file set through the
+  shared ADR-12 scope helper..." entry below.)
+
+- **Shared-file baseline is now a pre-change, per-branch-point snapshot,
+  written atomically under a sibling `flock`, read under a shared `flock`,
+  captured with fail-fast worktree cleanup, and a corrupt/mismatched/
+  degraded baseline is a loud error instead of a silent re-bootstrap**
+  (spec `integration-reality-gates-hardening.md` sections 3, 4.6 and 5.4;
+  issue #13 AC2; source PR #318 findings 318-D2 and 318-D3). The previous
+  post-change ratchet model wrote the baseline from a run of the
+  already-changed tree, so a regression a task introduced itself was
+  captured as "pre-existing" on the very first run and the gate passed
+  forever after; a missing or corrupt baseline silently re-bootstrapped
+  the same way, making baseline corruption an effective way to disable the
+  gate unnoticed, and two racing gate runs on the same repo could lose one
+  another's writes. `check-shared-file-impact` now resolves the work
+  unit's branch point via `git merge-base HEAD origin/<default-branch>`
+  and stores the baseline at
+  `.devbench/test-baselines/<repo>/<branch-point-sha>.json` (one file per
+  branch point, never overwritten by a later task diverging from a
+  different commit) with the exact fields `schema_version`, `captured_at`,
+  `branch_point`, `runner` and `failing`. When no baseline exists yet for
+  that branch point it is captured by running the full suite in an
+  isolated `git worktree` checked out AT the branch point -- never from
+  the caller's own working tree -- so the baseline is always a true
+  pre-change snapshot; a failure the unit's own diff introduces is no
+  longer indistinguishable from one that predates the branch. Branch-point
+  resolution and baseline validation now run BEFORE the (expensive) current-
+  tree suite, so a corrupt or mismatched stored baseline never costs a
+  full-suite run first; a degraded (unattributed) branch-point capture is
+  still discovered only after the current-tree suite has already run,
+  since the capture itself is a second full-suite run that only happens
+  once the first one has completed. Baseline writes use `atomic_write_text`
+  (temp-then-rename) held under an exclusive lock on a *sibling*
+  `<baseline>.json.lock` file via a new generic
+  `flock_path(lock_path, timeout_seconds, shared=...)` helper
+  in `session.py` (which `flock_backlog` is now a thin wrapper over,
+  rather than a separate re-implementation), bounded by
+  `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS` instead of blocking forever; a
+  reader takes the same lock file in shared mode so it can never observe a
+  write in progress. A baseline file that exists but fails to parse, or
+  whose stored `branch_point` disagrees with the resolved merge-base, now
+  exits 1 with `ERROR: shared-file baseline ... is corrupt and will not be
+  rewritten` (or the branch-point-mismatch equivalent) on stderr and the
+  file is left byte-for-byte untouched; the first-run bootstrap and
+  post-change ratchet write paths are removed entirely, not gated behind a
+  flag. The branch-point capture wraps the suite run and worktree removal
+  in `try`/`finally` so removal is always attempted; a removal failure
+  leaves the worktree directory in place (rather than deleting it out from
+  under a still-registered worktree) and names `git worktree prune` as the
+  remediation; and a capture run whose output cannot be attributed to
+  per-test failures (including the runner not starting at all) is now a
+  loud `ERROR` naming the runner and its stderr instead of silently
+  persisting a synthetic "suite failed" marker as the permanent baseline.
+
+- **Shared-file per-test failure parsing is now an explicit registry keyed by
+  the repo's configured test command, and an unrecognized format is a loud
+  pre-suite error instead of a degraded-but-passing marker** (spec
+  `integration-reality-gates-hardening.md` sections 3.5 and 4.6; issue #13;
+  source PR #318 finding 318-D4). As originally cherry-picked from PR #318 --
+  before the capture-path hardening described above -- the parser tried a
+  fixed list of regexes (pytest, `go test`, jest/mocha-style) against the
+  suite output and, when a non-zero exit matched none of them, wrote a single
+  synthetic `<suite-failed-no-per-test-detail-parsed>` marker into the
+  baseline as if it were a real failing test -- so an unrecognized runner
+  produced an opaque "failure" that compared equal on every later run, the
+  gate reported a pass over a suite it could not actually read, and nothing
+  told the operator that per-test attribution had been lost.
+  `check-shared-file-impact` now resolves the repo's test command
+  (`_select_test_command`) to one of three registered runner families -- a
+  bare `pytest` invocation, a `go test` invocation, or the npm/yarn/npx-
+  invoked jest form -- through a `_SHARED_FILE_RUNNER_PARSERS` registry. A
+  `make test` command (the shape returned whenever the repo's Makefile has a
+  `test` target -- the dominant shape for any Makefile-driven repo,
+  including this one) is not a fourth runner family and not assumed to wrap
+  pytest: each registry entry's invoker token is matched, by token
+  containment, against the `shlex.split(..., comments=True)` tokens of its
+  dry-run recipe (`make -n test`), comment-stripped so a trailing recipe
+  comment is never mistaken for the recipe itself. A Makefile `test` target
+  wrapping `go test`, jest, or an unregistered runner resolves (or errors)
+  the same way a direct invocation of that runner would, and a recipe whose
+  tokens contain more than one registered runner's invoker token (e.g. one
+  invoking both `go test` and `pytest` -- not necessarily ambiguous to a
+  human, e.g. a Python repo's recipe that installs JS dependencies before
+  running pytest also trips this) is now also a loud `ERROR: cannot parse
+  test output for runner '<cmd>'` naming the recipe and the matching
+  candidates rather than a silent pick of whichever registry entry happens
+  to iterate first. The no-match `ERROR` also now names the inspected
+  recipe text, not just the bare `make test` command. Token containment is
+  a narrower guarantee than "what the recipe actually invokes": a
+  registered runner's token appearing anywhere
+  in the recipe still selects that runner's parser even inside an uncovered
+  wrapper script's own arguments (e.g. `npm ci && ./scripts/run-tests.sh`
+  resolves to the npm/jest parser) or in a recipe that never runs that
+  runner at all (e.g. `echo skipping pytest` resolves to the pytest parser)
+  -- both are documented, known v1 limitations of the make-wrapped
+  resolution path (see `cmd_check_shared_file_impact`'s docstring), not
+  silently hidden. Each registry
+  entry owns a dedicated parser function for that runner's own failure-line
+  shape, a command-matching predicate for direct invocations, and a
+  recipe-matching predicate for `make`-wrapped invocations, so
+  `_resolve_runner_key` iterates the registry rather than restating the
+  runner list in a hand-written if-chain -- onboarding a new runner family
+  is exactly one new registry entry, never also an edit to
+  `_resolve_runner_key` itself, for either resolution path. A command (or,
+  for `make test`, a recipe) matching none of them is `ERROR: cannot parse
+  test output for runner '<cmd>'` on stderr, exit 1, raised before that
+  run's own suite subprocess is spawned -- for the current-tree evaluation
+  run and for a branch-point baseline capture alike, via a dedicated
+  `UnknownTestRunnerError`
+  (a `ValueError` subclass) rather than the builtin, so an unrelated
+  `ValueError` raised elsewhere in the gate is never misreported as an
+  unrecognized-runner error -- so an unsupported runner never produces a
+  partial or guessed result. The baseline record's `runner` field now stores
+  the resolved registry key (spec 5.4) rather than the raw command, so a
+  later run resolved to a different runner is detected as `ERROR: baseline
+  was captured with runner '<stored>' but the repo is configured for
+  '<cmd>'; failure sets are not comparable across runners` -- checked BEFORE
+  the current-tree suite runs (costing zero full-suite runs on the mismatch
+  path against an already-loaded baseline) rather than silently diffing
+  incomparable failure sets; the same check also applies to a freshly
+  captured baseline, since the branch-point worktree it is captured from may
+  carry a different Makefile than the current tree. The current-tree
+  evaluation run is now held to the same rule the branch-point capture run
+  has always had: a current-tree suite that exits non-zero yet whose
+  registered parser attributes zero failing node ids (e.g. a pytest
+  collection/import error, which never prints a `FAILED <node-id>` line) is
+  a loud `ERROR` rather than a `verdict: "pass"` reported over a suite that
+  could not actually be read. The degraded-marker constant and the combined
+  guess-every-format parser are deleted, not merely superseded. The
+  make-wrapped recipe is now split with `shlex.split(..., comments=True)`
+  rather than shlex's plain default: a trailing shell comment on the recipe
+  line (an ordinary, valid Makefile annotation) is stripped before token
+  matching instead of tokenised alongside the real recipe, and a recipe that
+  is not shell-tokenizable at all (an unmatched quote or apostrophe outside
+  of a comment) now raises the same dedicated `UnknownTestRunnerError` with
+  a single formed `ERROR: ...` line naming the command, instead of an
+  uncaught builtin `ValueError` traceback escaping the gate.
+
+- **`check-shared-file-impact` resolves its changed-file set through the
+  shared ADR-12 scope helper instead of a working-tree scan, attributes a
+  new full-suite failure to the unit only when the failure is inside the
+  unit's own scope, and its `PostToolUse` guard hook,
+  `assert-shared-file-impact.sh`, now enforces a self-written verdict
+  record instead of re-parsing the Claude Code payload**
+  (spec `integration-reality-gates-hardening.md` sections 3.5, 4.3 and 4.6;
+  AC-1 through AC-6, AC-9; source PR #318 findings 318-D7 and 318-D13).
+
+  **Scope and attribution (unchanged since first shipped).**
+  `cmd_check_shared_file_impact` previously computed its changed-file set via
+  `list_changed_files`, a raw working-tree scan: a file another, unrelated
+  task left dirty in the shared checkout could both trigger the gate and be
+  blamed for a failure that had nothing to do with the unit under test. It
+  now resolves scope exclusively through
+  `work_unit_scope.resolve_changed_files(unit_id, repo_path, mode)` -- the
+  same ADR-12 mode-aware helper `get-diff` and `check-manifest-scope`
+  already use, shared via a `cmd_check_shared_file_impact` `_resolve_scope_or_report`
+  call rather than a fourth inline `try`/`except` copy -- and matches
+  `gates.repos.<repo>.shared_file_impact.patterns` against the resolved
+  `ScopeResult.files`, never the working tree. A `git` plumbing failure, an
+  unresolvable unit/repo path, or a work-unit file deleted in a
+  same-process race (`FileNotFoundError`) surfaces as
+  `ERROR: cannot resolve scope for unit <unit-id>: <message>` (exit 1). The
+  full-suite RESULT the gate reports remains repo-wide (the suite itself is
+  never scoped), but which of that run's NEW failures actually BLOCK the
+  unit is narrower: a new failure is named in `new_failures` (and blocks)
+  only when `_shared_file_gate_attributable` can attribute its failing node
+  id's file to the unit's own `ScopeResult.files`; every other new failure
+  is still visible in the payload's `unattributed_new_failures` list but
+  never blocks.
+
+  **Guard hook: shipped design (round-5 redesign, replacing four earlier
+  review rounds' payload-parsing attempts described below).** Four review
+  rounds each replaced one sed/jq heuristic for re-deriving this hook's
+  verdict from the Claude Code PostToolUse payload -- first from a
+  nonexistent `tool_response.exit_code` field, then from `tool_input.command`
+  (a bare substring test, then progressively narrower quoted-region/token
+  matchers still defeated by `bash -lc`-style wrapper forms and an
+  apostrophe-sandwich quoting edge case) and `tool_response.stdout` (a
+  tiered JSON-document scan defeated by a decapitated block fragment
+  coexisting with an unrelated complete document). Every one of those
+  defeats shared a root cause: the hook was re-parsing an agent-authored
+  shell string or a composed stdout string it did not control, with no way
+  to prove the parsed result was actually this gate's own verdict. The
+  shipped design removes that entire re-parsing surface instead:
+  `cmd_check_shared_file_impact` now persists its own verdict to a 4-line
+  plain-text record file (`<workspace>/.devbench/shared-file-impact-verdict`,
+  or `<workspace>/.devbench/sessions/<DEVBENCH_SESSION_NAME>/shared-file-impact-verdict`
+  when a named session is active, spec 4.4.4) as the very first thing it
+  does -- `"pending"`, overwritten with `"pass"` or `"block"` only on a
+  clean exit path; every error-return path after that initial write leaves
+  it at `"pending"` on purpose. The record's 4th line is a per-invocation
+  correlator (`cli._shared_file_impact_invocation_id`, a fresh PID+counter
+  value generated once per `check-shared-file-impact` invocation) that only
+  `_write_shared_file_impact_verdict`'s own non-clobbering guard ever reads
+  back -- see finding (1) below; the hook itself never reads or cares about
+  this field. `assert-shared-file-impact.sh` no longer
+  reads `tool_input.command` or `tool_response` at all (it drains stdin
+  unread) and no longer sources `_hook_lib.sh` (there is no payload field
+  left for it to extract; AC-4's "every extracted field goes through
+  `_hook_lib.sh`" is satisfied vacuously). Its entire job is reading that
+  ONE record back on the next Bash PostToolUse event it receives and then
+  consuming it (deleting it after deciding what to do with it): a
+  `"block"` record blocks (exit 2); a `"pass"` record allows (exit 0);
+  `"pending"` (or any other unrecognised value) fails CLOSED (exit 2); no
+  record at all allows (exit 0). `DEVBENCH_SESSION_NAME` routing (the `..`
+  path-segment guard, and ASCII whitespace stripping) mirrors
+  `cli._session_state_file_path` for every ASCII-whitespace and
+  `..`-segment case, verified by a cross-layer test that writes via the
+  real Python function and reads via the real script rather than two
+  independent reimplementations of the same rule. Bounded, not universal
+  (round-6 finding): Python's `str.strip()` also strips several non-ASCII
+  whitespace code points (measured: U+001C, U+0085, U+00A0 among them) the
+  shell script's `[[:space:]]` class does not, so a `DEVBENCH_SESSION_NAME`
+  padded with one of those specific code points resolves to a different
+  record path in each layer -- a narrow, real divergence outside the
+  ASCII-whitespace cases covered above.
+
+  **Round-5 defects found in review and fixed in this same change.**
+  (1) *Block-then-pass clobber, a regression against round 4 (finding A1),
+  and its residual gap (same A1 finding family, closed in a later change).*
+  Two `check-shared-file-impact` invocations chained in a single Bash tool
+  call fire only ONE PostToolUse event for the whole call;
+  `_write_shared_file_impact_verdict` now refuses to overwrite an on-disk
+  `"block"` status with anything, so a DIFFERENT, later unit's own
+  `"pending"`/`"pass"` writes can never silently erase an earlier,
+  unconsumed `"block"` -- verified with a real two-call repro
+  (`pending`->`block` for one unit, then `pending`->`pass` for a second unit
+  in the same process) that now still reads `"block"` and still makes the
+  real hook exit 2. The same finding's residual gap: that guard protected
+  only `"block"`, so an unconsumed `"pending"` -- left behind by an
+  invocation that opened `"pending"` and then CRASHED before reaching its
+  own clean verdict, exactly the "started but the verdict cannot be
+  determined" case spec 3.5 requires to fail closed -- was still freely
+  overwritten by a DIFFERENT, later invocation's own clean `"pass"` write.
+  Every invocation now carries its own identity
+  (`cli._shared_file_impact_invocation_id`), recorded as the record's 4th
+  line; the guard now also refuses to overwrite an unconsumed `"pending"`
+  whose recorded invocation id differs from the id being written under, while
+  a SINGLE invocation's own `"pending"` -> `"pass"`/`"block"` transition
+  (matching id on both writes) is unaffected -- verified with a real
+  two-invocation repro (`pending` for invocation A, then A crashes; `pending`
+  then `pass` for a DIFFERENT invocation B) that now still reads `"pending"`
+  and still makes the real hook exit 2, alongside a regression test proving
+  an ordinary single passing invocation still ends at `"pass"` and the real
+  hook still exits 0.
+  (2) *`DEVBENCH_SESSION_NAME` whitespace-strip divergence.* `cli._session_state_file_path`
+  strips the env var with Python's `str.strip()`; the shell script now
+  strips it identically before routing, so a padded value (`' alpha '`) and
+  an all-whitespace value (`'  '`, equivalent to unset in Python) resolve to
+  the SAME record path in both layers -- previously the shell layer alone
+  left the padded/whitespace-only cases un-stripped, silently missing a
+  record the Python layer had written.
+  (3) *`..` guard divergence, a permanent false positive.* Python rejects
+  only an exact `..` PATH SEGMENT (`".." in Path(session_name).parts`); the
+  shell guard previously rejected any `..` SUBSTRING, so a devbench-accepted
+  session name such as `a..b` made the hook fail closed on every Bash call
+  for that session forever (the guard fired before the record was even
+  checked). The shell guard now implements the identical segment rule
+  (case-matching the wrapped name against `*/../*`), verified to agree with
+  Python on `../escape`, `a..b`, `..` and `x/../y`.
+  (4) *Consume-before-branch under `set -e`.* Unlinking the record requires
+  write permission on its CONTAINING directory. The hook previously
+  unlinked the record unconditionally before branching on its status; a
+  non-writable directory made that `rm -f` fail, and under `set -euo pipefail`
+  the whole script aborted with the OS's own stderr text and a
+  non-blocking exit code (1) instead of this hook's fail-closed exit 2 --
+  silently walking past a real `"block"` verdict. The hook now branches on
+  the record's status first and consumes it as part of reporting that
+  decision; a failed consume fails CLOSED (exit 2) with a controlled
+  message instead of leaking raw `rm` stderr.
+
+  **Round-6 correction (defect introduced by the round-5 residual-gap fix
+  above).** The foreign-pending guard from (1)'s residual gap took no
+  `status` parameter, so it refused EVERY foreign-invocation write over an
+  unconsumed `"pending"`, including a genuine `"block"` -- reproduced end
+  to end with NO concurrency on the exact `unit-a ; unit-b` chained shape
+  the module comment above the verdict-record constants names as the
+  threat model: unit A crashes leaving `"pending"`; unit B's gate
+  genuinely fails and writes `"block"`, which was silently REFUSED; the
+  record stayed `"pending"`/UNIT-A, and an agent following the hook's own
+  prescribed remediation (re-run unit A, which then passes) ended at
+  `"pass"` with the next Bash call ALLOWED, silently discarding unit B's
+  real regression. `_shared_file_impact_verdict_write_is_blocked` now
+  takes the incoming `status` and never refuses a `"block"` write over an
+  unconsumed `"pending"`: escalating `"pending"` straight to `"block"`
+  loses nothing, since `"block"` is itself the sticky, terminal status (1)
+  above protects. Verified with a real two-invocation repro (`"pending"`
+  for invocation A, then a DIFFERENT invocation B's genuine `"block"`)
+  that now reads `"block"` and makes the real hook exit 2 naming the
+  BLOCKING unit (B), not the crashed one (A). `invocation_id` is now a
+  required keyword-only parameter of `_write_shared_file_impact_verdict`
+  (previously defaulted to `""`, so two callers that both omitted it
+  collided and silently defeated the guard against each other).
+
+  **Residual, disclosed rather than fixed by redesign.**
+  (B1) `hooks.json` registers this script on `PostToolUse` for the `Bash`
+  tool only. Measured directly against this repo's own `hook-logs.jsonl`: a
+  Bash tool call that exits NON-ZERO emits a `PostToolUseFailure` event, not
+  `PostToolUse` (222 of 23,836 logged Bash tool-call completions, 0.93%, as
+  of this measurement); this hook is not registered for `PostToolUseFailure`,
+  so it never fires on a blocking `check-shared-file-impact` invocation's
+  OWN call (which exits non-zero). Combined with fix (1) above, the block is
+  not lost -- it is observed on the next Bash tool call whose PostToolUse
+  event actually reaches this hook, which is not guaranteed to be the very
+  next Bash call if intervening calls also exit non-zero. Registering this
+  hook on `PostToolUseFailure` too is a closable follow-up, knowingly
+  deferred with no tracking work unit filed yet (a prior draft,
+  E5-F2-S1-T3, was filed via `write-proposal` and then withdrawn via
+  `reject-proposal` after it deadlocked this unit as an auto-wired
+  blocker). `hooks.json` is a DEFERRED file outside this unit's Manifest,
+  marked ` (ref)` in this unit's own AC-6 and Definition of Done -- per
+  `docs/backlog-contract.md`'s `(ref)` rule, a read-only reference excluded
+  from the diff, which is the authority for it being out of scope here.
+  (C2) The "no record at all" case is reached three ways, not two: the hook
+  has never seen an invocation in this session; the prior record was
+  already consumed; or (previously undocumented) `cmd_check_shared_file_impact`
+  never reached its own first line at all (an unrecognised CLI subcommand,
+  an import-time configuration failure, argparse rejecting the invocation,
+  `devbench` not on PATH, or the initial `"pending"` write itself raising
+  `OSError`) -- none of which produce a record, so this case allows and is
+  not closable from inside this hook (there is nothing on disk to fail
+  closed on), symmetric with the existing `DEVBENCH_WORKSPACE_ROOT`-unset
+  exception.
+  (E1) The record is keyed only by (workspace, session); several agent
+  processes (the executor and every review judge) commonly share one
+  `DEVBENCH_SESSION_NAME` within an orchestrator run. Investigated for a
+  usable per-agent correlator visible to both the gate subprocess's
+  environment and this hook's invocation: the PostToolUse payload's
+  `session_id` and the gate subprocess's `CLAUDE_CODE_SESSION_ID` both
+  identify the top-level orchestrator session, not the individual agent --
+  measured directly against `hook-logs.jsonl`, multiple concurrently-running
+  agent types share the identical `session_id`. No usable correlator was
+  found; a verdict written by one agent's invocation can therefore be
+  consumed by a different, concurrently-running agent's own next Bash
+  PostToolUse event, bounded to agents sharing the same workspace and
+  session name.
+  (E2) AC-5's literal wording and the Definition of Done's `_hook_lib.sh`
+  line both describe the payload-parsing mechanism this redesign removes,
+  so neither is satisfiable verbatim by any implementation of this design;
+  `devbench` offers no mechanism to revise shipped acceptance-criteria text.
+  The shipped design instead satisfies AC-5's INTENT (spec 3.5, 4.6: fail
+  closed rather than allow whenever the verdict cannot be determined), which
+  every path through this hook still honours except the two narrow,
+  explicitly reasoned exceptions (no record at all, `DEVBENCH_WORKSPACE_ROOT`
+  unset).
+
+- **Reachability check on the code-review gate**
+  (`caylent-solutions/devbench-internal-backlog#10`). A task could
+  previously build a component, hook, slice, or pure function as a
+  self-contained deliverable, pass its own unit tests, clear `code-reviewer`,
+  and be marked done without the separate step of wiring it into the real app
+  (a route mount, a parent container's prop list, a shell's child
+  composition) ever happening -- `code-reviewer`'s rubric never checked
+  cross-file usage. A new `devbench check-reachability <id>` command greps
+  the target repo, language-agnostically and restricted to source-classified
+  files, for artifacts in the unit's own Changes Manifest scope with zero
+  non-test references, and `code-reviewer` now surfaces that evidence and
+  fails with `UNREACHABLE_ARTIFACT` when an artifact is genuinely orphaned
+  rather than a grep false positive. A legitimate deferral (feature-flagged,
+  Storybook-only, explicit follow-up task) is recorded with `uv run devbench
+  log-waiver <judge> <unit-id> --gate reachability --target <t> --reason <r>
+  --operator`, the only documented, audited way to clear a finding without
+  fixing the wiring.
+
+- **Added `devbench check-ancestry`, the canonical git-ancestry gate for
+  declared work-group dependencies**
+  (`caylent-solutions/devbench-internal-backlog#12`). Adds `devbench
+  check-ancestry <id> <dependency-ref> [<target-ref>]`, which runs `git
+  merge-base --is-ancestor` in the work unit's target repo to answer "has
+  this declared prerequisite actually merged" with real git ancestry
+  rather than a weaker proxy such as a local snapshot/report file. Wires
+  this into `spec-to-backlog`: when a spec/operator declares a
+  work-group dependency, the skill now auto-generates a mandatory,
+  executable ancestry-gate task at `E0-F<N>-S1-T1` that every root of the
+  intra-backlog dependency DAG depends on, so no other task in the
+  backlog can be claimed until the gate passes. `docs/cli-reference.md`
+  documents `devbench.check-ancestry` as the single canonical check for
+  dependency deliverability, and `docs/cross-backlog-dependencies.md`
+  gains a "producer is another devbench work group's branch" case
+  distinct from the existing operator-verified manual-blocker idiom.
+
+- **Added a copy-pattern permission/eligibility flag write-path audit helper**
+  (`caylent-solutions/devbench-internal-backlog#16`). Specs that instruct an
+  implementer to add a new permission/eligibility boolean by "following the
+  exact pattern of" an existing flag could silently inherit that flag's
+  missing write-path, since backlog generation never produced a task owning
+  "wire this flag to real data." The new
+  `devbench.plugin_helpers.permission_flag_writepath` module gives the
+  `spec-to-backlog` skill's new Step 3b a heuristic, source-grep-based way to
+  audit the referenced flag's write-path status and locate an existing
+  placeholder/mock permission-provider seam before backlog generation
+  proceeds, surfacing a `[BLOCKING_FINDING]` for operator acknowledgement
+  when the referenced pattern is not actually live.
+
+- **Added a newly-reachable-paths requirement to bug-fix tasks' Definition of
+  Done** (`caylent-solutions/devbench-internal-backlog#15`). A fix that clears
+  a reported repro often gates open a code path that was never reachable
+  before; confirming the repro passes says nothing about what was behind the
+  gate. `executor.md` gains a BUG-FIX COMPLETENESS section requiring the
+  executor to enumerate and live-verify what the fix newly unlocks before
+  completion, logged via `[NEWLY_REACHABLE]`; `code-reviewer.md` gains an
+  independent BUG-FIX COMPLETENESS rubric (items 53-55) backed by the new
+  `NEWLY_REACHABLE_PATH_UNVERIFIED` vocabulary code, and `blocker-resolver.md`
+  seeds a matching AC on bug-fix-shaped follow-up proposals. `proposal.py`'s
+  `generate_draft_md` auto-appends the matching Definition of Done item on
+  materialised drafts: keyed on the `## Task Type:` taxonomy
+  (`ProposedTask.task_type` resolving to `constants.TASK_TYPE_BEHAVIOR_FIX`),
+  not a title heuristic, so the mechanical DoD append is exempt from the
+  false positives/negatives a `"Fix "`-prefix title match would produce. See
+  `docs/newly-reachable-paths.md` for the full rationale and worked examples.
+
 - **`backlog_post_processor._find_section_bounds` matched heading text quoted
   in another section's prose** (issue #337). The unanchored
   `text.find(header)` let a Description that discusses "the task's
@@ -392,6 +2409,126 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `(<k> excluded: no execution window)` suffix, naming how many candidate
   rows were rejected. `docs/cli-reference.md`'s ETA-formula note documents
   the anchor contract and both suffixes.
+
+- **Rubric item numbering in `test-reviewer.md`, `code-reviewer.md` and the
+  `spec-to-backlog` SKILL renumbered once against the post-0.4.0 baseline,
+  and pinned structurally** (spec `integration-reality-gates-hardening.md`
+  section 4.11, PM-secondary-1; AC-12). The E1 cherry-pick tasks preserved
+  each source PR's own rubric item numbers verbatim (section 4.14: E1
+  preserves content, not numbering coherence), and since every PR was cut
+  from a pre-0.4.0 base, several insertions collided with each other and
+  with the shipped baseline: `test-reviewer.md`'s `COMPOSITION-ROOT /
+  REAL-ENTRY-POINT VERIFICATION` (issue #11) and `LAYOUT / VISUAL AC
+  VERIFICATION` (issue #14) sections both restarted at item 50, colliding
+  with the pre-existing `RED-GATE EVIDENCE` block; `code-reviewer.md`'s
+  `REACHABILITY` section (issue #10) restarted at item 53, colliding with
+  the pre-existing `BUG-FIX COMPLETENESS` block; and the `spec-to-backlog`
+  SKILL had duplicate items in Step 4b (issue #12 ancestry vs issue #16
+  write-path-audit), Step 5b (issue #228 baseline, issue #15
+  newly-reachable-paths, issue #16 write-path-audit, issue #11
+  composition-root and issue #14 layout all competing for items 12/13),
+  and its "Self-critique rubric for spec-to-backlog" reference section
+  (issue #12 vs issue #16, item 12). Every duplicate is renumbered forward
+  to the next free integer in file order; `test-reviewer.md`'s
+  `FIXTURE-CATALOG CONSISTENCY` block (already correctly at items 54-56)
+  and `code-reviewer.md`'s `BUG-FIX COMPLETENESS` block (already correctly
+  at items 53-56) are left untouched, matching the allocation table's
+  `test-reviewer items 54-56` / `code-reviewer items 53-55` anchors; the
+  SKILL's Step 4b, Step 5b and Step 7/self-critique-rubric duplicates
+  resolve to items 8-9, 13-15 (three of the five competing entries) and
+  12-13 respectively. Every internal cross-reference to a renumbered item
+  within these three files is updated in the same change; the external
+  `docs/composition-root-testing.md` "Step 5b item" citation is a
+  separate follow-up (E2-F7-S1-T3), since that file is outside this
+  change's Changes Manifest. Exit conditions that stated a bare item
+  count (`SKILL.md`'s "all 13 items scored PASS in Step 5b") now reference
+  "every item" generically, so a future rubric append cannot silently
+  leave a stale count behind. New structural test
+  `tests/test_plugin/test_rubric_numbering.py` asserts every rubric list
+  in the three files is unique, contiguous from 1 and monotonic in file
+  order, asserts the allocation-table anchors land on the correct content
+  (not just the correct number), asserts no exit condition states a bare
+  item count, and includes seeded-violation cases proving the extractor
+  genuinely detects a duplicate and a gap rather than passing by
+  construction.
+
+- **`docs/issue-provenance.md` -- the provenance map tying every integration-
+  reality gate to its issue and PR history** (spec
+  `integration-reality-gates-hardening.md` section 4.12, PM-secondary-2,
+  section 4.13; AC-3, AC-23, AC-24; AC-E2-F7-S1-T2-1 through -5). A single
+  five-column table (Gate, Internal Issue, Source PR, Devbench Issues, Spec
+  Section) maps each of the eight gates to its
+  `caylent-solutions/devbench-internal-backlog#10`-`#17` issue, its source
+  pull request `caylent-solutions/devbench#315`-`#322`, and its defining spec
+  section, plus rows for the `caylent-solutions/devbench#335`/`#336` harness
+  guard fixes and the five Section 15 follow-ups still awaiting an E11-filed
+  issue number. This table is the input E11's closure work units read to know
+  which issues, in which repo, to close. New
+  `tests/test_docs/test_issue_provenance.py` walks exactly six root/extension
+  pairs -- `docs/*.md`, `plugin/*.md`, `plugin/*.sh`, `plugin-authoring/*.md`,
+  `src/devbench/*.py` and `tests/*.py` -- plus `CHANGELOG.md` (a
+  directory-walk discovery, not a hard-coded file list, so a file a later
+  epic adds under one of those six pairs is covered automatically) for the
+  fully-qualified `devbench-internal-backlog#<N>` citation form and the
+  bare, zero-padded two-digit placeholder form the source PRs originally
+  carried, and asserts every one resolves against a row in the map,
+  confirming zero fabricated or unmapped internal-backlog citations remain
+  in the walked file set (AC-3); a seeded fabricated bare zero-padded
+  two-digit citation fails `find_unresolvable_citations`, and a seeded map
+  row citing a nonexistent spec section fails the new
+  `find_invalid_spec_sections` detector, proving both failure shapes the
+  source PRs and a drifted map row could produce are actually caught rather
+  than merely asserted. `parse_provenance_map` is the single annotated
+  helper every test case in the module uses to read the table, and it
+  raises naming the offending line when a data row is missing one of the
+  five required columns. JSON config surfaces such as
+  `src/devbench/config-schema.json` are outside the walked six pairs.
+
+- **`configure-devbench` rewritten as a full-config, every-invocation
+  interview with a schema-coverage pin** (spec
+  `integration-reality-gates-hardening.md` section 4.15, D-16, G12; AC-28,
+  AC-29; AC-E2-F8-S1-T1-1 through -6).
+  `plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`
+  now interviews the operator about EVERY setting in
+  `src/devbench/config-schema.json` -- 130 static leaf settings, plus the
+  dynamic per-entry maps collected through bounded free-text loops, across
+  21 steps, each with its own recommended value marked as such, every alternative,
+  and a free-form entry path, plus a full explanation of the setting and the
+  consequence of each choice. The interview runs in full on every
+  invocation; prior values are shown as the current value but never
+  silently reused without being re-asked. The `gates:` block added by E2-F1
+  (all eight gates, their tunables, `fixture_consistency.canonical_sources`
+  / `.scan`, and the `gates.repos.<org/repo>` per-repo override map) is
+  interviewed for the first time, alongside `orchestrate.max_cascade_depth`,
+  the `quota_handling:` block, the `skills:` block,
+  `git_ops.branch_prefix` / `.orphan_patterns` / `.pr_review_resolution`,
+  `repos.<org/repo>.branch_prefix`, `allowed_orgs`, `display_timezone`
+  (top-level and `report.display_timezone`), and
+  `backlog.bulk_update_confirm_threshold` / `.bulk_update_audit_path` --
+  every one of which the pre-rewrite skill either silently emitted at its
+  built-in default without asking, or never emitted at all. The Step 21
+  final-write step now validates the assembled yaml via
+  `load_runtime_config` strictly before writing
+  `backlog/config/devbench.yaml` and reporting `[CONFIGURE_DEVBENCH_DONE]`
+  success (AC-29), structurally pinned by file-order rather than by
+  inspection.
+
+  New `tests/test_plugin/test_configure_devbench_schema_coverage.py` is the
+  anti-drift mechanism: `walk_schema_settings` recursively walks
+  `config-schema.json` (including every `gates.*` key) and
+  `assert_skill_names_every_setting` fails naming any property the SKILL
+  text does not name; a companion `assert_interview_blocks_complete` parses
+  every `#### \`dotted.path\`` interview block and fails naming the setting
+  and the missing element when the Recommended, Alternatives, or Free-form
+  marker is absent. Both helpers, plus the AC-29 output-contract ordering
+  check, carry seeded-mutation and seeded-omission controls over synthetic
+  in-memory fixtures (never the real schema or SKILL file) proving every
+  assertion is genuinely falsifiable rather than vacuously true. A future
+  config key added without matching interview coverage now breaks this test
+  immediately instead of surviving as a silent one-time gap.
+  `docs/skills/configure-devbench.md` documents the every-invocation
+  contract, the 21-step walkthrough, and the schema-coverage regression
+  guard.
 
 ### Fixed
 
@@ -592,6 +2729,106 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   remains deferred until the single batch PR carrying `feat/bug-closure`
   merges to `main`, matching the posture already recorded for this
   identical PR pair.
+
+- **`spec-to-backlog`'s generator-side ancestry-gate template now teaches
+  the same four-outcome `check-ancestry` exit contract as `devbench
+  check-ancestry` itself and `docs/cross-backlog-dependencies.md`,
+  closing a disabled-gate fail-open in the generated `AC-DEP-001`**
+  (`plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md`
+  "Authoring the ancestry-gate task" block; issue #12). Because gates
+  default to disabled (D-17), a disabled ancestry gate's exit 0 was
+  indistinguishable, under the old two-outcome template, from a merged
+  dependency's exit 0 -- every ancestry-gate task generated into a
+  backlog that had not opted into `gates.ancestry.enabled` would
+  self-certify "dependency merged" with zero ancestry ever verified. The
+  template's generated `## Acceptance Criteria` now requires the printed
+  status line to carry `status: "pass"` together with `mode: "strict"` or
+  `mode: "squash-pr"`, and states explicitly that a printed `status:
+  "disabled"` line does not satisfy `AC-DEP-001`. The `### Approach`
+  block documents all four outcomes (merged, disabled-gate, BLOCKED/
+  evaluation error, usage error), the retired `"ancestor"`/`"not_ancestor"`
+  tokens are gone, the `dependency_ref`/`target_ref` examples read
+  `<remote>/<dependency-branch>` and `<remote>/<default-branch>` instead
+  of a hard-coded `origin/`, and the cross-reference to
+  `docs/cross-backlog-dependencies.md` now points at that document's
+  "Squash-aware verification (317-D02)" section rather than a superseded
+  "known limitation" paragraph.
+
+- **New `wire-gate <gate-task-id> --blocks-roots` verb mechanises
+  ancestry-gate fan-in, and `spec-to-backlog`-generated gate tasks are now
+  typed `chore` with a real Manifest row so they can actually reach
+  `done`** (spec `integration-reality-gates-hardening.md` section 4.5,
+  317-D01/317-D23; issue #12). Generating a gate task previously left it
+  untyped, which `validate-backlog` rule 21 defaults to the RED-gated
+  `behavior-fix` -- a check-only task authors no code and can never
+  produce the required RED evidence, so the generated task deadlocked
+  permanently at the done transition. The `spec-to-backlog` template now
+  authors `## Task Type: chore` with a `## Changes Manifest` row naming
+  the gate task's own report file (`docs/gate-reports/<id>-ancestry.md`)
+  instead of `(none)`, so the manifest is genuinely non-empty and
+  classifiable. Fanning the gate into every root of the intra-backlog
+  dependency DAG previously required hand-authoring an O(N) `##
+  Dependencies` row per root, each edit a place a hand-typed row could
+  silently drift from the canonical shape `validate-backlog` reads
+  (317-D23). `devbench wire-gate <gate-task-id> --blocks-roots` computes
+  the DAG roots itself and writes every edge through the same managed
+  dependency path `add-dep` already owns, so every row lands in the exact
+  canonical form; it validates every root BEFORE any write and fails
+  loudly (exit 1, zero edges written) on an unknown gate-task id, a
+  missing root file, or a root already wired to a different gate task. The
+  root computation also excludes the gate task's own Epic/Feature/Story
+  ancestors (present in every real generated tree) and any root already in
+  a terminal `done` / `declined` status, so a re-run is idempotent without
+  ever force-reverting a completed root's status back to `blocked`.
+  `docs/cli-reference.md` documents the verb under `## Gates`, pinned by
+  `tests/test_docs/test_cli_reference_wire_gate.py`.
+
+- **`check-ancestry` is wired into the done path and persists a
+  target-ref-aware `[GATE_PASS ancestry]` record; `mark-done` now enforces
+  it and re-verifies on resume when the target branch has moved** (spec
+  `integration-reality-gates-hardening.md` sections 4.2, 4.3, 4.5, 5.2;
+  AC-6, AC-7, AC-16; internal issue #12 AC3). A passing enabled run appends
+  exactly one `[GATE_PASS ancestry] <iso-utc> <scope-hash>` line to the
+  unit's audit section (surviving `read-unit --strip-comments`) through
+  `devbench.gate_records.compose_gate_pass_record`; a failing, error, or
+  disabled run writes none. The spec 5.2 status line also gains a
+  `scope_hash` field -- the same digest persisted in the record on a
+  passing run, and the empty string on the BLOCKED (`status: "fail"`)
+  line, which persists no record; this JSON field is printed as the
+  first stdout line of an enabled run, copied verbatim into the
+  generated gate task's report-file deliverable, and read by the
+  review judges from there. `devbench.gate_records.compute_scope_hash` gains an
+  explicit, named `target_ref_sha` parameter: the ancestry gate's scope
+  hash folds in the resolved target ref's current commit sha alongside
+  the unit's own Changes-Manifest file blob hashes, so an identical
+  changed-file set with a different target ref sha now hashes
+  differently, and the value is unchanged for every other gate's caller
+  that omits the parameter. `mark-done` on a unit whose repo has
+  `gates.ancestry.enabled` true now refuses (exit 1, no status write)
+  unless a fresh `[GATE_PASS ancestry]` record exists (or an operator has
+  filed a `[GATE_WAIVER ancestry]` -- the same whole-gate waiver bypass
+  every other machine-blocking gate already honours), naming the exact
+  remediation `uv run devbench check-ancestry <unit-id> <dependency-ref>`;
+  a record whose recomputed hash no longer matches -- including when only
+  the target branch has moved, with the Changes Manifest unchanged -- is
+  refused with `ERROR: gate 'ancestry' record is stale (scope changed
+  since it ran)`. Because `check-ancestry` accepts an OPTIONAL explicit
+  `<target-ref>` override, `cmd_check_ancestry` also writes a
+  `[GATE_ANCESTRY_TARGET_REF] <target-ref>` companion marker naming the
+  EXACT ref the passing run probed against
+  (`devbench.gate_records.compose_ancestry_target_ref_marker`), in the
+  SAME atomic write as the `[GATE_PASS ancestry]` record so a write
+  failure can never leave one without the other;
+  `mark_done`'s freshness recompute reads it back
+  (`BacklogManager._resolve_ancestry_target_ref`) instead of
+  re-deriving the repo's default branch, so a record produced with an
+  explicit override recomputes against the SAME ref rather than reading as
+  permanently stale. A `[GATE_PASS ancestry]` record present WITHOUT its
+  `[GATE_ANCESTRY_TARGET_REF]` companion (e.g. one written before this
+  marker existed) now makes `mark-done` refuse with `ERROR: Cannot
+  resolve ancestry gate target ref: no [GATE_ANCESTRY_TARGET_REF] marker
+  recorded ...` naming the same `check-ancestry` remediation, rather than
+  silently treating the record as unchanged.
 
 ## [0.4.0] -- 2026-08-12
 

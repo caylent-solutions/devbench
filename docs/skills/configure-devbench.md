@@ -1,35 +1,60 @@
 # configure-devbench skill quickstart
 
-The `configure-devbench` skill walks you through every `RuntimeConfig` section and
-produces a valid `backlog/config/devbench.yaml`. Each value is round-tripped through
-`RuntimeConfig` parsing immediately after entry; invalid values are rejected with the
-parser's error message and the operator is re-prompted.
+The `configure-devbench` skill interviews you about EVERY setting in
+`src/devbench/config-schema.json` -- every existing `RuntimeConfig` section
+and the `gates:` block alike (D-16, spec
+`integration-reality-gates-hardening.md` section 4.15) -- and produces a
+valid `backlog/config/devbench.yaml`. For each setting the skill shows one
+interactive choice menu: the recommended value marked as such, every
+alternative, and a free-form "enter your own" path, each with a full
+explanation of what the setting does and the consequence of each choice.
+Every value is round-tripped through `RuntimeConfig` parsing immediately
+after entry; invalid values are rejected with the parser's error message and
+the operator is re-prompted.
+
+## Every-invocation contract
+
+This interview runs in full on every invocation of the skill. It never
+silently reuses a prior answer without asking: when
+`backlog/config/devbench.yaml` already exists, its values are read and shown
+as the current value in every menu, but every single question is still asked
+again on every run. There is no "skip because unchanged" path.
 
 ## What configure-devbench produces
 
 - `backlog/config/devbench.yaml` -- a complete, validated devbench configuration
-  file covering every `RuntimeConfig` section.
+  file: every `config-schema.json` setting is interviewed, including
+  `quota_handling:` and `skills:`, and every answered value is written.
+  `gates:` is interviewed the same way, but (per the Step 21 disabled
+  sub-block trim below) it is omitted from the written file entirely when
+  every gate resolves to its `false` recommended default.
 - A `[CONFIGURE_DEVBENCH_DONE]` summary message listing the configured values,
-  including the `report` section.
+  including the `report` and `gates` sections.
 
-The produced file loads without `ConfigLoader` errors.
+The produced file loads without `ConfigLoader` errors -- the skill validates
+the authored yaml via `load_runtime_config` BEFORE it writes the file and
+reports success (spec section 4.15, AC-29): it never hands the operator a
+config that breaks at the next command.
 
 ### Full-default emission (issue #260, spec FR-3.6)
 
-The final-write step does not merely dump the values you entered: it emits
-every `RuntimeConfig` tuning section at its resolved built-in default, with
-the annotated comment copied verbatim from `sample-config.yaml`, even for
-sections you left untouched -- `timeouts`, `limits`, `stop_hook`, `hook_tail`,
+Every FR-3.6 tuning section -- `timeouts`, `limits`, `stop_hook`, `hook_tail`,
 `orchestrate`, `report` (including `models`, `default_model`, and every cost
 multiplier), `backlog`, `validate`, `skills`, `max_executor_retries`,
-`max_executor_retries_per_judge`, and `log_file`. This makes the written
-config self-documenting: an operator who later wants to tune a knob sees it
-in the file with its default value and comment already present, instead of
-discovering the knob only by reading `config_loader.py`.
+`max_executor_retries_per_judge`, and `log_file` -- is now interviewed in its
+own step (unlike the pre-rewrite skill, which emitted several of these at
+their built-in default without asking). The final-write step assembles the
+value the operator chose (or accepted as recommended) for each field, and any
+field genuinely left unanswered still falls back to its resolved built-in
+default with the annotated comment copied verbatim from `sample-config.yaml`.
+This makes the written config self-documenting: an operator who later wants
+to tune a knob sees it in the file with its value and comment already
+present, instead of discovering the knob only by reading `config_loader.py`.
 
 A few inert blocks are still trimmed rather than emitted: `bedrock_region`
 when `use_bedrock` is `false`, `agents` entries that are identical to their
-frontmatter defaults, and disabled sub-blocks.
+frontmatter defaults, disabled sub-blocks, and `debug:` entirely when the
+operator skipped the debug-configuration step.
 
 Every emitted default is sourced from the shipped config surface
 (`sample-config.yaml` and the `DEFAULT_*` constants in
@@ -83,47 +108,79 @@ Then within the session:
 run devbench:configure-devbench
 ```
 
-If `backlog/config/devbench.yaml` already exists, the skill reads it and pre-populates
-defaults for every question. Enter a blank line to accept the shown default.
+If `backlog/config/devbench.yaml` already exists, the skill reads it and shows
+its values as the current value for every question -- but, per the every-
+invocation contract above, still asks every question again. Enter a blank
+line to accept the shown current/recommended value.
 
 ## What the skill does (step by step)
 
-The skill walks through 17 sections, validating each before moving to the next:
+The skill walks through 21 steps, one interview menu per schema setting,
+validating each before moving to the next:
 
-1. **Read existing config** -- pre-populates defaults if `devbench.yaml` exists.
-2. **repos section** -- target repositories. Required fields per entry:
+1. **Read existing config** -- shows prior values as current if `devbench.yaml` exists.
+2. **repos section** (dynamic per-repo map) -- target repositories. Required fields per entry:
    - `org/repo` key (e.g. `myorg/myrepo`)
    - `checkout_directory` (workspace-relative; no leading `/` or `..`)
    - `default_branch` (e.g. `main`)
    - `merge_strategy` per-repo (optional override)
-3. **Top-level scalars** -- `merge_strategy`, `max_executor_retries`, `use_bedrock`,
-   `bedrock_region`.
+   - `branch_prefix` per-repo (optional override of `git_ops.branch_prefix`)
+3. **Top-level scalars** -- `merge_strategy`, `max_executor_retries`,
+   `max_executor_retries_per_judge`, `use_bedrock`, `bedrock_region`,
+   `allowed_orgs`, `display_timezone`, `log_file`.
 4. **timeouts section** -- per-operation timeout values in seconds.
 5. **limits section** -- threshold and limit values.
 6. **agents section** -- per-agent model overrides (executor, judges, workflow agents).
-7. **git_ops section** -- `single_branch`, `defer_pr`, `auto_finalize`, `auto_merge`,
-   `pause_before_merge`, `update_submodule`, `inline_orphan_cleanup`, `orphan_patterns`,
-   `ci_failure_retry`, `local_only`.
+7. **git_ops section** -- `single_branch`, `branch_prefix`, `defer_pr`, `auto_finalize`,
+   `auto_merge`, `provenance_path`, `update_submodule`, `inline_orphan_cleanup`,
+   `ci_failure_retry`, `orphan_patterns`, `local_only`, `pause_before_merge`,
+   and the `pr_review_resolution` sub-block (`enabled`, `agents`,
+   `decision_blocks`, `settle_seconds`, `poll_interval`).
 8. **task_factory section** -- `enabled`, `auto_accept_proposals`.
 9. **manifest_amendment section** -- `enabled`, `allowed_reasons`,
    `max_requests_per_execution`.
 10. **validate section** -- `check_orphan_path_tokens`.
 11. **stop_hook section** -- `max_blocks`, `window_seconds`, `stale_task_minutes`.
 12. **hook_tail section** -- column-cap settings for `devbench hook-tail`.
-13. **debug section** -- diagnostic knobs (leave blank for production workspaces).
-14. **backlog section** -- `default_status_for_new_work_units` (`in-queue` or `draft`).
-15. **notifications section** -- per-event Slack toggles under `notifications.events.*`
+13. **orchestrate section** -- `max_cascade_depth`.
+14. **debug section** -- diagnostic knobs (leave the whole section absent for production workspaces).
+15. **backlog section** -- `default_status_for_new_work_units` (`in-queue` or `draft`),
+    `bulk_update_confirm_threshold`, `bulk_update_audit_path`.
+16. **gates section** -- the eight integration-reality gates (`reachability`,
+    `ancestry`, `shared_file_impact`, `fixture_consistency`, `write_path_audit`,
+    `newly_reachable_paths`, `composition_root`, `layout_geometry`), each
+    disabled by default, plus `fixture_consistency.canonical_sources` /
+    `.scan` and the per-repo `gates.repos.<org/repo>` override map (spec
+    section 4.1; caylent-solutions/devbench-internal-backlog#10-#17).
+17. **skills section** -- `exemplar_backlog_path`, `exemplar_spec_path`,
+    `fan_out_threshold`, `max_iterations`.
+18. **notifications section** -- per-event Slack toggles under `notifications.events.*`
     plus the `notifications.slack` endpoint (PR #202).
-16. **report section** -- the `report.models` per-model pricing table, `default_model`
-    (fallback rate for unknown/missing model ids), and the cost multipliers
-    (`cache_read_multiplier`, `cache_write_5min_multiplier`,
+19. **report section** -- the `report.models` per-model pricing table, `default_model`
+    (fallback rate for unknown/missing model ids), `display_timezone`, and the
+    cost multipliers (`cache_read_multiplier`, `cache_write_5min_multiplier`,
     `cache_write_1hr_multiplier`, `data_residency_multiplier`,
     `fast_mode_multiplier`, `recent_pace_tasks`). Every rate defaults to the
     cited value in `sample-config.yaml` (issue #260, spec FR-3.6).
-17. **Final validation and write** -- assembles the YAML (emitting every
-    remaining `RuntimeConfig` section at its built-in default, see
-    "Full-default emission" above), runs the full `RuntimeConfig` round-trip
-    equivalence check, then writes `backlog/config/devbench.yaml`.
+20. **quota_handling section** -- `enabled`, `on_exhaustion`,
+    `poll_interval_seconds`, `max_wait_seconds`, `on_exhaustion_timeout`,
+    `resume_strategy`, `audit_comment_on_wait`, `audit_comment_on_resume`,
+    `log_structured_events` (issue #236, spec S5.2).
+21. **Final validation and write** -- assembles the YAML (emitting any
+    remaining FR-3.6 tuning field at its resolved value, see
+    "Full-default emission" above), validates via `load_runtime_config`, then
+    runs the full `RuntimeConfig` round-trip equivalence check, then writes
+    `backlog/config/devbench.yaml` and reports success.
+
+### Schema-coverage regression guard
+
+`tests/test_plugin/test_configure_devbench_schema_coverage.py` walks
+`src/devbench/config-schema.json` recursively and fails naming any property
+(including every `gates.*` key) the SKILL text does not name, plus a
+companion check that every interview block carries its Recommended,
+Alternatives, and Free-form markers. Any future config key added without
+matching interview coverage breaks this test, so the 21-step coverage above
+cannot silently drift out of date.
 
 ## Validation protocol
 
@@ -174,7 +231,7 @@ rejects absolute paths and `..` traversals immediately.
 
 | Artefact | Location | Condition |
 |----------|----------|-----------|
-| Config file | `backlog/config/devbench.yaml` | Written after all 17 sections validate |
+| Config file | `backlog/config/devbench.yaml` | Written after all 21 steps validate |
 | Summary message | stdout | `[CONFIGURE_DEVBENCH_DONE]` with a section summary |
 
 ## Cross-references

@@ -49,6 +49,613 @@ repos:
     branch_prefix: wg_004         # optional -- overrides top-level git_ops.branch_prefix
 ```
 
+Per-repo shared/high-fan-in file registration moved under `gates.repos.<org/repo>
+.shared_file_impact.patterns` -- see the `gates:` section below.
+
+---
+
+## `gates:` -- integration-reality gates (spec 4.1)
+
+Unified opt-in configuration for the eight integration-reality gates (caylent-solutions/devbench-internal-backlog#10..#17):
+`reachability`, `ancestry`, `shared_file_impact`, `fixture_consistency`, `write_path_audit`,
+`newly_reachable_paths`, `composition_root`, and `layout_geometry`. Every gate is disabled by
+default at the built-in level (D-17). `additionalProperties: false` applies at every level
+(`gates:`, each per-gate block, and `gates.repos.*`), so an unrecognised key -- including a typo,
+or a key from either retired pre-release surface below -- fails config-load with a `ValueError`
+naming the offending key rather than being silently ignored (D-2).
+
+```yaml
+gates:
+  reachability:
+    enabled: false
+    entry_points: []          # repo-relative paths; empty/absent uses the built-in stem-based default
+  ancestry:
+    enabled: false
+  shared_file_impact:
+    enabled: false
+    auto_derive_registry: false
+    fan_in_threshold: 3
+  fixture_consistency:
+    enabled: false
+    canonical_sources: []
+    scan: []
+    extract_source_literals: false
+  write_path_audit:
+    enabled: false
+  newly_reachable_paths:
+    enabled: false
+    paths: []                 # repo-relative paths; empty/absent means no registry configured
+  composition_root:
+    enabled: false
+  layout_geometry:
+    enabled: false
+  repos:
+    caylent-solutions/devbench:
+      shared_file_impact:
+        enabled: true
+        patterns:
+          - "src/app/Shell.tsx"
+          - "src/hooks/useAuth.*"
+      newly_reachable_paths:
+        enabled: true
+        paths:
+          - "src/ui/zindex.ts"
+```
+
+### Value-resolution precedence (D-15)
+
+Every gate field resolves through four layers, in this order (lowest to highest precedence):
+
+1. **Built-in default** -- `constants.py`; every gate disabled, every boolean tunable at
+   its documented default. Structural (non-boolean) tunables source their built-in
+   default elsewhere: `gates.reachability.entry_points`, for example, defaults to
+   `config_loader._REACHABILITY_ENTRY_POINTS_BUILTIN_DEFAULT`, itself derived from
+   `source_classification.ENTRY_POINT_STEMS` rather than `constants.GATE_FIELD_DEFAULTS`.
+2. **Project level** -- `gates.<gate>.*` in the workspace `devbench.yaml`.
+3. **Per-repo override** -- `gates.repos.<org/repo>.<gate>.*`, field-wise merged OVER the
+   project level, so a repo can flip `enabled` while inheriting every other tunable.
+4. **Environment** -- `DEVBENCH_GATE_<NAME>_ENABLED`, workspace-wide, highest precedence.
+
+**Status: resolver landed (E2-F1-S1-T2).** `config_loader.resolve_gate_config(gate, repo,
+runtime_config, env_enabled_override=None) -> ResolvedGateConfig` is now the single read path for
+this four-layer precedence chain: it merges built-in defaults, the project layer, the per-repo
+override layer, and the caller-supplied env layer field-wise, and records per-field provenance
+(`builtin` / `project` / `repo` / `env`) so a repo that flips `enabled` inherits every other
+project-level tunable instead of resetting it. `config.resolve_gate_env_override(gate)` resolves
+the `DEVBENCH_GATE_<NAME>_ENABLED` env layer through the existing `_resolve_bool` chain and is the
+value callers thread into `resolve_gate_config`'s `env_enabled_override` parameter --
+`config_loader.py` remains parse/validate-only and never reads environment variables itself. No
+consumer other than `resolve_gate_config` may read a gate's resolver-managed fields (`enabled`,
+`auto_derive_registry`, `fan_in_threshold`, `extract_source_literals`, `entry_points`, `paths`)
+directly off `RuntimeConfig.gates` (AC-27). `devbench gates` (E2-F1-S2-T1) is the first consumer: it
+renders one row per declared gate with the resolved `enabled` status and per-field provenance for
+every row, calling `resolve_gate_config` once per gate rather than reading `RuntimeConfig.gates`
+directly. Each per-gate check command adopts the resolver as its own hardening epic lands:
+`check-reachability` already reads both `enabled` and `entry_points` exclusively through
+`resolve_gate_config` (spec 4.4, E3-F1-S1-T2); `check-shared-file-impact` reads `enabled`,
+`auto_derive_registry` and `fan_in_threshold` the same way (spec 4.6, E5-F2-S1-T2);
+`check-fixture-consistency` reads `extract_source_literals` the same way (spec 4.7 bullet 4,
+E6-F2-S1-T1) -- it still reads `canonical_sources`/`scan` directly off
+`RuntimeConfig.gates.fixture_consistency`, since those are project/per-repo-only structural fields
+`resolve_gate_config` does not manage at all (no built-in default to merge against);
+`generate_draft_md` (`proposal.py`) reads `newly_reachable_paths.paths` exclusively through
+`resolve_gate_config` (spec 4.9a, decision C-03) when auto-appending the newly-reachable-paths
+acceptance criterion to a drafted `behavior-fix` task; later gate epics adopt the resolver in their
+own tasks.
+
+Unlike `entry_points`/`fan_in_threshold`, `newly_reachable_paths.paths` also carries a real
+per-repo override (`gates.repos.<org/repo>.newly_reachable_paths.paths`): a non-empty repo-level
+list replaces the project-level list wholesale for that repo (D-15 field-wise merge); an
+empty/absent repo-level list inherits the project-level list unchanged.
+
+### Per-gate tunables
+
+| Gate | Tunables (beyond `enabled`) | Per-repo override tunables |
+|------|------------------------------|------------------------------|
+| `reachability` | `entry_points` (issue #10 AC2) | `enabled` |
+| `ancestry` | none | `enabled` |
+| `shared_file_impact` | `auto_derive_registry`, `fan_in_threshold` | `enabled`, `patterns` |
+| `fixture_consistency` | `canonical_sources`, `scan`, `extract_source_literals` (heuristic, default false; spec 4.7 bullet 4) | `enabled` |
+| `write_path_audit` | none | `enabled` |
+| `newly_reachable_paths` | `paths` (spec 4.9a, decision C-03) | `enabled`, `paths` |
+| `composition_root` | none | `enabled` |
+| `layout_geometry` | none | `enabled` |
+
+### Migration: retired pre-release keys (spec 4.1, Section 6)
+
+Two keys that arrived on the branch ahead of any release are REMOVED by this same change, with
+zero remaining references anywhere in the loader, schema, sample config, or reference docs (spec
+Section 6: no released version ever carried these keys, so no migration path is owed):
+
+| Retired pre-release surface | New location |
+|-------------|---------------|
+| PR #318's per-repo glob key (nested under `repos.<repo>`) | `gates.repos.<org/repo>.shared_file_impact.patterns` |
+| PR #322's bare top-level opt-in block | `gates.fixture_consistency:` |
+
+A config that still sets either retired key fails `load_runtime_config` with a schema-validation
+`ValueError` (`additionalProperties: false` at the top level and on `repos.<repo>.*`). An absent
+`gates:` block loads into the all-disabled built-in tree with no error and no warning, so a
+0.4.0-era config with neither key keeps working unmodified (AC-4, Section 6).
+
+### `gates.reachability.entry_points` -- transitive reachability walk (caylent-solutions/devbench-internal-backlog#10 AC2)
+
+A list of repo-relative paths seeding the transitive reachability walk that `devbench
+check-reachability` runs once the gate finds a candidate artifact's word-boundary referrer(s). A
+referrer clears the candidate (`[OK]`) only when the referrer is itself reachable from this
+entry-point set, walked with a cycle-safe visited set; when every referrer is itself unreachable,
+the candidate is reported `[POTENTIALLY UNREACHABLE via orphan-chain]` instead of `[OK]` -- distinct
+from the no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape, though both count toward the spec 5.2
+status line's `findings` total.
+
+Absent or an explicit empty list both mean "not overridden at the project level": the resolved
+value falls back to the built-in default derived from `devbench.source_classification`'s
+entry-point-stem convention (`main`, `app`, `index`, `__init__`, `setup`, `conftest`, `wsgi`,
+`asgi`), matched case-insensitively against each candidate importer's own basename stem -- so
+`src/App.tsx` or `cmd/main.go` are recognised as composition roots without any configuration at
+all. An explicit `entry_points` list instead names literal repo-relative paths matched exactly;
+each configured path must exist in the repo checkout, or `check-reachability` fails loudly with
+`ERROR: gates.reachability.entry_points names a path that is not present in the repo: <path>`
+before examining any candidate, rather than silently walking a graph with zero real roots. Every
+element must actually BE repo-relative: an absolute path or a path containing a `..`
+parent-traversal segment fails config load fast (naming `gates.reachability.entry_points` and the
+offending value), enforced at two independent layers -- the JSON schema's `entry_points` item
+`pattern`, and `_parse_reachability_entry_points`'s own validation -- because `repo_path /
+entry_point` would otherwise silently discard `repo_path` for an absolute `entry_point` and let a
+file outside the checkout satisfy the existence check above.
+
+`entry_points` is read exclusively through `resolve_gate_config("reachability", repo)` (AC-27) --
+no module reads `gates.reachability.entry_points` off `RuntimeConfig.gates` directly. There is no
+per-repo override layer for this field today (this campaign configures a single target repo, spec
+Section 9); the `enabled` field's four-layer precedence is unaffected.
+
+### `gates.newly_reachable_paths.paths` -- cross-cutting-primitives registry (caylent-solutions/devbench-internal-backlog#15; spec 4.1, 4.9a; decision C-03)
+
+A list of repo-relative paths naming shared, stateful primitives' defining file(s) -- a shared
+z-index tier module, a shared dirty-flag/`setField` write path, a shared close/dismiss callback --
+that a newly-reachable-paths behavior-fix task should be cross-checked against. This is the migrated,
+config-backed home of the retired free-text primitives registry under `backlog/config/`
+(`docs/newly-reachable-paths.md`'s "Gate config: `gates.newly_reachable_paths`" section): the
+same convention, now schema-validated and resolved through the same four-layer precedence model
+every other gate tunable uses, instead of a hand-maintained markdown table two prompt-driven agents
+read via `cat`.
+
+Every element must be a non-empty, repo-relative path string: a non-list value, a non-string or
+empty-string element, an absolute path, or a path containing a `..` parent-traversal segment fails
+config load fast, naming `gates.newly_reachable_paths.paths` and the offending value -- the same
+`_parse_repo_relative_path_list` validation `gates.reachability.entry_points` uses (DRY: one shared
+validator, not two hand-copied ones).
+
+Unlike `entry_points`, `paths` carries a real per-repo override layer
+(`gates.repos.<org/repo>.newly_reachable_paths.paths`): a non-empty repo-level list replaces the
+project-level list wholesale for that repo (D-15 field-wise merge); an empty/absent repo-level list
+inherits the project-level list unchanged. `paths` is read exclusively through
+`resolve_gate_config("newly_reachable_paths", repo)` (AC-27) -- `generate_draft_md` (`proposal.py`)
+is the first consumer, calling the resolver when auto-appending the newly-reachable-paths
+acceptance criterion to a drafted `behavior-fix` task; no module reads
+`gates.newly_reachable_paths.paths` off `RuntimeConfig.gates` directly.
+
+### `gates.fixture_consistency` -- fixture-catalog cross-reference (caylent-solutions/devbench-internal-backlog#17)
+
+Opt-in and project-specific: `devbench check-fixture-consistency` is a no-op unless
+`gates.fixture_consistency.canonical_sources` is configured, since devbench cannot infer a
+target repo's fixture/mock-file layout on its own. When configured, the test-reviewer agent runs
+the check as review evidence and fails the review if a scanned fixture references an identifier
+absent from its canonical source, or a canonical source's coverage falls short of an
+`expected_count`. See `docs/backlog-contract.md`.
+
+**The in-fixture `allow_missing` waiver marker (spec `integration-reality-gates-hardening.md`
+4.7 bullet 5; PM-5's in-diff exception; E6-F1-S1-T2).** A scan target that intentionally models a
+not-found/empty-state edge case is scoped out of `missing_key` findings by attaching a
+structured marker directly to the waived record IN the scanned fixture file itself, not by a
+workspace-config key:
+
+```json
+{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}
+```
+
+`reason` must be a non-empty string; a marker of any other shape (missing `reason`, an
+empty-string `reason`, or a value that is not a `{"reason": "..."}` mapping) fails the check with
+a `ValueError` naming the fixture path and the offending record's identifier value, rather than
+silently suppressing anything. The marker is validated unconditionally wherever it appears, not
+only on a dict that also resolves the configured `identifier_field`: a marker attached to a
+record whose identifier field has no value in that same record (a typo'd or absent field name, or
+a marker placed at the fixture's envelope level rather than on an individual record) fails the
+same way, naming the fixture path and the record's own keys in place of an identifier value it
+does not have -- a waiver that can never be matched to a record is dead configuration, not a
+silent no-op. Every applied waiver is itself surfaced as a `waiver_applied`
+finding in the check's own report, so the suppression is visible there too, not only in the
+fixture's diff -- printed on both the `pass` and `fail` output, since a validly waived record is
+informational, not a blocking problem: `check-fixture-consistency`'s `status` is computed from
+the ATTRIBUTABLE BLOCKING finding kinds (`missing_key`, `coverage_shortfall`, `load_error`) --
+per spec 4.3, a `missing_key` finding is ATTRIBUTABLE only when the file it names, compared after
+lexical path normalisation, is a member of the calling unit's own resolved Changes-Manifest
+scope, while `coverage_shortfall` and `load_error` are never scope-filtered and always block
+regardless of scope -- so a run whose only
+finding is an applied waiver, or a `missing_key` finding naming a file outside that scope, still
+reports `status: "pass"` and exits 0. See `docs/cli-reference.md`'s `check-fixture-consistency`
+entry for the exact status/exit-code rule.
+
+**`gates.fixture_consistency.scan[].allow_missing` (the pre-E6-F1-S1-T2 workspace-config
+allowlist) is a REMOVED key** -- a complete replacement, not an addition. It shipped only in an
+unmerged draft PR (#322), so no migration path is owed (spec Section 6). A workspace config that
+still sets it fails `load_runtime_config` with a `ValueError` naming the removed key and the
+in-fixture marker above that replaced it, checked before JSON Schema validation runs so the
+message can name the replacement (the schema's own `additionalProperties: false` rejection
+cannot).
+
+### `gates.fixture_consistency.extract_source_literals` -- source-literal extraction (spec `integration-reality-gates-hardening.md` 4.7 bullet 4; caylent-solutions/devbench-internal-backlog#17 AC-19; E6-F2-S1-T1)
+
+`extract_source_literals: true` (default `false`) adds a second, heuristic scan mode on top of
+the structured JSON/YAML cross-reference above: `check-fixture-consistency` additionally
+enumerates the classified source files in the repo checkout via
+`devbench.source_classification.iter_classified_source_files` (PM-3: the single owner of
+extension classification -- `fixture_consistency.py` declares no extension tuple of its own) and
+scans each file's text, line by line, for an assignment whose key matches a configured
+`identifier_field`. A matched literal is resolved against the UNION of every canonical source
+sharing that `identifier_field` name (never cross-producted against an unrelated canonical
+source): canonical sources that declare the same `identifier_field` are treated as one combined
+identifier namespace, so a literal present in ANY member of that group passes, and a literal
+absent from all of them produces a `missing_key` finding naming the whole group (the finding's
+canonical-source path is a comma-joined list when the group has more than one member) and
+carrying `file:line` (a 1-based line number), so a reviewer can jump straight to the offending
+assignment. "The classified source files" is a scanning BOUNDARY,
+not literally every file: `iter_classified_source_files` prunes a fixed set of dependency/build/
+vendor directory names (`.git`, `.venv`, `venv`, `node_modules`, `dist`, `build`, `vendor`,
+`third_party`, and others -- see `source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS` for
+the full, closed list) DURING the walk, so a literal that lives only under one of those pruned
+directories is never scanned at all. The same boundary also excludes a class of individual
+files, independent of the pruned-directory names above: a FILE symlink whose resolved real path
+(via `os.path.realpath`) falls OUTSIDE the resolved scope root is excluded from the scan --
+whether the symlink is live or dangling. A FILE symlink whose resolved real path falls INSIDE the
+resolved scope root is still included, exactly like an ordinary file. A symlinked DIRECTORY is
+never descended into at all (`os.walk`'s own default `followlinks=False`), so nothing under a
+symlinked directory is ever scanned regardless of where that directory's target resolves -- this
+applies even when the target resolves inside the scope root. A repo checkout whose only
+classified source files happen to live entirely under a pruned directory, OR whose only
+classified source file is an out-of-root symlink, resolves to ZERO classified source files in
+scope, which hits the loud pre-scan error described below exactly the same way a repo with no
+classified source files anywhere would.
+
+**The identifier_field grammar.** A candidate assignment is `<field>` (optionally
+single/double-quoted, matching a JSON/JS/TS object key or a quoted dict key), followed by a `:`
+or `=` separator (optional surrounding whitespace), followed by either a single/double-quoted
+string literal or a bare integer/float literal -- e.g. `"sku": "SKU-DOES-NOT-EXIST"`,
+`sku = "SKU-DOES-NOT-EXIST"`, or `sku: "SKU-DOES-NOT-EXIST"` all match an `identifier_field` of
+`sku`. Matching happens per PHYSICAL LINE, never across a multi-line span -- this is what makes
+the reported line number meaningful, at the cost of the bounds below.
+
+**Documented accuracy bounds (why this mode defaults off).** This is a regex-based heuristic
+scan, not a parser, for any of the languages `source_classification.SOURCE_EXTENSIONS` covers:
+
+- It has no notion of comments: a literal inside a `#`/`//`/`/* */` comment, or inside a string
+  that merely *looks* like an assignment, is matched and flagged exactly like reachable code.
+- It has no notion of reachability or dead code: an assignment inside a function that is never
+  called, or behind a permanently-false conditional, is still scanned.
+- The grammar's quoted-content match requires a BARE quote character (`'` or `"`) to appear
+  IMMEDIATELY after the `:`/`=` separator (only whitespace may sit between them). When that bare
+  chunk is itself the first operand of a plain string concatenation (`"PRE" + suffix`,
+  `"GHOST-A" + "GHOST-B"`), it is matched on its FIRST quoted chunk only: `"PRE" + suffix` is
+  reported as the literal value `PRE` (a partial-literal false positive, since `PRE` alone was
+  never the intended complete value). The same first-chunk partial match happens when the
+  concatenation's continuation is on a SECOND physical line (`"GHOST-A" +` followed by
+  `"GHOST-B"` on the next line, or a backslash-continued Python assignment): the assignment's own
+  line is still scanned in isolation and still matches its first quoted chunk, so this is not a
+  "never matched" case either. Anything that puts a non-quote character between the separator and
+  the opening quote is simply UNMATCHED, never a partial match: an f-string/r-string/b-string/
+  u-string prefix (`f"{prefix}-SKU"`, `r"RAW-GHOST"`, `b"BYTES-GHOST"`) puts its prefix letter
+  there regardless of whether a leading literal chunk exists before any placeholder; a backtick
+  template literal (`` `GHOST-BT` ``) is never matched at all, since a backtick is not in the
+  grammar's quote-character class; and a parenthesised expression (`("GHOST-A" + "GHOST-B")`)
+  puts the opening `(` there. All three are simply never detected, not misreported.
+- A value spread across more than one physical line via a triple-quoted string (Python
+  `"""..."""`/`'''...'''`) is never matched -- the grammar explicitly rejects an opening quote
+  immediately followed by another instance of the same quote character (the start of a
+  triple-quote run), so this includes a triple-quoted value that happens to fit entirely on ONE
+  line (`sku = """GHOST-TQ"""`), which is also never matched, and a genuinely empty single/double
+  quoted string (`sku = ""`), which is likewise never matched -- rather than misreporting either
+  shape with a spurious empty literal value.
+- It does not decode escape sequences: `sku = "A\"B-GHOST"` is reported with the literal value
+  containing the raw, undecoded `\"` rather than a decoded `"`.
+- A value containing the OPPOSITE quote character from its own delimiter (`sku = "it's-GHOST"`) is
+  never matched at all -- the grammar's quoted-content character class excludes both quote
+  characters unless backslash-escaped, so an UNESCAPED embedded quote of either kind terminates
+  the match attempt with no closing delimiter found. A backslash-escaped embedded quote does not
+  terminate the match (it is consumed by the same undecoded-escape handling described above):
+  `sku = "A\"B-GHOST"` matches, with the raw undecoded `\"` included in the reported value.
+- It matches ANY assignment shape satisfying the grammar, regardless of which class, dict, or
+  data structure the key belongs to -- a coincidental variable name collision with a configured
+  `identifier_field` (e.g. a wholly unrelated `sku` local variable) can produce a false positive.
+
+Because of these bounds, a workspace enabling this mode should expect occasional false positives
+and should expect a handful of genuinely drifted literals to go undetected -- it is a
+drift-detection aid for catching stale hard-coded literals a reviewer would otherwise have to
+notice by eye, not a sound analysis. **There is no waiver mechanism for a source-literal
+finding**: the in-fixture `allow_missing` marker documented above is consulted only for the
+structured scan-target cross-reference (`_check_scan_targets`), never for `_check_source_literals`
+-- a source file is never parsed as a structured fixture record, so it has no record to attach a
+marker to in the first place. The only remedies for a source-literal `missing_key` finding (spec
+4.7 bullet 4; matching `fixture_consistency._MSG_SOURCE_LITERAL_MISSING_KEY`'s own wording
+verbatim) are: fix the literal to reference a real canonical key, correct the canonical source if
+it is the one that is incomplete, or disable `gates.fixture_consistency.extract_source_literals`
+entirely if the finding is a false positive of one of the bounds documented above. **Enabling the
+mode when the repo checkout resolves ZERO classified source files** is a loud, pre-scan
+`FixtureConsistencyConfigError` naming the resolved scope and the
+`gates.fixture_consistency.extract_source_literals` key (spec Section 7: an enabled mode that
+silently inspected nothing must never look identical to a genuine, clean pass, mirroring the
+empty-`scan`-list and zero-match-`identifier_field` shapes) -- this includes both the
+pruned-directory case described above AND a checkout whose only classified source file is an
+out-of-root symlink (excluded by the symlink boundary described above), a second route to this
+same zero-classified-source-files error. **A directory under the resolved scope that cannot be
+listed** (e.g.
+permission denied) aborts the walk with exactly one `load_error` finding naming the unreadable
+directory, rather than silently skipping that subtree and reporting a clean pass having inspected
+only part of the resolved scope (spec Section 7). **A source file that raises `UnicodeDecodeError`
+or `OSError`** while being read produces exactly one `load_error` finding naming the file; every
+other classified source file is still scanned
+(never a silent `except (...): continue`).
+
+**What a `missing_key` finding prints, and the redaction posture on the extracted value
+(SECURITY, security_review AND code_review round-4, convergent findings).** This mode's own
+selection logic reports exactly the literals ABSENT from the canonical catalog -- a hard-coded
+credential assigned to a matching `identifier_field` key via a grammar-matched assignment shape
+(see "The identifier_field grammar" above) is reported here, since it can never appear in a
+legitimate canonical catalog; a credential assigned via a shape the grammar does not match (e.g.
+an f-string/r-string/b-string prefix, a backtick template literal, a parenthesised expression, or
+a value containing an unescaped opposite quote character -- see the accuracy bounds above) is not
+scanned at all, exactly like any other literal in an unmatched shape. Because gate stdout flows
+into CI job logs and review comments, the finding NEVER reproduces any part of the extracted
+value, regardless of its length: there is no length threshold below which a value is echoed in
+full. A prior length threshold of 32 characters (below which a value was shown unredacted) and a
+disclosed 4-character prefix on longer values were both found indefensible -- a Stripe live
+secret key and a session identifier of exactly 32 characters sat precisely on the old threshold,
+and a 4-character prefix is exactly the length of common credential-type prefixes (`ghp_`,
+`AKIA`, `AIza`, `eyJh`), disclosing credential type and issuer for no review benefit `file:line`
+does not already provide. The finding instead prints the placeholder
+`<redacted, N chars total; see file:line above to inspect it directly>`, naming only the value's
+original length, never any of its content -- this is a UNIFORM policy applied to every value
+regardless of its shape, never a credential-shape heuristic (matching a `ghp_`/`sk-`/`eyJ`
+prefix, for example) that could fail open on a format it does not recognise. The finding still
+carries `file:line` and the matched field name, sufficient for a reviewer to open the file and
+inspect the value directly.
+
+### `gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` -- auto-derived shared-file registry (caylent-solutions/devbench-internal-backlog#13 AC4)
+
+The hand-maintained glob list below (`gates.repos.<org/repo>.shared_file_impact.patterns`) decays:
+a module that becomes a composition root after the list was written is never added, so the gate
+stops firing exactly where it matters most. `auto_derive_registry: true` (default `false`) closes
+that gap by ADDITIONALLY computing a shared-file set from the import graph, unioned with the
+hand-authored list below (see "Additive override" below -- this never replaces the hand list, and
+the hand list remains the only way to name a shared file the scanner cannot derive, e.g. any file
+whose extension is not classified as source):
+
+- `check-shared-file-impact` walks every source file classified by
+  `devbench.source_classification.is_source_extension` (pruning vendored/dependency directories
+  during the walk, never scanning or voting from them -- the full, CLOSED set is `.git`, `.venv`,
+  `venv`, `node_modules`, `__pycache__`, `.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`,
+  `.ruff_cache`, `.eggs`, `site-packages`, `dist`, `build`, `htmlcov`, `vendor` and `third_party`;
+  because `dist` and `build` are pruned unconditionally, any first-party source that happens to
+  live under a directory named `dist/` or `build/` is never scanned and never votes, exactly like
+  a vendored file would be -- this is a real limitation, not merely an implication of the pruning
+  behaviour above. This is a finite list, not an exhaustive denylist of every vendor/dependency convention, so an
+  unlisted SUBDIRECTORY anywhere under the repo -- e.g. `bower_components/`, `.direnv/`,
+  `target/` -- still has its own internals scanned and voted on; this applies only to
+  subdirectories the walk descends into, not to the repo root itself, which is always scanned
+  regardless of what it is named. This same walk also excludes a class of individual files,
+  independent of the pruned-directory names above: a FILE symlink whose resolved real path (via
+  `os.path.realpath`) falls OUTSIDE the resolved repo root is excluded from both scanning AND
+  fan-in voting, whether the symlink is live or dangling; one resolving INSIDE the repo root is
+  still included, exactly like an ordinary file. A symlinked DIRECTORY is never descended into at
+  all (`os.walk`'s own default `followlinks=False`), so a `.py` file living only under a
+  symlinked directory neither votes nor is scanned -- see `iter_classified_source_files` for the
+  shared implementation both this gate and `extract_source_literals` above delegate to), extracts
+  each file's import/require targets via
+  `source_classification.extract_import_targets` (language-appropriate scanning dispatched on the
+  extension the file already carries -- Python `import`/`from ... import`, the JS/TS family's
+  `import`/`require`/dynamic `import()`/`export ... from`/`export * from`, Go's `import` blocks
+  (every grouped block in the file, not only the first), Ruby's `require`/`require_relative`,
+  Java/Kotlin's `import`, Swift's `import`, C#'s `using`, and PHP's `require`/`include`/`use`; a
+  `.vue` file's imports live inside an embedded `<script>` block this scanner does not parse, so a
+  `.vue` file always contributes zero import targets even though it is itself a valid, votable
+  candidate), and RESOLVES each target -- never against a bare global basename index, which would
+  credit an unrelated same-named file (e.g. a stdlib `import types` crediting an unrelated
+  `mylib/types.py`). The resolution splits into three buckets by the target's first character,
+  tested AFTER normalising any backslash separator to `/` -- relevant only to PHP's `use`
+  namespace form (see bucket (ii) below); every other language's target already uses `/` as
+  written. (i) A target starting with `.` resolves against the IMPORTING file's own directory --
+  Python's leading-dot level semantics, or a `./`/`../`-style path for the JS/TS family, Ruby, and
+  a relative PHP `require`/`include`. This bucket applies ONLY to Python, the JS/TS family, Ruby
+  and PHP: Go, Java/Kotlin, C#, and Swift are ALWAYS resolved by bucket (iii) below regardless of
+  the target's first character, a leading `.` included -- this is behaviourally inert for the
+  JVM (Java/Kotlin)/C#/Swift languages, since no valid import in those languages can begin with a
+  dot, but it means the partition below is by LANGUAGE FAMILY first and by leading character only
+  within the families bucket (i) actually applies to. (ii) A target starting with `/` resolves
+  against the repo ROOT ONLY, never a `src/` fallback -- the JS/TS family, Ruby, and PHP (Python's
+  own extractor never emits a `/`-prefixed target, so this bucket does not arise for Python in
+  practice). For PHP specifically, a `use` namespace written with a leading backslash (e.g.
+  `use \Lib\Shared;`) normalises that backslash to `/` before the first-character test and so
+  lands HERE, repo-root-only -- NOT in bucket (iii) below. (iii) Everything else -- a target with
+  neither a leading `.` nor a leading `/` after normalisation -- resolves against the repo root
+  and, when present, a top-level `src/` directory for Go's always-absolute import paths (always
+  this bucket regardless of the target's own leading character, per bucket (i)'s note above),
+  Python's absolute dotted targets, PHP's bare `require`/`include` targets and a `use` namespace
+  with NO leading backslash (e.g. `use Lib\Shared;`), and the JVM (Java/Kotlin)/C#/Swift dotted
+  forms (also always this bucket regardless of the target's own leading character); for the JS/TS
+  family and Ruby, that same neither-`.`-nor-`/` shape (a bare or aliased specifier, e.g. a bare
+  `import 'shared'` or `require 'shared'`) is deliberately never resolved and casts no fan-in
+  vote, even when a same-named file exists elsewhere in the repo. A
+  directory-form import (naming a package/barrel directly,
+  e.g. `from mypkg import X` or `import {A} from './lib'`) resolves to that directory's entry file
+  (`__init__.py` for Python, `index.<ext>` for the JS/TS family). A target resolving to MORE than
+  one on-disk file is credited to NEITHER candidate (a `WARNING:` naming the ambiguity is printed
+  to stderr rather than guessing); a target resolving to nothing in the repo (e.g. a stdlib or
+  third-party import, or one of the JS/TS/Ruby bare targets described above) casts no vote at all.
+  A directory-form target that normalises to the REPO ROOT ITSELF (e.g. `app/importer.js`
+  importing `'..'`) never resolves to the root's own entry file even when one exists: the
+  underlying matcher treats a prefix that normalises to the empty string or `.` (the repo root
+  itself) as always yielding no match, so a directory-form target one level too shallow to name
+  any real subdirectory is refused rather than credited to the root's entry file; this
+  under-credits (never falsely credits) and only arises at that single degenerate depth -- the
+  same import written one directory deeper resolves normally.
+- A file whose resolved DISTINCT importer count is strictly greater than `fan_in_threshold`
+  (default `3`, must be an integer `>= 1`) is included in the derived shared-file set.
+- The derived set is printed in this command's JSON payload (`"derived_registry"`) on every
+  invocation of an ENABLED gate that reaches a verdict (pass or block) with `auto_derive_registry`
+  enabled, matched or not -- an invocation that raises before reaching a verdict (e.g. an
+  unrecognised full-suite runner), and an invocation where `gates.shared_file_impact.enabled` is
+  `false` (which writes its own PASS verdict record and returns before any payload is built,
+  regardless of `auto_derive_registry`), both print no payload at all. It is ADDITIONALLY cached
+  alongside the shared-file baseline
+  record, as
+  `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.derived-registry.json` (a
+  sibling of the baseline record's own `<branch-point-sha>.json`), ONLY on a matched invocation
+  (once a branch point/baseline is resolved) -- and as soon as that baseline is loaded, BEFORE the
+  full-suite command is even resolved, so a matched invocation that later raises (an unrecognised
+  runner, a baseline/runner mismatch) can still leave this cache written even though it aborts with
+  no comparison and no printed payload. A no-match run resolves no branch point/baseline at all, so
+  there is nothing for this cache to sit "alongside" on that path; the printed payload already
+  covers what registry was in effect for a no-match run. This cache is write-only: no devbench
+  command reads it back. It exists so an operator can inspect the file directly on disk during an
+  investigation ("what did the derived set look like when this verdict was reached") -- not as a
+  runtime dependency any command re-reads.
+
+**Additive override, never a replacement (spec 4.6):** the hand-maintained `patterns` list below
+is unioned with the auto-derived set, not superseded by it. A hand-listed file the scanner did not
+derive still matches; a derived file matches even when the hand list is empty -- an operator can
+always force a file into the shared-file set by hand-listing it, regardless of `auto_derive_registry`.
+Because derivation only ever considers files `is_source_extension` classifies as source, a shared
+NON-source file (e.g. a shared YAML/JSON config, a shell script outside that extension set) can
+never be derived and must stay hand-listed regardless of `auto_derive_registry`.
+
+`enabled`, `auto_derive_registry` and `fan_in_threshold` are all read exclusively through
+`resolve_gate_config("shared_file_impact", repo)` (AC-27); a non-integer or `< 1` threshold, or an
+unrecognised key inside the `gates.shared_file_impact` block, fails config load naming the
+offending key (spec 4.1 AC-5).
+
+### `gates.repos.<org/repo>.shared_file_impact.patterns` -- shared-file full-suite regression gate (caylent-solutions/devbench-internal-backlog#13)
+
+Optional list of `fnmatch`-style glob patterns, matched against POSIX paths relative to the
+repo root. Identifies "shared/high-fan-in" files for this repo -- app-level composition roots,
+shared shell/container components, widely-consumed hooks -- where a change can silently break
+already-passing code in unrelated features.
+
+When a work unit's diff (resolved through the same ADR-12 mode-aware
+`work_unit_scope.resolve_changed_files` helper `get-diff` and `check-manifest-scope` use, never
+a raw working-tree scan) touches a path matching one of these patterns,
+`devbench check-shared-file-impact <unit-id>` (invoked by the executor, enforced by the
+`assert-shared-file-impact.sh` guard hook) runs the FULL test suite -- not the task's scoped
+subset -- and diffs the resulting failing-test set against a pre-change baseline stored at
+`<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`, one file per merge-base
+branch point the unit diverged from. The full-suite RESULT reported is always repo-wide, but
+which of that run's newly-introduced failures actually **block** task completion is narrower:
+only a failure whose failing node id is attributable to the unit's own Changes Manifest scope
+(the `pytest` parser's `"<file>::<test>"` node ids are checked against that scope; `go test` and
+jest node ids ordinarily carry no `::` at all and are attributable unconditionally -- but this is
+not an absolute guarantee: the jest parser captures the raw description text after the failure
+marker and the `go test` parser captures a bare non-whitespace token, so a test name or
+description that happens to contain a literal `::` is still split on it by the same file-segment
+check the `pytest` case uses, and the leading fragment -- not a real file path -- is then checked
+against scope and can be silently excluded from `new_failures` into `unattributed_new_failures`)
+blocks -- so a regression this task caused in a file outside its own Changes Manifest is reported in the JSON payload's
+`unattributed_new_failures` list but does not block this task, and pre-existing/flaky failures
+never stall an unrelated task either way. See `devbench check-shared-file-impact --help` and
+`src/devbench/cli.py::cmd_check_shared_file_impact` for the full algorithm: the baseline is
+captured once per branch point by running the full suite in an isolated `git worktree` checked
+out AT that branch point (never from the current, already-changed tree), and a baseline that
+exists but fails to parse, or whose stored `branch_point` disagrees with the resolved
+merge-base, is a loud `ERROR` on stderr (exit 1) that leaves the file untouched -- there is no
+silent re-bootstrap path.
+
+The `assert-shared-file-impact.sh` guard hook does not parse the invoking Bash tool call's
+command text or `tool_response.stdout` at all: `cmd_check_shared_file_impact` persists its own
+verdict to a small record file (`<workspace>/.devbench/shared-file-impact-verdict`, or a
+`<workspace>/.devbench/sessions/<DEVBENCH_SESSION_NAME>/` subdirectory when a named session is
+active) as the very first thing it does -- `"pending"`, overwritten with `"pass"` or `"block"`
+only on a clean exit -- and the hook's entire job is reading that ONE record back on the next
+Bash call it receives, then consuming (deleting) it. An unconsumed `"block"` record is never
+overwritten by a later, different invocation's own `"pending"`/`"pass"` writes, so it survives
+until a Bash PostToolUse event actually consumes it. Almost the identical protection applies to
+an unconsumed `"pending"` record: each invocation carries its own identity (a fresh PID+counter
+value recorded on the record's 4th line), and a DIFFERENT, later invocation's own `"pending"`/
+`"pass"` writes can never silently erase an earlier invocation's still-open `"pending"` -- the
+case where that earlier invocation crashed before reaching its own clean verdict -- while that
+SAME invocation's own subsequent `"pass"`/`"block"` write still transitions the record normally.
+The one write this protection deliberately lets through is a DIFFERENT, later invocation's own
+genuine `"block"`: it always escalates over an unconsumed `"pending"` rather than being refused,
+since `"block"` is itself the strongest, sticky status this same paragraph's first sentence
+protects, so nothing is lost by letting the escalation land -- refusing it would instead silently
+discard the escalating invocation's own genuine failing verdict. A `"block"` record blocks (exit 2); a
+`"pass"` record allows; a record still reading `"pending"` (every error path
+`check-shared-file-impact` can exit through AFTER its initial write without reaching a clean
+verdict -- an unrecognised unit id, no local repo path configured, the config file failed to
+load, a scope-resolution error, the import-fan-in scan failed, `_evaluate_shared_file_gate`
+raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, the
+due `[GATE_PASS shared_file_impact]` record write failing (the work-unit file cannot be
+located, or the audit-marker append itself raises an `OSError`), or the process crashing or
+being killed mid-run) fails CLOSED (blocks, exit 2). No record at all
+allows, and is reached three ways, only two of which are the intended "nothing unresolved" case:
+the gate was never invoked in this session; its prior record was already consumed; or (not
+closable from inside this hook) `cmd_check_shared_file_impact` never reached its own first line
+at all -- an unrecognised CLI subcommand, an import-time configuration failure, argparse
+rejecting the invocation, `devbench` not on PATH, or the initial `"pending"` write itself raising
+`OSError` -- none of which produce a record for the hook to find. Note also that a Bash tool call
+exiting non-zero (exactly what a blocking `check-shared-file-impact` invocation itself does)
+emits Claude Code's `PostToolUseFailure` event rather than `PostToolUse`, and this hook is
+registered on `PostToolUse` only, so a block is observed on the next Bash call whose
+`PostToolUse` event reaches this hook rather than necessarily on the gate's own call.
+
+**Hand-maintained by default, auto-derivable on request (caylent-solutions/devbench-internal-backlog#13
+AC4):** this registry is hand-maintained per repo unless `gates.shared_file_impact.auto_derive_registry`
+is set to `true`, in which case the shared-file set is ADDITIONALLY computed from the repo's actual
+import fan-in and unioned with this hand list, never replacing it (see
+`gates.shared_file_impact.auto_derive_registry` / `fan_in_threshold` above). `auto_derive_registry`
+defaults to `false`, so a repo that has not opted in still needs this list reviewed/regenerated by
+hand as the codebase evolves -- nothing does that automatically for such a repo.
+
+Omitting `patterns` entirely (or leaving it empty) makes `check-shared-file-impact` a permanent
+no-op for that repo UNLESS `gates.shared_file_impact.auto_derive_registry` is also `true`, in which
+case a derived file can still match and the gate can still block even with no hand-authored
+patterns at all. Only when both `patterns` is empty AND `auto_derive_registry` is `false` (or
+unset) is the gate a permanent no-op, identical to today's behavior before this feature existed.
+
+### `gates.layout_geometry` -- layout/geometry judge-evidence gate and its `log-waiver` exception route (caylent-solutions/devbench-internal-backlog#14; spec 4.9c, 4.2, 4.9 PM-5)
+
+**Purpose.** `layout_geometry` has no automated check command of its own -- it exists so an
+operator can see, in `devbench gates`, whether a repo is expected to carry `[LAYOUT-AC]`-tagged
+acceptance criteria for layout/visual-geometry-sensitive changes (spec 4.9c). A `[LAYOUT-AC]`-
+tagged AC line must name at least one keyword from `LAYOUT_GEOMETRY_KEYWORDS`
+(`src/devbench/constants.py`) -- the single source of truth both the `test-reviewer` rubric and
+the `spec-to-backlog` SKILL render their keyword list from -- or `validate-backlog` rejects it.
+
+**Default.** `false` at the built-in level (D-17): a fresh install behaves exactly as it did
+before this gate existed until an operator opts a repo in via `gates.layout_geometry.enabled:
+true` (project level) or `gates.repos.<org/repo>.layout_geometry.enabled: true` (per-repo).
+
+**Tier.** `judge-evidence` (`constants.GATE_TIERS`; see [`gates`](cli-reference.md#gates) for the
+tier taxonomy). A `judge-evidence` gate never blocks `mark-done` on its own; it is evidence the
+`test-reviewer` judge weighs (spec Section 0.2), not a machine-checked pass/fail outcome. Actual
+browser geometry -- pixel layout, overlap, viewport behavior -- is verified OUTSIDE devbench, by a
+human, a screenshot-diff tool, or an end-to-end browser test the target repo owns; devbench's own
+role stops at confirming a `[LAYOUT-AC]`-tagged acceptance criterion, where present, is
+well-formed and names a recognized keyword.
+
+**Env override.** `DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED` (spec Section 7), the same
+`DEVBENCH_GATE_<NAME>_ENABLED` convention every gate uses (highest-precedence layer, D-15).
+
+**Exception route (spec 4.9, PM-5).** Because this is a `judge-evidence` gate, a waiver is
+recorded with `log-waiver` and accepts EITHER attribution -- `--operator` is NOT required (unlike
+a `machine-blocking` gate, where it is mandatory):
+
+```
+$ uv run devbench log-waiver test_review E9-F1-S1-T1 \
+    --gate layout_geometry --target "src/app/ResizablePanel.tsx" \
+    --reason "geometry verified by hand in a live browser; no automated layout AC applies"
+```
+
+`--reason` is mandatory and non-empty; an empty or missing `--reason` is a usage error, exit `2`.
+A supplied reason containing a disallowed character (an em-dash, a control character, or a
+bracketed TDD phase tag such as `[RED]`) exits `1`. See
+[`log-waiver`](cli-reference.md#log-waiver) for the full command reference.
+
 ---
 
 ## `backlog:` -- backlog lifecycle settings (issue #189)
@@ -176,6 +783,7 @@ git_ops:
   auto_finalize: false          # auto-run git-ops-finalize when all WUs terminal
   auto_merge: false             # auto-merge after CI green (requires auto_finalize + defer_pr)
   orphan_patterns: []           # replaces built-in orphan fnmatch list when non-empty
+  # provenance_path: docs/release-notes/provenance-map.json  # PR-body provenance map (below)
                                 # built-in list covers terraform state/plan, terragrunt
                                 # cache, python caches/venv/egg-info, ansible *.retry, helm
                                 # charts/*.tgz, node_modules, .DS_Store. LOCK FILES ARE EXCLUDED.
@@ -186,6 +794,64 @@ git_ops:
     settle_seconds: 60
     poll_interval: 5
 ```
+
+### `git_ops.provenance_path` -- PR-body provenance map (spec 4.13; D-17)
+
+Path to a JSON provenance map that `git-ops-finalize` reads to compose the batch PR body: the PR
+title, one `###`-headed per-epic summary section, then a closing-keyword block with one
+`Fixes ...` line per mapped issue (`Fixes <org>/<repo>#<n>` cross-repo, `Fixes #<n>` same-repo,
+both rendered by the same code path). Without a resolved map, `git-ops-finalize` composes a plain
+body that carries no closing-keyword block, so issues in the batch never auto-close on merge
+(the gap observed on PR #334).
+
+- **Default:** unset. With no `provenance_path` and no `--provenance` flag, the composed body is
+  byte-identical to the plain body `git-ops-finalize` has always produced -- this key is a pure
+  additive opt-in (spec Section 6).
+- **Override:** `git-ops-finalize --provenance <path>` beats this config key for a single
+  invocation; the config key alone is what lets an unattended `auto_finalize` run pick up the
+  feature with no operator step. There is no `DEVBENCH_*` environment override for this key
+  (YAML-only, the same as its sibling path/name settings `single_branch` and `branch_prefix`
+  above).
+- **Path resolution:** a relative value (from either the config key or the `--provenance` flag)
+  resolves against the TARGET REPO working tree -- the local filesystem path that
+  `repos.<org/repo>.checkout_directory` resolves to for the `<repo>` positional `git-ops-finalize`
+  runs against -- never `DEVBENCH_WORKSPACE_ROOT` and never the devbench process's current working
+  directory. An absolute path is used as-is. `git_ops` (including `provenance_path`) is a single
+  GLOBAL config block, while `git-ops-finalize <repo>` runs per repo, so in a multi-repo workspace
+  one relative `provenance_path` value resolves to a DIFFERENT file inside each repo's checkout.
+  Either point the relative value at a path that exists identically in every target repo, use an
+  absolute path, or override the value per repo with `--provenance` at invocation time.
+- **Failure mode:** a configured or passed path that is missing, unreadable, not valid JSON, or
+  parses to zero mapped issues fails the command loudly (exit 1, naming the path) before any push
+  happens -- it never silently falls back to the plain body. This list is not exhaustive: any
+  structurally malformed map fails the same way (loudly, naming the path, before any push) --
+  including a payload that does not decode to a JSON object, a missing or non-list top-level
+  `epics`, a non-object epic entry, an epic missing a non-empty `name` or `summary`, an epic whose
+  `issues` is present but not a list, a non-object issue entry, an issue missing an integer
+  `number`, and an issue `repo` that is not an `owner/name` string.
+
+Provenance map shape (required fields marked):
+
+```json
+{
+  "epics": [
+    {
+      "name": "E1: Cherry-pick integration",
+      "summary": "One-line summary of what this epic delivered.",
+      "issues": [
+        {"repo": "org/other-repo", "number": 10},
+        {"number": 335}
+      ]
+    }
+  ]
+}
+```
+
+Top-level `epics` is required and must be a list. Each epic requires a non-empty string `name`
+and a non-empty string `summary`; an epic's `issues` is optional but, when present, must be a
+list. Each `issues` entry needs an integer `number`; an omitted `repo` (or a `repo` equal to the
+target repo) renders the same-repo `Fixes #<n>` form, any other `repo` (a string matching
+`owner/name`) renders the cross-repo `Fixes <repo>#<n>` form.
 
 ---
 

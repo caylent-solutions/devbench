@@ -30,6 +30,9 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
             "SCOPE_VIOLATION",
             "MANIFEST_TODO_UNFILLED",
             "AGENT_LOG_CONTRADICTS_DIFF",
+            "NEWLY_REACHABLE_PATH_UNVERIFIED",
+            "UNREACHABLE_ARTIFACT",
+            "WRITE_PATH_UNVERIFIED",
         }
     ),
     "test_review": frozenset(
@@ -39,6 +42,9 @@ JUDGE_CATEGORIES: Final[dict[str, frozenset[str]]] = {
             "COVERAGE_REGRESSION",
             "TDD_CYCLE_MISSING",
             "DRY_VIOLATION",
+            "FIXTURE_CATALOG_MISMATCH",
+            "COMPOSITION_ROOT_MISSING",
+            "LAYOUT_STUB_WITHOUT_LIVE_TEST",
         }
     ),
     "doc_review": frozenset(

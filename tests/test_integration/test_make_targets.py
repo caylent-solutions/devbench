@@ -14,15 +14,29 @@ Covers:
 
 from __future__ import annotations
 
+import inspect
 import os
+import shlex
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import test_backlog.test_review_feedback_vocabulary as _membership_coverage_module
+
+from devbench.vocabulary_generation import DOC_RELATIVE_PATH
 
 # Repo root is two levels above this test file:
 # tests/test_integration/test_make_targets.py -> tests/test_integration -> tests -> repo root
 _REPO_ROOT = Path(__file__).parent.parent.parent
+
+# Repo-relative path of finding 322-D21's membership-coverage module,
+# derived from the imported module's own file identity rather than a
+# hand-typed literal, so a future rename of the test file cannot leave a
+# stale path string behind unnoticed.
+_MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH = (
+    Path(inspect.getfile(_membership_coverage_module)).relative_to(_REPO_ROOT).as_posix()
+)
 
 
 def _make_dry_run(target: str, env: dict[str, str] | None = None) -> str:
@@ -295,6 +309,162 @@ class TestCoverageGate:
         assert "--cov-fail-under=98" in output, (
             f"Expected '--cov-fail-under=98' in make -n test-coverage output, got:\n{output}"
         )
+
+
+@pytest.fixture
+def _restored_vocab_doc() -> Iterator[Path]:
+    """Yield the real vocabulary doc path, restoring its original content on teardown.
+
+    A full filesystem copy of the checkout (so `uv run` inside the recipe
+    resolves an independent project) was tried and rejected: `uv run`
+    re-resolves the editable `devbench` install against whichever
+    `pyproject.toml` identity it is invoked from, so running it from a
+    second copy of this checkout re-links the *shared* `.venv` to that
+    copy and leaves it dangling once the copy is deleted -- corrupting the
+    venv for every other process using this checkout (including the
+    orchestrator that may be running this very test). Mutating the tracked
+    file in place and restoring it in this fixture's teardown (which pytest
+    always runs, even on assertion failure) avoids that shared-state risk
+    entirely: the target `make check-vocabulary-drift` recipe never changes
+    directory, so `uv run` keeps resolving the one real project throughout.
+    """
+    target = _REPO_ROOT / DOC_RELATIVE_PATH
+    original = target.read_text(encoding="utf-8")
+    try:
+        yield target
+    finally:
+        target.write_text(original, encoding="utf-8")
+
+
+@pytest.mark.functional
+class TestVocabularyDriftCheck:
+    """AC-E2-F5-S1-T2-1/2/3 (spec 4.10; AC-11): `make check-vocabulary-drift`
+    regenerates every guard-marked surface into a scratch directory and
+    diffs it against the committed tree, and `validate` runs it."""
+
+    def test_freshly_generated_tree_passes_drift_check(self) -> None:
+        """AC-E2-F5-S1-T2-2: the committed tree is not itself drifted."""
+        result = subprocess.run(
+            ["make", "check-vocabulary-drift"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"Expected rc=0 on the freshly generated tree, got {result.returncode}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    def test_hand_edited_generated_block_fails_naming_regeneration_command(self, _restored_vocab_doc: Path) -> None:
+        """AC-E2-F5-S1-T2-1: a hand-edit inside the guard-marked block makes
+        the drift check exit non-zero, naming both the offending file and
+        `make generate-vocabulary` as the fix."""
+        target = _restored_vocab_doc
+        original = target.read_text(encoding="utf-8")
+        marker = "<!-- generated:vocabulary -->"
+        marker_index = original.index(marker)
+        insertion_point = marker_index + len(marker)
+        hand_edit = "\n| `HAND_EDITED_ROW` | injected by test | should be overwritten |"
+        mutated = original[:insertion_point] + hand_edit + original[insertion_point:]
+        assert mutated != original
+        target.write_text(mutated, encoding="utf-8")
+
+        result = subprocess.run(
+            ["make", "check-vocabulary-drift"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0, (
+            f"Expected non-zero rc on a hand-edited generated block, got 0.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "make generate-vocabulary" in result.stderr, (
+            f"Expected the regeneration command named on stderr, got:\n{result.stderr}"
+        )
+        assert DOC_RELATIVE_PATH in result.stderr, (
+            f"Expected the offending file '{DOC_RELATIVE_PATH}' named on stderr, got:\n{result.stderr}"
+        )
+
+    def test_validate_runs_the_drift_check(self) -> None:
+        """AC-E2-F5-S1-T2-3 / AC-E2-F5-S1-T3-7: the drift check is a
+        prerequisite of `validate`, pinned by the drift target's own dry-run
+        recipe lines rather than an internal function/symbol name -- so this
+        test survives a refactor of how the drift check is implemented."""
+        drift_output = _make_dry_run("check-vocabulary-drift")
+        drift_recipe_lines = [line for line in drift_output.splitlines() if line.strip()]
+        assert drift_recipe_lines, (
+            f"Expected 'make -n check-vocabulary-drift' to produce at least one recipe line, got:\n{drift_output}"
+        )
+
+        validate_output = _make_dry_run("validate")
+        for line in drift_recipe_lines:
+            assert line in validate_output, (
+                f"Expected drift target's recipe line to appear in 'make -n validate' output.\n"
+                f"Missing line: {line!r}\nvalidate output:\n{validate_output}"
+            )
+
+
+@pytest.mark.functional
+class TestMembershipCoverageGateReachableFromValidate:
+    """AC-E2-F5-S1-T2-4/-5/-6 (spec 4.10; finding 322-D21): `validate`'s test
+    stage must actually execute the membership-coverage module, the same way
+    `TestVocabularyDriftCheck.test_validate_runs_the_drift_check` above pins
+    that the drift target is reachable from `validate`. `test-coverage`'s
+    recipe is a single ``pytest tests/`` invocation with no marker filter or
+    explicit path list today; this test proves that invocation, run for
+    real in collect-only mode, actually collects the membership-coverage
+    module, so a future narrowing of the invocation fails here instead of
+    silently dropping finding 322-D21's completeness gate out of
+    `make validate`."""
+
+    def test_validate_pytest_invocation_collects_the_membership_module(self) -> None:
+        coverage_recipe = _make_dry_run("test-coverage")
+        pytest_invocation_lines = [line for line in coverage_recipe.splitlines() if "pytest" in line]
+        assert len(pytest_invocation_lines) == 1, (
+            f"Expected exactly one pytest invocation line in 'make -n test-coverage' output, got:\n{coverage_recipe}"
+        )
+        pytest_command = shlex.split(pytest_invocation_lines[0])
+
+        collection = subprocess.run(
+            [*pytest_command, "--collect-only", "-q"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert collection.returncode == 0, (
+            f"Expected validate's pytest invocation to collect cleanly, got rc={collection.returncode}.\n"
+            f"stdout:\n{collection.stdout}\nstderr:\n{collection.stderr}"
+        )
+        assert _MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH in collection.stdout, (
+            "Expected validate's pytest invocation to collect tests from "
+            f"'{_MEMBERSHIP_COVERAGE_MODULE_RELATIVE_PATH}', but it is absent from the collection output "
+            "-- a narrowed path list or marker filter would silently drop finding 322-D21's completeness "
+            f"gate out of 'make validate'.\ncollection output:\n{collection.stdout}"
+        )
+
+    def test_test_coverage_is_a_validate_prerequisite(self) -> None:
+        """Pins that `test-coverage` -- and therefore the membership-coverage
+        module `test_validate_pytest_invocation_collects_the_membership_module`
+        above proves it collects -- is actually reachable from `validate`,
+        the same way `TestVocabularyDriftCheck.test_validate_runs_the_drift_check`
+        pins the drift target's wiring. Without this test, removing
+        `test-coverage` from the `validate` prerequisite list in `Makefile`
+        would leave the test above green (it invokes `test-coverage`
+        directly) while silently dropping finding 322-D21's completeness
+        gate out of `make validate`."""
+        coverage_recipe = _make_dry_run("test-coverage")
+        pytest_invocation_lines = [line for line in coverage_recipe.splitlines() if "pytest" in line]
+        assert pytest_invocation_lines, (
+            f"Expected 'make -n test-coverage' to produce at least one pytest invocation line, got:\n{coverage_recipe}"
+        )
+
+        validate_output = _make_dry_run("validate")
+        for line in pytest_invocation_lines:
+            assert line in validate_output, (
+                "Expected test-coverage's pytest invocation line to appear in 'make -n validate' output.\n"
+                f"Missing line: {line!r}\nvalidate output:\n{validate_output}"
+            )
 
 
 @pytest.mark.functional

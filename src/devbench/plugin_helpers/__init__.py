@@ -12,4 +12,8 @@ Modules:
 - :mod:`devbench.plugin_helpers.backlog_post_processor` -- per-WU-file
   post-processing passes the spec-to-backlog skill runs after Step 5
   authoring and before Step 5d's ``validate-backlog`` invocation.
+- :mod:`devbench.plugin_helpers.permission_flag_writepath` -- Step 3b's
+  write-path audit for spec clauses that instruct a new permission/
+  eligibility field to "follow the pattern of" an existing flag, plus
+  placeholder/mock permission-provider seam detection.
 """

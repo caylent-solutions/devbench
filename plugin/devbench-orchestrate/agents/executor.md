@@ -152,6 +152,29 @@ If pre-existing index entries from a prior blocked task pollute your staging are
 4. Implement all acceptance criteria.
 5. Update documentation per AC-DOC requirements in the same change as code changes.
 6. Verify all work by reading back written files and running tests.
+6b. **Newly-reachable-paths marker (`## Task Type: behavior-fix` units only).** When the
+    work unit you are executing declares `## Task Type: behavior-fix` AND the
+    `newly_reachable_paths` gate is enabled for the target repo, run
+    ```bash
+    uv run devbench gates
+    ```
+    and check the `newly_reachable_paths` row's `status` column -- that row resolves against
+    whichever repo's override sets `enabled` (the first sorted repo carrying one), which is
+    NOT guaranteed to be this target repo once more than one repo carries an override; when in
+    doubt confirm the actual value directly via `gates.repos.<org/repo>.newly_reachable_paths.enabled`
+    in `backlog/config/devbench.yaml`. When the gate is enabled for this repo, run
+    ```bash
+    uv run devbench log-newly-reachable $ARGUMENTS --path <p> --method <m> --result <r>
+    ```
+    once per code path this fix newly makes reachable. See "BUG-FIX COMPLETENESS:
+    newly-reachable paths" below for what to enumerate and how to live-verify each path
+    before logging it -- the general read-back-and-check-exit-codes duty is
+    `## VERIFICATION REQUIREMENTS`'s, not restated here. A non-zero exit from
+    `log-newly-reachable` is a hard stop: do not substitute prose for the marker and do
+    not silently retry with different arguments hoping it passes -- treat it like any
+    other failing prerequisite and route it through the blocker path (a
+    `[NEEDS_ESCALATION]` comment naming the exact stderr message, or the BUG ESCALATION
+    FOR VALIDATION GATES flow if this task is itself a validation gate).
 7. Stage all changed files with `git add` (run in the repo_path directory).
 7b. Pre-review self-check -- before logging completion, verify:
     - [ ] Every acceptance criterion in the work unit is meaningfully addressed (not just named in comments)
@@ -161,6 +184,7 @@ If pre-existing index entries from a prior blocked task pollute your staging are
     - [ ] No bypass annotations staged: nosec, noqa, type: ignore, nolint, eslint-disable
     - [ ] `git status --short` (in repo_path) shows only files listed in the Changes Manifest
     - [ ] No edits made to ANY `backlog/**/*.md` work-unit file other than via `devbench log-comment`, `devbench log-tdd`, `devbench log-verdict`, `devbench request-amendment`, or `devbench add-dep`. Direct file edits to OTHER tasks' work-unit `.md` files are forbidden -- they bypass the manifest-amender gate and the audit trail. If you need to modify another task's Manifest or Dependencies, route the change through `devbench add-dep` (for dep wiring) or emit a proposal via `devbench write-proposal` (for everything else).
+    - [ ] If this work unit declares `## Task Type: behavior-fix` (see "BUG-FIX COMPLETENESS" below), exactly one of these three states holds: (1) the `newly_reachable_paths` gate is enabled for this repo and one `[NEWLY_REACHABLE]` marker per newly-reachable path is logged via `log-newly-reachable` (Main sequence step 6b); (2) genuinely nothing new is unlocked, and a one-sentence justification is folded into the GREEN `log-tdd` entry instead (`log-newly-reachable` has no `none` sentinel value); or (3) the gate is disabled or unconfigured for this repo and paths ARE newly reachable, in which case Main sequence step 6b's "Drafted AC vs. gate config" paragraph applies -- do NOT call `log-newly-reachable`, and instead record the enumeration/live-verification evidence directly in the GREEN `log-tdd` entry.
     If any item is not satisfied, resolve it before proceeding to step 8.
 8. Log completion in the work unit Comments section.
 
@@ -311,6 +335,38 @@ Procedure (execute in order -- each step is load-bearing):
 
 Scope discipline: use this procedure ONLY when the task itself is a validation gate. If the task's Approach authorises production fixes and you simply discovered an additional out-of-scope bug while implementing authorised changes, the correct path remains the amendment flow in step 3 (stage the fix, request an amendment). Do not use bug-escalation to route around a rejected amendment.
 
+**Newly-reachable-paths AC.** When a proposed follow-up task in step 2 above is itself a fix that was gating off a code path (a crash, a disabled control, a silently-skipped branch), add a third AC line to that entry's `suggested_acs` naming the `log-newly-reachable` verb, e.g. `AC-VERIFY-001 newly-reachable code paths (see docs/newly-reachable-paths.md) enumerated and live-verified at smoke-test level; logged via uv run devbench log-newly-reachable <unit-id> --path <p> --method <m> --result <r>`. This mechanism keys off `ProposedTask.task_type` -- the proposal's `task_type` field, defaulting to `behavior-fix` (`constants.DEFAULT_TASK_TYPE`) for every proposed task -- NOT the drafted file's rendered `## Task Type:` line, which `generate_draft_md` computes separately via `infer_task_type(files_to_own)`; the two can diverge, so a proposal whose `files_to_own` are all documentation paths still renders `## Task Type: docs` while carrying this AC line (`src/devbench/backlog/proposal.py`). This seeds the requirement into the follow-up task from the moment it is drafted, rather than relying on whichever executor later picks it up to know about the BUG-FIX COMPLETENESS section below on their own.
+
+## BUG-FIX COMPLETENESS: newly-reachable paths
+
+This section applies whenever the work unit you are executing declares `## Task Type: behavior-fix` (the taxonomy `manager.py` validates). That declared header is a DIFFERENT field from the one `task-factory`'s `generate_draft_md` uses to gate its newly-reachable-paths acceptance-criterion auto-append: the auto-append keys off `ProposedTask.task_type` (default `behavior-fix`), while the drafted file's `## Task Type:` header is rendered separately via `infer_task_type(files_to_own)` (`src/devbench/backlog/proposal.py`) -- the two can diverge, so a materialised unit can carry the newly-reachable AC line while its own `## Task Type:` header reads `docs`. Whether THIS section applies to the unit you are executing is decided strictly by the header on that unit, not by how it was drafted. It does NOT apply to `docs`, `chore`, `test-only`, `refactor`, or `feature`-typed units. When drafting a follow-up proposal (step 2 above), when in doubt declare `behavior-fix` rather than a weaker type -- an unnecessary "none" line costs one CLI call; skipping a genuinely gated-path fix costs another multi-round remediation chain. Full rationale and worked examples: `docs/newly-reachable-paths.md`.
+
+**Why this exists.** A defect that gates off a code path (the crash prevented a screen from rendering, the disabled button never let its handler run) hides everything downstream of the gate. Confirming the original repro now passes proves the gate opened -- it says nothing about what was behind the gate. Recurring pattern across multi-round remediation: the newly-reachable code turns out to have its own pre-existing (and previously untestable) defect, discovered one QA round later instead of in this task.
+
+**Step 1 -- enumerate.** Before logging completion, list every code path this fix newly makes reachable that was NOT reachable before your change ("newly reachable" = could not execute, render, or receive user interaction while the defect was present, and now can). Enumerate at minimum the FIRST HOP downstream of the gate you removed -- you are not required to trace every possible path transitively, but "the button is now enabled" without naming what the button's handler does is not adequate. See `docs/newly-reachable-paths.md` for adequate-vs-inadequate examples.
+
+If, after genuine consideration, the fix unlocks no new code path (the defect was fully self-contained), say so explicitly with a one-sentence justification rather than omitting the step -- see "Step 3" below for where that justification goes.
+
+**Step 2 -- live-verify.** For each enumerated path, perform a real, smoke-test-level check that it actually works now that it is reachable -- running the app/service and exercising the path, an integration/functional test, or at minimum a targeted unit test against the newly-reachable branch. Reading the code and reasoning "this looks fine" is NOT verification. This is the same live-verification duty `## VERIFICATION REQUIREMENTS` describes generally; this step just names the specific paths it applies to here.
+
+If live-verification surfaces a new, independent defect in a newly-reachable path, do NOT silently mark the task done. Treat it exactly like any other bug discovered during TDD GREEN: fix it under the Amendment path above if it is minimal and in scope, or escalate it via the BUG ESCALATION FOR VALIDATION GATES proposal flow (or a `[NEEDS_ESCALATION]` comment naming the newly-reachable path and the defect found in it) if it is not.
+
+**Step 3 -- log it.** Run `log-newly-reachable` per Main sequence step 6b above -- once per enumerated path:
+
+```bash
+uv run devbench log-newly-reachable $ARGUMENTS --path <p> --method <m> --result <r>
+```
+
+`--method` is one of `manual`, `unit_test`, `integration_test`, `functional_test`; `--result` is one of `verified`, `broken`. `log-newly-reachable` has no sentinel value for "nothing newly reachable" -- if, after genuine consideration in Step 1, this fix unlocks no new code path, do NOT invent a placeholder path/method/result to force a marker; fold a one-sentence justification into this task's GREEN `log-tdd` entry instead (see `docs/newly-reachable-paths.md`'s "When no path is newly reachable"). A non-zero exit from `log-newly-reachable` is the hard stop Main sequence step 6b describes.
+
+This marker set is what `code-reviewer.md`'s BUG-FIX COMPLETENESS rubric reads from the TDD Cycle Log audit section -- while the `newly_reachable_paths` gate is enabled for this repo, a `behavior-fix` unit with no `[NEWLY_REACHABLE]` marker (and no GREEN `log-tdd` "nothing unlocked" justification) fails that review even if the original repro passes. When the gate is disabled or unconfigured for this repo (the common case, since `constants.GATE_ENABLED_DEFAULT` is `False` at every level), the code-reviewer does not FAIL for a missing marker; it still requires the GREEN `log-tdd` entry recording the enumeration/live-verification evidence described in the "Drafted AC vs. gate config" paragraph below. Self-reporting this step is necessary but not sufficient: the code-reviewer's independent check is what actually decides the verdict, so do not treat logging the marker (or the GREEN `log-tdd` substitute) as the end of the obligation -- the enumeration and verification have to be real.
+
+**Gate tier note.** `newly_reachable_paths` is a judge-evidence gate (`constants.GATE_TIERS`); the code-reviewer's BUG-FIX COMPLETENESS check weighs the `[NEWLY_REACHABLE]` marker set as evidence, not as a machine-checked outcome. This gate has no dedicated `check-newly-reachable` command that prints spec 4.1's canonical `{"gate":"newly_reachable_paths","status":"disabled"}` line; the observable signal instead is a `disabled` value in the `newly_reachable_paths` row's `status` column of `uv run devbench gates` -- treat that reading as neither a pass nor a fail signal (spec `integration-reality-gates-hardening.md` Section 0.2).
+
+**Drafted AC vs. gate config.** `task-factory`'s acceptance-criterion auto-append (`proposal.py`) always drafts the newly-reachable-paths AC on a `behavior-fix` unit, independent of whether the `newly_reachable_paths` gate is enabled for the target repo. If this task's Acceptance Criteria carry that drafted line but `uv run devbench gates` reports `newly_reachable_paths` disabled or unconfigured for this repo, do NOT skip Steps 1-2 above: enumeration and live-verification are basic engineering hygiene independent of gate configuration, so still perform them and record the evidence via the GREEN `log-tdd` entry. Only Step 3's `log-newly-reachable` CLI call (and Main sequence step 6b) is conditioned on the gate being enabled for this repo, because that machine-readable marker exists specifically to feed the code-reviewer's judge-evidence rubric.
+
+**Cross-cutting primitives.** If `gates.newly_reachable_paths.paths` is configured for this repo (project-level `backlog/config/devbench.yaml`, or a `gates.repos.<org/repo>.newly_reachable_paths.paths` override -- run `uv run devbench gates` to confirm the gate's status, then read the config file directly for the path list; the retired free-text `backlog/config/cross-cutting-primitives.md` file no longer exists), check whether any file in your diff matches a listed primitive (a shared z-index tier, a shared dirty-flag/`setField` path, a shared close/dismiss callback, or similar). If it does, explicitly enumerate and verify the primitive's OTHER named consumers as part of Step 1/Step 2 above, not just the consumer you were fixing -- a fix that reuses a shared stateful primitive without checking its other consumers is exactly the failure mode this section exists to catch.
+
 ## COMMENT LANGUAGE DISCIPLINE
 
 When you call `uv run devbench log-comment` or return a final assistant message, you MUST describe conditions factually. You MUST NOT use imperatives that direct the orchestrator's loop. The orchestrator decides its own control flow based ONLY on `uv run devbench next` and the stop-hook circuit breaker -- per the SKILL halt-discipline rule. Your prose has no effect on whether the loop continues; treating it as if it does will get your message rejected by the deterministic guard hook.
@@ -345,6 +401,61 @@ If the `guard-comment-format.sh` hook rejects your call with stderr `forbidden c
 - After writing a file, read it back to confirm contents match intent.
 - After running a command, check exit codes and output.
 - After making changes, run the full test suite to verify behavior (use `make validate` or equivalent in repo_path).
+- **Shared-file impact gate (caylent-solutions/devbench-internal-backlog#13).** Before logging completion, run:
+  ```bash
+  uv run devbench check-shared-file-impact $ARGUMENTS
+  ```
+  This runs no test suite for most tasks: when the gate is disabled or unconfigured for the
+  target repo, exit 0 and print only `{"gate": "shared_file_impact", "status": "disabled"}`
+  (no payload, no `shared_file_impact` key at all); when the gate is enabled but this task's
+  diff (resolved through the same ADR-12 mode-aware scope helper `get-diff` uses, never a raw
+  working-tree scan) touches none of the target repo's configured
+  `gates.repos.<repo>.shared_file_impact.patterns` (an app-level composition root, a shared
+  shell/container component, a widely-consumed shared hook) or auto-derived shared files,
+  exit 0 and print the payload with `shared_file_impact: false`. It is NOT a full no-op even
+  on this enabled no-match path, though: when `gates.shared_file_impact.enabled` is `true` for
+  the repo AND this task's Changes Manifest is non-empty, a no-match run still appends a
+  `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` record to this
+  task's audit trail -- `mark-done` requires a fresh one of these (or an operator
+  `[GATE_WAIVER shared_file_impact]`) before it will proceed, refusing otherwise with the
+  exact `uv run devbench check-shared-file-impact <unit-id>` remediation command. When it matches, the command runs the FULL
+  test suite (not just the files this task touched) and reports that repo-wide RESULT, but
+  BLOCKS (non-zero exit) only on a new failure vs. the stored baseline whose failing node id
+  is attributable to THIS task's own Changes Manifest scope -- a regression this task caused
+  in a file it actually touched. A new failure whose file is outside that scope (a regression
+  this task caused in code that was never in its own Changes Manifest) is still surfaced in
+  the JSON payload's `unattributed_new_failures` list, but never blocks and never fails this
+  task; `go test` / jest node ids ordinarily carry no file segment and so are attributable
+  unconditionally (a test name or description that happens to contain a literal `::` is a rare
+  exception -- it is still split on the file-segment check). A `PostToolUse` guard hook
+  (`assert-shared-file-impact.sh`) enforces this: `check-shared-file-impact` persists its own
+  verdict to a small record file as the very first thing it does (`"pending"`, overwritten with
+  `"pass"` or `"block"` only on a clean exit), and the hook's entire job is reading that record
+  back on the next Bash call whose `PostToolUse` event reaches it -- never re-parsing the command
+  text or its own printed JSON output. A `"block"` record blocks progression the same way a
+  failing `pytest` / `make test` already does via `assert-tests-pass.sh`, and stays blocking
+  (never silently overwritten by a DIFFERENT, later invocation's own write) until the hook
+  actually consumes it; the hook also fails CLOSED (blocks) when the record still reads
+  `"pending"` -- covering every error path `check-shared-file-impact` can exit through, after its
+  initial write, without reaching a clean verdict (an unrecognised unit id, no local repo path
+  configured, the config file failed to load, a scope-resolution error, the import-fan-in scan
+  failed, `_evaluate_shared_file_gate` raising `RuntimeError`/`UnknownTestRunnerError`/
+  `TimeoutError`, the due `[GATE_PASS shared_file_impact]` record write
+  failing -- the work-unit file cannot be located, or the audit-marker append itself raises an
+  `OSError` -- or the process crashing or being killed mid-run). A
+  `"pending"` left by an invocation that crashed mid-run is protected almost the same way as a
+  `"block"`: it is never silently overwritten by a DIFFERENT invocation's own `"pending"` or
+  `"pass"` write, only by that same crashed invocation's own follow-up write (which never comes),
+  by the hook consuming it, or by a DIFFERENT invocation's own genuine `"block"` write -- a foreign
+  `"block"` always escalates over an unconsumed `"pending"` (never refused), since `"block"` is
+  itself the strongest, sticky status and nothing is lost by letting the escalation land. If it
+  blocks, fix every failure it names in `new_failures` (do not delete or skip those tests) and
+  re-run it before logging completion -- do not mark the task done with an unresolved block. This
+  verdict record is keyed only by (workspace, session) -- not by which agent wrote it -- so on a
+  workspace/session shared with other concurrently-running agents (e.g. review judges) a
+  `"block"` naming a DIFFERENT unit id than the one you are executing can, in rare cases, surface
+  on your own next Bash call; treat it the same way (resolve the named unit's failure, or escalate
+  if it is not yours to fix) rather than assuming the hook misfired.
 - Document all verification steps in the log comment below.
 
 ---

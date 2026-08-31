@@ -30,6 +30,7 @@ from devbench.session import (
     SessionRegistry,
     detect_scope_overlap,
     flock_backlog,
+    flock_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -376,6 +377,107 @@ class TestLivenessOfSessions:
     def test_empty_list_returns_empty_dict(self, workspace: Path) -> None:
         reg = SessionRegistry(workspace)
         assert reg.liveness_of_sessions([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# flock_path
+# ---------------------------------------------------------------------------
+
+
+class TestFlockPath:
+    """Direct tests for the generic ``flock_path`` primitive ``flock_backlog`` wraps.
+
+    ``flock_backlog`` reuses this primitive rather than re-implementing the
+    poll/timeout logic (spec `integration-reality-gates-hardening.md` Section
+    3), and the shared-file baseline writer (``src/devbench/cli.py``) is a
+    second, independent caller with its own lock-path sibling file -- so this
+    class exercises the generic contract directly, including the ``shared``
+    branch that ``flock_backlog`` never uses.
+    """
+
+    def test_lock_file_created_at_arbitrary_path(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "nested" / "custom.lock"
+        with flock_path(lock_path, timeout_seconds=5):
+            assert lock_path.exists()
+
+    def test_lock_released_on_normal_exit_allows_reacquire(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        with flock_path(lock_path, timeout_seconds=5):
+            pass
+        with flock_path(lock_path, timeout_seconds=1):
+            pass
+
+    def test_lock_released_on_exception_allows_reacquire(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        with pytest.raises(RuntimeError, match="boom"):
+            with flock_path(lock_path, timeout_seconds=5):
+                raise RuntimeError("boom")
+        with flock_path(lock_path, timeout_seconds=1):
+            pass
+
+    def test_non_positive_timeout_raises_value_error(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        with pytest.raises(ValueError, match="timeout_seconds must be positive"):
+            with flock_path(lock_path, timeout_seconds=0):
+                pass
+
+    def test_exclusive_holder_blocks_a_second_exclusive_acquire_until_timeout(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as held_fd:
+            fcntl.flock(held_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with pytest.raises(TimeoutError, match=r"custom\.lock"):
+                    with flock_path(lock_path, timeout_seconds=1):
+                        pass
+            finally:
+                fcntl.flock(held_fd.fileno(), fcntl.LOCK_UN)
+
+    def test_timeout_error_message_contains_timeout_value(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as held_fd:
+            fcntl.flock(held_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with pytest.raises(TimeoutError, match="1s"):
+                    with flock_path(lock_path, timeout_seconds=1):
+                        pass
+            finally:
+                fcntl.flock(held_fd.fileno(), fcntl.LOCK_UN)
+
+    def test_shared_holder_blocks_a_concurrent_exclusive_acquire(self, tmp_path: Path) -> None:
+        """A ``shared=True`` reader is not invisible to a concurrent exclusive writer:
+        the writer must wait, so it can never observe a torn/in-progress read."""
+        lock_path = tmp_path / "custom.lock"
+        with flock_path(lock_path, timeout_seconds=5, shared=True):
+            with pytest.raises(TimeoutError):
+                with flock_path(lock_path, timeout_seconds=1, shared=False):
+                    pass
+
+    def test_two_shared_holders_do_not_block_each_other(self, tmp_path: Path) -> None:
+        """Two concurrent ``shared=True`` acquisitions on the same lock both succeed."""
+        lock_path = tmp_path / "custom.lock"
+        with flock_path(lock_path, timeout_seconds=5, shared=True):
+            with flock_path(lock_path, timeout_seconds=1, shared=True):
+                pass
+
+    def test_lock_file_is_never_deleted(self, tmp_path: Path) -> None:
+        """The lock file itself is a pure lock inode -- it survives the context exiting,
+        unlike the data file callers write under the lock."""
+        lock_path = tmp_path / "custom.lock"
+        with flock_path(lock_path, timeout_seconds=5):
+            pass
+        assert lock_path.exists()
+
+    def test_unexpected_os_error_propagates(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "custom.lock"
+        with patch(
+            "devbench.session.fcntl.flock",
+            side_effect=OSError(errno.EBADF, "Bad file descriptor"),
+        ):
+            with pytest.raises(OSError, match="Bad file descriptor"):
+                with flock_path(lock_path, timeout_seconds=5):
+                    pass
 
 
 # ---------------------------------------------------------------------------

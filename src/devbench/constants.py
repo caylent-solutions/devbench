@@ -12,6 +12,7 @@ region below and consumed by ``src/devbench/session.py``.
 """
 
 import re
+from collections.abc import Mapping
 
 # ---------------------------------------------------------------------------
 # Markdown section headers
@@ -1307,3 +1308,208 @@ SKILL_AUDIT_MAX_ITERATIONS_REACHED: str = "[SKILL_MAX_ITERATIONS_REACHED]"
 
 # Audit-row tag emitted when a skill converges (unresolved count <= threshold).
 SKILL_AUDIT_QUALITY_THRESHOLD_REACHED: str = "[SKILL_QUALITY_THRESHOLD_REACHED]"
+
+
+# ---------------------------------------------------------------------------
+# Integration-reality gates (spec integration-reality-gates-hardening.md
+# section 4.1; caylent-solutions/devbench-internal-backlog#10..#17; D-2,
+# D-15, D-17). Built-in defaults for the eight gates' resolver-managed
+# fields, consumed exclusively by ``config_loader.resolve_gate_config`` --
+# the single read path for gate configuration (AC-27).
+# ``config_loader.GATE_NAMES`` (a frozenset, used for O(1) membership
+# checks) derives from the ordered tuple below rather than repeating the
+# literal gate-name list a second time.
+# ---------------------------------------------------------------------------
+
+# Canonical name of the ancestry gate (spec 4.5; internal issue #12 AC3).
+# Declared once here, alongside ``GATE_NAMES``, so every module that needs
+# to compare against or look up this gate by name (``cli.py``,
+# ``devbench.backlog.manager``) imports the SAME symbol instead of each
+# declaring its own hand-typed module-private mirror of the literal
+# "ancestry" -- exactly the drift-prevention pattern ``GATE_STATUS_*``
+# already documents below (code_review FAIL, E4-F2-S1-T1 round 1: two
+# independent module-private copies of this literal had drifted into a
+# third, undetected one).
+GATE_ANCESTRY: str = "ancestry"
+
+# Ordered, canonical list of the eight integration-reality gate names.
+GATE_NAMES: tuple[str, ...] = (
+    "reachability",
+    GATE_ANCESTRY,
+    "shared_file_impact",
+    "fixture_consistency",
+    "write_path_audit",
+    "newly_reachable_paths",
+    "composition_root",
+    "layout_geometry",
+)
+
+# D-17: every gate disabled by default; every implemented tunable at its
+# documented, equally-disabled default. ``fan_in_threshold`` (spec 4.6
+# hardening; shipped by E5-F2-S1-T2 as
+# ``GateSharedFileImpactConfig.fan_in_threshold``) is an int-valued tunable,
+# not modeled in this bool-only dict: ``resolve_gate_config`` merges it
+# through its own gate-specific step
+# (``_merge_shared_file_impact_fan_in_threshold`` in ``config_loader.py``),
+# mirroring how ``reachability.entry_points`` is merged.
+GATE_ENABLED_DEFAULT: bool = False
+GATE_AUTO_DERIVE_REGISTRY_DEFAULT: bool = False
+GATE_EXTRACT_SOURCE_LITERALS_DEFAULT: bool = False
+
+# Built-in per-gate default field values, keyed by gate name then field
+# name. Every gate carries "enabled"; `shared_file_impact` additionally
+# carries "auto_derive_registry" and `fixture_consistency` additionally
+# carries "extract_source_literals" -- the only tunables with a
+# project/built-in precedence relationship today (spec 4.1). Structural,
+# list-valued config (`canonical_sources`, `scan`, `patterns`) is
+# project/per-repo-only with no built-in default to merge against, so it
+# is intentionally absent here.
+GATE_FIELD_DEFAULTS: dict[str, dict[str, bool]] = {
+    "reachability": {"enabled": GATE_ENABLED_DEFAULT},
+    "ancestry": {"enabled": GATE_ENABLED_DEFAULT},
+    "shared_file_impact": {
+        "enabled": GATE_ENABLED_DEFAULT,
+        "auto_derive_registry": GATE_AUTO_DERIVE_REGISTRY_DEFAULT,
+    },
+    "fixture_consistency": {
+        "enabled": GATE_ENABLED_DEFAULT,
+        "extract_source_literals": GATE_EXTRACT_SOURCE_LITERALS_DEFAULT,
+    },
+    "write_path_audit": {"enabled": GATE_ENABLED_DEFAULT},
+    "newly_reachable_paths": {"enabled": GATE_ENABLED_DEFAULT},
+    "composition_root": {"enabled": GATE_ENABLED_DEFAULT},
+    "layout_geometry": {"enabled": GATE_ENABLED_DEFAULT},
+}
+
+# DEVBENCH_GATE_<NAME>_ENABLED env-var name components (spec Section 7):
+# workspace-wide, highest-precedence layer, resolved by
+# ``devbench.config.resolve_gate_env_override`` through the existing
+# ``_resolve_bool`` chain.
+GATE_ENV_VAR_PREFIX: str = "DEVBENCH_GATE_"
+GATE_ENV_VAR_SUFFIX: str = "_ENABLED"
+
+# Per-field provenance labels rendered by the `devbench gates` provenance
+# column (spec 4.1, D-15; AC-27) -- which of the four precedence layers set
+# a resolved field.
+GATE_PROVENANCE_BUILTIN: str = "builtin"
+GATE_PROVENANCE_PROJECT: str = "project"
+GATE_PROVENANCE_REPO: str = "repo"
+GATE_PROVENANCE_ENV: str = "env"
+
+# ---------------------------------------------------------------------------
+# Gate tier taxonomy (spec integration-reality-gates-hardening.md section
+# 4.2, D-6; AC-E2-F2-S1-T1-4, AC-E2-F2-S1-T1-5). Three tiers describe how
+# strongly a gate's outcome is trusted:
+#   - machine-blocking: a passing `[GATE_PASS <gate>]` record
+#     (`devbench.gate_records`) is REQUIRED before `mark_done` proceeds
+#     (E2-F2-S1-T2's `_check_gate_pass_done_invariant`).
+#   - judge-evidence: the gate's findings inform the review judges but do
+#     not themselves block `mark_done`.
+#   - advisory: informational only. No gate carries this tier today -- D-6
+#     assigns only the two tiers above to the eight declared gates -- but
+#     the symbol exists so a future gate can adopt the weakest tier without
+#     inventing a fourth taxonomy value.
+# PM-3: these are named importable symbols, not inline strings, because the
+# `gates` CLI table, each gate command's output line, and the judge/docs
+# vocabulary tests (E2-F2-S2-T1) all cross-reference them.
+# ---------------------------------------------------------------------------
+GATE_TIER_MACHINE_BLOCKING: str = "machine-blocking"
+GATE_TIER_JUDGE_EVIDENCE: str = "judge-evidence"
+GATE_TIER_ADVISORY: str = "advisory"
+
+# D-6's machine-blocking set, declared once as the single input GATE_TIERS
+# below is built from. Keeping this private and gate-name-only (rather than
+# writing GATE_TIERS as an independent literal dict) means GATE_TIERS's keys
+# can never drift from GATE_NAMES: a ninth gate added to GATE_NAMES without a
+# tier decision here automatically lands in the weaker judge-evidence tier
+# instead of being silently absent from GATE_TIERS.
+_GATE_TIER_D6_MACHINE_BLOCKING_NAMES: frozenset[str] = frozenset(
+    {"reachability", GATE_ANCESTRY, "shared_file_impact", "fixture_consistency"}
+)
+
+# Declares the tier of all eight gates (spec 4.2, D-6): reachability,
+# ancestry, shared_file_impact and fixture_consistency are machine-blocking;
+# write_path_audit, newly_reachable_paths, composition_root and
+# layout_geometry are judge-evidence.
+GATE_TIERS: Mapping[str, str] = {
+    gate: (GATE_TIER_MACHINE_BLOCKING if gate in _GATE_TIER_D6_MACHINE_BLOCKING_NAMES else GATE_TIER_JUDGE_EVIDENCE)
+    for gate in GATE_NAMES
+}
+
+# ---------------------------------------------------------------------------
+# Gate status vocabulary (spec integration-reality-gates-hardening.md
+# section 5.2, 4.1). Every gate command's spec 5.2 status line and spec 4.1
+# disabled line report ``status`` as exactly one of these four values;
+# declared once here, beside ``GATE_NAMES``/``GATE_TIERS``, so per-gate
+# command implementations in ``cli.py`` (``cmd_check_ancestry``,
+# ``cmd_check_reachability``, and future gate commands) share a single
+# source instead of each declaring its own byte-identical
+# ``_<GATE>_STATUS_*`` constants.
+# ---------------------------------------------------------------------------
+GATE_STATUS_DISABLED: str = "disabled"
+GATE_STATUS_PASS: str = "pass"
+GATE_STATUS_FAIL: str = "fail"
+GATE_STATUS_ERROR: str = "error"
+
+# ---------------------------------------------------------------------------
+# GATE_WAIVER marker attribution vocabulary (spec 3.6, 4.9; D-6). A
+# ``[GATE_WAIVER <gate>]`` marker's attribution field is exactly one of
+# these two values: "operator" is the only waiver authority for a
+# machine-blocking gate (``GATE_TIER_MACHINE_BLOCKING`` above) -- an
+# "executor"-attributed marker alone never satisfies one, since executors
+# do not self-certify a machine-blocking gate's outcome. Single-sourced
+# here so ``devbench.backlog.manager`` (``compose_gate_waiver_record`` /
+# ``parse_gate_waiver_record``'s grammar and the ``mark_done`` gate-record
+# invariant) and ``devbench.cli`` (``log-waiver``'s ``--operator`` flag and
+# each machine-blocking gate command's waiver-adoption filter, e.g.
+# ``check-reachability``) share one vocabulary instead of each re-declaring
+# the literal ``"operator"``/``"executor"`` strings.
+# ---------------------------------------------------------------------------
+GATE_WAIVER_ATTRIBUTION_OPERATOR: str = "operator"
+GATE_WAIVER_ATTRIBUTION_EXECUTOR: str = "executor"
+
+# ---------------------------------------------------------------------------
+# Layout/geometry AC tagging grammar (spec 4.9c; 319-D critical). PR #319
+# shipped ``[LAYOUT-AC]`` tagging as prompt-only prose that told authors to
+# place the tag in a position ``validate-backlog`` never parsed, so nothing
+# in the toolchain could distinguish a correctly tagged unit from a silently
+# ignored one. These two constants move the tag onto the acceptance-criteria
+# line grammar ``devbench.backlog.manager._check_layout_ac_grammar`` walks,
+# and give the keyword heuristic a single source of truth. Consumed (never
+# hand-copied) by the ``spec-to-backlog`` SKILL's Step 3a authoring
+# instruction and by ``test-reviewer.md``'s LAYOUT / VISUAL AC VERIFICATION
+# rubric -- both surfaces render the keyword list from
+# ``LAYOUT_GEOMETRY_KEYWORDS`` between a
+# ``<!-- generated:layout-ac-keywords -->`` guard-marker pair, actually
+# regenerated by ``devbench.backlog.manager.regenerate_layout_ac_keyword_surfaces``
+# (``REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND`` names the exact
+# regeneration command) and pinned byte-identical against this constant by
+# ``tests/test_constants.py``.
+# ---------------------------------------------------------------------------
+LAYOUT_AC_TAG: str = "[LAYOUT-AC]"
+
+# Whitespace-free, lower-case keyword tokens (spec-to-backlog Step 3a's
+# original heuristic phrasing preserved, with ``position: fixed`` /
+# ``position: absolute`` compacted to a colon-joined, space-free token so
+# every member satisfies the whitespace-free shape this constant is pinned
+# to). Matching removes all whitespace from the candidate AC text (case
+# folded to lower-case) before the substring check, so authored prose
+# reading ``position: fixed`` normalizes to ``position:fixed`` and matches
+# this token unchanged. A ``[LAYOUT-AC]``-tagged AC line must name at least
+# one of these keywords (case-insensitive, substring match after whitespace
+# removal) or ``validate-backlog`` rejects it (spec 4.9c).
+LAYOUT_GEOMETRY_KEYWORDS: frozenset[str] = frozenset(
+    {
+        "sticky",
+        "z-index",
+        "viewport",
+        "breakpoint",
+        "flex-shrink",
+        "autosize",
+        "overlap",
+        "position:fixed",
+        "position:absolute",
+        "cascade",
+        "specificity",
+    }
+)

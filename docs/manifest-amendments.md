@@ -72,7 +72,7 @@ If either post-check fails, the atomic rename is reversed and the work-unit file
 4. The orchestrator detects the pending request file after the executor returns and invokes the `manifest-amender` agent.
 5. The agent reads the work unit, the staged diff, and the request JSON; decides `apply` or `reject`.
 6. On `apply`: the agent runs `uv run devbench apply-amendment <task-id>`. CLI appends rows, writes audit, atomically commits to disk, runs Layer 3 post-check. On success the request file is deleted; on failure the write is rolled back and the agent logs REVIEW_FAIL.
-7. On `reject`: the agent (a) first reverts every file listed in the pending request from the target repo (`git restore --staged`, `checkout --`, `clean -f --`) so stale staged edits do not leak into subsequent tasks, then (b) runs `uv run devbench reject-amendment <task-id> "<reason>"`. CLI writes a rejection audit comment, transitions the task to `blocked`, and **archives** the pending request to `<workspace>/.devbench/rejected-requests/<task-id>-<timestamp>.json` so `blocker-resolver` + `task-factory` (on by default, see [ADR-03](adr/03-task-factory.md) and [ADR-32](adr/32-task-factory-default-on.md)) can read it afterwards. The agent MUST verify the archive exists on disk before logging its verdict -- the manifest-amender prompt has a numbered execute-and-verify recipe with a final `test -f .devbench/rejected-requests/...` assertion that aborts the verdict if the side-effect did not land.
+7. On `reject`: the agent (a) first reverts every file listed in the pending request from the target repo so stale staged edits do not leak into subsequent tasks, then (b) runs `uv run devbench reject-amendment <task-id> "<reason>"`. `plugin/devbench-orchestrate/agents/manifest-amender.md`'s **Step B.reject** block is the single source of truth for step (a)'s recipe -- this doc does not restate its commands, so the two documents cannot drift out of sync when the recipe changes. CLI writes a rejection audit comment, transitions the task to `blocked`, and **archives** the pending request to `<workspace>/.devbench/rejected-requests/<task-id>-<timestamp>.json` so `blocker-resolver` + `task-factory` (on by default, see [ADR-03](adr/03-task-factory.md) and [ADR-32](adr/32-task-factory-default-on.md)) can read it afterwards. The agent MUST verify both the archive and the structured rejection-feedback JSON exist on disk before logging its verdict -- the manifest-amender prompt's recipe aborts the verdict if either side effect did not land.
 8. On post-Layer-3 success the standard review-supervisor runs against the updated manifest; the rest of the pipeline is unchanged.
 
 ## Amendment request JSON schema
@@ -115,23 +115,36 @@ The amender also logs a final `REVIEW_PASS` or `REVIEW_FAIL` verdict via `log-ve
 
 ### Rejection feedback persistence (issue #154)
 
-Every rejection also writes a structured feedback JSON to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json` so the executor-feedback collector can ingest the rejection on the next retry. Schema:
+Every rejection also writes a structured feedback JSON via `persist_rejection_feedback()` (`src/devbench/backlog/amendment.py`) so the executor-feedback collector can ingest the rejection on the next retry. Issue #154's original implementation wrote to `<workspace>/.devbench/amender-rejections/<task-id>-<n>.json`; issue #156 unified this with every other review-judge rejection, so the current write path is `<workspace>/.devbench/review-failures/<task-id>-manifest_amender-<n>.json` -- the `manifest_amender` segment is the judge name in the shared review-failures schema. The legacy `amender-rejections` directory is preserved **read-only**: `read_review_failure_files()` still reads it (forward compatibility for archived runs), but nothing writes to it anymore. Schema:
 
 ```json
 {
+  "schema_version": 1,
   "task_id": "EX-F1-S1-T1",
+  "judge": "manifest_amender",
   "attempt": 1,
+  "rejected_at": "2026-05-02T12:34:56Z",
+  "categories": [
+    {
+      "code": "SCOPE",
+      "severity": "fail",
+      "summary": "amendment is out of scope for this task",
+      "remediation": "Address the manifest-amender finding and re-stage; or surface a dependent task via [NEEDS_DEP] when the fix belongs upstream.",
+      "files": ["path/to/file.py"]
+    }
+  ],
+  "raw_verdict_text": "amendment is out of scope for this task",
+  "capped": false,
   "reason_category": "SCOPE",
   "reason_text": "amendment is out of scope for this task",
   "request": { /* original AmendmentRequest dict */ },
-  "capped": false,
   "recorded_at": "2026-05-02T12:34:56Z"
 }
 ```
 
-`reason_category` is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Rejection reasons that include any of the canonical category tokens are auto-classified by substring match; everything else falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
+`categories[].code` (and the legacy `reason_category` field, preserved for issue #154 consumers) is one of `SCOPE` / `APPROACH_AUTH` / `JUSTIFICATION_COHERENCE` / `PRE_FILTER` / `OTHER`. Classification resolves by the EARLIEST canonical token named in the upper-cased rejection reason, not by a fixed scan order over the taxonomy: a reason mentioning several tokens (for example a rejection that opens with `PRE_FILTER` but later reports that `APPROACH_AUTH, SCOPE and JUSTIFICATION_COHERENCE all PASSED`) classifies as whichever token appears first in the text. A reason naming no canonical token falls back to `OTHER`. The amender prompt instructs the LLM to surface the canonical token inline so consumers always see a known category.
 
-The directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
+The `review-failures` directory layout mirrors `<workspace>/.devbench/ci-failures/` (used by `_handle_ci_failure`) and `<workspace>/.devbench/pr-bot-feedback/` (used by `_handle_pr_review_resolution`). The blocker-resolver / executor-feedback consumer reads all three paths via the same retry pipeline so every kind of late-stage rejection feeds the next executor invocation. The per-task attempt counter is bounded by `MAX_RETRY_ATTEMPTS`; once the cap is exceeded the file is still written but stamped `"capped": true` so consumers can detect budget exhaustion rather than silently dropping the record.
 
 ## What the amendment workflow does NOT do
 

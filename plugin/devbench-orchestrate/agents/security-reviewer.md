@@ -158,4 +158,6 @@ If failing, include the most critical finding (with severity classification) in 
 ```
 uv run devbench log-rejection-feedback security_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `security_review`: `SECRET_LEAK`, `UNAUTHORIZED_DEP`, `SCOPE_VIOLATION`. See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
+Every `code` MUST come from the controlled vocabulary for `security_review`: `SCOPE_VIOLATION`, `SECRET_LEAK`, `UNAUTHORIZED_DEP`.
+<!-- /generated:vocabulary --> See `docs/review-feedback-vocabulary.md` for per-code remediation guidance.

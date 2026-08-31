@@ -62,7 +62,38 @@ plugin/devbench-orchestrate/
     │                              (ADR-33: review-supervisor never spawns the judges itself). Issue #118
     │                              -- closes the loophole where the supervisor escalated to repo-mutation
     │                              rights via subagent spawn.
-    └── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    ├── assert-tests-pass.sh     ← enforces test suite passes after Bash
+    └── assert-shared-file-impact.sh
+                                 ← enforces the shared-file full-suite regression gate
+                                   (caylent-solutions/devbench-internal-backlog#13):
+                                   blocks when `devbench check-shared-file-impact` reports a diff
+                                   touched a `gates.repos.<repo>.shared_file_impact.patterns`
+                                   match, OR (when `gates.shared_file_impact.auto_derive_registry`
+                                   is enabled, caylent-solutions/devbench-internal-backlog#13 AC4)
+                                   touched a file the import-fan-in scanner derived -- an empty
+                                   `patterns` list does not by itself mean this gate never fires --
+                                   AND the full-suite run introduced a failure attributable
+                                   to the unit's own Changes Manifest scope that is not present in
+                                   the stored baseline (a new failure outside that scope is
+                                   reported but never blocks). Reads the verdict from a small
+                                   record file `check-shared-file-impact` persists as the very
+                                   first thing it does, never from the invoking command's own
+                                   text or `tool_response.stdout` -- and fails CLOSED (blocks) on
+                                   a record still reading `"pending"` (every error path
+                                   `check-shared-file-impact` can exit through, after its initial
+                                   write, without reaching a clean `"pass"`/`"block"` verdict).
+                                   An unconsumed `"block"` record is never overwritten by a
+                                   DIFFERENT, later invocation's own write; an unconsumed
+                                   `"pending"` record is never overwritten by a DIFFERENT, later
+                                   invocation's own `"pending"`/`"pass"` write, but IS escalated by
+                                   a DIFFERENT invocation's own genuine `"block"` write (each
+                                   invocation carries its own PID+counter identity) since nothing
+                                   is lost letting the strongest verdict land; the SAME
+                                   invocation's own pending -> pass/block transition is
+                                   unaffected. Registered on `PostToolUse`
+                                   only (not `PostToolUseFailure`), so a blocking gate run's own
+                                   non-zero-exit Bash call is observed on the NEXT `PostToolUse`-
+                                   emitting Bash call, not necessarily its own.
 ```
 
 ---

@@ -14,6 +14,34 @@ Work unit and repo context:
 Git diff (authoritative work-unit scope per ADR-12):
 !`uv run devbench get-diff $ARGUMENTS`
 
+Write-path audit re-run (judge-evidence, conditional -- spec 4.8, 321-D21): if this unit's
+Acceptance Criteria name a permission or eligibility flag (the write-path task shape the
+`spec-to-backlog` skill's Step 4a generates from a Step 3b copy-pattern match), run
+`uv run devbench check-write-path $ARGUMENTS --flag <flag-name>` with your Bash tool, substituting
+the flag named in the Acceptance Criteria for `<flag-name>`, and read the spec 5.2 status line it
+prints as its first stdout line. A `verdict` of `default`, `no_write_path` or `not_found` on a
+delivered write-path task is a `WRITE_PATH_UNVERIFIED` rejection: quote the printed `verdict` and
+the audit's evidence lines in the feedback. See the WRITE-PATH AUDIT rubric below for how to weigh
+the result.
+
+Cross-cutting-primitives registry (judge-evidence, conditional -- spec 4.9a, decision C-03): the retired
+free-text `backlog/config/cross-cutting-primitives.md` file no longer exists in this workspace layout. The
+registry now lives at `gates.newly_reachable_paths.paths` (project-level) and
+`gates.repos.<org/repo>.newly_reachable_paths.paths` (repo-level override) in `backlog/config/devbench.yaml`,
+resolved exclusively through `resolve_gate_config` (`src/devbench/config_loader.py`). Run `uv run devbench gates`
+with your Bash tool; its `newly_reachable_paths` row's `status` column resolves against whichever repo's
+override actually sets `enabled` (the first sorted repo carrying one), which is NOT guaranteed to be this
+target repo once more than one repo carries an override -- confirm this repo's actual enabled/disabled value
+directly via `gates.repos.<org/repo>.newly_reachable_paths.enabled` in `backlog/config/devbench.yaml` when in
+doubt. Then read the `gates.newly_reachable_paths.paths` and `gates.repos.<org/repo>.newly_reachable_paths.paths`
+entries directly from `backlog/config/devbench.yaml` for the configured path list -- `devbench gates` itself
+renders status/provenance only, not the `paths` list. An absent or empty `paths` list means no registry is
+configured for this repo; skip rule 55. See `docs/newly-reachable-paths.md`'s "Gate config" section for the
+full precedence model.
+
+Reachability evidence (candidate-surfacing scan -- a clean enabled run also persists a [GATE_PASS reachability] record into the work-unit file, see REACHABILITY rubric below for how to judge):
+!`uv run devbench check-reachability $ARGUMENTS`
+
 **Scope contract:** `devbench get-diff` is the AUTHORITATIVE source of "what changed in this work unit". Do NOT run `git diff origin/main`, `git diff main...HEAD`, or any other raw-git command to compute scope; in single-branch + defer_pr mode those views include accumulated work from prior tasks (ADR-12) and produce false positives.
 
 ---
@@ -101,6 +129,28 @@ Evaluate the code diff against the acceptance criteria and CLAUDE.md standards.
 51. Deployment smoke tests (`tests/smoke/`) must exist for every new API endpoint: at minimum a `/health` GET and one authenticated endpoint call that verifies HTTP status codes against the deployed environment.
 52. The local development table-creation script (`scripts/create-local-tables.sh`) must be updated whenever a new DynamoDB table is added.
 
+## BUG-FIX COMPLETENESS
+This section applies only when the work unit declares `## Task Type: behavior-fix` (the taxonomy `manager.py` validates). That declared header is a DIFFERENT field from the one `task-factory`'s `generate_draft_md` uses to gate its newly-reachable-paths acceptance-criterion auto-append: the auto-append keys off `ProposedTask.task_type` (default `behavior-fix`), while the drafted file's `## Task Type:` header is rendered separately via `infer_task_type(files_to_own)` (`src/devbench/backlog/proposal.py`) -- the two can diverge, so a drafted unit can carry the newly-reachable AC line while its own `## Task Type:` header reads `docs`. Whether THIS section applies to the unit under review is decided strictly by the header on that unit. Skip this section entirely for `docs`, `chore`, `test-only`, `refactor`, and `feature`-typed units. Full rationale and worked examples: `docs/newly-reachable-paths.md`.
+
+53. When the `newly_reachable_paths` row of the `uv run devbench gates` table (run in Evidence above) resolves `status` `enabled` for this repo (see the per-repo resolution caveat in the Cross-cutting-primitives registry paragraph above), the TDD Cycle Log audit section (retained by this judge's `read-unit --strip-comments` Evidence fetch, unlike the Comments section) carries a `[NEWLY_REACHABLE] <path> <method> <result>` marker per path -- written via `uv run devbench log-newly-reachable`, an explicit enumeration of the code paths this fix newly makes reachable. FAIL with `NEWLY_REACHABLE_PATH_UNVERIFIED` if a `behavior-fix` unit's log carries no such marker while the gate is enabled; do not accept "the original repro now passes" as a substitute -- that is a different claim. A GREEN `log-tdd` entry stating no new path was unlocked (see `docs/newly-reachable-paths.md`'s "When no path is newly reachable") is an acceptable substitute for the marker, since `log-newly-reachable` has no `none` sentinel value -- but a bare absence of both is not. When the resolved `status` instead reads `disabled` (`constants.GATE_ENABLED_DEFAULT` is `false` at every level, so this is the common case), `executor.md` Main sequence step 6b correctly skips the `log-newly-reachable` CLI call -- do not FAIL for a missing marker in that case. Still require the GREEN `log-tdd` entry to record the enumeration/live-verification evidence `executor.md`'s "Drafted AC vs. gate config" paragraph describes, and FAIL with `NEWLY_REACHABLE_PATH_UNVERIFIED` only if that record is itself absent.
+54. Each `[NEWLY_REACHABLE]` marker's newly-reachable path is backed by evidence of a real/live check -- the marker's own `--method` field (`manual`, `unit_test`, `integration_test`, `functional_test`) is not itself sufficient; the diff or log must also carry the actual command/test-run output or an explicit manual-verification note naming what was exercised and the result, not just restated confidence that the code "should" work. FAIL with `NEWLY_REACHABLE_PATH_UNVERIFIED` if any marked path has no verification evidence attached.
+55. If the diff touches a file named in the resolved cross-cutting-primitives registry (`gates.newly_reachable_paths.paths`, read in Evidence above, when non-empty for this repo), the `[NEWLY_REACHABLE]` marker set explicitly addresses that primitive's other named consumers. FAIL with `NEWLY_REACHABLE_PATH_UNVERIFIED` if the registry flags an overlap and no marker mentions it.
+56. `newly_reachable_paths` is a judge-evidence gate (`constants.GATE_TIERS`); a missing or inadequate `[NEWLY_REACHABLE]` marker set is evidence this review weighs, not a machine-checked outcome. This gate has no dedicated `check-newly-reachable` command that prints spec 4.1's canonical `{"gate":"newly_reachable_paths","status":"disabled"}` line; the observable signal instead is a `disabled` value in the `newly_reachable_paths` row's `status` column of the `uv run devbench gates` table run in Evidence above -- treat that reading as neither a pass nor a fail signal, never as a finding (spec `integration-reality-gates-hardening.md` Section 0.2).
+
+## REACHABILITY
+57. The reachability evidence above evaluates every classified source file in the unit's own Changes Manifest -- resolved through `devbench.work_unit_scope.resolve_changed_files` (spec 4.3, AC-9), never a scan of newly-added files in the diff -- with zero non-test word-boundary references found elsewhere in the target repo. A clean, enabled run with zero findings also persists a `[GATE_PASS reachability] <iso-utc> <scope-hash>` record into the unit's audit trail (`devbench.gate_records.compose_gate_pass_record`), which `mark-done` later requires in place of a fresh scan (or an operator waiver -- see (c) below). For each candidate in the evidence above:
+    a. For a candidate marked `[POTENTIALLY UNREACHABLE]` (including the `via orphan-chain` variant), check whether it is genuinely orphaned: not imported/mounted/routed from any real composition root (a route table, a parent container's prop list, a shell's child composition), reachable only from its own test/story file, or not reachable at all.
+    b. Rule out known false-positive shapes before failing: a dynamic `import()` / lazy route split, a barrel re-export the grep missed, a symbol name that differs from what the tool guessed, or a consumer added in a different file not yet visible to a plain grep (e.g. computed/templated identifiers). If you can find the real importer yourself from the diff or evidence, treat it as a false positive and note it as a confirmation, not a finding.
+    c. There is no source-comment escape hatch and no executor self-certification: a candidate is cleared ONLY by an OPERATOR-attributed `[GATE_WAIVER reachability] <iso-utc> <target> operator <reason>` marker naming this file in the work unit's audit trail. An executor-attributed marker on the same target exempts nothing -- `check-reachability` scans and reports the candidate normally, exactly as if no waiver existed, and `mark-done` still refuses the unit absent an operator waiver or a fresh `[GATE_PASS reachability]` record (`cli._REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION`, `manager._check_gate_pass_done_invariant`). A `[DEFERRED]` output token or a source comment naming the deleted escape-hatch marker exempts nothing either: `check-reachability` no longer emits or honours either.
+    d. A candidate legitimately cleared this way is rendered `[WAIVED] <target> -- <reason>` instead of `[OK]` / `[POTENTIALLY UNREACHABLE]` / `[LOAD_ERROR]`, and is excluded entirely from the blocking `findings` count -- the widened `Summary: <N> candidate(s) examined, <N> potentially unreachable, <N> load error(s), <N> waived.` line reports it separately. Excluding it from the count does NOT exempt the reason from scrutiny: a vague or absent `<reason>` (e.g. "TODO", "later") is itself a finding even on a `[WAIVED]` block -- require a real, specific justification (feature flag, Storybook-only, explicitly scoped follow-up task) and FAIL if the recorded reason does not meet that bar.
+    e. If a candidate is genuinely orphaned and not legitimately waived, FAIL with finding code `UNREACHABLE_ARTIFACT`: name the file, the symbol(s) checked, and state plainly that it is not imported by any non-test file, then require it be wired into the real app (or recorded as a legitimate deferral via `uv run devbench log-waiver <judge> <unit-id> --gate reachability --target <t> --reason <r> --operator`, since the operator is the only waiver authority for the reachability gate).
+    f. A `[LOAD_ERROR]` entry (candidate file unreadable) IS a blocking finding, not informational: it is counted in the spec 5.2 status line's `findings` total and drives `check-reachability`'s own exit code 1. Treat it like `[POTENTIALLY UNREACHABLE]` above -- FAIL with finding code `UNREACHABLE_ARTIFACT` naming the path and the OS error, unless the unreadability is itself explained and fixed elsewhere in the diff. The message "No classified source files found in this work unit's Changes Manifest." (an empty, correctly-scoped Manifest) is informational only -- not itself a finding.
+
+## WRITE-PATH AUDIT
+This section applies only when this unit's Acceptance Criteria name a permission or eligibility flag (the write-path task shape the `spec-to-backlog` skill's Step 4a generates from a Step 3b copy-pattern match); skip it entirely otherwise.
+
+58. `write_path_audit` is a judge-evidence gate (`constants.GATE_TIERS`); run the conditional `check-write-path` re-run instructed in the Evidence section above and read the printed spec 5.2 status line. A `verdict` of `default`, `no_write_path` or `not_found` is evidence this review weighs as a `WRITE_PATH_UNVERIFIED` finding: quote the printed `verdict` and the audit's evidence lines in the feedback, and require the flag be wired to a real (or explicit placeholder) write path before the unit is considered delivered. A `verdict` of `live` or `indeterminate` is a pass signal for this rubric item, and a `{"gate":"write_path_audit","status":"disabled"}` line means the gate is not configured for this repo -- treat it as neither a pass nor a fail signal, never as a finding.
+
 ## OUT OF SCOPE FOR FINDINGS
 The following files are operational backlog-tracking artifacts. You may read them to understand acceptance criteria, Definition of Done, and agent log evidence, but do not raise findings, flag defects, or fail based on their content or status values:
 - `BACKLOG.md` -- work-unit status index
@@ -130,7 +180,9 @@ c. **Verdict-emission contract (issue #156, FAIL only):** in addition to `log-ve
 ```
 uv run devbench log-rejection-feedback code_review $ARGUMENTS --json '<payload>'
 ```
-Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. Every `code` MUST come from the controlled vocabulary for `code_review`: `MAKE_VALIDATE_FAILURE`, `HARDCODED_URL`, `MISSING_AC_EVIDENCE`, `SOLID_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SCOPE_VIOLATION`, `MANIFEST_TODO_UNFILLED`, `AGENT_LOG_CONTRADICTS_DIFF`. The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
+Payload shape: `{"categories": [{"code": "<CODE>", "severity": "fail"|"warn", "summary": "<one-line>", "remediation": "<actionable fix>", "files": ["<path>"]}, ...], "raw_verdict_text": "<full verdict body>"}`. <!-- generated:vocabulary -->
+Every `code` MUST come from the controlled vocabulary for `code_review`: `AGENT_LOG_CONTRADICTS_DIFF`, `HARDCODED_URL`, `MAKE_VALIDATE_FAILURE`, `MANIFEST_TODO_UNFILLED`, `MISSING_AC_EVIDENCE`, `NEWLY_REACHABLE_PATH_UNVERIFIED`, `SCOPE_VIOLATION`, `SECURITY_BYPASS_ANNOTATION`, `SOLID_VIOLATION`, `UNREACHABLE_ARTIFACT`, `WRITE_PATH_UNVERIFIED`.
+<!-- /generated:vocabulary --> The executor reads the persisted JSON on retry; the done-gate refuses `mark-done` until every category is cleared via `[REJECTION_FEEDBACK_RESOLVED] code_review:<CODE>` OR escalated via `[NEEDS_DEP] code_review:<CODE>`. See `docs/review-feedback-vocabulary.md` for the per-code remediation guide.
 
 **Phase 2 -- JSON response envelope (last thing output in your response text):**
 

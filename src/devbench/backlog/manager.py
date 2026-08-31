@@ -36,10 +36,13 @@ the ``## Status Summary`` table in sync.
 import itertools
 import logging
 import re
+import subprocess
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Final
 
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.comment_time import comment_timestamp, tdd_timestamp
@@ -58,7 +61,14 @@ from devbench.constants import (
     EXPECTED_OUTPUT_LINE_RE,
     EXPECTED_OUTPUT_NONE,
     FAILURE_DIGEST_RE,
+    GATE_ANCESTRY,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
+    GATE_WAIVER_ATTRIBUTION_EXECUTOR,
+    GATE_WAIVER_ATTRIBUTION_OPERATOR,
     GATED_TASK_TYPES,
+    LAYOUT_AC_TAG,
+    LAYOUT_GEOMETRY_KEYWORDS,
     RED_OBSERVED_ENTRY_LINE_RE,
     RED_OBSERVED_MESSAGE_FIELDS_RE,
     STATUS_BLOCKED,
@@ -89,6 +99,7 @@ from devbench.constants import (
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
+from devbench.vocabulary_generation import replace_guarded_block
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -342,6 +353,289 @@ def green_green_observed_satisfied(content: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Spec 4.2/G4 machine-blocking gate-record done-gate invariant (E2-F2-S1-T2).
+# Mirrors the FR-4.5/FR-4.6 section above: a manager-level check consumed
+# directly by ``mark_done`` so every caller inherits it. Per Section 3.6,
+# executors do not self-certify gate outcomes -- the operator is the only
+# waiver authority for a machine-blocking gate -- so this module must be able
+# to tell an operator-attributed ``[GATE_WAIVER <gate>]`` marker apart from
+# an executor-attributed one before it can decide whether an ENABLED
+# machine-blocking gate's requirement is met.
+#
+# The ``log-waiver`` WRITER verb landed in E2-F4-S1-T1. The consolidated
+# waiver READER (``gate_waiver_records``, the sole scan-and-parse loop for
+# the ``[GATE_WAIVER <gate>]`` marker family) now lives in
+# ``gate_records.py`` (E3-F2-S1-T1, the first per-gate consumer that needed
+# to share it across gates); ``_latest_gate_waiver_attribution`` below
+# delegates to it rather than re-scanning *content* with a second copy of
+# the tag grammar.
+# ---------------------------------------------------------------------------
+
+# Bounded timeout (seconds) for the read-only ``git hash-object`` call used
+# to recompute a machine-blocking gate's scope hash for freshness comparison
+# (spec 4.2, AC-7). Mirrors ``devbench.backlog.manifest._GIT_DIFF_TIMEOUT``'s
+# generous-but-bounded git-subprocess discipline.
+_GATE_SCOPE_HASH_GIT_TIMEOUT: int = 30
+
+
+def _latest_gate_waiver_attribution(content: str, gate: str) -> str | None:
+    """Return the attribution of the most recent ``[GATE_WAIVER <gate>]`` marker for *gate*.
+
+    Delegates to ``devbench.gate_records.gate_waiver_records``, the sole
+    scan-and-parse loop for the ``[GATE_WAIVER <gate>]`` marker family
+    (spec 4.9, 5.3), rather than re-scanning *content* with a second, looser
+    copy of the tag regex: two independent readers of the same grammar had
+    drifted (``code_review`` SOLID_VIOLATION,
+    ``.devbench/review-failures/E3-F2-S1-T1-code_review-1.json``) -- this
+    module's own former ``_GATE_WAIVER_TAG_RE`` line-scan pulled out only
+    the attribution field via a loose pattern that never routed through
+    ``parse_gate_waiver_record``, the strict spec-5.3 grammar authority, so
+    it silently treated a marker with an empty reason or a missing target
+    as a well-formed, attributable waiver. Routing through
+    ``gate_waiver_records`` means a malformed marker for *gate* is now a
+    loud ``RuntimeError`` here too, matching the fail-fast rule every other
+    reader of this marker family already enforces.
+
+    Mirrors ``gate_records.latest_gate_pass_record``'s append-only-log
+    semantics: ``gate_waiver_records`` returns every well-formed record for
+    *gate* in file order, and the LAST one (across every target) wins, so
+    the most recently written waiver for *gate* wins regardless of which
+    target it names.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+        gate: The declared gate name to look up.
+
+    Returns:
+        ``"operator"`` or ``"executor"`` (the marker's attribution field),
+        or ``None`` when no well-formed ``[GATE_WAIVER <gate>]`` marker is
+        present.
+
+    Raises:
+        RuntimeError: A line tagged ``[GATE_WAIVER <gate>]`` is present but
+            the remainder of that line does not parse as a well-formed
+            record (spec Section 7 fail-loud rule) -- a malformed waiver
+            for *gate* is never silently skipped or treated as "not a
+            waiver".
+    """
+    from devbench.gate_records import gate_waiver_records
+
+    try:
+        records = gate_waiver_records(content, gate)
+    except ValueError as exc:
+        raise RuntimeError(f"malformed [GATE_WAIVER {gate}] marker: {exc}") from exc
+    if not records:
+        return None
+    return records[-1].attribution
+
+
+# ---------------------------------------------------------------------------
+# GATE_WAIVER WRITER (spec 4.9, 5.3; E2-F4-S1-T1). ``log-waiver`` is the CLI
+# verb that authors a ``[GATE_WAIVER <gate>] <iso-utc> <target>
+# <operator|executor> <reason>`` marker; ``compose_gate_waiver_record`` below
+# is the sole authorized builder of that text (spec 3.6: executors do not
+# self-certify, so a waiver record can only ever come from this function,
+# never hand-typed agent prose), mirroring
+# ``devbench.gate_records.compose_gate_pass_record``'s role for the sibling
+# ``[GATE_PASS]`` marker family. ``parse_gate_waiver_record`` is the matching
+# strict reader, reused by both ``validate-backlog``'s grammar rule
+# (``BacklogManager._check_gate_waiver_grammar``) and
+# ``count_gate_waiver_markers`` (the ``report`` PM-5 waiver-count consumer),
+# so "what a well-formed marker looks like" has exactly one definition.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateWaiverRecord:
+    """A parsed ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>`` marker (spec 5.3).
+
+    Attributes:
+        gate: The declared gate name (a ``devbench.constants.GATE_TIERS`` key).
+        timestamp: The timezone-aware UTC instant the waiver was issued.
+        target: The specific file/path/artifact the waiver covers.
+        attribution: ``"operator"`` or ``"executor"``.
+        reason: The free-text rationale (the remainder of the line).
+    """
+
+    gate: str
+    timestamp: datetime
+    target: str
+    attribution: str
+    reason: str
+
+
+def compose_gate_waiver_record(
+    gate: str,
+    target: str,
+    attribution: str,
+    reason: str,
+    *,
+    timestamp: datetime | None = None,
+) -> str:
+    """Compose the single-line ``[GATE_WAIVER <gate>] <iso-utc> <target> <attribution> <reason>`` marker (spec 5.3).
+
+    The sole authorized builder of the ``[GATE_WAIVER]`` marker text (spec
+    3.6): ``cli.cmd_log_waiver`` calls this function rather than formatting
+    the tag itself, so a waiver record can only ever be produced from
+    already-validated fields -- never from agent prose.
+
+    Args:
+        gate: One of the declared ``devbench.constants.GATE_TIERS`` gate names.
+        target: The specific file/path/artifact the waiver covers. Must be a
+            single non-empty token with no whitespace -- the marker grammar
+            is space-delimited positional fields, so a whitespace-bearing
+            target would corrupt the field boundary on read-back.
+        attribution: ``"operator"`` or ``"executor"``.
+        reason: Free-text rationale. Must be non-empty. The caller
+            (``cli.cmd_log_waiver``) is responsible for the em-dash /
+            control-character / bracketed-phase-tag boundary validation
+            (``cli._validate_agent_free_text``) before calling this
+            function; this function only enforces non-emptiness.
+        timestamp: The timezone-aware instant the waiver was issued.
+            Defaults to the current UTC time. A timezone-aware value in
+            another zone is converted to UTC; a naive value is rejected.
+
+    Returns:
+        The exact one-line marker text (no trailing newline).
+
+    Raises:
+        ValueError: If ``gate`` is not declared, ``attribution`` is not
+            ``"operator"``/``"executor"``, ``target`` is empty or contains
+            whitespace, ``reason`` is empty, or ``timestamp`` is naive.
+    """
+    if gate not in GATE_TIERS:
+        raise ValueError(f"Unknown gate {gate!r}; declared gates are: {', '.join(sorted(GATE_TIERS))}.")
+    if attribution not in (GATE_WAIVER_ATTRIBUTION_OPERATOR, GATE_WAIVER_ATTRIBUTION_EXECUTOR):
+        raise ValueError(
+            f"attribution must be {GATE_WAIVER_ATTRIBUTION_OPERATOR!r} or "
+            f"{GATE_WAIVER_ATTRIBUTION_EXECUTOR!r}; got {attribution!r}."
+        )
+    if not target or any(ch.isspace() for ch in target):
+        raise ValueError(f"target must be a single non-empty token with no whitespace; got {target!r}.")
+    if not reason or not reason.strip():
+        raise ValueError("reason must be non-empty.")
+
+    if timestamp is None:
+        resolved_timestamp = datetime.now(tz=UTC)
+    elif timestamp.tzinfo is None:
+        raise ValueError(f"timestamp must be timezone-aware; got a naive datetime {timestamp!r}.")
+    else:
+        resolved_timestamp = timestamp.astimezone(UTC)
+
+    return f"[GATE_WAIVER {gate}] {resolved_timestamp.isoformat()} {target} {attribution} {reason}"
+
+
+# Strict full-grammar match, anchored from the tag through end-of-line:
+# ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor> <reason>``.
+# Distinct from ``gate_records._WAIVER_TAG_RE`` (a loose, embedded-anywhere
+# search used only to locate the ``[GATE_WAIVER <gate>]`` tag on a line
+# before slicing off the remainder to parse here) -- this pattern is the
+# strict grammar authority both ``parse_gate_waiver_record`` and,
+# transitively, the validate-backlog grammar rule and the report
+# waiver-count consumer rely on.
+_GATE_WAIVER_RECORD_RE = re.compile(
+    r"^\[GATE_WAIVER (?P<gate>[A-Za-z0-9_]+)\] (?P<timestamp>\S+) (?P<target>\S+) "
+    rf"(?P<attribution>{GATE_WAIVER_ATTRIBUTION_OPERATOR}|{GATE_WAIVER_ATTRIBUTION_EXECUTOR}) (?P<reason>.+)$"
+)
+
+
+def parse_gate_waiver_record(text: str) -> GateWaiverRecord:
+    """Parse one isolated ``[GATE_WAIVER <gate>] ...`` marker (spec 5.3).
+
+    Args:
+        text: A single already-isolated marker string, starting at the
+            ``[GATE_WAIVER`` tag (leading/trailing whitespace is tolerated
+            and stripped) -- e.g. one produced by
+            ``compose_gate_waiver_record``, or a candidate line sliced from
+            the tag's position onward by a caller scanning a larger file.
+
+    Returns:
+        The parsed :class:`GateWaiverRecord`.
+
+    Raises:
+        ValueError: If ``text`` does not match the spec-5.3 grammar exactly,
+            names an undeclared gate, or carries a timestamp that is not a
+            timezone-aware ISO-8601 value. No partial record is ever
+            returned.
+    """
+    match = _GATE_WAIVER_RECORD_RE.match(text.strip())
+    if match is None:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (does not match the spec 5.3 grammar): {text!r}")
+
+    gate = match.group("gate")
+    if gate not in GATE_TIERS:
+        raise ValueError(
+            f"Unknown gate {gate!r} in [GATE_WAIVER] marker; declared gates are: {', '.join(sorted(GATE_TIERS))}."
+        )
+
+    raw_timestamp = match.group("timestamp")
+    try:
+        timestamp = datetime.fromisoformat(raw_timestamp)
+    except ValueError as exc:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (timestamp is not valid ISO-8601): {text!r}") from exc
+    if timestamp.tzinfo is None:
+        raise ValueError(f"Malformed [GATE_WAIVER] marker (timestamp is not timezone-aware): {text!r}")
+
+    return GateWaiverRecord(
+        gate=gate,
+        timestamp=timestamp,
+        target=match.group("target"),
+        attribution=match.group("attribution"),
+        reason=match.group("reason"),
+    )
+
+
+def count_gate_waiver_markers(content: str) -> tuple[int, int]:
+    """Return ``(operator_count, executor_count)`` of well-formed ``[GATE_WAIVER]`` markers in *content*.
+
+    Used by ``devbench.reporting.report`` (spec 4.9, PM-5) to surface the
+    outstanding-waiver count split by attribution, "so an operator sees at a
+    glance how much of the run is riding on [waivers]". Every well-formed
+    marker (per ``parse_gate_waiver_record`` -- the single grammar authority
+    ``validate-backlog``'s own grammar rule enforces) counts once; a line
+    that fails to parse is skipped here rather than raised -- a malformed
+    marker is already flagged as a validate-backlog error, and the report is
+    a best-effort operational snapshot that must never crash on malformed
+    data in an unrelated unit.
+
+    Args:
+        content: The full text of a work-unit markdown file.
+
+    Returns:
+        A ``(operator_count, executor_count)`` tuple.
+    """
+    operator_count = 0
+    executor_count = 0
+    for line in content.splitlines():
+        tag_idx = line.find("[GATE_WAIVER")
+        if tag_idx == -1:
+            continue
+        try:
+            record = parse_gate_waiver_record(line[tag_idx:])
+        except ValueError:
+            continue
+        if record.attribution == GATE_WAIVER_ATTRIBUTION_OPERATOR:
+            operator_count += 1
+        else:
+            executor_count += 1
+    return operator_count, executor_count
+
+
+def _gate_check_command(gate: str) -> str:
+    """Return the ``check-<gate>`` CLI verb name for *gate* (e.g. ``check-reachability``).
+
+    Every machine-blocking gate's check verb is registered as
+    ``check-<gate-name-with-underscores-replaced-by-hyphens>`` (see
+    ``cli.py``'s ``_COMMANDS`` registry: ``check-reachability``,
+    ``check-ancestry``, ``check-shared-file-impact``,
+    ``check-fixture-consistency``) -- derived here rather than duplicated as
+    a second literal mapping, so the remediation command named in a done-gate
+    refusal can never drift from the registered verb name.
+    """
+    return f"check-{gate.replace('_', '-')}"
+
+
 def resolve_judge_retry_budget(judge_name: str) -> int:
     """Return the executor retry budget that applies to *judge_name*.
 
@@ -391,6 +685,137 @@ def count_review_fails_for_judge(content: str, judge_name: str) -> int:
     """
     token = f"[judge/{judge_name}]"
     return sum(1 for line in content.splitlines() if token in line and "[REVIEW_FAIL]" in line)
+
+
+# ---------------------------------------------------------------------------
+# LAYOUT_GEOMETRY_KEYWORDS surface generation (spec 4.9c, AC-TEST-004;
+# code_review round 1, this unit: the ``<!-- generated:layout-ac-keywords
+# -->`` guard-marker blocks in ``test-reviewer.md`` and the ``spec-to-backlog``
+# SKILL were hand-typed copies with no code that actually generated them,
+# falsifying the "consumed via generation" claim these surfaces (and
+# ``CHANGELOG.md``, and the constants-module comment above
+# ``LAYOUT_AC_TAG``) made. This section closes that gap by reusing
+# ``devbench.vocabulary_generation.replace_guarded_block`` -- "the single
+# implementation of the guard-marker contract, used by both surface kinds"
+# -- with this domain's own marker literals, mirroring
+# ``devbench.plugin_helpers.permission_flag_writepath.regenerate_skill_step_3b``,
+# the precedent consumer that reuses the same shared splicer for an
+# unrelated guard-marked block rather than folding a second domain's
+# generation targets into ``vocabulary_generation``'s own
+# ``JUDGE_CATEGORIES``-specific ``generate_all``/``find_drifted_surfaces``
+# enumeration.
+# ---------------------------------------------------------------------------
+
+_LAYOUT_AC_KEYWORD_GUARD_MARKER_START: Final[str] = "<!-- generated:layout-ac-keywords -->"
+_LAYOUT_AC_KEYWORD_GUARD_MARKER_END: Final[str] = "<!-- /generated:layout-ac-keywords -->"
+
+#: Repo-relative paths of the two shipped surfaces that render
+#: ``LAYOUT_GEOMETRY_KEYWORDS`` between the guard-marker pair above
+#: (spec 4.9c). Both are also pinned byte-identical to
+#: :func:`render_layout_ac_keyword_block`'s output by
+#: ``tests/test_constants.py::TestLayoutGeometryKeywordSurfacesMatchConstant``.
+LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS: Final[tuple[str, ...]] = (
+    "plugin/devbench-orchestrate/agents/review_team/test-reviewer.md",
+    "plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md",
+)
+
+#: Command an operator (or a drift-pin failure message) names to regenerate
+#: both surfaces above. A single module constant so the text can never
+#: itself drift from what actually regenerates the block, mirroring
+#: ``permission_flag_writepath.REGENERATE_SKILL_STEP_3B_COMMAND``.
+REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND: Final[str] = (
+    'uv run python -c "from pathlib import Path; '
+    "from devbench.backlog.manager import regenerate_layout_ac_keyword_surfaces; "
+    "regenerate_layout_ac_keyword_surfaces(Path('<repo-root>'))\""
+)
+
+
+def render_layout_ac_keyword_block() -> str:
+    """Render the sorted, comma-joined ``LAYOUT_GEOMETRY_KEYWORDS`` list (spec 4.9c).
+
+    The single source of truth every guard-marked surface in
+    :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS` renders, byte for
+    byte, between its ``<!-- generated:layout-ac-keywords -->`` pair.
+    Sorted for deterministic, idempotent output (the same reasoning
+    ``vocabulary_generation.render_prompt_sentence`` sorts its codes).
+
+    Returns:
+        ``"autosize, breakpoint, cascade, ..."`` -- every
+        :data:`~devbench.constants.LAYOUT_GEOMETRY_KEYWORDS` member,
+        comma-and-space-joined, alphabetically sorted.
+    """
+    return ", ".join(sorted(LAYOUT_GEOMETRY_KEYWORDS))
+
+
+def render_layout_ac_keyword_surface_content(repo_root: Path, relative_path: str) -> str:
+    """Return *relative_path*'s full content with its keyword guard block regenerated, in memory.
+
+    Does not write to disk -- shared by :func:`regenerate_layout_ac_keyword_surfaces`
+    (which does write) and by the drift-pin test (which only compares this
+    function's output against the committed file).
+
+    Args:
+        repo_root: This checkout's own root (the directory containing
+            ``plugin/`` and ``plugin-authoring/``).
+        relative_path: One entry of :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS`.
+
+    Returns:
+        *relative_path*'s content with exactly the guard-marked block's
+        inner text replaced by :func:`render_layout_ac_keyword_block`'s
+        output; every byte outside the pair is unchanged.
+
+    Raises:
+        ValueError: *relative_path* is not a member of
+            :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS`.
+        FileNotFoundError: *repo_root* does not contain *relative_path*.
+        GuardMarkerError: *relative_path*'s content has no
+            ``<!-- generated:layout-ac-keywords -->`` guard-marker pair, an
+            unterminated one, or a second occurrence of the start marker.
+    """
+    if relative_path not in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+        raise ValueError(
+            f"'{relative_path}' is not a layout-AC keyword surface; must be one of "
+            f"{LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS}."
+        )
+    path = repo_root / relative_path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"'{relative_path}' not found under repo_root={repo_root!r}. "
+            "Pass this checkout's own root (the directory containing 'plugin/' and 'plugin-authoring/')."
+        )
+    content = path.read_text(encoding="utf-8")
+    new_content, _ = replace_guarded_block(
+        content,
+        render_layout_ac_keyword_block(),
+        source=relative_path,
+        start_marker=_LAYOUT_AC_KEYWORD_GUARD_MARKER_START,
+        end_marker=_LAYOUT_AC_KEYWORD_GUARD_MARKER_END,
+        remediation_command=REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND,
+        reject_duplicate=True,
+    )
+    return new_content
+
+
+def regenerate_layout_ac_keyword_surfaces(repo_root: Path) -> list[Path]:
+    """Regenerate both guard-marked ``LAYOUT_GEOMETRY_KEYWORDS`` surfaces under *repo_root*, in place.
+
+    Args:
+        repo_root: This checkout's own root.
+
+    Returns:
+        The absolute paths written, in :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS` order.
+
+    Raises:
+        FileNotFoundError: *repo_root* is missing one of the target surfaces.
+        GuardMarkerError: A target surface's guard markers are missing or malformed.
+    """
+    written: list[Path] = []
+    for relative_path in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+        new_content = render_layout_ac_keyword_surface_content(repo_root, relative_path)
+        path = repo_root / relative_path
+        atomic_write_text(path, new_content)
+        written.append(path)
+    return written
 
 
 class BacklogManager:
@@ -496,17 +921,325 @@ class BacklogManager:
                 )
             )
 
+    @staticmethod
+    def _run_gate_scope_hash_git(repo_path: Path, args: list[str], description: str) -> str:
+        """Run a ``git -C <repo_path> <args>`` invocation shared by the scope-hash helpers.
+
+        :meth:`_git_blob_hash` (per-file blob hash, for every non-ancestry
+        gate's ``_recompute_gate_scope_hash``) needs "run git with a
+        configurable timeout, fail loud naming the command context on a
+        non-zero exit or a timeout" behaviour; defined once here (DRY)
+        rather than duplicated per caller. The ancestry gate's own git
+        calls (per-Manifest-file blob hash AND target-ref resolution) are
+        NOT routed through this helper -- they go through
+        ``cli._compute_ancestry_scope_hash`` instead, the single shared
+        assembly both ``cli._write_ancestry_gate_pass_record`` and
+        :meth:`_recompute_gate_scope_hash` call for ``gate == "ancestry"``
+        (code_review FAIL, round 1: two independent assemblies with
+        different timeout policies had to agree byte-for-byte forever and
+        nothing enforced that).
+
+        Args:
+            repo_path: Local repo checkout root ``git -C`` runs against.
+            args: The git subcommand and its arguments, e.g.
+                ``["hash-object", "--", rel_path]``.
+            description: A short ``for <...>`` style description of *args*'
+                subject, folded into both the timeout and non-zero-exit
+                ``RuntimeError`` messages.
+
+        Returns:
+            The command's stripped stdout.
+
+        Raises:
+            RuntimeError: The git invocation timed out, or exited non-zero.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_GATE_SCOPE_HASH_GIT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"git {args[0]} timed out {description} in {repo_path}") from exc
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {args[0]} failed {description} in {repo_path} (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    @staticmethod
+    def _git_blob_hash(repo_path: Path, rel_path: str) -> str:
+        """Return the git blob hash of *rel_path*'s current on-disk content in *repo_path*.
+
+        Uses ``git hash-object`` against the working tree, so an
+        uncommitted edit is hashed by its live bytes rather than its
+        last-committed blob -- the scope hash a machine-blocking gate
+        command persists (spec 4.2) is over the content actually in scope
+        when it ran, not over whatever HEAD happened to hold.
+
+        Args:
+            repo_path: Local repo checkout root.
+            rel_path: Path to hash, relative to *repo_path*.
+
+        Returns:
+            The lowercase git blob hash (SHA-1) hex string.
+
+        Raises:
+            RuntimeError: If git times out or exits non-zero (e.g. the file
+                no longer exists in the checkout).
+        """
+        return BacklogManager._run_gate_scope_hash_git(repo_path, ["hash-object", "--", rel_path], f"for {rel_path!r}")
+
+    @staticmethod
+    def _resolve_ancestry_target_ref(content: str) -> str:
+        """Return the ancestry gate's recorded target-ref STRING (spec 4.5, internal issue #12 AC3).
+
+        Reads the ref back from the ``[GATE_ANCESTRY_TARGET_REF]``
+        companion marker ``cli._write_ancestry_gate_pass_record`` persists
+        alongside every ``[GATE_PASS ancestry]`` record (via
+        ``gate_records.latest_ancestry_target_ref``) -- it never
+        re-derives the repo's default branch itself. ``check-ancestry``
+        accepts an OPTIONAL explicit ``<target-ref>`` override (spec 4.5),
+        so the ref actually probed at gate-pass time is not always the
+        default branch; re-deriving the default here would resolve a
+        DIFFERENT ref than the one folded into the stored record whenever
+        an explicit override was used, making the record read as
+        permanently stale even though nothing about the recorded target
+        ref itself has changed (spec 3.5 fallback ban -- this never
+        silently guesses which ref was used).
+
+        A pure function of *content* -- it performs no git I/O of its own.
+        The caller (:meth:`_recompute_gate_scope_hash`) is responsible for
+        resolving the returned ref string to a commit sha, via the SAME
+        :func:`_compute_ancestry_scope_hash` assembly
+        ``cli._write_ancestry_gate_pass_record`` calls (single source of
+        truth, code_review FAIL round 1).
+
+        Args:
+            content: The full text of the work-unit markdown file.
+
+        Returns:
+            The resolved target ref's exact persisted string (e.g.
+            ``origin/main`` or an explicit override).
+
+        Raises:
+            RuntimeError: No well-formed ``[GATE_ANCESTRY_TARGET_REF]``
+                marker is present in *content* (e.g. a record written
+                before this marker existed), or a marker IS present but
+                malformed -- ``gate_records.latest_ancestry_target_ref``'s
+                ``ValueError`` is translated to ``RuntimeError`` here so
+                every caller of this method (``cmd_mark_done`` catches
+                ``RuntimeError`` only) renders a clean ``ERROR:`` instead
+                of an uncaught traceback.
+        """
+        from devbench.gate_records import latest_ancestry_target_ref
+
+        try:
+            target_ref = latest_ancestry_target_ref(content)
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot resolve ancestry gate target ref: malformed marker: {exc}") from exc
+        if target_ref is None:
+            raise RuntimeError(
+                "Cannot resolve ancestry gate target ref: no [GATE_ANCESTRY_TARGET_REF] marker recorded "
+                "alongside the [GATE_PASS ancestry] record. Run: uv run devbench check-ancestry "
+                "<unit-id> <dependency-ref> to produce a fresh record."
+            )
+        return target_ref
+
+    @staticmethod
+    def _recompute_gate_scope_hash(repo: str, content: str, gate: str = "") -> str:
+        """Recompute *content*'s current Changes-Manifest scope hash (spec 4.2, AC-7).
+
+        The freshness half of the machine-blocking gate-record invariant: a
+        persisted ``[GATE_PASS <gate>]`` record's ``scope_hash`` is only
+        valid for the exact file content that was in scope when the gate
+        ran. This recomputes ``gate_records.compute_scope_hash``'s formula
+        (SHA-256 over the sorted changed-file list plus per-file git blob
+        hashes) over the unit's CURRENT ``## Changes Manifest`` file list,
+        read from the resolved repo checkout
+        (``config_loader.get_repo_local_path``) -- so an edit to any
+        in-scope file's content after the gate ran changes the recomputed
+        hash even though the manifest's declared file list is unchanged.
+
+        Args:
+            repo: Canonical ``org/repo`` string (``_extract_repo``'s result).
+            content: The full text of the work-unit markdown file.
+            gate: The declared gate name this recompute is for. This is the
+                one machine-blocking gate (of ``constants.GATE_TIERS``)
+                whose scope hash is target-ref-aware (spec 4.5, internal
+                issue #12 AC3): the comparison below is keyed off the
+                imported ``constants.GATE_ANCESTRY`` (the single canonical
+                definition ``GATE_NAMES``/``GATE_TIERS`` are built from),
+                never a hand-typed module-private literal -- a mirrored
+                module-private copy of this same string had drifted
+                undetected into a third independent declaration
+                (code_review FAIL, round 1). When this is ``"ancestry"``,
+                the digest is delegated ENTIRELY to
+                ``cli._compute_ancestry_scope_hash`` -- the SAME assembly
+                ``cli._write_ancestry_gate_pass_record`` calls to produce
+                the original record, so the two can never independently
+                drift -- called with the target ref read back via
+                ``_resolve_ancestry_target_ref``. Every other gate name
+                (including the default ``""``) leaves the digest formula
+                byte-identical to before this parameter existed.
+
+        Returns:
+            The recomputed scope hash.
+
+        Raises:
+            RuntimeError: If the Changes Manifest is missing/malformed, is
+                empty, or a file it declares cannot be hashed in the
+                checkout; or, for ``gate == "ancestry"``, if the recorded
+                target ref cannot be resolved -- never silently treated as
+                "no change".
+        """
+        from devbench.backlog.manifest import ManifestParseError, parse_manifest
+        from devbench.config import RUNTIME_CONFIG, WORKSPACE_ROOT
+        from devbench.config_loader import get_repo_local_path
+
+        try:
+            manifest_rows = parse_manifest(content)
+        except ManifestParseError as exc:
+            raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+        repo_path = get_repo_local_path(repo, RUNTIME_CONFIG, WORKSPACE_ROOT)
+
+        if gate == GATE_ANCESTRY:
+            from devbench.cli import _compute_ancestry_scope_hash
+
+            target_ref = BacklogManager._resolve_ancestry_target_ref(content)
+            try:
+                return _compute_ancestry_scope_hash(repo_path, manifest_rows, target_ref)
+            except RuntimeError as exc:
+                raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+        from devbench.gate_records import compute_scope_hash
+
+        file_blob_hashes = {row.file: BacklogManager._git_blob_hash(repo_path, row.file) for row in manifest_rows}
+        try:
+            return compute_scope_hash(file_blob_hashes, target_ref_sha=None)
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot recompute gate scope hash for repo {repo!r}: {exc}") from exc
+
+    def _check_gate_pass_done_invariant(self, unit_id: str, content: str) -> None:
+        """Raise ``RuntimeError`` when an ENABLED machine-blocking gate lacks
+        a fresh ``[GATE_PASS]`` record or an operator ``[GATE_WAIVER]``
+        (spec 4.2, G4).
+
+        Mirrors ``_check_task_type_done_invariant``'s pattern: a single,
+        manager-level check consumed directly by :meth:`mark_done`, so every
+        caller (``cmd_mark_done``, ``_check_merge_handle_merged``, and any
+        future caller) inherits it identically -- the exact bug class that
+        pattern was introduced to close (spec Section 3 reuse table).
+
+        For each of the four machine-blocking gates (``constants.GATE_TIERS``)
+        that resolves ENABLED for the unit's repo
+        (``config_loader.resolve_gate_config``, the sole read path, AC-27):
+
+        1. An operator-attributed ``[GATE_WAIVER <gate>]`` marker alone
+           satisfies the requirement (spec 3.6, 4.9) -- checked first so a
+           waived gate never needs a repo checkout to recompute anything.
+        2. Otherwise a ``[GATE_PASS <gate>]`` record must exist, and its
+           persisted scope hash must match the CURRENT recomputed scope
+           hash (``_recompute_gate_scope_hash``); a mismatch is a stale
+           record (AC-7), refused with the spec 4.2 wording.
+        3. Otherwise: an executor-attributed waiver is insufficient for a
+           machine-blocking gate (spec 3.6) and is refused naming the
+           missing operator attribution; no waiver and no record at all is
+           refused with the exact G4 worked-example remediation.
+
+        A unit with no ``## Target Repository`` section (``_extract_repo``
+        returns ``None``) is "check does not apply" -- the same
+        fail-open-on-absent-section behaviour every other repo-scoped check
+        in this module already uses (e.g. ``_fix_manifest_prefixes``),
+        preserving today's behaviour for every existing caller/test that
+        never declared a repo.
+
+        Args:
+            unit_id: Work unit ID, named in every rejection message.
+            content: The full text of the work-unit markdown file.
+
+        Raises:
+            RuntimeError: An enabled machine-blocking gate's requirement is
+                unmet, per the three cases above.
+        """
+        repo = self._extract_repo(content)
+        if repo is None:
+            return
+
+        from devbench.config import RUNTIME_CONFIG, resolve_gate_env_override
+        from devbench.config_loader import resolve_gate_config
+        from devbench.gate_records import latest_gate_pass_record
+
+        for gate, tier in GATE_TIERS.items():
+            if tier != GATE_TIER_MACHINE_BLOCKING:
+                continue
+            resolved = resolve_gate_config(gate, repo, RUNTIME_CONFIG, resolve_gate_env_override(gate))
+            if not resolved.values["enabled"]:
+                continue
+
+            try:
+                attribution = _latest_gate_waiver_attribution(content, gate)
+            except RuntimeError as exc:
+                # Re-raise with the unit id folded in: `_latest_gate_waiver_attribution`
+                # is a content-only helper (its own direct-call unit tests
+                # pass no unit id) and its message already names the
+                # offending line via `parse_gate_waiver_record`'s ValueError,
+                # but a `mark-done` refusal must name the unit too, matching
+                # `check-reachability`'s "malformed ... marker in <unit-id>"
+                # wording (spec Section 7 fail-loud rule).
+                raise RuntimeError(f"{exc} (unit {unit_id})") from exc
+            if attribution == GATE_WAIVER_ATTRIBUTION_OPERATOR:
+                continue
+
+            remediation = f"uv run devbench {_gate_check_command(gate)} {unit_id}"
+            if gate == GATE_ANCESTRY:
+                # check-ancestry's required positional args are
+                # `<unit-id> <dependency-ref>` (spec 4.5): the remediation
+                # command is not runnable without a dependency ref, so the
+                # refusal names it as a placeholder for the operator to fill
+                # in, mirroring how every other worked-example remediation
+                # in this module names every required argument.
+                remediation += " <dependency-ref>"
+            record = latest_gate_pass_record(content, gate)
+            if record is not None:
+                current_hash = self._recompute_gate_scope_hash(repo, content, gate)
+                if current_hash == record.scope_hash:
+                    continue
+                raise RuntimeError(
+                    f"gate {gate!r} record is stale (scope changed since it ran). "
+                    f"Run: {remediation} to produce a fresh record."
+                )
+
+            if attribution == GATE_WAIVER_ATTRIBUTION_EXECUTOR:
+                raise RuntimeError(
+                    f"gate {gate!r} is enabled for repo {repo!r} but its only [GATE_WAIVER {gate}] "
+                    f"record for {unit_id} is executor-attributed; a machine-blocking gate requires an "
+                    "operator-attributed waiver (spec Section 3.6: executors do not self-certify). "
+                    f"Run: {remediation}, or have an operator issue an operator-attributed waiver."
+                )
+
+            raise RuntimeError(
+                f"done-gate: gate {gate!r} is enabled for repo {repo!r} but has no [GATE_PASS {gate}] "
+                f"record for {unit_id}. Run: {remediation}"
+            )
+
     def mark_done(self, work_unit_path: Path, backlog_index: Path, unit_id: str) -> None:
         """Mark a work unit as Done in both files.
 
         Raises ``RuntimeError`` if the task's own FR-4.5/FR-4.6 task-type
         completion invariant is unmet (``_check_task_type_done_invariant``),
-        or if not all required review judges have passed in the most recent
-        review round (done-gate enforcement). Both checks are enforced here
-        -- not in a CLI-layer wrapper -- so every caller (``cmd_mark_done``,
-        ``_check_merge_handle_merged``, and any future caller) inherits them
-        identically; there is no second done-transition path that can skip
-        either check (E4-F4-S1-T2 round 3).
+        if an enabled machine-blocking gate lacks a fresh ``[GATE_PASS]``
+        record or operator ``[GATE_WAIVER]`` (``_check_gate_pass_done_invariant``,
+        spec 4.2/G4), or if not all required review judges have passed in
+        the most recent review round (done-gate enforcement). All three
+        checks are enforced here -- not in a CLI-layer wrapper -- so every
+        caller (``cmd_mark_done``, ``_check_merge_handle_merged``, and any
+        future caller) inherits them identically; there is no second
+        done-transition path that can skip any of them (E4-F4-S1-T2 round 3;
+        E2-F2-S1-T2).
 
         Args:
             work_unit_path: Path to the work-unit ``.md`` file.
@@ -514,13 +1247,15 @@ class BacklogManager:
             unit_id: The work-unit identifier.
 
         Raises:
-            RuntimeError: If the task-type invariant is unmet, or if not all
-                required judges passed in the last round.
+            RuntimeError: If the task-type invariant is unmet, if an enabled
+                machine-blocking gate's record requirement is unmet, or if
+                not all required judges passed in the last round.
             FileNotFoundError: If either file does not exist.
             ValueError: If the status line or unit row is not found.
         """
         content = work_unit_path.read_text(encoding="utf-8")
         self._check_task_type_done_invariant(unit_id, content)
+        self._check_gate_pass_done_invariant(unit_id, content)
         if not self._last_round_all_passed(work_unit_path):
             raise RuntimeError(
                 f"Cannot mark {unit_id} done: not all required judges passed in the most recent review round"
@@ -879,7 +1614,12 @@ class BacklogManager:
             file-less; this converges the validator with ``parse_index``, which
             raises on the same file-less Task row and tolerates a file-less
             non-Task row.
-        27. Marker/status agreement: a non-terminal Task carrying a
+        27. ``[GATE_WAIVER]`` marker grammar (spec 5.3; E2-F4-S1-T1): a
+            ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
+            <reason>`` line that fails to parse against the spec grammar
+            (``parse_gate_waiver_record``) is an error naming the unit and
+            the offending line; a well-formed marker is accepted silently.
+        28. Marker/status agreement: a non-terminal Task carrying a
             ``[BLOCKED_PENDING_PROPOSAL]`` marker whose target is itself
             non-terminal MUST have status ``blocked``. The marker and the status
             are written by separate steps, and the ADR-07 cascade
@@ -887,6 +1627,22 @@ class BacklogManager:
             candidates, so a mismatch strands the task permanently once its
             blocker completes. Markers whose targets are all terminal are exempt
             (the cascade has legitimately requeued the task).
+        29. ``[LAYOUT-AC]`` tag grammar (spec 4.9c; 319-D critical): a tag on a
+            ``- [ ] AC-...`` bullet line inside ``## Acceptance Criteria`` must
+            name a keyword from ``constants.LAYOUT_GEOMETRY_KEYWORDS`` or the
+            line is an error. A tag found in ``## Description`` (including a
+            nested ``### `` subsection such as ``### Approach``) or
+            ``## Definition of Done`` is an error naming that section; a tag
+            found on a non-``- [`` bullet line inside ``## Acceptance
+            Criteria`` is also an error naming that section (see
+            ``_LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS`` for the exact,
+            deliberately narrow allowlist of sections scanned for
+            misplacement -- a tag in another top-level section, such as
+            ``## Related Specifications``, or in ``## Acceptance Criteria``
+            prose that is not itself a ``- [``-prefixed line, is NOT scanned
+            by this rule). Tasks with no ``## Acceptance Criteria`` section
+            are skipped (Check 7 owns that error) and untagged Tasks are
+            untouched.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -926,6 +1682,7 @@ class BacklogManager:
         self._check_no_glob_in_manifest(rows, workspace_root, errors)
         self._check_manifest_conflicts(rows, workspace_root, errors, strict=strict)
         self._check_language_ac_alignment(rows, workspace_root, errors)
+        self._check_layout_ac_grammar(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
         self._check_expected_output(rows, workspace_root, errors)
@@ -937,6 +1694,7 @@ class BacklogManager:
         self._check_no_orphan_path_tokens(rows, workspace_root, errors)
         self._check_marker_status_agreement(rows, workspace_root, errors)
         self._check_already_satisfied_decline_citation(rows, workspace_root, errors)
+        self._check_gate_waiver_grammar(rows, workspace_root, errors)
         return errors
 
     _CANONICAL_FULL_INDEX_HEADER_CELLS: tuple[str, ...] = (
@@ -2243,6 +3001,136 @@ class BacklogManager:
                 return idx
         return -1
 
+    @staticmethod
+    def _insert_entry_before_heading(lines: list[str], heading_idx: int, entry: str) -> list[str]:
+        """Return *lines* with *entry* spliced in immediately before ``lines[heading_idx]``.
+
+        Trims trailing blank lines from the block preceding the heading,
+        then inserts exactly one blank line, *entry* (its own trailing
+        newline stripped), another blank line, and the heading line onward
+        unchanged. Shared splice primitive behind both ``_append_tdd_entry``
+        (inserts before the next ``## `` heading following ``## TDD Cycle
+        Log``) and ``_append_audit_marker_before_comments`` (inserts before
+        ``## Comments`` specifically) so the "insert with exactly one blank
+        line of separation on each side" formatting rule has one definition
+        (DRY).
+
+        Args:
+            lines: File content split into lines (no trailing newline on
+                each).
+            heading_idx: Index of the heading line *entry* is inserted
+                before.
+            entry: The entry text (a trailing newline, if present, is
+                stripped).
+
+        Returns:
+            The new full line list. The caller joins it with ``"\\n"`` and
+            appends a trailing newline.
+        """
+        before = lines[:heading_idx]
+        while before and before[-1].strip() == "":
+            before.pop()
+        new_lines = before + ["", entry.rstrip("\n"), "", lines[heading_idx]]
+        new_lines.extend(lines[heading_idx + 1 :])
+        return new_lines
+
+    def _append_audit_marker_before_comments(self, work_unit_path: Path, marker: str) -> None:
+        """Insert a single-line structured audit marker immediately before ``## Comments``.
+
+        Thin single-marker convenience wrapper around
+        :meth:`_append_audit_markers_before_comments` (which performs the
+        actual read-modify-write); kept as its own method because most
+        callers (``compose_gate_waiver_record``'s ``[GATE_WAIVER]`` marker,
+        ``log-newly-reachable``'s ``[NEWLY_REACHABLE]`` marker) only ever
+        have one marker to persist per call.
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            marker: The exact one-line marker text (no trailing newline).
+
+        Raises:
+            OSError: The file cannot be read or written (propagated
+                unchanged from ``Path.read_text``/``atomic_write_text`` --
+                never swallowed).
+        """
+        self._append_audit_markers_before_comments(work_unit_path, [marker])
+
+    def _append_audit_markers_before_comments(self, work_unit_path: Path, markers: Sequence[str]) -> None:
+        """Insert one or more structured audit markers immediately before ``## Comments``, in ONE atomic write.
+
+        ``read-unit --strip-comments`` (``cli.cmd_read_unit``) truncates a
+        work unit's content at the literal ``\\n## Comments`` marker before
+        every review judge's Evidence fetch reads it (the PM-6
+        evidence-horizon rule, E2-F3-S1-T2 pins this empirically). A
+        structured marker appended via ``_append_comment`` (the normal
+        audit-comment path used by ``[BLOCKED]``/``[QUOTA_WAITING]``) would
+        therefore be invisible to the very judges spec 3.6 requires to
+        weigh it. This helper is the alternative insertion point every
+        judge-visible structured marker writer must use instead --
+        currently ``compose_gate_waiver_record``'s ``[GATE_WAIVER]`` marker
+        (spec 5.3), ``cli._write_ancestry_gate_pass_record``'s
+        ``[GATE_PASS ancestry]`` record together with its
+        ``[GATE_ANCESTRY_TARGET_REF]`` companion marker (spec 4.5, this
+        task); ``log-newly-reachable``'s ``[NEWLY_REACHABLE]`` marker (spec
+        4.9(a), E2-F4-S1-T2) is a documented future consumer of the same
+        insertion point.
+
+        When a caller needs to persist MULTIPLE markers that must never be
+        observed independently (e.g. a ``[GATE_PASS ancestry]`` record and
+        its ``[GATE_ANCESTRY_TARGET_REF]`` companion: a reader that finds
+        the first without the second treats the record as unresolvable),
+        it MUST pass them all to a single call here rather than calling
+        :meth:`_append_audit_marker_before_comments` once per marker -- this
+        method performs exactly one ``Path.read_text``/``atomic_write_text``
+        round trip for the whole batch, so a write failure can never leave
+        some markers persisted and others missing (code_review FAIL, round
+        1: two sequential single-marker calls left a `[GATE_PASS ancestry]`
+        record with no companion marker on a second-call failure).
+
+        Mechanically identical to ``_append_tdd_entry``'s "insert before the
+        next ``## `` heading" logic (both delegate to
+        ``_insert_entry_before_heading``), but keyed to ``## Comments``
+        specifically rather than assuming ``## TDD Cycle Log`` happens to be
+        the section immediately preceding it -- so this insertion point
+        stays correct even if a future template inserts another section
+        between TDD Cycle Log and Comments. When the file carries no ``##
+        Comments`` section at all, the markers are appended at EOF (there is
+        nothing to strip against, so any location is judge-visible).
+
+        Args:
+            work_unit_path: Path to the work-unit ``.md`` file.
+            markers: The exact one-line marker texts (no trailing newline),
+                inserted in the given order. Must be non-empty.
+
+        Raises:
+            ValueError: ``markers`` is empty. Enforces the precondition
+                stated above: silently writing a blank line for an empty
+                sequence (the fail-open default of ``"\\n".join(())``)
+                would violate the project's fail-fast contract, so this is
+                a loud, immediate failure instead of a silent no-op write.
+            OSError: The file cannot be read or written (propagated
+                unchanged from ``Path.read_text``/``atomic_write_text`` --
+                never swallowed, so a full disk or a read-only file
+                surfaces as a loud, actionable failure to the caller
+                rather than a silent partial write).
+        """
+        if not markers:
+            raise ValueError("markers must be non-empty: an empty sequence would silently write a blank audit line.")
+
+        combined_entry = "\n".join(marker.rstrip("\n") for marker in markers)
+
+        content = work_unit_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        comments_idx = next((i for i, line in enumerate(lines) if line == COMMENTS_SECTION_HEADER), -1)
+
+        if comments_idx == -1:
+            content = content.rstrip("\n") + "\n\n" + combined_entry + "\n"
+        else:
+            new_lines = self._insert_entry_before_heading(lines, comments_idx, combined_entry)
+            content = "\n".join(new_lines) + "\n"
+
+        atomic_write_text(work_unit_path, content)
+
     def _append_tdd_entry(self, work_unit_path: Path, phase: str, message: str) -> None:
         """Append a TDD phase entry to the TDD Cycle Log section of a work-unit file.
 
@@ -2296,12 +3184,7 @@ class BacklogManager:
         else:
             # Insert before the next ## heading, preserving exactly one blank
             # line above the entry and exactly one blank line below it.
-            before_next = lines[:next_section_idx]
-            # Strip trailing blank lines from the block before the next heading.
-            while before_next and before_next[-1].strip() == "":
-                before_next.pop()
-            new_lines = before_next + ["", entry.rstrip("\n"), "", lines[next_section_idx]]
-            new_lines.extend(lines[next_section_idx + 1 :])
+            new_lines = self._insert_entry_before_heading(lines, next_section_idx, entry)
             content = "\n".join(new_lines) + "\n"
 
         atomic_write_text(work_unit_path, content)
@@ -3089,6 +3972,235 @@ class BacklogManager:
                     f"per docs/acceptance-criteria-canonical.md."
                 )
 
+    _AC_BULLET_RE: re.Pattern[str] = re.compile(r"^- \[[ xX]\] AC-\S+")
+    _INLINE_CODE_SPAN_RE: re.Pattern[str] = re.compile(r"`[^`\n]*`")
+
+    # REQUIRED GRAMMAR POSITION (code_review round 2, this unit; stated
+    # verbatim here and mirrored in SKILL.md Step 3a/Step 5 and
+    # test-reviewer.md item 60 so the accepted position and the documented
+    # position never diverge again):
+    #
+    #   An UNBACKTICKED [LAYOUT-AC] tag applies to the AC line ANYWHERE it
+    #   appears on that '- [ ] AC-...' bullet line -- immediately after the
+    #   AC id, after a parenthetical spec reference (this repo's prevailing
+    #   AC-line house style, e.g. '- [ ] AC-LAYOUT-001 (spec 4.9c)
+    #   [LAYOUT-AC] ...'), or mid-sentence. A BACKTICKED `[LAYOUT-AC]` tag
+    #   applies ONLY when it sits immediately after the AC id (one optional
+    #   layer of backticks at that fixed position), because a backticked
+    #   occurrence anywhere else on the line is indistinguishable from prose
+    #   that merely quotes the tag while discussing the mechanism itself
+    #   (e.g. this very work unit's own AC-TEST-002/003 bullets) -- exactly
+    #   the self-referential-spec false positive a raw, position-unaware
+    #   substring check produced against the real backlog tree
+    #   (`uv run devbench validate-backlog` regression this unit's own
+    #   round-1 fix introduced and then closed). Round 1 silently dropped
+    #   the unbackticked tag in every position except immediately after the
+    #   AC id, reintroducing the 319-D silent-ignore defect this unit
+    #   exists to close; round 2 closes that gap by making the unbackticked
+    #   form position-independent while keeping the backticked form
+    #   anchored, so no on-bullet placement is ever silently ignored.
+    _TAGGED_AC_BULLET_POSITION_RE: re.Pattern[str] = re.compile(
+        r"^- \[[ xX]\] AC-\S+\s+`" + re.escape(LAYOUT_AC_TAG) + r"`(?:\s|$)"
+    )
+
+    # Exact, deliberately narrow allowlist of top-level sections scanned for a
+    # misplaced [LAYOUT-AC] tag -- NOT every authored section, and not every
+    # section other than the operational/audit ones excluded below. Spec
+    # 4.9c's error path names exactly three example placements: Description,
+    # Approach and Definition of Done; Approach is a nested `### ` subsection
+    # of `## Description` per `_extract_sections`, so "Description" already
+    # covers it, leaving this two-entry tuple. Other authored spec sections
+    # this rule does NOT scan for misplacement (e.g. `## Related
+    # Specifications`) are out of this rule's v1 scope, same as the
+    # operational/audit sections (`Comments`, `TDD Cycle Log`, `Dependencies`,
+    # `Status`, `Target Repository`, `Changes Manifest`) that legitimately
+    # quote the tag in prose (e.g. an audit comment discussing a *different*
+    # unit's layout work, or a Dependencies row echoing another Task's
+    # title) and are excluded because a tag-placement mistake would not
+    # occur there.
+    _LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS: tuple[str, ...] = ("Description", "Definition of Done")
+
+    @classmethod
+    def _strip_inline_code_spans(cls, text: str) -> str:
+        """Remove backtick-delimited inline-code spans from *text*.
+
+        A `[LAYOUT-AC]` tag mentioned in prose (e.g. `` `[LAYOUT-AC]` tag
+        ``, quoting the tag for documentation purposes) is not an attempt
+        to actually apply the tag. Stripping inline-code spans before
+        scanning for the literal tag lets `_check_layout_ac_grammar`
+        distinguish a real grammar violation from a work unit's own prose
+        describing the mechanism (e.g. this task's own specification file).
+        Operates per physical line by design: a code span that itself wraps
+        across a soft line break inside a paragraph is intentionally left
+        unstripped on the wrapped-into line, which only widens (never
+        narrows) what gets treated as a candidate tag occurrence -- callers
+        that need line-exact attribution (the AC-bullet scan below) only
+        ever apply this to a single already-isolated bullet line, where the
+        tag and its surrounding backticks are always co-located.
+        """
+        return cls._INLINE_CODE_SPAN_RE.sub("", text)
+
+    def _check_layout_ac_grammar(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 29: `[LAYOUT-AC]` tag grammar (spec 4.9c; 319-D critical).
+
+        PR #319 shipped `[LAYOUT-AC]` tagging as prompt-only prose that told
+        authors to place the tag in a position `validate-backlog` never
+        parsed, so nothing in the toolchain could distinguish a correctly
+        tagged unit from a silently ignored one. This rule moves the tag
+        onto the acceptance-criteria line grammar this method walks:
+
+        - A `[LAYOUT-AC]` tag on a `- [ ] AC-...` bullet line inside
+          `## Acceptance Criteria` must name at least one keyword from
+          `LAYOUT_GEOMETRY_KEYWORDS` (case-insensitive substring match,
+          after whitespace is stripped from the candidate line) or the
+          line is an error quoting the unit id and the offending line.
+          Only the bullet-opening physical line is examined -- a Task's
+          longer-form AC prose commonly wraps onto indented continuation
+          lines, and the grammar's contract is that the tag sits on the
+          checkbox line itself, not a continuation. Within that line, an
+          unbackticked tag applies anywhere (immediately after the AC id,
+          after a parenthetical spec reference, or mid-sentence); a
+          backticked tag applies only immediately after the AC id, so a
+          backticked mention elsewhere in the line's prose is not mistaken
+          for an application (`_check_layout_ac_tagged_bullet`).
+        - A `[LAYOUT-AC]` tag found in `## Description` (which also carries
+          every nested `### ` subsection, e.g. `### Approach`) or
+          `## Definition of Done` is an error naming the section the tag
+          was found in and the remediation (move the tag onto the AC
+          line). Operational/audit sections (Comments, TDD Cycle Log, and
+          similar) are not scanned -- see
+          `_LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS`.
+        - Tasks whose `## Acceptance Criteria` section is absent or
+          unparseable are skipped without error; that defect is owned by
+          Check 7 (`_check_task_content`), so one root cause never produces
+          two contradictory findings.
+        - Untagged tasks are untouched.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            sections = self._extract_sections(content)
+            self._check_layout_ac_misplacement(row_id, sections, errors)
+            self._check_layout_ac_bullet_lines(row_id, sections, errors)
+
+    def _check_layout_ac_misplacement(
+        self,
+        row_id: str,
+        sections: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """A `[LAYOUT-AC]` tag outside `## Acceptance Criteria` is always
+        an error naming the section it was found in (spec 4.9c)."""
+        for section_name in self._LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS:
+            body = sections.get(section_name)
+            if body is None:
+                continue
+            if LAYOUT_AC_TAG in self._strip_inline_code_spans(body):
+                errors.append(
+                    f"{row_id}: {LAYOUT_AC_TAG} tag found in '## {section_name}' "
+                    f"section; the tag must be placed on the AC line itself "
+                    f"inside '## Acceptance Criteria' (spec 4.9c). Move the tag "
+                    f"onto the relevant '- [ ] AC-...' line."
+                )
+
+    def _check_layout_ac_bullet_lines(
+        self,
+        row_id: str,
+        sections: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """Walk `## Acceptance Criteria` bullet lines for `[LAYOUT-AC]` grammar.
+
+        A tagged bullet must name a `LAYOUT_GEOMETRY_KEYWORDS` member; a
+        `[LAYOUT-AC]` tag on a non-AC bullet line is an error naming the
+        section. Continuation lines (not starting a bullet) are ignored --
+        the grammar's contract is that the tag sits on the checkbox line
+        itself. Missing `## Acceptance Criteria` is skipped (Check 7 owns
+        that error).
+
+        Delegates the two outcomes to dedicated helpers rather than
+        interleaving them in one loop body (SRP): a line matching
+        `_AC_BULLET_RE` is a real AC bullet, checked by
+        `_check_layout_ac_tagged_bullet` for whether the tag actually
+        applies (an unbackticked tag applies anywhere on the bullet line; a
+        backticked tag applies only immediately after the AC id -- see the
+        REQUIRED GRAMMAR POSITION comment above
+        `_TAGGED_AC_BULLET_POSITION_RE`); any other `- [`-prefixed line is
+        checked here, with `_strip_inline_code_spans` applied first so
+        prose that merely quotes the tag (e.g. a checklist note discussing
+        the mechanism) is not misread as a misplaced application.
+        """
+        ac_body = sections.get("Acceptance Criteria")
+        if ac_body is None:
+            return
+
+        for line in ac_body.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- ["):
+                continue
+            if self._AC_BULLET_RE.match(stripped):
+                self._check_layout_ac_tagged_bullet(row_id, stripped, errors)
+                continue
+            clean = self._strip_inline_code_spans(stripped)
+            if LAYOUT_AC_TAG in clean:
+                errors.append(
+                    f"{row_id}: {LAYOUT_AC_TAG} tag found in '## Acceptance "
+                    f"Criteria' section but not on an AC bullet line: "
+                    f"{stripped!r}. Move the tag onto a '- [ ] AC-...' line."
+                )
+
+    def _check_layout_ac_tagged_bullet(
+        self,
+        row_id: str,
+        stripped: str,
+        errors: list[str],
+    ) -> None:
+        """Check a real `- [ ] AC-...` bullet line for `[LAYOUT-AC]` grammar.
+
+        The tag APPLIES to this AC in either of two cases (see the
+        REQUIRED GRAMMAR POSITION comment above
+        `_TAGGED_AC_BULLET_POSITION_RE` for the full rationale):
+
+        - An UNBACKTICKED `[LAYOUT-AC]` occurrence ANYWHERE on the bullet
+          line (immediately after the AC id, after a parenthetical spec
+          reference, or mid-sentence) always applies -- round 2 closes the
+          319-D-class silent-ignore gap round 1 left for every position
+          other than immediately after the AC id.
+        - A BACKTICKED `` `[LAYOUT-AC]` `` occurrence applies only when it
+          sits immediately after the AC id (`_TAGGED_AC_BULLET_POSITION_RE`).
+          A backticked occurrence anywhere else on the line (discussing the
+          tagging mechanism itself, as this very work unit's own
+          AC-TEST-002/003 bullets do) is not an application of the tag and
+          is silently untouched -- the same "prose about the mechanism is
+          not the mechanism" distinction `_check_layout_ac_misplacement`
+          already draws for other sections, applied here to the position
+          within an AC bullet rather than to the section the bullet lives
+          in.
+        """
+        clean = self._strip_inline_code_spans(stripped)
+        bare_tag_applies = LAYOUT_AC_TAG in clean
+        backticked_tag_at_anchor = self._TAGGED_AC_BULLET_POSITION_RE.match(stripped) is not None
+        if not bare_tag_applies and not backticked_tag_at_anchor:
+            return
+        normalized = re.sub(r"\s+", "", stripped.lower())
+        if not any(keyword in normalized for keyword in LAYOUT_GEOMETRY_KEYWORDS):
+            errors.append(
+                f"{row_id}: {LAYOUT_AC_TAG}-tagged AC line names no keyword "
+                f"from LAYOUT_GEOMETRY_KEYWORDS: {stripped!r}. Name one of "
+                f"the declared layout/geometry keywords or remove the tag."
+            )
+
     def _check_no_glob_in_manifest(
         self,
         rows: list[tuple[str, str, str]],
@@ -3850,7 +4962,7 @@ class BacklogManager:
         workspace_root: Path,
         errors: list[str],
     ) -> None:
-        """Rule 27: a task waiting on a live ``[BLOCKED_PENDING_PROPOSAL]`` marker must be ``blocked``.
+        """Rule 28: a task waiting on a live ``[BLOCKED_PENDING_PROPOSAL]`` marker must be ``blocked``.
 
         The marker and the ``## Status:`` line are written by separate steps, and
         three consumers read them independently, so a disagreement is silently
@@ -4085,6 +5197,65 @@ class BacklogManager:
                     f"already-satisfied decline to cite the closing commit or task, e.g. "
                     f"'already-satisfied (citing abc1234)'."
                 )
+
+    def _check_gate_waiver_grammar(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 27: every ``[GATE_WAIVER <gate>]`` marker matches the spec 5.3 grammar.
+
+        Scans only the ``## TDD Cycle Log`` section body of every Task
+        work-unit file -- the sole location ``log-waiver``
+        (``BacklogManager._append_audit_marker_before_comments``) ever
+        writes a ``[GATE_WAIVER]`` marker -- for lines containing the
+        literal ``[GATE_WAIVER`` tag substring, and re-parses each one with
+        ``parse_gate_waiver_record`` -- the single writer-and-reader
+        authority for the marker grammar (mirrors how ``gate_records``'s
+        ``parse_gate_pass_record`` polices the sibling ``[GATE_PASS]``
+        family). A line that fails to parse is reported naming the unit id
+        and the exact offending line text, so an operator can locate and fix
+        (or re-issue via ``log-waiver``) the malformed waiver directly. A
+        well-formed marker produces no error.
+
+        Scoping to the TDD Cycle Log section (mirroring
+        ``TDD_CYCLE_LOG_SECTION_BODY_RE``'s use by ``red_gate_satisfied``) is
+        load-bearing, not cosmetic: an unscoped whole-file scan false-flags
+        every backtick-quoted mention of the ``[GATE_WAIVER <gate>]``
+        grammar in prose sections (Description, Approach, Acceptance
+        Criteria, Related Specifications, Comments) -- exactly the kind of
+        documentation citation this very work unit's own Acceptance Criteria
+        and Approach sections contain -- as a malformed marker.
+
+        Args:
+            rows: Parsed ``(id, status, file_path)`` index rows.
+            workspace_root: Workspace root used to resolve work-unit file
+                paths.
+            errors: Shared error accumulator; violations are appended here.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str:
+                continue
+            if not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            section_match = TDD_CYCLE_LOG_SECTION_BODY_RE.search(content)
+            if section_match is None:
+                continue
+            for line in section_match.group(1).splitlines():
+                tag_idx = line.find("[GATE_WAIVER")
+                if tag_idx == -1:
+                    continue
+                try:
+                    parse_gate_waiver_record(line[tag_idx:])
+                except ValueError as exc:
+                    errors.append(f"{row_id}: malformed [GATE_WAIVER] marker {line.strip()!r}: {exc}")
 
     @staticmethod
     def _derive_branch_for_row(

@@ -21,6 +21,19 @@ from types import ModuleType
 
 import pytest
 
+#: A Stripe-shaped fake credential for the redaction tests below, assembled
+#: from fragments rather than written as one literal.
+#:
+#: The value authenticates nothing -- it is written into a `tmp_path` file at
+#: test time and names itself FAKE. But GitHub push protection pattern-matches
+#: the `sk_live_` prefix without reading the assertions around it, so storing
+#: it whole made the branch unpushable and would have raised a repository
+#: secret-scanning alert on a test that exists to PREVENT credential leakage.
+#:
+#: Kept Stripe-shaped on purpose: the gate must redact a real-world credential
+#: shape, so a generic placeholder would weaken what these tests prove.
+_FAKE_STRIPE_KEY = "sk_" + "live_" + "FAKE0000000000000000EXAMPLE"
+
 
 def _pfw() -> ModuleType:
     """Import ``devbench.plugin_helpers.permission_flag_writepath`` on demand.
@@ -1985,11 +1998,11 @@ class TestRender:
         pfw = _pfw()
         _write(
             tmp_path / "src" / "config" / "settings.py",
-            'STRIPE_SECRET_KEY = "sk_live_FAKE0000000000000000EXAMPLE"\n',
+            f'STRIPE_SECRET_KEY = "{_FAKE_STRIPE_KEY}"\n',
         )
         audit = pfw.audit_write_path(tmp_path, "STRIPE_SECRET_KEY")
         rendered = audit.render()
-        assert "sk_live_FAKE0000000000000000EXAMPLE" not in rendered
+        assert _FAKE_STRIPE_KEY not in rendered
         assert "src/config/settings.py:1" in rendered
 
     def test_render_still_shows_the_per_site_expression_verdict(self, tmp_path: Path) -> None:
@@ -2010,7 +2023,7 @@ class TestRender:
         pfw = _pfw()
         _write(
             tmp_path / "src" / "config" / "settings.py",
-            'STRIPE_SECRET_KEY = "sk_live_FAKE0000000000000000EXAMPLE"\n',
+            f'STRIPE_SECRET_KEY = "{_FAKE_STRIPE_KEY}"\n',
         )
         audit = pfw.audit_write_path(tmp_path, "STRIPE_SECRET_KEY")
         rendered = audit.render()

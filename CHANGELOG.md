@@ -55,6 +55,29 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   changed; `GitOpsService.compose_finalize_pr_body` already rendered the
   correct closing-keyword lines.
 
+- **Corrected the cross-repo auto-close overstatement in the
+  `configure-devbench` authoring skill's `git_ops.provenance_path` guidance**
+  (spec `integration-reality-gates-hardening.md` section 4.13, AC-DOC-001;
+  E11-F1-S2-T2). The `git_ops.provenance_path` entry's Alternatives bullet in
+  `plugin-authoring/devbench-authoring/skills/configure-devbench/SKILL.md`
+  previously recommended the provenance map as "useful for unattended
+  `auto_finalize` runs that need issues to auto-close on merge" with no
+  same-repository qualifier, immediately after telling the reader that both
+  cross-repo and same-repo `Fixes` forms come from a single rendering path.
+  That is false for cross-repository mapped issues: GitHub's closing-keyword
+  auto-close mechanism only fires for an issue in the SAME repository as the
+  merging pull request, and a cross-repository `Fixes owner/repo#n` line only
+  creates a cross-reference on the target issue, never a state change, which
+  is exactly why the eight `caylent-solutions/devbench-internal-backlog`
+  issues in `E11-F1-S1-T1` had to be closed by hand. The bullet now states
+  both effects distinctly, consistent with `docs/cli-reference.md`'s
+  `git-ops-finalize --provenance` entry and
+  `docs/release-notes/candidate-release-integration-reality-gates.md`'s
+  "Closing keywords" section. A sweep of `plugin-authoring/` and `plugin/`
+  found no other instance of the claim class. No production code changed;
+  `GitOpsService.compose_finalize_pr_body` already rendered the correct
+  closing-keyword lines.
+
 - **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
   with a named keyword constant** (spec `integration-reality-gates-hardening.md`
   section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`

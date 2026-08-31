@@ -7,6 +7,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Live-smoke checklist content and its zero-to-ready cross-reference are
+  now pinned against silent drift** (E12-F1-S2-T1). New
+  `tests/test_docs/test_live_smoke_evidence.py` closes a gap that was
+  demonstrated, not theorised: replacing
+  `docs/release-notes/live-smoke-evidence.md` with a three-line stub left
+  the whole suite green, because the only prior assertion touching the
+  file was that its path resolves. The new module pins the document's
+  structural invariants (both gate names present in the fenced gates
+  fragment, numbered-step count equal to evidence-table row count, every
+  operator-evidence cell empty, the operator-gating statement naming
+  `E12-F1-S1-T2` as held present, the report and finalize steps present)
+  and, for machine verification rather than prose assertion, loads the
+  fenced `gates:` fragment through the real config loader
+  (`devbench.config_loader.load_runtime_config`) and asserts it validates
+  against the shipped JSON Schema, and resolves every CLI verb named in
+  the checklist's runnable command blocks against the real dispatch
+  table (`devbench.cli._COMMANDS`) instead of a hand-maintained list. A
+  permanent `TestStubMutationControls` class reproduces the historical
+  three-line-stub gutting and proves every extraction helper now fails
+  against it. `tests/test_docs/test_zero_to_ready_link_integrity.py`
+  gains `live-smoke-evidence.md` to its expected-cross-reference
+  parametrize list, closing a probe-proven gap where the existing pin
+  guarded link resolution but not link presence.
+
 - **Release-notes preamble reconciled to the filed Section 15 follow-ups,
   plus a pinned, fail-fast closing-keyword count invariant** (spec
   `integration-reality-gates-hardening.md` section 4.13, AC-24;

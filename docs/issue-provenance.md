@@ -70,3 +70,81 @@ this table. Devbench-repo issue citations (e.g. `caylent-solutions/devbench#228`
 those six root/extension pairs and `CHANGELOG.md` -- including Markdown files under
 `tests/fixtures/`, shell scripts outside `plugin/`, and JSON config files such as
 `src/devbench/config-schema.json` -- are outside this walk's scope.
+
+## Closure log
+
+Spec section 4.13 (AC-23) closure evidence for the eight
+`caylent-solutions/devbench-internal-backlog` gate issues, produced by E11-F1-S1-T1.
+Each row below is transcribed directly from live `gh` command output captured while
+this unit executed against `caylent-solutions/devbench-internal-backlog`, not
+reconstructed or assumed. The state-before value is what `gh issue view <n>` reported
+immediately before this unit's first action on that issue; the comment URL is the
+exact URL `gh issue comment` returned on success; the closed-at value is the
+`closedAt` field `gh issue view <n> --json state,closedAt` reported immediately after
+the close call. This is a plain list, not a fifth pipe-table, so the resolvability
+parser above (which treats every `|`-prefixed line after the header as another data
+row of the single provenance table) never mistakes it for additional provenance rows.
+
+- Issue `caylent-solutions/devbench-internal-backlog#10` (`reachability`, E3): state
+  before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/10#issuecomment-5473216108;
+  closed at = 2026-08-31T03:11:28Z.
+- Issue `caylent-solutions/devbench-internal-backlog#11` (`composition_root`, E9):
+  state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/11#issuecomment-5473216872;
+  closed at = 2026-08-31T03:11:34Z.
+- Issue `caylent-solutions/devbench-internal-backlog#12` (`ancestry`, E4): state
+  before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/12#issuecomment-5473217644;
+  closed at = 2026-08-31T03:11:41Z.
+- Issue `caylent-solutions/devbench-internal-backlog#13` (`shared_file_impact`, E5):
+  state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/13#issuecomment-5473218436;
+  closed at = 2026-08-31T03:11:49Z.
+- Issue `caylent-solutions/devbench-internal-backlog#14` (`layout_geometry`, E10):
+  state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/14#issuecomment-5473219203;
+  closed at = 2026-08-31T03:11:56Z.
+- Issue `caylent-solutions/devbench-internal-backlog#15` (`newly_reachable_paths`,
+  E8): state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/15#issuecomment-5473219990;
+  closed at = 2026-08-31T03:12:03Z.
+- Issue `caylent-solutions/devbench-internal-backlog#16` (`write_path_audit`, E7):
+  state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/16#issuecomment-5473220853;
+  closed at = 2026-08-31T03:12:10Z.
+- Issue `caylent-solutions/devbench-internal-backlog#17` (`fixture_consistency`,
+  E6): state before = OPEN; comment =
+  https://github.com/caylent-solutions/devbench-internal-backlog/issues/17#issuecomment-5473221570;
+  closed at = 2026-08-31T03:12:17Z.
+
+No mapped issue was observed already CLOSED before this unit acted, so no row above
+carries a skip reason; all eight received the comment-then-close sequence. Every
+comment body matches the spec 4.13 template verbatim (re-verified against a live
+`gh api repos/caylent-solutions/devbench-internal-backlog/issues/10/comments` read):
+
+```
+Fixed by <unit-ids> on branch `candidate-release/integration-reality-gates` (combined PR: opens at finalize). The fix goes live when that branch merges to main.
+```
+
+with `<unit-ids>` populated from the terminal (`done`) work-unit ids under the
+mapped epic (E3, E9, E4, E5, E10, E8, E7, E6 respectively; declined siblings
+within those epics, which were never implemented, are excluded from each
+list). The combined PR for
+`candidate-release/integration-reality-gates` does not exist yet at the time this
+unit ran (`git_ops.defer_pr: true`, `auto_finalize: true`; it is created once at
+finalize), so every comment uses the DoR-approved literal substitute `opens at
+finalize` for the PR field rather than a fabricated PR number or URL.
+
+An idempotency pass was run after the eight closures above: `gh issue list
+--repo caylent-solutions/devbench-internal-backlog --state all --json
+number,state,title --limit 100` was re-queried for issues `#10`-`#17` and every one
+reported `state: CLOSED`, so the re-run posted zero comments and issued zero close
+calls (AC-FUNC-002). A follow-up `gh issue view <n> --repo
+caylent-solutions/devbench-internal-backlog --json state,comments` for each of the
+eight issues confirmed `state: CLOSED` and exactly one comment whose body matches the
+template above; each issue additionally carries one earlier, pre-existing comment
+(a bare source-PR link, e.g. `https://github.com/caylent-solutions/devbench/pull/315`
+on `#10`) authored before this unit ran, which does not match the Section 4.13
+template and is therefore not counted against AC-FUNC-001's "exactly one comment
+matching the Section 4.13 template" requirement.

@@ -7,6 +7,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **All eight `caylent-solutions/devbench-internal-backlog` gate issues
+  (`#10`-`#17`) closed with an auditable branch-note comment** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-23;
+  E11-F1-S1-T1). Because these issues live in a different repository from
+  the code that fixes them, no closing keyword in the combined
+  `candidate-release/integration-reality-gates` PR can ever auto-close
+  them (section 13, D-11); each was still OPEN at the time this unit ran,
+  so each received `gh issue comment` with the Section 4.13 template
+  naming the terminal work-unit ids that implemented its gate, then
+  `gh issue close`. `docs/issue-provenance.md` gains a `## Closure log`
+  section recording, per issue, the state observed before acting, the
+  live comment URL and the closing timestamp, all transcribed from actual
+  `gh` command output; a follow-up idempotency pass confirmed all eight
+  issues already CLOSED and posted zero further comments.
+
 - **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
   with a named keyword constant** (spec `integration-reality-gates-hardening.md`
   section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`

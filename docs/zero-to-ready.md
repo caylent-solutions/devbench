@@ -1093,6 +1093,7 @@ directory.
 - [`docs/backlog-contract.md`](backlog-contract.md) (ref) -- validation rule set and workspace layout
 - [`docs/llm-authentication.md`](llm-authentication.md) (ref) -- full Claude / Bedrock auth options
 - [`docs/manual-blockers.md`](manual-blockers.md) (ref) -- manual-blocker format
+- [`docs/release-notes/live-smoke-evidence.md`](release-notes/live-smoke-evidence.md) (ref) -- operator-gated live-smoke checklist (two gates enabled against a seeded fixture workspace)
 
 ---
 

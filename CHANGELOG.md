@@ -199,6 +199,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `### scaffold-store-factory` entry under `## Gates`, pinned against
   drift by `tests/test_docs/test_cli_reference_scaffold_store_factory.py`.
 
+- **Operator-gated live-smoke checklist authored** (spec
+  `integration-reality-gates-hardening.md` section 10, "Live smoke
+  (operator-gated)" bullet, AC-25; E12-F1-S1-T1). New
+  `docs/release-notes/live-smoke-evidence.md` gives the operator a numbered,
+  copy-pasteable checklist that scripts a short real `devbench` run against
+  a seeded fixture workspace with the `reachability` and `shared_file_impact`
+  gates enabled: seed a non-gated (`chore`-typed) fixture work unit and its
+  `BACKLOG.md` index rows, verify both gates resolve `enabled`, observe
+  `mark-done` refuse with its remediation command before either gate has
+  run, satisfy both gates, hand-seed the five required judges'
+  `[REVIEW_PASS]` records via `log-verdict` (gate satisfaction alone is not
+  sufficient for `mark-done` to succeed), observe `mark-done` succeed, then
+  capture `report`, a `git-ops`-produced commit, and the `git-ops-finalize`
+  composed PR body as evidence. The evidence table ships with every
+  operator-evidence cell empty; the companion task `E12-F1-S1-T2` is
+  released `## Status: hold` and is the only path that fills those cells
+  in, never the orchestrator.
+  `docs/zero-to-ready.md` gains a cross-reference to the new document under
+  its `## Cross-references` section.
+
 ### Changed
 
 - **The composition-root testing requirement is now keyed off the task

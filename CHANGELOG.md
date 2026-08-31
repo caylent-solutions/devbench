@@ -38,6 +38,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   predates the `git-ops-finalize --provenance` / `git_ops.provenance_path`
   product fix (section 6; `E2-F9-S1-T1`) that automates this for future runs.
 
+- **Corrected the cross-repo auto-close overstatement in the `git-ops-finalize
+  --provenance` CLI reference entry** (spec `integration-reality-gates-hardening.md`
+  section 4.13, AC-DOC-001; E11-F1-S2-T1). `docs/cli-reference.md`'s
+  `git-ops-finalize --provenance` entry previously concluded that the composed
+  closing-keyword block makes the combined PR "auto-close every issue it fixes
+  on merge" regardless of repository. That claim is false for cross-repository
+  mapped issues: GitHub's closing-keyword auto-close mechanism only fires for
+  an issue in the SAME repository as the merging pull request, and a
+  cross-repository `Fixes owner/repo#n` line only creates a cross-reference on
+  the target issue, never a state change, which is exactly why the eight
+  `caylent-solutions/devbench-internal-backlog` issues in `E11-F1-S1-T1` had
+  to be closed by hand. The entry now states both effects distinctly,
+  consistent with `docs/release-notes/candidate-release-integration-reality-gates.md`'s
+  "Closing keywords" section and the two bullets above. No production code
+  changed; `GitOpsService.compose_finalize_pr_body` already rendered the
+  correct closing-keyword lines.
+
 - **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
   with a named keyword constant** (spec `integration-reality-gates-hardening.md`
   section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`
@@ -908,11 +925,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GitOpsService.compose_finalize_pr_body` in `src/devbench/github/git_ops.py`
   composes the PR title, a per-epic summary section, and one closing-keyword
   line per mapped issue (`Fixes <org>/<repo>#<n>` cross-repo, `Fixes #<n>`
-  same-repo, both rendered by the same code path), so an unattended
-  `auto_finalize` run auto-closes every mapped issue on merge with no operator
-  step -- except when a PR is already open on the branch, per issue #129, in
-  which case the open PR is reused as-is and the freshly-composed body is
-  computed but never posted. A missing, unreadable, invalid, or issue-empty
+  same-repo, both rendered by the same code path); an unattended
+  `auto_finalize` run posts this composed body with no operator step, but
+  only the same-repo `Fixes #<n>` lines auto-close on merge, because GitHub's
+  closing-keyword auto-close mechanism only fires for an issue in the SAME
+  repository as the merging pull request -- the cross-repo `Fixes
+  <org>/<repo>#<n>` lines create a cross-reference on the target issue for
+  traceability but never change its state -- except when a PR is already open
+  on the branch, per issue #129, in which case the open PR is reused as-is
+  and the freshly-composed body is computed but never posted. A missing, unreadable, invalid, or issue-empty
   map fails loudly (exit 1, naming the path) BEFORE any push happens -- it
   never silently falls back to the plain body. `--provenance` beats the
   config key; both beat the plain-body default; there is no `DEVBENCH_*`

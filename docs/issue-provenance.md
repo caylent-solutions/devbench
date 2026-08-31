@@ -14,24 +14,27 @@ placeholders survived the Epic 1 cherry-pick within that walked surface (AC-3).
 
 E11's closure work units (spec section 4.13) read this table verbatim to know which issues, in
 which repo, to close, and in what order the closing PR body cites them -- this table is the input to
-that closure work, not decoration.
+that closure work, not decoration. The five Section 15 follow-up rows (`#356`-`#360`) are
+excluded from that closure input set: they are deliberately OPEN by design and must NEVER be
+closed by E11 closure work units -- see the `## Follow-up issues` subsection below for the
+full record of why each stays open.
 
 | Gate | Internal Issue | Source PR | Devbench Issues | Spec Section |
 |------|-----------------|-----------|------------------|--------------|
 | `reachability` | `caylent-solutions/devbench-internal-backlog#10` | `caylent-solutions/devbench#315` | none | `4.4` |
 | `composition_root` | `caylent-solutions/devbench-internal-backlog#11` | `caylent-solutions/devbench#316` | none | `4.9` |
 | `ancestry` | `caylent-solutions/devbench-internal-backlog#12` | `caylent-solutions/devbench#317` | none | `4.5` |
-| `shared_file_impact` | `caylent-solutions/devbench-internal-backlog#13` | `caylent-solutions/devbench#318` | none | `4.6` |
-| `layout_geometry` | `caylent-solutions/devbench-internal-backlog#14` | `caylent-solutions/devbench#319` | none | `4.9` |
+| `shared_file_impact` | `caylent-solutions/devbench-internal-backlog#13` | `caylent-solutions/devbench#318` | `caylent-solutions/devbench#360` | `4.6` |
+| `layout_geometry` | `caylent-solutions/devbench-internal-backlog#14` | `caylent-solutions/devbench#319` | `caylent-solutions/devbench#358` | `4.9` |
 | `newly_reachable_paths` | `caylent-solutions/devbench-internal-backlog#15` | `caylent-solutions/devbench#320` | none | `4.9` |
 | `write_path_audit` | `caylent-solutions/devbench-internal-backlog#16` | `caylent-solutions/devbench#321` | none | `4.8` |
 | `fixture_consistency` | `caylent-solutions/devbench-internal-backlog#17` | `caylent-solutions/devbench#322` | none | `4.7` |
-| harness guard fixes landed on `feat/bug-closure` ahead of this campaign (D-12): `guard-bash.sh`'s `git checkout --theirs`/`--ours` permit (`#335`) and the `.devbench/active-work-unit` claim marker (`#336`) | none | none | `caylent-solutions/devbench#335`, `caylent-solutions/devbench#336` | `4.12` |
-| assert-tests-pass.sh fail-open rework | TBD (filed at E11) | none | TBD (filed at E11) | `15` |
-| guard-git-stage rule-1 cwd/-C quirks | TBD (filed at E11) | none | TBD (filed at E11) | `15` |
-| real-browser layout machine-verification design | TBD (filed at E11) | none | TBD (filed at E11) | `15` |
-| build-time generation of rubric bodies | TBD (filed at E11) | none | TBD (filed at E11) | `15` |
-| auto-registry fan-in tuning telemetry | TBD (filed at E11) | none | TBD (filed at E11) | `15` |
+| harness guard fixes landed on `feat/bug-closure` ahead of this campaign (D-12): `guard-bash.sh`'s `git checkout --theirs`/`--ours` permit (`#335`) and the `.devbench/active-work-unit` claim marker (`#336`) | none | none | `caylent-solutions/devbench#335`, `caylent-solutions/devbench#336`, `caylent-solutions/devbench#357` | `4.12` |
+| assert-tests-pass.sh fail-open rework | none | none | `caylent-solutions/devbench#356` | `15` |
+| guard-git-stage rule-1 cwd/-C quirks | none | none | `caylent-solutions/devbench#357` | `15` |
+| real-browser layout machine-verification design | none | none | `caylent-solutions/devbench#358` | `15` |
+| build-time generation of rubric bodies | none | none | `caylent-solutions/devbench#359` | `15` |
+| auto-registry fan-in tuning telemetry | none | none | `caylent-solutions/devbench#360` | `15` |
 
 Column notes:
 
@@ -40,8 +43,9 @@ Column notes:
   not tied to a single gate.
 - **Internal Issue** -- the fully-qualified `caylent-solutions/devbench-internal-backlog#<N>` issue
   this row was requested by. `#10`-`#17` are the eight gate issues (spec sections 4.4-4.9); the five
-  Section 15 follow-up rows have no issue number yet because spec section 15 defers filing them until
-  E11.
+  Section 15 follow-up rows carry `none` here, not a number, because they were never requested by an
+  internal-backlog issue -- E11-F1-S1-T3 filed each directly as a `caylent-solutions/devbench`-repo
+  issue (see the Devbench Issues column), the same shape as the harness-guard-fixes row above them.
 - **Source PR** -- the fully-qualified `caylent-solutions/devbench#<N>` draft pull request the gate
   was hardened from. `#315`-`#322` is the set of eight source PRs; spec section 4.14 defines a
   different, non-ascending landing order for cherry-picking them (`#321` -> `#317` -> `#320` ->
@@ -51,9 +55,16 @@ Column notes:
   `.devbench/active-work-unit` claim marker; both are harness guard fixes that landed on
   `feat/bug-closure` before this campaign's branch was cut (spec section 1.2, decision D-12); they
   are not tied to any single gate, so they carry their own row rather than being attached to one of
-  the eight gate rows. `caylent-solutions/devbench-internal-backlog` (this workspace's separate
-  internal-backlog repo) never appears in this column; that repo's issues live only in the Internal
-  Issue column.
+  the eight gate rows. `#357` (`guard-git-stage rule-1 cwd/-C quirks`) is cross-referenced onto this
+  same row because Section 12 documents that follow-up as a secondary finding of `#336`. `#358`
+  (`real-browser layout machine-verification design`) and `#360` (`auto-registry fan-in tuning
+  telemetry`) are additionally cross-referenced onto the `layout_geometry` and `shared_file_impact`
+  gate rows respectively, because Section 15's follow-up list ties each to that specific gate; every
+  filed follow-up also keeps its own dedicated row below (`#356`, `#357`, `#358`, `#359`, `#360`),
+  each OPEN by design (spec Section 15 files these as tracked future work, not work this campaign
+  closes) -- see the `## Follow-up issues` subsection for the full record.
+  `caylent-solutions/devbench-internal-backlog` (this workspace's separate internal-backlog repo)
+  never appears in this column; that repo's issues live only in the Internal Issue column.
 - **Spec Section** -- the `spec/integration-reality-gates-hardening.md` heading that defines this
   row's requirement.
 
@@ -181,6 +192,69 @@ The Section 4.13 release-notes PR-body block this unit authored is
 PR title line, a per-epic summary and a closing-keyword block with one `Fixes
 caylent-solutions/devbench-internal-backlog#<n>` line for each of `#10`-`#17` above and one
 bare `Fixes #<n>` line for each of `#335`, `#336` above -- ten lines total, matching this
-table's mapped-issue count exactly (AC-24). That file also names the Phase 5 operator handoff
+table's mapped-issue count exactly (AC-24). The five Section 15 follow-up rows
+(`#356`-`#360`) are excluded from that mapped-issue count: they are deliberately OPEN
+tracked future work this campaign explicitly declined to implement, not issues this
+campaign closes, so no `Fixes` line exists for any of them anywhere in that file (see
+the `## Follow-up issues` subsection below). That file also names the Phase 5 operator handoff
 step and the `git_ops.provenance_path` config key that supersedes it for future runs (spec
 section 6).
+
+## Follow-up issues
+
+Spec Section 15 ("Future work (explicitly deferred)") and Section 12 ("Out of
+scope (this spec)") names five pieces of deferred work and requires each to be
+FILED as its own `caylent-solutions/devbench` issue during E11
+(E11-F1-S1-T3). Each row below is transcribed directly from live `gh issue
+view <n> --repo caylent-solutions/devbench --json number,title,state,url`
+output captured immediately after this unit's `gh issue create` call, not
+reconstructed or assumed. Every issue is deliberately left OPEN: unlike the
+mapped gate issues E11-F1-S1-T1 and E11-F1-S1-T2 closed, these are tracked
+future work items this campaign explicitly declined to implement, so closing
+them here would misrepresent the campaign as having done the deferred work.
+This is a plain list, not a sixth pipe-table, so the resolvability parser
+above (which treats every `|`-prefixed line after the header as another data
+row of the single provenance table) never mistakes it for additional
+provenance rows.
+
+- Item: assert-tests-pass.sh fail-open rework. Issue:
+  `caylent-solutions/devbench#356`
+  (https://github.com/caylent-solutions/devbench/issues/356). State: OPEN.
+  Deferring spec section: `15`.
+- Item: guard-git-stage rule-1 cwd/-C quirks. Issue:
+  `caylent-solutions/devbench#357`
+  (https://github.com/caylent-solutions/devbench/issues/357). State: OPEN.
+  Deferring spec section: `15`.
+- Item: real-browser layout machine-verification design. Issue:
+  `caylent-solutions/devbench#358`
+  (https://github.com/caylent-solutions/devbench/issues/358). State: OPEN.
+  Deferring spec section: `15`.
+- Item: build-time generation of rubric bodies. Issue:
+  `caylent-solutions/devbench#359`
+  (https://github.com/caylent-solutions/devbench/issues/359). State: OPEN.
+  Deferring spec section: `15`.
+- Item: auto-registry fan-in tuning telemetry. Issue:
+  `caylent-solutions/devbench#360`
+  (https://github.com/caylent-solutions/devbench/issues/360). State: OPEN.
+  Deferring spec section: `15`.
+
+Each issue body names the deferring spec section (Section 15, cross-referenced
+from Section 12 for the four items Section 12 also lists by name -- the
+fail-open rework, the guard-git-stage rule-1 quirks, the real-browser
+machine-verification design and the build-time-generation-beyond-vocabulary
+item; the auto-registry fan-in telemetry item is Section-15-only and carries
+no Section 12 cross-reference), the
+motivating finding or issue (`L-claude-md-24` for the fail-open rework;
+`caylent-solutions/devbench#336` for the guard-git-stage rule-1 quirks;
+`caylent-solutions/devbench-internal-backlog#14` for the layout
+machine-verification design; the E2 vocabulary-only generation scope for the
+rubric-bodies item; `caylent-solutions/devbench-internal-backlog#13` and
+decision D-9 for the auto-registry fan-in telemetry item), and the reason the
+work was excluded from this campaign (AC-FUNC-001).
+
+An idempotency pass was run after filing: `gh issue list --repo
+caylent-solutions/devbench --state all --search "\"<title>\" in:title" --json
+number,title,state` was re-queried for each of the five titles above and each
+returned exactly the one issue number already filed (`#356`-`#360`), so a
+second filing pass creates zero issues and reuses the existing numbers
+(AC-FUNC-003).

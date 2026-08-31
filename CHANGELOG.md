@@ -78,6 +78,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GitOpsService.compose_finalize_pr_body` already rendered the correct
   closing-keyword lines.
 
+- **Filed the five spec Section 15 follow-up issues and folded them into the
+  provenance map** (spec `integration-reality-gates-hardening.md` section 15,
+  section 12, AC-FUNC-001 through AC-FUNC-004; E11-F1-S1-T3). One
+  `caylent-solutions/devbench` issue now exists for each deferred item --
+  `assert-tests-pass.sh` fail-open rework (`#356`), guard-git-stage rule-1
+  cwd/-C quirks (`#357`), real-browser layout machine-verification design
+  (`#358`), build-time generation of rubric bodies (`#359`) and auto-registry
+  fan-in tuning telemetry (`#360`) -- each body naming the deferring spec
+  section and the motivating finding or issue; a re-run of the filing pass
+  matched all five titles to their existing issue and created zero new
+  issues. `docs/issue-provenance.md` gains each number in the Devbench Issues
+  column of its placeholder row (plus a cross-reference on the
+  `layout_geometry`, `shared_file_impact` and harness-guard-fixes rows where
+  Section 15 ties a follow-up to an existing row) and a new
+  `## Follow-up issues` subsection recording item, issue, state OPEN and
+  deferring spec section per row; every number was verified live against
+  `gh issue view` before being recorded.
+
 - **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
   with a named keyword constant** (spec `integration-reality-gates-hardening.md`
   section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`

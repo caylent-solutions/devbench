@@ -148,3 +148,39 @@ template above; each issue additionally carries one earlier, pre-existing commen
 on `#10`) authored before this unit ran, which does not match the Section 4.13
 template and is therefore not counted against AC-FUNC-001's "exactly one comment
 matching the Section 4.13 template" requirement.
+
+Spec section 4.13 (AC-23) closure evidence for the two `caylent-solutions/devbench`-repo
+issues in this table's "Devbench Issues" column (`#335`, `#336`), produced by
+E11-F1-S1-T2. Both were observed via a live `gh issue view <n> --repo
+caylent-solutions/devbench --json number,state,title,comments` call immediately before this
+unit's first action; both already reported `state: CLOSED` with zero comments, so neither
+received the Section 4.13 branch-note comment or a `gh issue close` call -- each is recorded
+below with its skip reason instead (AC-FUNC-004), matching Approach step 3's "issues observed
+CLOSED are skipped with an audit note."
+
+- Issue `caylent-solutions/devbench#335` (`guard-bash.sh` over-blocked `git checkout
+  --theirs`/`--ours` via the bare `git checkout --` substring pattern): state before =
+  CLOSED; skip reason = already closed before this unit ran. The fix landed in commit
+  `8ac9c07` on `feat/bug-closure` (spec section 1.2, decision D-12) and was inherited by
+  `candidate-release/integration-reality-gates` when this campaign's branch was cut from
+  `feat/bug-closure` tip `8ac9c07` -- the fix therefore predates any campaign work-unit id, so
+  no `<unit-ids>` value exists to cite in a comment; no comment posted, no close call issued.
+- Issue `caylent-solutions/devbench#336` (`guard-git-stage.sh` rule 2 manifest-scope
+  enforcement was dead code because `CURRENT_WORK_UNIT_FILE` was never set in production):
+  state before = CLOSED; skip reason = same as `#335` -- fixed by the same commit `8ac9c07`
+  on `feat/bug-closure`, already CLOSED at branch-cut; no comment posted, no close call
+  issued.
+
+An idempotency pass was run after the observation above: `gh issue view 335 --repo
+caylent-solutions/devbench --json number,state,comments` and the equivalent call for `#336`
+were re-queried and both still report `state: CLOSED` with zero comments, so the re-run
+posted zero further comments and issued zero close calls (AC-FUNC-004).
+
+The Section 4.13 release-notes PR-body block this unit authored is
+`docs/release-notes/candidate-release-integration-reality-gates.md` (spec 5.6): it carries the
+PR title line, a per-epic summary and a closing-keyword block with one `Fixes
+caylent-solutions/devbench-internal-backlog#<n>` line for each of `#10`-`#17` above and one
+bare `Fixes #<n>` line for each of `#335`, `#336` above -- ten lines total, matching this
+table's mapped-issue count exactly (AC-24). That file also names the Phase 5 operator handoff
+step and the `git_ops.provenance_path` config key that supersedes it for future runs (spec
+section 6).

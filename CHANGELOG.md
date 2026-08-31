@@ -22,6 +22,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `gh` command output; a follow-up idempotency pass confirmed all eight
   issues already CLOSED and posted zero further comments.
 
+- **The `caylent-solutions/devbench`-repo half of Section 4.13 closure lands,
+  plus the release-notes PR-body closing-keyword block** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-23, AC-24;
+  E11-F1-S1-T2). Live `gh issue view` calls found `caylent-solutions/devbench#335`
+  and `#336` already CLOSED (fixed by commit `8ac9c07` on `feat/bug-closure`,
+  inherited at this campaign's branch-cut per decision D-12), so neither needed
+  a comment or a close call; `docs/issue-provenance.md`'s `## Closure log`
+  gains a skip-reasoned row for each. New
+  `docs/release-notes/candidate-release-integration-reality-gates.md` carries
+  the PR title line, a per-epic summary and a closing-keyword block (one
+  `Fixes caylent-solutions/devbench-internal-backlog#<n>` line per `#10`-`#17`,
+  one bare `Fixes #<n>` line per `#335`/`#336`) for the operator to apply to
+  the combined PR body at Phase 5 handoff, because the running harness
+  predates the `git-ops-finalize --provenance` / `git_ops.provenance_path`
+  product fix (section 6; `E2-F9-S1-T1`) that automates this for future runs.
+
 - **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
   with a named keyword constant** (spec `integration-reality-gates-hardening.md`
   section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`

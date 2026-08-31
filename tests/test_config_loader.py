@@ -5351,6 +5351,242 @@ class TestFixtureConsistencyConfigDocstringDocumentsSymlinkExclusionAndRedaction
         assert "unconditionally regardless of length" in section
 
 
+@pytest.mark.unit
+class TestGatesConfigDocstringDocumentsLayoutGeometryWaiverRoute:
+    """E10-F1-S1-T2 (spec 4.9c, 4.2, 4.9 PM-5): ``GatesConfig``'s ``layout_geometry``
+    attribute docstring names the gate's judge-evidence tier and its ``log-waiver``
+    exception route (mandatory reason, ``--operator`` not required), mirrored from
+    ``docs/devbench-yaml-reference.md``'s ``gates.layout_geometry`` section. Follows the
+    same drift-pin pattern as
+    ``TestFixtureConsistencyConfigDocstringDocumentsSymlinkExclusionAndRedaction`` above:
+    scoped to just the ``layout_geometry`` attribute's own paragraph within the dataclass
+    docstring, so this dies only if THIS mirrored copy drifts. Imports ``GatesConfig``
+    inside the test body (not at module level) so a scoped stash of
+    ``src/devbench/config_loader.py`` alone yields a collected FAILED assertion, never a
+    collection ERROR."""
+
+    def test_attribute_docstring_documents_judge_evidence_tier_and_waiver_route(self) -> None:
+        import inspect
+
+        from devbench.config_loader import GatesConfig
+
+        doc = inspect.getdoc(GatesConfig)
+        assert doc is not None
+        section = doc.split("layout_geometry: layout-geometry gate tunables")[1]
+        normalized = " ".join(section.split())
+        assert "no tunable beyond" in normalized
+        assert "Judge-evidence tier" in normalized
+        assert "never blocks ``mark-done``" in normalized
+        assert "browser geometry itself is verified outside devbench" in normalized
+        assert "``log-waiver``" in normalized
+        assert "mandatory non-empty" in normalized
+        assert "``--operator`` is NOT required" in normalized
+
+
+@pytest.mark.unit
+class TestLayoutGeometryGateConfigNamedRegressionPins:
+    """E10-F1-S1-T2 (spec 4.1, AC-4/AC-5/AC-27): the ``gates.layout_geometry``
+    four-layer precedence, fail-fast unknown-key/wrong-type error paths, and
+    per-repo field-wise override. The underlying generic mechanism (the
+    ``GatesConfig.layout_geometry`` field, its ``_parse_simple_gate_enabled``/
+    ``_parse_gate_override_enabled`` parsing, and ``resolve_gate_config``'s
+    generic ``GATE_FIELD_DEFAULTS``-driven merge) was already shipped for
+    ALL eight gates -- including ``layout_geometry`` -- by E2-F1-S1-T1
+    (commit 195be6a) and E2-F1-S1-T2 (commit 7a669c5), which predate this
+    task. These cases exist because no prior test named ``layout_geometry``
+    explicitly by name (every existing precedence/error-path test uses
+    ``ancestry``/``shared_file_impact``/``reachability`` as its exemplar
+    gate) -- they PIN the already-correct generic behavior specifically for
+    THIS gate name, closing the AC-TEST-001/002/003/004 and AC-CYCLE-001
+    coverage gap without re-implementing the generic mechanism a second
+    time (DRY)."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_no_gates_key_resolves_disabled_with_builtin_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-001: absent gates: key resolves layout_geometry.enabled False, builtin provenance."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.layout_geometry.enabled is False
+        from devbench.config_loader import resolve_gate_config
+
+        result = resolve_gate_config("layout_geometry", "org/repo", rt)
+        assert result.values == {"enabled": False}
+        assert result.provenance == {"enabled": "builtin"}
+
+    def test_project_level_enabled_true_resolves_project_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-002 (project layer): project-level enabled: true resolves True, project provenance."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config_loader import resolve_gate_config
+
+        result = resolve_gate_config("layout_geometry", "org/repo", rt)
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_per_repo_override_flips_enabled_with_repo_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-002 (repo layer), AC-CYCLE-001: a per-repo override under
+        gates.repos.caylent-solutions/devbench flips enabled while every other
+        repo stays on the project-level value. Project is set to True (differs
+        from the builtin False default) so the un-overridden repo's resolved
+        provenance is genuinely 'project', not 'builtin'."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+              org/other: {}
+            gates:
+              layout_geometry:
+                enabled: true
+              repos:
+                caylent-solutions/devbench:
+                  layout_geometry:
+                    enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config_loader import resolve_gate_config
+
+        overridden = resolve_gate_config("layout_geometry", "caylent-solutions/devbench", rt)
+        assert overridden.values == {"enabled": False}
+        assert overridden.provenance == {"enabled": "repo"}
+        elsewhere = resolve_gate_config("layout_geometry", "org/other", rt)
+        assert elsewhere.values == {"enabled": True}
+        assert elsewhere.provenance == {"enabled": "project"}
+
+    def test_env_override_beats_project_and_repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-TEST-002 (env layer): DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED beats both lower layers.
+
+        Hermetic by construction: the unset leg explicitly ``delenv``s the
+        variable (rather than trusting the ambient shell), and the env-wins
+        leg ``setenv``s it and threads the result through the real
+        ``resolve_gate_env_override`` derivation, so the documented operator
+        env override is genuinely exercised in both directions instead of a
+        hand-injected boolean standing in for it.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+            gates:
+              layout_geometry:
+                enabled: false
+              repos:
+                caylent-solutions/devbench:
+                  layout_geometry:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config import resolve_gate_env_override
+        from devbench.config_loader import resolve_gate_config
+
+        env_var = "DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED"
+
+        monkeypatch.delenv(env_var, raising=False)
+        with_env_unset = resolve_gate_config(
+            "layout_geometry",
+            "caylent-solutions/devbench",
+            rt,
+            env_enabled_override=resolve_gate_env_override("layout_geometry"),
+        )
+        assert with_env_unset.values == {"enabled": True}
+        assert with_env_unset.provenance == {"enabled": "repo"}
+
+        monkeypatch.setenv(env_var, "false")
+        with_env_set = resolve_gate_config(
+            "layout_geometry",
+            "caylent-solutions/devbench",
+            rt,
+            env_enabled_override=resolve_gate_env_override("layout_geometry"),
+        )
+        assert with_env_set.values == {"enabled": False}
+        assert with_env_set.provenance == {"enabled": "env"}
+
+    def test_unknown_key_under_layout_geometry_raises_naming_key(self, tmp_path: Path) -> None:
+        """AC-TEST-003: an unrecognised key under gates.layout_geometry fails load naming it."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.layout_geometry.*bogus_key"):
+            load_runtime_config(cfg, {})
+
+    def test_non_boolean_enabled_raises_naming_key_and_expected_type(self, tmp_path: Path) -> None:
+        """AC-TEST-003: a non-boolean gates.layout_geometry.enabled fails load naming key and type."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.layout_geometry\.enabled.*boolean"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_and_sample_config_both_carry_the_gate(self) -> None:
+        """AC-TEST-004: config-schema.json and sample-config.yaml both declare
+        gates.layout_geometry with additionalProperties: false preserved at
+        both the top-level gate block and the per-repo override block."""
+        repo_root = Path(__file__).resolve().parent.parent
+        schema = json.loads((repo_root / "src" / "devbench" / "config-schema.json").read_text(encoding="utf-8"))
+        gates_props = schema["properties"]["gates"]["properties"]
+        assert "layout_geometry" in gates_props
+        assert gates_props["layout_geometry"]["additionalProperties"] is False
+        assert "enabled" in gates_props["layout_geometry"]["properties"]
+        repo_override_props = gates_props["repos"]["patternProperties"]["^[^/]+/[^/]+$"]["properties"]
+        assert "layout_geometry" in repo_override_props
+        assert repo_override_props["layout_geometry"]["additionalProperties"] is False
+
+        sample_config = (repo_root / "sample-config.yaml").read_text(encoding="utf-8")
+        gates_section_start = sample_config.index("# gates:")
+        gates_section_end = sample_config.index("# ---", gates_section_start + len("# gates:"))
+        gates_section = sample_config[gates_section_start:gates_section_end]
+        assert "layout_geometry:" in gates_section, (
+            "sample-config.yaml 'gates:' section is missing its commented layout_geometry block (AC-TEST-004)"
+        )
+        # Scope past the shared "layout_geometry:" substring match (it also appears inside the
+        # gate's own comment prose) down to the start of the next sibling gate key, so this
+        # assertion can only pass against the actual gates.layout_geometry commented block --
+        # not any incidental mention of the gate name elsewhere in the section.
+        after_key = gates_section[gates_section.index("layout_geometry:") + 1 :]
+        next_sibling_key = re.search(r"\n#   [a-z]", after_key)
+        layout_geometry_block = after_key[: next_sibling_key.start()] if next_sibling_key else after_key
+        assert "enabled: false" in layout_geometry_block, (
+            "sample-config.yaml 'gates.layout_geometry' commented block is missing its "
+            "'enabled: false' line (AC-TEST-004)"
+        )
+
+
 # ---------------------------------------------------------------------------
 # gates.reachability.entry_points (spec 4.1, 4.4 bullet 2; issue #10 AC2)
 # ---------------------------------------------------------------------------

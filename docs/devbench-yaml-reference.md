@@ -617,6 +617,45 @@ case a derived file can still match and the gate can still block even with no ha
 patterns at all. Only when both `patterns` is empty AND `auto_derive_registry` is `false` (or
 unset) is the gate a permanent no-op, identical to today's behavior before this feature existed.
 
+### `gates.layout_geometry` -- layout/geometry judge-evidence gate and its `log-waiver` exception route (caylent-solutions/devbench-internal-backlog#14; spec 4.9c, 4.2, 4.9 PM-5)
+
+**Purpose.** `layout_geometry` has no automated check command of its own -- it exists so an
+operator can see, in `devbench gates`, whether a repo is expected to carry `[LAYOUT-AC]`-tagged
+acceptance criteria for layout/visual-geometry-sensitive changes (spec 4.9c). A `[LAYOUT-AC]`-
+tagged AC line must name at least one keyword from `LAYOUT_GEOMETRY_KEYWORDS`
+(`src/devbench/constants.py`) -- the single source of truth both the `test-reviewer` rubric and
+the `spec-to-backlog` SKILL render their keyword list from -- or `validate-backlog` rejects it.
+
+**Default.** `false` at the built-in level (D-17): a fresh install behaves exactly as it did
+before this gate existed until an operator opts a repo in via `gates.layout_geometry.enabled:
+true` (project level) or `gates.repos.<org/repo>.layout_geometry.enabled: true` (per-repo).
+
+**Tier.** `judge-evidence` (`constants.GATE_TIERS`; see [`gates`](cli-reference.md#gates) for the
+tier taxonomy). A `judge-evidence` gate never blocks `mark-done` on its own; it is evidence the
+`test-reviewer` judge weighs (spec Section 0.2), not a machine-checked pass/fail outcome. Actual
+browser geometry -- pixel layout, overlap, viewport behavior -- is verified OUTSIDE devbench, by a
+human, a screenshot-diff tool, or an end-to-end browser test the target repo owns; devbench's own
+role stops at confirming a `[LAYOUT-AC]`-tagged acceptance criterion, where present, is
+well-formed and names a recognized keyword.
+
+**Env override.** `DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED` (spec Section 7), the same
+`DEVBENCH_GATE_<NAME>_ENABLED` convention every gate uses (highest-precedence layer, D-15).
+
+**Exception route (spec 4.9, PM-5).** Because this is a `judge-evidence` gate, a waiver is
+recorded with `log-waiver` and accepts EITHER attribution -- `--operator` is NOT required (unlike
+a `machine-blocking` gate, where it is mandatory):
+
+```
+$ uv run devbench log-waiver test_review E9-F1-S1-T1 \
+    --gate layout_geometry --target "src/app/ResizablePanel.tsx" \
+    --reason "geometry verified by hand in a live browser; no automated layout AC applies"
+```
+
+`--reason` is mandatory and non-empty; an empty or missing `--reason` is a usage error, exit `2`.
+A supplied reason containing a disallowed character (an em-dash, a control character, or a
+bracketed TDD phase tag such as `[RED]`) exits `1`. See
+[`log-waiver`](cli-reference.md#log-waiver) for the full command reference.
+
 ---
 
 ## `backlog:` -- backlog lifecycle settings (issue #189)

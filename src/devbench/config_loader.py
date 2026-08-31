@@ -867,7 +867,16 @@ class GatesConfig:
             including ``paths`` (spec 4.1, 4.9a; decision C-03 -- the
             migrated cross-cutting-primitives registry).
         composition_root: composition-root gate tunables.
-        layout_geometry: layout-geometry gate tunables.
+        layout_geometry: layout-geometry gate tunables (no tunable beyond
+            ``enabled``). Judge-evidence tier (``constants.GATE_TIERS``;
+            spec 4.2) -- never blocks ``mark-done`` on its own; browser
+            geometry itself is verified outside devbench. Waived with
+            ``log-waiver`` (spec 4.9, PM-5): a mandatory non-empty
+            ``--reason``, and ``--operator`` is NOT required (unlike a
+            machine-blocking gate) because this gate accepts either
+            attribution. See the ``gates.layout_geometry`` section of
+            ``docs/devbench-yaml-reference.md`` for the full exception-
+            route reference (E10-F1-S1-T2).
         repos: Optional per-repo override map, keyed by ``org/repo``. Every
             key must already be present in the top-level ``repos:``
             mapping -- an override naming an unconfigured repo is a

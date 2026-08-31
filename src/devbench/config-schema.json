@@ -789,7 +789,7 @@
         },
         "layout_geometry": {
           "type": "object",
-          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#14). No gate-specific tunables beyond enabled.",
+          "description": "layout-geometry gate (caylent-solutions/devbench-internal-backlog#14; spec 4.9c). No gate-specific tunables beyond enabled. Judge-evidence tier (constants.GATE_TIERS, spec 4.2); waived via log-waiver with a mandatory --reason and no --operator requirement. See docs/devbench-yaml-reference.md's gates.layout_geometry section for the full exception-route reference.",
           "additionalProperties": false,
           "properties": {
             "enabled": {

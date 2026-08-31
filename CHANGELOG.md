@@ -41,6 +41,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `tests/test_constants.py::TestLayoutGeometryKeywordSurfacesMatchConstant`,
   so the list exists exactly once in the tree.
 
+- **`gates.layout_geometry` documented as a first-class judge-evidence gate,
+  with a structural drift pin on its documentation surfaces** (spec
+  `integration-reality-gates-hardening.md` sections 4.1, 4.9c, 4.2, 4.9 PM-5;
+  issue `caylent-solutions/devbench-internal-backlog#14`; E10-F1-S1-T2). The
+  `gates.layout_geometry` node in the `GatesConfig` tree, `config-schema.json`
+  and `sample-config.yaml` were already generically shipped for all eight
+  gates by E2-F1-S1-T1/E2-F1-S1-T2; this task closes the two things E10-F1-S1-T1
+  left open: `docs/devbench-yaml-reference.md` now carries a dedicated
+  `gates.layout_geometry` subsection (purpose, default, judge-evidence tier,
+  `DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED` env override, and the `log-waiver`
+  exception route -- a mandatory non-empty `--reason`, and `--operator` NOT
+  required since a judge-evidence gate accepts either attribution, unlike a
+  machine-blocking gate), mirrored into `GatesConfig`'s `layout_geometry`
+  attribute docstring and pinned drift-free by
+  `tests/test_config_loader.py::TestGatesConfigDocstringDocumentsLayoutGeometryWaiverRoute`.
+  New `tests/test_plugin/test_layout_ac_pins.py` independently checks both
+  shipped keyword surfaces' raw guard-block text against
+  `LAYOUT_GEOMETRY_KEYWORDS` directly (complementing, not duplicating, the
+  byte-identical generator pin `TestLayoutGeometryKeywordSurfacesMatchConstant`
+  already provides) and asserts the yaml reference documents the gate and its
+  waiver route -- every check asserts rather than skips when a pinned file is
+  missing. `tests/test_config_loader.py` also gains named regression pins
+  (`TestLayoutGeometryGateConfigNamedRegressionPins`) for the four-layer
+  precedence, the unknown-key/wrong-type fail-fast paths, and the schema/
+  sample-config coverage, explicitly by gate name for the first time.
+
 - **`scaffold-store-factory` CLI verb: a composition-root store-factory test
   skeleton generator** (spec `integration-reality-gates-hardening.md`
   section 4.9(b), issue `caylent-solutions/devbench-internal-backlog#11`

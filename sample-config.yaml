@@ -550,6 +550,10 @@ validate:
 #   composition_root:                   # caylent-solutions/devbench-internal-backlog#11
 #     enabled: false
 #   layout_geometry:                    # caylent-solutions/devbench-internal-backlog#14
+#     # Judge-evidence tier (spec 4.2, 4.9c): never blocks mark-done on its own; browser
+#     # geometry itself is verified outside devbench. Waived via `log-waiver` with a
+#     # mandatory --reason; --operator is NOT required (see docs/devbench-yaml-reference.md's
+#     # gates.layout_geometry section for the full exception-route reference).
 #     enabled: false
 #   repos:                              # optional per-repo override, field-wise merged over the project level
 #     caylent-solutions/devbench:

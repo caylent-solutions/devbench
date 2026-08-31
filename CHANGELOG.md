@@ -7,6 +7,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Release-notes preamble reconciled to the filed Section 15 follow-ups,
+  plus a pinned, fail-fast closing-keyword count invariant** (spec
+  `integration-reality-gates-hardening.md` section 4.13, AC-24;
+  E11-F1-S2-T3). `docs/release-notes/candidate-release-integration-reality-gates.md`
+  no longer asserts the five Section 15 follow-up rows are `TBD (filed at
+  E11)` or promises `E11-F1-S1-T3` will add their lines to the closing-keyword
+  block -- both went stale once `E11-F1-S1-T3` filed them as
+  `caylent-solutions/devbench#356` through `#360` -- and no longer
+  misclassifies `#335`/`#336` as cross-repo issues while explaining why the
+  five follow-ups stay excluded; the block still records exactly ten
+  closing-keyword lines with no line added for any of the five, which stay
+  deliberately OPEN. `tests/test_docs/test_issue_provenance.py` gains
+  `TestClosingKeywordCountInvariant`, pinning that the block carries exactly
+  one recognised GitHub closing-keyword line (the full case-insensitive
+  `close(s/d)`/`fix(es/ed)`/`resolve(s/d)` set, not only exact-case `Fixes`)
+  per numbered mapped issue with the OPEN follow-ups excluded, raising on any
+  unrecognised line or code fence found under the heading instead of
+  silently skipping it, with the Section 15 exclusion set derived from
+  parsed map rows rather than transcribed. `extract_devbench_repo_issue_tokens`
+  is wired into a real campaign-file walk resolving `caylent-solutions/devbench#<N>`
+  citations against the map's Devbench Issues column unioned with its Source
+  PR column (plus a small, named pre-campaign allowlist), closing a gap
+  inherited from `E2-F7-S1-T2` where that citation form was never resolved
+  against any real file at all.
+
 - **All eight `caylent-solutions/devbench-internal-backlog` gate issues
   (`#10`-`#17`) closed with an auditable branch-note comment** (spec
   `integration-reality-gates-hardening.md` section 4.13, AC-23;

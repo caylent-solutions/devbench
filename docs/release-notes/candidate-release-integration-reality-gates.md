@@ -97,10 +97,11 @@ machine-verified from inside devbench.
 **E11 -- Issue closure and PR provenance.** In progress. `E11-F1-S1-T1` closed the eight
 `caylent-solutions/devbench-internal-backlog` gate issues (`#10`-`#17`) with the Section
 4.13 branch-note comment. This unit (`E11-F1-S1-T2`) closes the devbench-repo half of the
-requirement and authors this release-notes file. `E11-F1-S1-T3`, which depends on this unit,
-still needs to file the spec section 15 follow-up issues and fold them into the provenance
-map -- those follow-ups are not part of this block's closing-keyword line count because they
-have no issue number yet.
+requirement and authors this release-notes file. `E11-F1-S1-T3` filed the five spec section 15
+follow-up issues as `caylent-solutions/devbench#356` through `#360` and folded them into the
+provenance map -- those follow-ups are not part of this block's closing-keyword line count
+because they are deliberately OPEN tracked future work, not because they lack an issue
+number.
 
 **E12 -- Proof (operator-gated live smoke).** Not yet started (epic status: in-queue;
 `E12-F1-S1-T1` blocked, `E12-F1-S1-T2` hold). E12 is the operator-gated live-smoke proof of
@@ -125,8 +126,12 @@ precisely because no cross-repo keyword could have closed them on merge. AC-24 r
 equals the number of mapped issues in `docs/issue-provenance.md`'s provenance table plus its
 `#335`/`#336` row: the eight `caylent-solutions/devbench-internal-backlog` gate issues plus the
 two devbench-repo harness-guard issues -- ten lines total. The five spec-section-15 follow-up
-rows are still `TBD (filed at E11)` in the map and therefore contribute no line here;
-`E11-F1-S1-T3` will add their lines to this block once it files them.
+issues, filed by `E11-F1-S1-T3` as `caylent-solutions/devbench#356` through `#360`, contribute
+no line here: they are deliberately OPEN tracked future work this campaign explicitly declined
+to implement, not issues this campaign closes. Unlike the eight cross-repo `#10`-`#17` lines,
+and like `#335`/`#336`, these five are same-repo issues, so a bare `Fixes #356` line WOULD
+auto-close one of them on merge -- no line is added for any of `#356`-`#360`, by design, and
+the count stays at ten.
 
 ### Closes
 

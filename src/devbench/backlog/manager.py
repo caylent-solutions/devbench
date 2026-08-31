@@ -42,7 +42,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Final
 
 from devbench.backlog.work_unit import WorkUnitType
 from devbench.comment_time import comment_timestamp, tdd_timestamp
@@ -67,6 +67,8 @@ from devbench.constants import (
     GATE_WAIVER_ATTRIBUTION_EXECUTOR,
     GATE_WAIVER_ATTRIBUTION_OPERATOR,
     GATED_TASK_TYPES,
+    LAYOUT_AC_TAG,
+    LAYOUT_GEOMETRY_KEYWORDS,
     RED_OBSERVED_ENTRY_LINE_RE,
     RED_OBSERVED_MESSAGE_FIELDS_RE,
     STATUS_BLOCKED,
@@ -97,6 +99,7 @@ from devbench.constants import (
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
+from devbench.vocabulary_generation import replace_guarded_block
 
 # Terminal statuses for parent-rollup purposes: a child in either state is
 # "finalised" and does not block its parent from rolling to done. Kept at
@@ -682,6 +685,137 @@ def count_review_fails_for_judge(content: str, judge_name: str) -> int:
     """
     token = f"[judge/{judge_name}]"
     return sum(1 for line in content.splitlines() if token in line and "[REVIEW_FAIL]" in line)
+
+
+# ---------------------------------------------------------------------------
+# LAYOUT_GEOMETRY_KEYWORDS surface generation (spec 4.9c, AC-TEST-004;
+# code_review round 1, this unit: the ``<!-- generated:layout-ac-keywords
+# -->`` guard-marker blocks in ``test-reviewer.md`` and the ``spec-to-backlog``
+# SKILL were hand-typed copies with no code that actually generated them,
+# falsifying the "consumed via generation" claim these surfaces (and
+# ``CHANGELOG.md``, and the constants-module comment above
+# ``LAYOUT_AC_TAG``) made. This section closes that gap by reusing
+# ``devbench.vocabulary_generation.replace_guarded_block`` -- "the single
+# implementation of the guard-marker contract, used by both surface kinds"
+# -- with this domain's own marker literals, mirroring
+# ``devbench.plugin_helpers.permission_flag_writepath.regenerate_skill_step_3b``,
+# the precedent consumer that reuses the same shared splicer for an
+# unrelated guard-marked block rather than folding a second domain's
+# generation targets into ``vocabulary_generation``'s own
+# ``JUDGE_CATEGORIES``-specific ``generate_all``/``find_drifted_surfaces``
+# enumeration.
+# ---------------------------------------------------------------------------
+
+_LAYOUT_AC_KEYWORD_GUARD_MARKER_START: Final[str] = "<!-- generated:layout-ac-keywords -->"
+_LAYOUT_AC_KEYWORD_GUARD_MARKER_END: Final[str] = "<!-- /generated:layout-ac-keywords -->"
+
+#: Repo-relative paths of the two shipped surfaces that render
+#: ``LAYOUT_GEOMETRY_KEYWORDS`` between the guard-marker pair above
+#: (spec 4.9c). Both are also pinned byte-identical to
+#: :func:`render_layout_ac_keyword_block`'s output by
+#: ``tests/test_constants.py::TestLayoutGeometryKeywordSurfacesMatchConstant``.
+LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS: Final[tuple[str, ...]] = (
+    "plugin/devbench-orchestrate/agents/review_team/test-reviewer.md",
+    "plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md",
+)
+
+#: Command an operator (or a drift-pin failure message) names to regenerate
+#: both surfaces above. A single module constant so the text can never
+#: itself drift from what actually regenerates the block, mirroring
+#: ``permission_flag_writepath.REGENERATE_SKILL_STEP_3B_COMMAND``.
+REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND: Final[str] = (
+    'uv run python -c "from pathlib import Path; '
+    "from devbench.backlog.manager import regenerate_layout_ac_keyword_surfaces; "
+    "regenerate_layout_ac_keyword_surfaces(Path('<repo-root>'))\""
+)
+
+
+def render_layout_ac_keyword_block() -> str:
+    """Render the sorted, comma-joined ``LAYOUT_GEOMETRY_KEYWORDS`` list (spec 4.9c).
+
+    The single source of truth every guard-marked surface in
+    :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS` renders, byte for
+    byte, between its ``<!-- generated:layout-ac-keywords -->`` pair.
+    Sorted for deterministic, idempotent output (the same reasoning
+    ``vocabulary_generation.render_prompt_sentence`` sorts its codes).
+
+    Returns:
+        ``"autosize, breakpoint, cascade, ..."`` -- every
+        :data:`~devbench.constants.LAYOUT_GEOMETRY_KEYWORDS` member,
+        comma-and-space-joined, alphabetically sorted.
+    """
+    return ", ".join(sorted(LAYOUT_GEOMETRY_KEYWORDS))
+
+
+def render_layout_ac_keyword_surface_content(repo_root: Path, relative_path: str) -> str:
+    """Return *relative_path*'s full content with its keyword guard block regenerated, in memory.
+
+    Does not write to disk -- shared by :func:`regenerate_layout_ac_keyword_surfaces`
+    (which does write) and by the drift-pin test (which only compares this
+    function's output against the committed file).
+
+    Args:
+        repo_root: This checkout's own root (the directory containing
+            ``plugin/`` and ``plugin-authoring/``).
+        relative_path: One entry of :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS`.
+
+    Returns:
+        *relative_path*'s content with exactly the guard-marked block's
+        inner text replaced by :func:`render_layout_ac_keyword_block`'s
+        output; every byte outside the pair is unchanged.
+
+    Raises:
+        ValueError: *relative_path* is not a member of
+            :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS`.
+        FileNotFoundError: *repo_root* does not contain *relative_path*.
+        GuardMarkerError: *relative_path*'s content has no
+            ``<!-- generated:layout-ac-keywords -->`` guard-marker pair, an
+            unterminated one, or a second occurrence of the start marker.
+    """
+    if relative_path not in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+        raise ValueError(
+            f"'{relative_path}' is not a layout-AC keyword surface; must be one of "
+            f"{LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS}."
+        )
+    path = repo_root / relative_path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"'{relative_path}' not found under repo_root={repo_root!r}. "
+            "Pass this checkout's own root (the directory containing 'plugin/' and 'plugin-authoring/')."
+        )
+    content = path.read_text(encoding="utf-8")
+    new_content, _ = replace_guarded_block(
+        content,
+        render_layout_ac_keyword_block(),
+        source=relative_path,
+        start_marker=_LAYOUT_AC_KEYWORD_GUARD_MARKER_START,
+        end_marker=_LAYOUT_AC_KEYWORD_GUARD_MARKER_END,
+        remediation_command=REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND,
+        reject_duplicate=True,
+    )
+    return new_content
+
+
+def regenerate_layout_ac_keyword_surfaces(repo_root: Path) -> list[Path]:
+    """Regenerate both guard-marked ``LAYOUT_GEOMETRY_KEYWORDS`` surfaces under *repo_root*, in place.
+
+    Args:
+        repo_root: This checkout's own root.
+
+    Returns:
+        The absolute paths written, in :data:`LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS` order.
+
+    Raises:
+        FileNotFoundError: *repo_root* is missing one of the target surfaces.
+        GuardMarkerError: A target surface's guard markers are missing or malformed.
+    """
+    written: list[Path] = []
+    for relative_path in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+        new_content = render_layout_ac_keyword_surface_content(repo_root, relative_path)
+        path = repo_root / relative_path
+        atomic_write_text(path, new_content)
+        written.append(path)
+    return written
 
 
 class BacklogManager:
@@ -1493,6 +1627,22 @@ class BacklogManager:
             candidates, so a mismatch strands the task permanently once its
             blocker completes. Markers whose targets are all terminal are exempt
             (the cascade has legitimately requeued the task).
+        29. ``[LAYOUT-AC]`` tag grammar (spec 4.9c; 319-D critical): a tag on a
+            ``- [ ] AC-...`` bullet line inside ``## Acceptance Criteria`` must
+            name a keyword from ``constants.LAYOUT_GEOMETRY_KEYWORDS`` or the
+            line is an error. A tag found in ``## Description`` (including a
+            nested ``### `` subsection such as ``### Approach``) or
+            ``## Definition of Done`` is an error naming that section; a tag
+            found on a non-``- [`` bullet line inside ``## Acceptance
+            Criteria`` is also an error naming that section (see
+            ``_LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS`` for the exact,
+            deliberately narrow allowlist of sections scanned for
+            misplacement -- a tag in another top-level section, such as
+            ``## Related Specifications``, or in ``## Acceptance Criteria``
+            prose that is not itself a ``- [``-prefixed line, is NOT scanned
+            by this rule). Tasks with no ``## Acceptance Criteria`` section
+            are skipped (Check 7 owns that error) and untagged Tasks are
+            untouched.
 
         Args:
             backlog_index: Path to the ``BACKLOG.md`` index file.
@@ -1532,6 +1682,7 @@ class BacklogManager:
         self._check_no_glob_in_manifest(rows, workspace_root, errors)
         self._check_manifest_conflicts(rows, workspace_root, errors, strict=strict)
         self._check_language_ac_alignment(rows, workspace_root, errors)
+        self._check_layout_ac_grammar(rows, workspace_root, errors)
         self._check_source_test_pairs(rows, workspace_root, errors)
         self._check_task_type_taxonomy(rows, workspace_root, errors)
         self._check_expected_output(rows, workspace_root, errors)
@@ -3820,6 +3971,235 @@ class BacklogManager:
                     f"Append '-- N/A for {tier} Tasks (no Python source authored)' "
                     f"per docs/acceptance-criteria-canonical.md."
                 )
+
+    _AC_BULLET_RE: re.Pattern[str] = re.compile(r"^- \[[ xX]\] AC-\S+")
+    _INLINE_CODE_SPAN_RE: re.Pattern[str] = re.compile(r"`[^`\n]*`")
+
+    # REQUIRED GRAMMAR POSITION (code_review round 2, this unit; stated
+    # verbatim here and mirrored in SKILL.md Step 3a/Step 5 and
+    # test-reviewer.md item 60 so the accepted position and the documented
+    # position never diverge again):
+    #
+    #   An UNBACKTICKED [LAYOUT-AC] tag applies to the AC line ANYWHERE it
+    #   appears on that '- [ ] AC-...' bullet line -- immediately after the
+    #   AC id, after a parenthetical spec reference (this repo's prevailing
+    #   AC-line house style, e.g. '- [ ] AC-LAYOUT-001 (spec 4.9c)
+    #   [LAYOUT-AC] ...'), or mid-sentence. A BACKTICKED `[LAYOUT-AC]` tag
+    #   applies ONLY when it sits immediately after the AC id (one optional
+    #   layer of backticks at that fixed position), because a backticked
+    #   occurrence anywhere else on the line is indistinguishable from prose
+    #   that merely quotes the tag while discussing the mechanism itself
+    #   (e.g. this very work unit's own AC-TEST-002/003 bullets) -- exactly
+    #   the self-referential-spec false positive a raw, position-unaware
+    #   substring check produced against the real backlog tree
+    #   (`uv run devbench validate-backlog` regression this unit's own
+    #   round-1 fix introduced and then closed). Round 1 silently dropped
+    #   the unbackticked tag in every position except immediately after the
+    #   AC id, reintroducing the 319-D silent-ignore defect this unit
+    #   exists to close; round 2 closes that gap by making the unbackticked
+    #   form position-independent while keeping the backticked form
+    #   anchored, so no on-bullet placement is ever silently ignored.
+    _TAGGED_AC_BULLET_POSITION_RE: re.Pattern[str] = re.compile(
+        r"^- \[[ xX]\] AC-\S+\s+`" + re.escape(LAYOUT_AC_TAG) + r"`(?:\s|$)"
+    )
+
+    # Exact, deliberately narrow allowlist of top-level sections scanned for a
+    # misplaced [LAYOUT-AC] tag -- NOT every authored section, and not every
+    # section other than the operational/audit ones excluded below. Spec
+    # 4.9c's error path names exactly three example placements: Description,
+    # Approach and Definition of Done; Approach is a nested `### ` subsection
+    # of `## Description` per `_extract_sections`, so "Description" already
+    # covers it, leaving this two-entry tuple. Other authored spec sections
+    # this rule does NOT scan for misplacement (e.g. `## Related
+    # Specifications`) are out of this rule's v1 scope, same as the
+    # operational/audit sections (`Comments`, `TDD Cycle Log`, `Dependencies`,
+    # `Status`, `Target Repository`, `Changes Manifest`) that legitimately
+    # quote the tag in prose (e.g. an audit comment discussing a *different*
+    # unit's layout work, or a Dependencies row echoing another Task's
+    # title) and are excluded because a tag-placement mistake would not
+    # occur there.
+    _LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS: tuple[str, ...] = ("Description", "Definition of Done")
+
+    @classmethod
+    def _strip_inline_code_spans(cls, text: str) -> str:
+        """Remove backtick-delimited inline-code spans from *text*.
+
+        A `[LAYOUT-AC]` tag mentioned in prose (e.g. `` `[LAYOUT-AC]` tag
+        ``, quoting the tag for documentation purposes) is not an attempt
+        to actually apply the tag. Stripping inline-code spans before
+        scanning for the literal tag lets `_check_layout_ac_grammar`
+        distinguish a real grammar violation from a work unit's own prose
+        describing the mechanism (e.g. this task's own specification file).
+        Operates per physical line by design: a code span that itself wraps
+        across a soft line break inside a paragraph is intentionally left
+        unstripped on the wrapped-into line, which only widens (never
+        narrows) what gets treated as a candidate tag occurrence -- callers
+        that need line-exact attribution (the AC-bullet scan below) only
+        ever apply this to a single already-isolated bullet line, where the
+        tag and its surrounding backticks are always co-located.
+        """
+        return cls._INLINE_CODE_SPAN_RE.sub("", text)
+
+    def _check_layout_ac_grammar(
+        self,
+        rows: list[tuple[str, str, str]],
+        workspace_root: Path,
+        errors: list[str],
+    ) -> None:
+        """Check 29: `[LAYOUT-AC]` tag grammar (spec 4.9c; 319-D critical).
+
+        PR #319 shipped `[LAYOUT-AC]` tagging as prompt-only prose that told
+        authors to place the tag in a position `validate-backlog` never
+        parsed, so nothing in the toolchain could distinguish a correctly
+        tagged unit from a silently ignored one. This rule moves the tag
+        onto the acceptance-criteria line grammar this method walks:
+
+        - A `[LAYOUT-AC]` tag on a `- [ ] AC-...` bullet line inside
+          `## Acceptance Criteria` must name at least one keyword from
+          `LAYOUT_GEOMETRY_KEYWORDS` (case-insensitive substring match,
+          after whitespace is stripped from the candidate line) or the
+          line is an error quoting the unit id and the offending line.
+          Only the bullet-opening physical line is examined -- a Task's
+          longer-form AC prose commonly wraps onto indented continuation
+          lines, and the grammar's contract is that the tag sits on the
+          checkbox line itself, not a continuation. Within that line, an
+          unbackticked tag applies anywhere (immediately after the AC id,
+          after a parenthetical spec reference, or mid-sentence); a
+          backticked tag applies only immediately after the AC id, so a
+          backticked mention elsewhere in the line's prose is not mistaken
+          for an application (`_check_layout_ac_tagged_bullet`).
+        - A `[LAYOUT-AC]` tag found in `## Description` (which also carries
+          every nested `### ` subsection, e.g. `### Approach`) or
+          `## Definition of Done` is an error naming the section the tag
+          was found in and the remediation (move the tag onto the AC
+          line). Operational/audit sections (Comments, TDD Cycle Log, and
+          similar) are not scanned -- see
+          `_LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS`.
+        - Tasks whose `## Acceptance Criteria` section is absent or
+          unparseable are skipped without error; that defect is owned by
+          Check 7 (`_check_task_content`), so one root cause never produces
+          two contradictory findings.
+        - Untagged tasks are untouched.
+        """
+        for row_id, _, file_path_str in rows:
+            if not row_id or row_id.startswith("-") or row_id.lower() == "id":
+                continue
+            if not file_path_str or not self._is_task_id(row_id):
+                continue
+            wu_path = workspace_root / file_path_str
+            if not wu_path.exists():
+                continue
+            content = wu_path.read_text(encoding="utf-8")
+            sections = self._extract_sections(content)
+            self._check_layout_ac_misplacement(row_id, sections, errors)
+            self._check_layout_ac_bullet_lines(row_id, sections, errors)
+
+    def _check_layout_ac_misplacement(
+        self,
+        row_id: str,
+        sections: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """A `[LAYOUT-AC]` tag outside `## Acceptance Criteria` is always
+        an error naming the section it was found in (spec 4.9c)."""
+        for section_name in self._LAYOUT_AC_MISPLACEMENT_SCAN_SECTIONS:
+            body = sections.get(section_name)
+            if body is None:
+                continue
+            if LAYOUT_AC_TAG in self._strip_inline_code_spans(body):
+                errors.append(
+                    f"{row_id}: {LAYOUT_AC_TAG} tag found in '## {section_name}' "
+                    f"section; the tag must be placed on the AC line itself "
+                    f"inside '## Acceptance Criteria' (spec 4.9c). Move the tag "
+                    f"onto the relevant '- [ ] AC-...' line."
+                )
+
+    def _check_layout_ac_bullet_lines(
+        self,
+        row_id: str,
+        sections: dict[str, str],
+        errors: list[str],
+    ) -> None:
+        """Walk `## Acceptance Criteria` bullet lines for `[LAYOUT-AC]` grammar.
+
+        A tagged bullet must name a `LAYOUT_GEOMETRY_KEYWORDS` member; a
+        `[LAYOUT-AC]` tag on a non-AC bullet line is an error naming the
+        section. Continuation lines (not starting a bullet) are ignored --
+        the grammar's contract is that the tag sits on the checkbox line
+        itself. Missing `## Acceptance Criteria` is skipped (Check 7 owns
+        that error).
+
+        Delegates the two outcomes to dedicated helpers rather than
+        interleaving them in one loop body (SRP): a line matching
+        `_AC_BULLET_RE` is a real AC bullet, checked by
+        `_check_layout_ac_tagged_bullet` for whether the tag actually
+        applies (an unbackticked tag applies anywhere on the bullet line; a
+        backticked tag applies only immediately after the AC id -- see the
+        REQUIRED GRAMMAR POSITION comment above
+        `_TAGGED_AC_BULLET_POSITION_RE`); any other `- [`-prefixed line is
+        checked here, with `_strip_inline_code_spans` applied first so
+        prose that merely quotes the tag (e.g. a checklist note discussing
+        the mechanism) is not misread as a misplaced application.
+        """
+        ac_body = sections.get("Acceptance Criteria")
+        if ac_body is None:
+            return
+
+        for line in ac_body.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- ["):
+                continue
+            if self._AC_BULLET_RE.match(stripped):
+                self._check_layout_ac_tagged_bullet(row_id, stripped, errors)
+                continue
+            clean = self._strip_inline_code_spans(stripped)
+            if LAYOUT_AC_TAG in clean:
+                errors.append(
+                    f"{row_id}: {LAYOUT_AC_TAG} tag found in '## Acceptance "
+                    f"Criteria' section but not on an AC bullet line: "
+                    f"{stripped!r}. Move the tag onto a '- [ ] AC-...' line."
+                )
+
+    def _check_layout_ac_tagged_bullet(
+        self,
+        row_id: str,
+        stripped: str,
+        errors: list[str],
+    ) -> None:
+        """Check a real `- [ ] AC-...` bullet line for `[LAYOUT-AC]` grammar.
+
+        The tag APPLIES to this AC in either of two cases (see the
+        REQUIRED GRAMMAR POSITION comment above
+        `_TAGGED_AC_BULLET_POSITION_RE` for the full rationale):
+
+        - An UNBACKTICKED `[LAYOUT-AC]` occurrence ANYWHERE on the bullet
+          line (immediately after the AC id, after a parenthetical spec
+          reference, or mid-sentence) always applies -- round 2 closes the
+          319-D-class silent-ignore gap round 1 left for every position
+          other than immediately after the AC id.
+        - A BACKTICKED `` `[LAYOUT-AC]` `` occurrence applies only when it
+          sits immediately after the AC id (`_TAGGED_AC_BULLET_POSITION_RE`).
+          A backticked occurrence anywhere else on the line (discussing the
+          tagging mechanism itself, as this very work unit's own
+          AC-TEST-002/003 bullets do) is not an application of the tag and
+          is silently untouched -- the same "prose about the mechanism is
+          not the mechanism" distinction `_check_layout_ac_misplacement`
+          already draws for other sections, applied here to the position
+          within an AC bullet rather than to the section the bullet lives
+          in.
+        """
+        clean = self._strip_inline_code_spans(stripped)
+        bare_tag_applies = LAYOUT_AC_TAG in clean
+        backticked_tag_at_anchor = self._TAGGED_AC_BULLET_POSITION_RE.match(stripped) is not None
+        if not bare_tag_applies and not backticked_tag_at_anchor:
+            return
+        normalized = re.sub(r"\s+", "", stripped.lower())
+        if not any(keyword in normalized for keyword in LAYOUT_GEOMETRY_KEYWORDS):
+            errors.append(
+                f"{row_id}: {LAYOUT_AC_TAG}-tagged AC line names no keyword "
+                f"from LAYOUT_GEOMETRY_KEYWORDS: {stripped!r}. Name one of "
+                f"the declared layout/geometry keywords or remove the tag."
+            )
 
     def _check_no_glob_in_manifest(
         self,

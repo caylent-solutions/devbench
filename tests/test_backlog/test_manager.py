@@ -4518,6 +4518,8 @@ class _ValidateRuleHarness:
         deps_rows: str = "| none | | |",
         status: str = "in-queue",
         task_type: str | None = None,
+        description_body: str = "Test task.\n",
+        dod_block: str = "- [ ] Done\n",
     ) -> Path:
         wu = backlog_dir / f"{unit_id}.md"
         task_type_section = f"## Task Type: {task_type}\n\n" if task_type is not None else ""
@@ -4527,7 +4529,7 @@ class _ValidateRuleHarness:
             f"{task_type_section}"
             f"## Target Repository\n\n"
             f"- **Repo:** `{repo}`\n\n"
-            f"## Description\n\nTest task.\n\n"
+            f"## Description\n\n{description_body}\n"
             f"## Dependencies\n\n"
             f"| ID | Title | Status |\n"
             f"|----|-------|--------|\n"
@@ -4537,7 +4539,7 @@ class _ValidateRuleHarness:
             f"| File | Change |\n"
             f"|------|--------|\n"
             f"{manifest_rows}\n"
-            f"## Definition of Done\n\n- [ ] Done\n",
+            f"## Definition of Done\n\n{dod_block}",
             encoding="utf-8",
         )
         return wu
@@ -4881,6 +4883,439 @@ class TestValidateLanguageAcAlignment:
         )
         errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
         assert not any("requires the N/A suffix" in e for e in errors)
+
+
+class TestLayoutAcGrammar:
+    """Tests for _check_layout_ac_grammar (spec 4.9c; 319-D critical).
+
+    Exercised off the real ``LAYOUT_AC_TAG`` / ``LAYOUT_GEOMETRY_KEYWORDS``
+    constants imported from ``devbench.constants`` -- never a re-typed
+    keyword list (Approach step 1). The import is deliberately local to each
+    test body (never module-level) so this class remains collectible, and
+    every non-layout test in this module remains runnable, even in states
+    where ``constants.py`` has not yet defined these two names (e.g. under
+    ``tdd-gate``'s RED-verification stash of the in-Manifest ``src/`` files).
+    """
+
+    H = _ValidateRuleHarness
+
+    def test_tagged_ac_line_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG, LAYOUT_GEOMETRY_KEYWORDS
+
+        for i, keyword in enumerate(sorted(LAYOUT_GEOMETRY_KEYWORDS)):
+            unit_id = f"EX-F1-S1-T{i + 1}"
+            ac_block = f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify behavior involving {keyword} at 320px.\n"
+            self.H.make_task(backlog_dir, unit_id, "ex/foo", "| `docs/notes.md` | new |\n", ac_block=ac_block)
+        index_rows = "".join(
+            f"| EX-F1-S1-T{i + 1} | T{i + 1} | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T{i + 1}.md` |\n"
+            for i in range(len(LAYOUT_GEOMETRY_KEYWORDS))
+        )
+        self.H.make_index(tmp_path, index_rows)
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tagged_ac_line_naming_no_keyword_emits_exactly_one_error_with_id_and_line(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify totally unrelated numeric parsing behavior."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_backticked_tag_on_ac_line_naming_no_keyword_is_still_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 1 (this unit): both shipped surfaces
+        (`test-reviewer.md`, the `spec-to-backlog` SKILL) print the tag
+        literal wrapped in backticks (`` `[LAYOUT-AC]` ``). Stripping
+        inline-code spans from the AC bullet line itself before checking
+        for the tag's presence silently reclassified a backticked tag as
+        untagged -- the exact surface-divergence class this unit exists to
+        close. A backticked tag naming no real keyword must still be
+        detected and rejected."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 `{LAYOUT_AC_TAG}` Verify totally unrelated numeric parsing behavior."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_backticked_tag_on_ac_line_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion to the rejection case above: a backticked tag that DOES
+        name a real keyword must validate cleanly, proving the fix detects
+        the tag (not merely rejects everything backticked)."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = f"- [ ] AC-TEST-001 `{LAYOUT_AC_TAG}` Verify sticky positioning at 320px.\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tag_mentioned_mid_sentence_in_ac_prose_is_not_treated_as_an_application(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Regression (this unit): an AC bullet that DISCUSSES the tagging
+        mechanism -- naming the tag literal several words into the
+        sentence, as this very work unit's own AC-TEST-002/003 bullets do
+        -- must not be treated as an application of the tag to that AC.
+        `uv run devbench validate-backlog` regressed against the real
+        backlog tree exactly this way while this unit's own fix for the
+        backticked-tag detection gap (test_backticked_tag_on_ac_line_...
+        above) was in flight: a raw, position-unaware substring check
+        flagged every self-referential AC bullet across the tree that
+        merely quotes `[LAYOUT-AC]` in prose."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = (
+            f"- [ ] AC-TEST-002 (spec 4.9c) A `{LAYOUT_AC_TAG}` tag placed anywhere "
+            "other than an AC line is an error.\n"
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_unbackticked_tag_after_a_parenthetical_spec_reference_naming_no_keyword_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 2 (this unit): 87 of the 265 `- [ ] AC-...`
+        bullets in this repo's own `backlog/` tree carry a parenthetical
+        spec reference immediately after the AC id -- the prevailing house
+        style, not an edge case. Round 1's position-anchored regex silently
+        dropped an unbackticked tag placed after that parenthetical (zero
+        errors, no diagnostic), reintroducing the 319-D silent-ignore
+        defect this unit exists to close. An unbackticked tag must apply
+        regardless of where on the bullet line it sits."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-LAYOUT-001 (spec 4.9c) {LAYOUT_AC_TAG} Verify totally unrelated numeric parsing."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_unbackticked_tag_mid_sentence_naming_no_keyword_is_rejected(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """code_review round 2 (this unit): an unbackticked tag wrapped
+        several words into the AC bullet's prose (not immediately after
+        the AC id) must apply and be rejected for naming no keyword, not
+        silently dropped."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] AC-TEST-001 Verify the header stays put {LAYOUT_AC_TAG} when scrolled."
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=offending_line + "\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "no keyword from" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_unbackticked_tag_mid_sentence_naming_a_real_keyword_validates_with_zero_errors(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion positive control to the two rejection cases above: an
+        unbackticked tag placed anywhere on the bullet line that DOES name
+        a real keyword must validate cleanly, proving the position-
+        independent fix detects the tag rather than rejecting everything
+        off-anchor."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = f"- [ ] AC-TEST-001 (spec 4.9c) Verify sticky positioning {LAYOUT_AC_TAG} at 320px.\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_backticked_tag_not_immediately_after_ac_id_is_not_treated_as_an_application(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """Companion to test_tag_mentioned_mid_sentence_in_ac_prose_is_not_
+        treated_as_an_application above, restated explicitly for the
+        round-2 fix: a BACKTICKED tag is only recognized immediately after
+        the AC id. A backticked tag placed after a parenthetical spec
+        reference is prose quoting the mechanism, not an application, and
+        must remain silently untouched -- this is what distinguishes the
+        round-2 fix (unbackticked tags apply anywhere) from a regression
+        back to a raw, position-unaware substring check (which would also
+        catch backticked mentions and reintroduce the false-positive class
+        this unit's round-1 fix closed)."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        ac_block = (
+            f"- [ ] AC-LAYOUT-001 (spec 4.9c) A `{LAYOUT_AC_TAG}` tag mentioned in prose discussing the mechanism.\n"
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert layout_errors == []
+
+    def test_tag_on_a_non_ac_bullet_inside_acceptance_criteria_emits_one_error(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        offending_line = f"- [ ] Some non-AC checklist note {LAYOUT_AC_TAG} misplaced here."
+        ac_block = f"- [ ] AC-TEST-001 A real AC line unrelated to layout.\n{offending_line}\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=ac_block,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and "not on an AC bullet line" in e]
+        assert len(layout_errors) == 1
+        assert "EX-F1-S1-T1" in layout_errors[0]
+        assert offending_line in layout_errors[0]
+
+    def test_tag_placed_in_description_body_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            description_body=f"Some prose that misplaces {LAYOUT_AC_TAG} directly in Description.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Description" in layout_errors[0]
+
+    def test_tag_placed_in_nested_approach_subsection_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        description_body = f"### Approach\n\n1. Do the thing, watch for {LAYOUT_AC_TAG} misuse.\n\n"
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            description_body=description_body,
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Description" in layout_errors[0]
+
+    def test_tag_placed_in_definition_of_done_emits_one_error_naming_the_section(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            dod_block=f"- [ ] Misplaced {LAYOUT_AC_TAG} in the Definition of Done.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if "EX-F1-S1-T1" in e and LAYOUT_AC_TAG in e]
+        assert len(layout_errors) == 1
+        assert "Definition of Done" in layout_errors[0]
+
+    def test_untagged_task_is_untouched_by_the_rule(self, tmp_path: Path, backlog_dir: Path) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(backlog_dir, "EX-F1-S1-T1", "ex/foo", "| `docs/notes.md` | new |\n")
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any(LAYOUT_AC_TAG in e for e in errors)
+
+    def test_one_correct_and_one_misplaced_tag_task_in_a_single_run(self, tmp_path: Path, backlog_dir: Path) -> None:
+        """AC-CYCLE-001 (spec 4.9c, AC-22): a scratch backlog containing one
+        correctly tagged Task and one misplaced-tag Task must report zero
+        errors for the first and a named error for the second in a single
+        `validate()` invocation."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T1",
+            "ex/foo",
+            "| `docs/notes.md` | new |\n",
+            ac_block=f"- [ ] AC-TEST-001 {LAYOUT_AC_TAG} Verify sticky positioning at 320px.\n",
+        )
+        self.H.make_task(
+            backlog_dir,
+            "EX-F1-S1-T2",
+            "ex/foo",
+            "| `docs/other.md` | new |\n",
+            description_body=f"Prose that misplaces {LAYOUT_AC_TAG} directly in Description.\n",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n"
+            "| EX-F1-S1-T2 | T2 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T2.md` |\n",
+        )
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        layout_errors = [e for e in errors if LAYOUT_AC_TAG in e]
+        assert not any("EX-F1-S1-T1" in e for e in layout_errors)
+        misplaced = [e for e in layout_errors if "EX-F1-S1-T2" in e]
+        assert len(misplaced) == 1
+        assert "Description" in misplaced[0]
+
+    def test_missing_acceptance_criteria_section_is_skipped_without_crash(
+        self, tmp_path: Path, backlog_dir: Path
+    ) -> None:
+        """test_review round 1 (this unit): the docstring's two-part
+        contract is "does not crash AND does not emit a second,
+        contradictory `[LAYOUT-AC]` finding for the same missing-section
+        defect (owned by Check 7)" -- asserting only the no-crash half left
+        a spurious `[LAYOUT-AC]` error on an AC-less Task unable to fail
+        this test. Both halves are now asserted."""
+        from devbench.constants import LAYOUT_AC_TAG
+
+        # Check 7 owns the missing-section error; this rule must not crash
+        # or emit a second, contradictory finding for the same defect.
+        wu = backlog_dir / "EX-F1-S1-T1.md"
+        wu.write_text(
+            "# EX-F1-S1-T1\n\n"
+            "## Status: in-queue\n\n"
+            "## Target Repository\n\n"
+            "- **Repo:** `ex/foo`\n\n"
+            "## Description\n\nTest task.\n\n"
+            "## Dependencies\n\n"
+            "| ID | Title | Status |\n"
+            "|----|-------|--------|\n"
+            "| none | | |\n\n"
+            "## Changes Manifest\n\n"
+            "| File | Change |\n"
+            "|------|--------|\n"
+            "| `docs/notes.md` | new |\n"
+            "## Definition of Done\n\n- [ ] Done\n",
+            encoding="utf-8",
+        )
+        self.H.make_index(
+            tmp_path,
+            "| EX-F1-S1-T1 | T1 | Task | in-queue | none | ex/foo | `backlog/EX-F1-S1-T1.md` |\n",
+        )
+        # Must not raise.
+        errors = BacklogManager().validate(tmp_path / "BACKLOG.md", tmp_path)
+        assert not any(LAYOUT_AC_TAG in e for e in errors)
 
 
 class TestValidateSourceTestPairs:

@@ -7,6 +7,40 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`[LAYOUT-AC]` tagging moves onto the `validate-backlog` AC-line grammar,
+  with a named keyword constant** (spec `integration-reality-gates-hardening.md`
+  section 4.9c, AC-22; issue `caylent-solutions/devbench-internal-backlog#14`
+  319-D critical; E10-F1-S1-T1). PR #319 shipped `[LAYOUT-AC]` tagging as
+  prompt-only prose that told authors to place the tag in a position
+  `validate-backlog` never parsed, and shipped zero tests, so nothing in the
+  toolchain could distinguish a correctly tagged unit from a silently
+  ignored one. `src/devbench/constants.py` now declares `LAYOUT_AC_TAG` and
+  `LAYOUT_GEOMETRY_KEYWORDS` (the geometry keyword heuristic, promoted from
+  hand-copied prose to a single named constant); `src/devbench/backlog/manager.py`
+  gains `_check_layout_ac_grammar` (Check 29 in `validate()`), which rejects
+  a tagged AC line that names no keyword from the constant, rejects a
+  `[LAYOUT-AC]` tag placed in `## Description` (including a nested
+  `### Approach` subsection) or `## Definition of Done`, and rejects a tag
+  found on a non-AC bullet line inside `## Acceptance Criteria` itself, each
+  with an actionable message naming the work-unit id and the offending
+  line/section. Required tag position on the AC bullet line: an
+  UNBACKTICKED `[LAYOUT-AC]` tag is recognized anywhere on that line
+  (immediately after the AC id, after a parenthetical spec reference, or
+  mid-sentence); a BACKTICKED `` `[LAYOUT-AC]` `` tag is recognized only
+  immediately after the AC id, so a backtick-wrapped mention elsewhere on
+  the line is treated as prose discussing the tag rather than an
+  application of it.
+  `plugin/devbench-orchestrate/agents/review_team/test-reviewer.md`'s LAYOUT
+  / VISUAL AC VERIFICATION rubric and the `spec-to-backlog` SKILL's Step 3a
+  authoring instruction both render the keyword list from
+  `LAYOUT_GEOMETRY_KEYWORDS` between a `<!-- generated:layout-ac-keywords -->`
+  guard-marker pair, actually written by the new
+  `devbench.backlog.manager.regenerate_layout_ac_keyword_surfaces` (run via
+  `REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND`) and pinned byte-identical
+  to the constant by
+  `tests/test_constants.py::TestLayoutGeometryKeywordSurfacesMatchConstant`,
+  so the list exists exactly once in the tree.
+
 - **`scaffold-store-factory` CLI verb: a composition-root store-factory test
   skeleton generator** (spec `integration-reality-gates-hardening.md`
   section 4.9(b), issue `caylent-solutions/devbench-internal-backlog#11`

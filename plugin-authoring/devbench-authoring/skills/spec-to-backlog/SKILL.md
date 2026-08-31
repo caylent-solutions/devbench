@@ -184,11 +184,37 @@ pointer-blocking elements) is not provable by that kind of test alone, no matter
 implementation is written.
 
 While extracting ACs (above), keyword-scan each AC's text (case-insensitive, substring
-match) for layout/CSS-geometry-sensitive language: `sticky`, `z-index`, `viewport`,
-`breakpoint`, `flex-shrink`, `autosize`, `overlap`, `position: fixed`,
-`position: absolute`, `cascade`, `specificity`. An AC matching one or more of these terms
-is a **Layout/Visual AC** -- tag it `[LAYOUT-AC]` so every leaf task descending from it
-carries the tag through Step 5.
+match after whitespace is stripped from the candidate text) against the layout/CSS-
+geometry-sensitive keyword list below, sourced from `LAYOUT_GEOMETRY_KEYWORDS` in
+`src/devbench/constants.py`. This scan only fires when a spec's AC text actually
+contains one of these terms -- a spec with no layout-sensitive language produces zero
+`[LAYOUT-AC]` tags and this step is a no-op for it. An AC matching one or more of these
+terms is a **Layout/Visual AC** -- tag it `[LAYOUT-AC]` so every leaf task descending
+from it carries the tag through Step 5.
+
+**Required tag position (`validate-backlog` Check 29):** place the tag directly on the
+`- [ ] AC-<id> ...` bullet line, not in `## Description`, `### Approach`, or
+`## Definition of Done`. An UNBACKTICKED `[LAYOUT-AC]` tag is recognized ANYWHERE on
+that bullet line -- immediately after the AC id, after a parenthetical spec reference
+(e.g. `- [ ] AC-EXAMPLE-001 (spec 4.9c) [LAYOUT-AC] ...`), or mid-sentence. A
+BACKTICKED `` `[LAYOUT-AC]` `` tag is recognized ONLY when it sits immediately after
+the AC id (e.g. `` - [ ] AC-EXAMPLE-001 `[LAYOUT-AC]` ... ``); a backtick-wrapped
+mention anywhere else on the line is treated as prose discussing the tag, not an
+application of it, and is silently ignored.
+
+The block below is generated from `LAYOUT_GEOMETRY_KEYWORDS` in
+`src/devbench/constants.py` by `devbench.backlog.manager.render_layout_ac_keyword_block()`;
+do not hand-edit content between the markers -- the next regeneration run overwrites it.
+Regenerate with `uv run python -c "from pathlib import Path; from devbench.backlog.manager
+import regenerate_layout_ac_keyword_surfaces; regenerate_layout_ac_keyword_surfaces(Path('<repo-root>'))"`
+after changing the constant; `TestLayoutGeometryKeywordSurfacesMatchConstant` in
+`tests/test_constants.py` pins that this block stays byte-identical to the constant, sorted
+and comma-joined, and that no second hand-typed copy of the list exists anywhere else in the
+tree.
+
+<!-- generated:layout-ac-keywords -->
+autosize, breakpoint, cascade, flex-shrink, overlap, position:absolute, position:fixed, specificity, sticky, viewport, z-index
+<!-- /generated:layout-ac-keywords -->
 
 **This is a keyword heuristic, not a guarantee.** Expect both:
 - **False positives** -- an AC that mentions "width" or "position" with no real rendered-geometry
@@ -204,7 +230,11 @@ carries the tag through Step 5.
 
 Any leaf task whose Acceptance Criteria include a `[LAYOUT-AC]`-tagged item MUST, when
 authored in Step 5a:
-- Carry the `[LAYOUT-AC]` marker on the AC line itself in `## Acceptance Criteria`.
+- Carry the `[LAYOUT-AC]` marker on the AC line itself in `## Acceptance Criteria`,
+  never in `## Description`, `### Approach`, or `## Definition of Done`. An unbackticked
+  tag is recognized anywhere on the AC bullet line; a backticked tag is recognized only
+  immediately after the AC id (see the "Required tag position" callout in Step 3a for
+  the full grammar).
 - Carry a Definition of Done line requiring real-render/live-browser verification (e.g.
   Playwright -- the most common case for web UI work, though the check applies equally to
   any stack whose standard unit-test harness has no real layout/rendering engine) at the
@@ -492,7 +522,7 @@ Score each item PASS or FAIL:
 13. **AC-FINAL tier-suffix on non-Python tasks** (issue #228): when this task's Changes Manifest contains zero `.py` paths, the Python-tooling AC-FINAL lines (`AC-FINAL-002` ruff format, `AC-FINAL-003` ruff check, `AC-FINAL-004` mypy, `AC-FINAL-005` pytest tier, `AC-FINAL-006` pytest other tier, `AC-FINAL-008` bandit, `AC-FINAL-014` coverage) MUST carry the explicit suffix `-- N/A for <Tier> Tasks (no Python source authored)`. Tier is derived from the dominant Manifest file extension: `.yml` / `.yaml` -> `YAML`, `.md` -> `Markdown`, `.toml` -> `TOML`, `.tf` / `.hcl` / `.tfvars` -> `HCL`, `.json` -> `JSON`, `.xml` -> `XML`; manifests with multiple non-Python extensions report `Mixed`. FAIL if a non-Python task lacks the suffix on any of those AC-FINAL lines. The `suffix_na_on_non_python_tasks` post-processor pass (Step 5d) deterministically adds the suffix when missing. See `docs/acceptance-criteria-canonical.md`.
 14. **Write-path task is distinct and seam-referenced** (QA finding 07): if this task IS a permission/eligibility flag's write-path task (Step 4a), it does NOT also carry "add field to state" or "gate UI" scope (those stay in their own tasks), and its `### Approach` + `## Acceptance Criteria` name the placeholder/mock seam path from Step 3b-iv when one was found. If this task instead ADDS or GATES a permission/eligibility field, it does NOT itself claim to establish that field's write-path -- its Description or AC defers write-path responsibility to the dedicated task by ID. FAIL if either boundary is blurred (a write-path task also doing state/UI work, or a state/UI task silently claiming the write-path is handled). N/A for tasks that touch no permission/eligibility field.
 15. **Composition-root AC item present when required** (caylent-solutions/devbench-internal-backlog#11; spec 4.9(b), decision D-13): if the Changes Manifest adds or modifies a UI component (or equivalent presentation-layer unit) that consumes shared/app-level state, `## Acceptance Criteria` contains an explicit item requiring a test through the real composition root (per Step 1b item 13 and `docs/composition-root-testing.md`). A `## Definition of Done` item does NOT satisfy this check. FAIL if such a task's manifest touches a state-consuming UI component and `## Acceptance Criteria` has no such item, including when the item was drafted as a `## Definition of Done` line instead. Auto-PASS (not applicable) for tasks whose Changes Manifest contains no UI-component files, or whose UI components are genuinely stateless with no shared/app-level dependencies.
-16. **Layout/Visual AC Definition of Done**: when this task's `## Acceptance Criteria` contains any AC tagged `[LAYOUT-AC]` (Step 3a keyword heuristic: sticky, z-index, viewport, breakpoint, flex-shrink, autosize, overlap, position: fixed/absolute, cascade/specificity), `## Definition of Done` MUST contain an explicit real-render/live-browser verification line (e.g. Playwright, or the equivalent real-renderer for the target stack) naming the specific viewport(s)/breakpoint(s) from the AC. A jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent) without a companion real-render assertion for the same AC, is NOT sufficient proof of completion for that item. FAIL if a `[LAYOUT-AC]`-tagged task's Definition of Done omits this line or the line is satisfiable by stub-only evidence. This is a heuristic gate, not a guarantee -- false positives/negatives from the Step 3a keyword scan are expected and may be corrected with a one-line justification in `## Comments` rather than a rubric failure, provided the justification is present.
+16. **Layout/Visual AC Definition of Done**: when this task's `## Acceptance Criteria` contains any AC tagged `[LAYOUT-AC]` (the Step 3a keyword heuristic; see Step 3a for the keyword list), `## Definition of Done` MUST contain an explicit real-render/live-browser verification line (e.g. Playwright, or the equivalent real-renderer for the target stack) naming the specific viewport(s)/breakpoint(s) from the AC. A jsdom-only test, or a test that stubs a layout/rendering primitive (`offsetHeight`, `getBoundingClientRect`, `ResizeObserver`, or equivalent) without a companion real-render assertion for the same AC, is NOT sufficient proof of completion for that item. FAIL if a `[LAYOUT-AC]`-tagged task's Definition of Done omits this line or the line is satisfiable by stub-only evidence. This is a heuristic gate, not a guarantee -- false positives/negatives from the Step 3a keyword scan are expected and may be corrected with a one-line justification in `## Comments` rather than a rubric failure, provided the justification is present.
 
 ### 5c -- Revise
 

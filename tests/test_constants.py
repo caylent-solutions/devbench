@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -1223,3 +1225,253 @@ class TestGateWaiverAttributionConstants:
         from devbench.constants import GATE_WAIVER_ATTRIBUTION_OPERATOR
 
         assert cli_module._REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION is GATE_WAIVER_ATTRIBUTION_OPERATOR
+
+
+class TestLayoutAcConstants:
+    """``LAYOUT_AC_TAG`` / ``LAYOUT_GEOMETRY_KEYWORDS`` (spec 4.9c; 319-D
+    critical): single source of truth for the ``[LAYOUT-AC]`` AC-line
+    grammar ``devbench.backlog.manager._check_layout_ac_grammar`` enforces.
+    """
+
+    def test_layout_ac_tag_is_the_literal_bracketed_string(self) -> None:
+        from devbench.constants import LAYOUT_AC_TAG
+
+        assert LAYOUT_AC_TAG == "[LAYOUT-AC]"
+
+    def test_layout_geometry_keywords_is_a_nonempty_frozenset_of_str(self) -> None:
+        from devbench.constants import LAYOUT_GEOMETRY_KEYWORDS
+
+        assert isinstance(LAYOUT_GEOMETRY_KEYWORDS, frozenset)
+        assert len(LAYOUT_GEOMETRY_KEYWORDS) > 0
+        assert all(isinstance(keyword, str) for keyword in LAYOUT_GEOMETRY_KEYWORDS)
+
+    def test_layout_geometry_keywords_members_are_lower_case_and_whitespace_free(self) -> None:
+        from devbench.constants import LAYOUT_GEOMETRY_KEYWORDS
+
+        for keyword in LAYOUT_GEOMETRY_KEYWORDS:
+            assert keyword == keyword.lower(), f"{keyword!r} is not lower-case"
+            assert not any(ch.isspace() for ch in keyword), f"{keyword!r} contains whitespace"
+            assert keyword != "", "keyword must not be empty"
+
+    def test_manager_module_consumes_the_shared_constants_not_a_local_copy(self) -> None:
+        """``devbench.backlog.manager`` must import the tag/keyword vocabulary
+        from ``constants`` rather than re-declaring its own module-level
+        copy (the drift-prevention pattern this file's other ``Test*Constants``
+        classes already pin for ``GATE_WAIVER_ATTRIBUTION_*``)."""
+        import devbench.backlog.manager as manager_module
+        from devbench.constants import LAYOUT_AC_TAG, LAYOUT_GEOMETRY_KEYWORDS
+
+        assert manager_module.LAYOUT_AC_TAG is LAYOUT_AC_TAG
+        assert manager_module.LAYOUT_GEOMETRY_KEYWORDS is LAYOUT_GEOMETRY_KEYWORDS
+
+
+class TestLayoutGeometryKeywordSurfacesMatchConstant:
+    """AC-TEST-004 (spec 4.9c): the keyword list exists exactly once in the
+    tree, as ``LAYOUT_GEOMETRY_KEYWORDS`` in ``src/devbench/constants.py``.
+    The rubric block in ``test-reviewer.md`` and the authoring instruction
+    in the ``spec-to-backlog`` SKILL both render the same sorted,
+    comma-joined list between a ``<!-- generated:layout-ac-keywords -->``
+    guard-marker pair, actually written by
+    ``devbench.backlog.manager.regenerate_layout_ac_keyword_surfaces``
+    (code_review round 1, this unit: before this fix, nothing generated
+    these blocks -- they were hand-typed copies pinned only by string
+    comparison, not by a real generator's own output). This class pins both
+    surfaces byte-identical to that generator's output (the same pattern
+    ``TestSkillStep3bGeneratedFromConstants`` in
+    ``tests/test_plugin_helpers/test_permission_flag_writepath.py`` uses for
+    its own guard-marked block) and proves no third, independently
+    hand-typed copy of the joined list exists anywhere else in the tree.
+    AC-TEST-006's data-gating assertion lives in
+    ``TestSkillStep3aLayoutScanIsDataGated`` below; its no-bare-item-count
+    half is covered by
+    ``tests/test_plugin/test_rubric_numbering.py::TestNoBareItemCounts``.
+    """
+
+    _TEST_REVIEWER_RELATIVE_PATH = "plugin/devbench-orchestrate/agents/review_team/test-reviewer.md"
+    _SKILL_RELATIVE_PATH = "plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md"
+
+    @staticmethod
+    def _repo_root() -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def _rendered_keyword_list(cls) -> str:
+        from devbench.backlog.manager import render_layout_ac_keyword_block
+
+        return render_layout_ac_keyword_block()
+
+    @classmethod
+    def _assert_surface_matches_generated(cls, relative_path: str, repo_root: Path) -> None:
+        """Shared pin assertion: used by both the real committed-file pin and
+        the seeded-hand-edit drift proof below, so the two can never
+        independently drift on what "matches" means."""
+        from devbench.backlog.manager import (
+            REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND,
+            render_layout_ac_keyword_surface_content,
+        )
+
+        path = repo_root / relative_path
+        committed = path.read_text(encoding="utf-8")
+        regenerated = render_layout_ac_keyword_surface_content(repo_root, relative_path)
+        assert committed == regenerated, (
+            f"'{relative_path}' has drifted from its generated form. "
+            f"Run: {REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND}"
+        )
+
+    def test_test_reviewer_prompt_generated_block_matches_constant(self) -> None:
+        self._assert_surface_matches_generated(self._TEST_REVIEWER_RELATIVE_PATH, self._repo_root())
+
+    def test_skill_generated_block_matches_constant(self) -> None:
+        self._assert_surface_matches_generated(self._SKILL_RELATIVE_PATH, self._repo_root())
+
+    def test_hand_edited_test_reviewer_block_fails_and_names_the_regeneration_command(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND
+
+        scratch_root = tmp_path / "scratch-repo"
+        target = scratch_root / self._TEST_REVIEWER_RELATIVE_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        real_content = (self._repo_root() / self._TEST_REVIEWER_RELATIVE_PATH).read_text(encoding="utf-8")
+        hand_edited = real_content.replace("autosize, breakpoint", "AUTOSIZE-HAND-EDITED, breakpoint")
+        assert hand_edited != real_content  # sanity: the seeded edit actually landed
+        target.write_text(hand_edited, encoding="utf-8")
+
+        with pytest.raises(AssertionError) as excinfo:
+            self._assert_surface_matches_generated(self._TEST_REVIEWER_RELATIVE_PATH, scratch_root)
+
+        assert REGENERATE_LAYOUT_AC_KEYWORD_SURFACES_COMMAND in str(excinfo.value)
+
+    def test_regenerate_layout_ac_keyword_surfaces_writes_the_regenerated_content_to_disk(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import (
+            LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS,
+            regenerate_layout_ac_keyword_surfaces,
+            render_layout_ac_keyword_surface_content,
+        )
+
+        scratch_root = tmp_path / "scratch-repo"
+        expected_by_path = {}
+        for relative_path in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+            target = scratch_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            real_content = (self._repo_root() / relative_path).read_text(encoding="utf-8")
+            # Seed a hand-edited (drifted) copy so regeneration has something to fix.
+            target.write_text(real_content.replace("autosize", "AUTOSIZE-HAND-EDITED"), encoding="utf-8")
+            expected_by_path[relative_path] = render_layout_ac_keyword_surface_content(scratch_root, relative_path)
+
+        written = regenerate_layout_ac_keyword_surfaces(scratch_root)
+
+        assert len(written) == len(LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS)
+        for relative_path in LAYOUT_AC_KEYWORD_SURFACE_RELATIVE_PATHS:
+            assert (scratch_root / relative_path).read_text(encoding="utf-8") == expected_by_path[relative_path]
+
+    def test_render_layout_ac_keyword_surface_content_rejects_unknown_relative_path(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import render_layout_ac_keyword_surface_content
+
+        with pytest.raises(ValueError, match="not a layout-AC keyword surface"):
+            render_layout_ac_keyword_surface_content(tmp_path, "docs/unrelated.md")
+
+    def test_render_layout_ac_keyword_surface_content_missing_file_raises_file_not_found_error(
+        self, tmp_path: Path
+    ) -> None:
+        from devbench.backlog.manager import render_layout_ac_keyword_surface_content
+
+        with pytest.raises(FileNotFoundError, match=self._TEST_REVIEWER_RELATIVE_PATH):
+            render_layout_ac_keyword_surface_content(tmp_path, self._TEST_REVIEWER_RELATIVE_PATH)
+
+    def test_no_second_literal_copy_of_the_joined_keyword_list_exists_in_the_tree(self) -> None:
+        """Grep the tree for the exact sorted, comma-joined keyword list.
+
+        It must appear in exactly the two generated guard-marker blocks
+        pinned above (never as a hand-typed literal anywhere else,
+        including this test file itself, which computes the expected value
+        dynamically from ``LAYOUT_GEOMETRY_KEYWORDS`` rather than quoting
+        the joined string). Any other hit means someone hand-copied the
+        list a second time instead of generating it from the constant.
+        """
+        joined = self._rendered_keyword_list()
+        repo_root = self._repo_root()
+        expected_hits = {
+            repo_root / "plugin" / "devbench-orchestrate" / "agents" / "review_team" / "test-reviewer.md",
+            repo_root / "plugin-authoring" / "devbench-authoring" / "skills" / "spec-to-backlog" / "SKILL.md",
+        }
+        excluded_dir_names = {".git", ".venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
+        actual_hits: set[Path] = set()
+        for path in repo_root.rglob("*"):
+            if not path.is_file():
+                continue
+            if any(part in excluded_dir_names for part in path.parts):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            if joined in text:
+                actual_hits.add(path)
+        assert actual_hits == expected_hits, (
+            f"Expected the joined LAYOUT_GEOMETRY_KEYWORDS list to appear only in "
+            f"{sorted(str(p) for p in expected_hits)}, but found it in "
+            f"{sorted(str(p) for p in actual_hits)}."
+        )
+
+
+class TestSkillStep3aLayoutScanIsDataGated:
+    """AC-TEST-006 (spec 4.11): the ``spec-to-backlog`` SKILL's Step 3a
+    layout-AC keyword scan must be data-gated -- it fires only when a
+    spec's AC text actually contains a ``LAYOUT_GEOMETRY_KEYWORDS`` term,
+    and is a documented no-op for a spec with no layout-sensitive language.
+
+    test_review round 1 (this unit): the Step 3a paragraph's data-gating
+    sentence was previously asserted NOWHERE -- deleting it left the whole
+    suite green. This class isolates the Step 3a layout paragraph (the
+    prose between its anchor sentence and the generated keyword
+    guard-marker block) and asserts the data-gating clause verbatim, with a
+    seeded-negative control (removing the sentence from a copy of the
+    isolated paragraph) proving the assertion can actually fail.
+    """
+
+    _DATA_GATED_SENTENCE = (
+        "This scan only fires when a spec's AC text actually contains one of these terms -- "
+        "a spec with no layout-sensitive language produces zero `[LAYOUT-AC]` tags and this "
+        "step is a no-op for it."
+    )
+    _GUARD_START = "<!-- generated:layout-ac-keywords -->"
+
+    @staticmethod
+    def _repo_root() -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def _skill_path(cls) -> Path:
+        return cls._repo_root() / "plugin-authoring" / "devbench-authoring" / "skills" / "spec-to-backlog" / "SKILL.md"
+
+    @classmethod
+    def _step_3a_paragraph(cls, text: str) -> str:
+        guard_start = text.find(cls._GUARD_START)
+        if guard_start == -1:
+            raise AssertionError(f"SKILL.md is missing the {cls._GUARD_START} guard-marker start")
+        paragraph_start = text.rfind("While extracting ACs", 0, guard_start)
+        if paragraph_start == -1:
+            raise AssertionError("SKILL.md's Step 3a layout-AC scanning paragraph was not found")
+        return text[paragraph_start:guard_start]
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        """Collapse runs of whitespace (including markdown soft line-wraps)
+        to a single space, so a sentence spanning a wrapped line in the
+        committed file still matches its single-line constant here."""
+        return " ".join(text.split())
+
+    def test_step_3a_paragraph_states_the_scan_is_data_gated(self) -> None:
+        text = self._skill_path().read_text(encoding="utf-8")
+        paragraph = self._normalize_whitespace(self._step_3a_paragraph(text))
+        assert self._DATA_GATED_SENTENCE in paragraph
+
+    def test_seeded_removal_of_the_data_gating_sentence_fails_the_assertion(self) -> None:
+        text = self._skill_path().read_text(encoding="utf-8")
+        paragraph = self._normalize_whitespace(self._step_3a_paragraph(text))
+        assert self._DATA_GATED_SENTENCE in paragraph  # sanity: real prose still carries it
+
+        seeded = paragraph.replace(self._DATA_GATED_SENTENCE, "")
+        assert seeded != paragraph  # sanity: the seeded removal actually landed
+
+        with pytest.raises(AssertionError):
+            assert self._DATA_GATED_SENTENCE in seeded

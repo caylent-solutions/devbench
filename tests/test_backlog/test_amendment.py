@@ -12,6 +12,7 @@ import pytest
 from devbench.backlog.amendment import (
     ALLOWED_AMENDMENT_REASONS,
     AMENDER_AGENT_ID,
+    AMENDER_REJECTION_CATEGORIES,
     AMENDMENT_APPLIED_ACTION,
     AMENDMENT_DIR_NAME,
     AMENDMENT_REJECTED_ACTION,
@@ -21,6 +22,7 @@ from devbench.backlog.amendment import (
     AmendmentRequest,
     _append_audit_comment,
     _build_audit_entry,
+    _categorise_rejection_reason,
     apply_amendment,
     delete_request,
     read_request,
@@ -1119,3 +1121,107 @@ class TestApplyAmendmentWithRemoval:
 
         with pytest.raises(AmendmentError, match="at least one file"):
             apply_amendment(tmp_workspace, tmp_workspace / "BACKLOG.md", request.task_id)
+
+
+# ---------------------------------------------------------------------------
+# ``_categorise_rejection_reason`` -- earliest-named-token classification
+# (issue #154 / #156 follow-up: a hardcoded iteration order over the
+# taxonomy tuple let an incidentally-mentioned category beat the actually
+# -declared one; see E3-F2-S1-T5).
+# ---------------------------------------------------------------------------
+
+
+# Verbatim ``reason_text`` archived at
+# ``.devbench/review-failures/E3-F2-S1-T1-manifest_amender-2.json`` for the
+# real rejection that surfaced this defect. Stored as a hermetic fixture
+# string rather than read from disk at test time.
+_E3_F2_S1_T1_REJECTION_REASON = (
+    "PRE_FILTER pre-conflict (issue #137): both requested paths are already claimed by "
+    "E10-F1-S1-T1 (status: blocked) in the same repo caylent-solutions/devbench -- "
+    "'src/devbench/backlog/manager.py' and 'tests/test_backlog/test_manager.py' appear "
+    "in that unit's Changes Manifest (lines 304, 308). 'blocked' is a HARD claimant "
+    "status (BacklogManager._HARD_CLAIMANT_STATUSES) and is not terminal, so the "
+    "done/declined auto-dep exception does not apply, and no ordering dependency exists "
+    "in either direction (E3-F2-S1-T1 deps: E3-F1-S1-T2, E3-F2-S1-T3, E3-F2-S1-T4; "
+    "E10-F1-S1-T1 deps: E9-F2-S1-T1). Appending these rows would author a new hard "
+    "Manifest conflict. Resolve via dep wiring or a spec-correction recovery task before "
+    "re-requesting. APPROACH_AUTH, SCOPE and JUSTIFICATION_COHERENCE all PASSED and no "
+    "project-standards violations were found, so the underlying manager.py delegation "
+    "fix is sound and should be re-requested once the E10-F1-S1-T1 claim is resolved."
+)
+
+
+class TestCategoriseRejectionReasonEarliestToken:
+    """AC-FUNC-001 through AC-FUNC-005: earliest-named-token classification."""
+
+    def test_real_pre_filter_rejection_classifies_as_pre_filter(self) -> None:
+        """AC-FUNC-001: the archived E3-F2-S1-T1 rejection opens with
+        'PRE_FILTER' but its narrative later names 'APPROACH_AUTH, SCOPE and
+        JUSTIFICATION_COHERENCE' -- the earliest-declared token must win, not
+        whichever tuple entry a hardcoded iteration order happens to hit
+        first."""
+        assert _categorise_rejection_reason(_E3_F2_S1_T1_REJECTION_REASON) == "PRE_FILTER"
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            pytest.param(
+                "APPROACH_AUTH FAIL: the Approach does not authorise this; SCOPE was fine.",
+                "APPROACH_AUTH",
+                id="approach_auth_named_first",
+            ),
+            pytest.param(
+                "SCOPE FAIL: unrelated refactor; PRE_FILTER passed.",
+                "SCOPE",
+                id="scope_named_first",
+            ),
+        ],
+    )
+    def test_competing_tokens_resolve_by_earliest_occurrence(self, reason: str, expected: str) -> None:
+        """AC-FUNC-002: whichever canonical token is named first in the
+        reason string wins, regardless of any fixed iteration order over
+        the taxonomy."""
+        assert _categorise_rejection_reason(reason) == expected
+
+    def test_no_token_falls_back_to_other(self) -> None:
+        """AC-FUNC-004: a reason naming no canonical token falls back to 'OTHER'."""
+        assert _categorise_rejection_reason("the amendment looks fine but we cannot accept it right now") == "OTHER"
+
+    def test_matching_is_case_insensitive(self) -> None:
+        """AC-FUNC-004: a lowercase token mention still classifies correctly."""
+        assert _categorise_rejection_reason("this reason mentions pre_filter in lowercase") == "PRE_FILTER"
+
+    @pytest.mark.parametrize("token", sorted(AMENDER_REJECTION_CATEGORIES - {"OTHER"}))
+    @pytest.mark.parametrize(
+        "suffix_template",
+        [
+            "{token} FAIL: reason text",
+            "{token}: some narrative text",
+        ],
+    )
+    def test_each_canonical_token_recognised_in_isolation(self, token: str, suffix_template: str) -> None:
+        """AC-FUNC-003 + REFACTOR characterization: one parametrized case per
+        canonical token (crossed with two independent narrative shapes),
+        proving no token in the shared taxonomy constant is silently
+        unrecognised by the classifier and that the candidate list is
+        derived from ``AMENDER_REJECTION_CATEGORIES`` (minus ``OTHER``)
+        rather than a fourth hand-copied tuple literal that could silently
+        drop one. Each token reports independently rather than stopping at
+        the first failure."""
+        assert _categorise_rejection_reason(suffix_template.format(token=token)) == token
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            _E3_F2_S1_T1_REJECTION_REASON,
+            "APPROACH_AUTH FAIL: the Approach does not authorise this; SCOPE was fine.",
+            "SCOPE FAIL: unrelated refactor; PRE_FILTER passed.",
+            "the amendment looks fine but we cannot accept it right now",
+            "this reason mentions pre_filter in lowercase",
+        ],
+    )
+    def test_result_is_always_a_member_of_the_taxonomy(self, reason: str) -> None:
+        """AC-FUNC-005: the returned value is always a member of
+        ``AMENDER_REJECTION_CATEGORIES``, asserted directly rather than
+        assumed."""
+        assert _categorise_rejection_reason(reason) in AMENDER_REJECTION_CATEGORIES

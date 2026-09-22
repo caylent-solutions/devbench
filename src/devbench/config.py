@@ -77,6 +77,8 @@ from devbench.constants import (
     DEFAULT_TEST_TIMEOUT,
     DEFAULT_TRANSPORT_RESTART_BACKOFF_BASE_SECONDS,
     DEFAULT_TRANSPORT_RESTART_BACKOFF_MAX_SECONDS,
+    GATE_ENV_VAR_PREFIX,
+    GATE_ENV_VAR_SUFFIX,
     VALID_ORCHESTRATE_EFFORTS,
     ModelRates,
 )
@@ -134,6 +136,43 @@ def _resolve_bool(name: str, yaml_value: bool | None, default: bool) -> bool:
     if yaml_value is not None:
         return yaml_value
     return default
+
+
+def resolve_gate_env_override(gate: str) -> bool | None:
+    """Resolve the ``DEVBENCH_GATE_<NAME>_ENABLED`` workspace-wide env override for *gate*.
+
+    The highest-precedence layer in the four-layer gate config model (spec
+    4.1, D-15; AC-27). Callers thread the result into
+    ``devbench.config_loader.resolve_gate_config``'s ``env_enabled_override``
+    parameter -- ``config_loader.py`` is parse/validate only and never
+    reads environment variables itself, so this module (the one place that
+    already centralizes every env-driven config value) owns the env-name
+    derivation and boolean parsing.
+
+    Reuses ``_resolve_bool``'s parsing and failure semantics (same accepted
+    boolean vocabulary, same error message shape) rather than
+    re-implementing them, so this gate-specific env var can never silently
+    diverge from every other env-driven boolean this module resolves.
+
+    Args:
+        gate: Gate name (e.g. ``"shared_file_impact"``). Membership in
+            ``GATE_NAMES`` is the resolver's responsibility, not this
+            function's -- it only derives the env var name and parses
+            whatever is there.
+
+    Returns:
+        ``True``/``False`` when the env var is set to a recognised boolean
+        token, or ``None`` when the env var is unset -- the caller should
+        fall through to the next-lower precedence layer.
+
+    Raises:
+        ValueError: If the env var is set to a value outside the accepted
+            boolean vocabulary.
+    """
+    name = f"{GATE_ENV_VAR_PREFIX}{gate.upper()}{GATE_ENV_VAR_SUFFIX}"
+    if _read_env(name) is None:
+        return None
+    return _resolve_bool(name, None, False)
 
 
 def _resolve_float(name: str, yaml_value: float | None, default: float) -> float:

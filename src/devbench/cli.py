@@ -27,7 +27,8 @@ Commands::
                             violations; --strict also flags draft/hold Manifest conflicts
     ensure-branch <id>      Create or switch to work unit branch before executor runs
     git-ops <id>            Run git operations for a work unit (commit-only when defer_pr is set)
-    git-ops-finalize <repo> Push single branch and create PR (after all deferred commits)
+    git-ops-finalize <repo> [--provenance <path>]
+                            Push single branch and create PR (after all deferred commits)
     report [since]          Print progress report with velocity stats
     log <message>           Append a message to the orchestrator log file
     start                   Run the orchestrate skill via the Claude Agent SDK (non-interactive);
@@ -41,10 +42,13 @@ Plugin agent bridge commands (used by devbench plugin agents)::
     get-diff <id>                           Return combined git diff for the work unit's repo
     check-manifest-scope <id>               Print out-of-Manifest staged paths; exit non-zero
                                              on mismatch (read-only, no LLM judgement)
+    check-reachability <id>                 Word-boundary, source-classified reachability gate over the unit's
+                                             Changes Manifest scope; blocks (exit 1) on any finding (spec 4.4)
     run-tests <id>                          Run test suite for the work unit's repo
     tdd-gate <id>                           Run the machine-observed RED gate for a gated task;
                                              on a genuine RED, records the orchestrator-only
                                              RED_OBSERVED entry (FR-4.2, exits 1 on any rejection)
+    check-fixture-consistency <id>          Cross-reference fixtures against the canonical dataset (opt-in)
     log-verdict <judge> <id> <v> [msg]      Log a judge verdict (pass|fail) to work unit Comments
     log-comment <agent> <id> <message>      Log a non-verdict agent comment to work unit Comments
     log-tdd <id> <phase> <message>          Log a TDD phase entry (RED|GREEN|REFACTOR) to TDD Cycle Log;
@@ -70,17 +74,22 @@ for easy parsing by Claude Code or other automation.
 
 import asyncio
 import contextlib
+import fnmatch
 import functools
 import getpass
 import io
+import itertools
 import json
 import logging
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -147,6 +156,7 @@ from devbench.backlog.manager import (
     BacklogManager,
     _build_remedies_rejection_message,
     _extract_wu_title,
+    compose_gate_waiver_record,
     count_review_fails_for_judge,
     green_green_observed_satisfied,
     red_gate_satisfied,
@@ -242,6 +252,16 @@ from devbench.constants import (
     FAILURE_DIGEST_RE,
     FINALIZE_COMMIT_TEMPLATE,
     FINALIZE_PR_TITLE_TEMPLATE,
+    GATE_ANCESTRY,
+    GATE_PROVENANCE_BUILTIN,
+    GATE_STATUS_DISABLED,
+    GATE_STATUS_ERROR,
+    GATE_STATUS_FAIL,
+    GATE_STATUS_PASS,
+    GATE_TIER_MACHINE_BLOCKING,
+    GATE_TIERS,
+    GATE_WAIVER_ATTRIBUTION_EXECUTOR,
+    GATE_WAIVER_ATTRIBUTION_OPERATOR,
     KNOWN_JUDGE_NAMES,
     OPERATOR_INPUT_REQUIRED_TAG,
     ORCHESTRATOR_AUTO_RESTART_AUDIT_PREFIX,
@@ -261,6 +281,7 @@ from devbench.constants import (
     RED_OBSERVED_RECORD_MISSING_FIELD_TEMPLATE,
     RED_OBSERVED_RECORD_WHITESPACE_TEST_NODE_ID_TEMPLATE,
     RED_OBSERVED_RECORD_ZERO_EXIT_CODE_MESSAGE,
+    SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS,
     SESSION_DEFAULT_NAME,
     SESSION_DRAIN_SIGNAL_FILENAME,
     SESSION_PID_FILENAME,
@@ -322,9 +343,24 @@ from devbench.scope import (
     _scope_file_path,
     _tokenise,
 )
-from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog
+from devbench.session import ClaimRaceError, Session, SessionRegistry, detect_scope_overlap, flock_backlog, flock_path
+from devbench.source_classification import (
+    JS_TS_FAMILY_EXTENSIONS,
+    SOURCE_EXTENSIONS,
+    extract_import_targets,
+    is_entry_point_stem,
+    is_source_extension,
+    is_test_path,
+    iter_classified_source_files,
+)
 from devbench.utils.io import atomic_write_text
 from devbench.utils.process import run_command
+from devbench.work_unit_scope import MODE_DEFER_PR, MODE_PER_TASK_BRANCH, ScopeResult, resolve_changed_files
+
+if TYPE_CHECKING:
+    from devbench.backlog.manifest import ManifestRow
+    from devbench.config_loader import FixtureConsistencyConfig, ResolvedGateConfig, RuntimeConfig
+    from devbench.fixture_consistency import FixtureFinding
 
 __all__ = ["_format_duration", "green_green_observed_satisfied", "red_gate_satisfied"]
 
@@ -4388,86 +4424,151 @@ def _render_untracked_hunks(repo_path: Path, allowed: set[str]) -> list[str]:
     return hunks
 
 
-def _load_manifest_paths_or_report(unit_id: str, wu_file: Path | None) -> list[str] | None:
-    """Return the unit's real Changes Manifest file paths, or ``None`` on failure.
+def _no_task_commit_found_message(unit_id: str, repo_path: Path) -> str:
+    """Build the fail-fast diagnostic for defer_pr post-commit with zero matching commits.
 
-    Shared by :func:`cmd_get_diff` (FR-12) and :func:`cmd_check_manifest_scope`
-    (spec 4.C) so a missing work-unit file or a malformed ``## Changes Manifest``
-    table is reported identically from either verb. ``_is_real_manifest_path``
-    filters sentinel/placeholder cells (``(none)``, ``<verification-only>``, ...)
-    so callers never see a non-file token as a pathspec entry or a Manifest match
-    target. On failure, the verbatim ERROR is already printed to stderr; the
-    caller must return 1 without printing anything further.
+    Shared by :func:`cmd_get_diff`'s defer_pr branch: the working tree is
+    clean but :func:`devbench.work_unit_scope.resolve_changed_files` found no
+    commit whose subject matches ``^<unit_id>:`` -- there is no HEAD
+    fallback (db-247).
     """
-    from devbench.backlog.manifest import ManifestParseError, parse_manifest
-
-    if wu_file is None:
-        print(f"ERROR: Cannot scope diff for '{unit_id}': work-unit file not found", file=sys.stderr)
-        return None
-    try:
-        rows = parse_manifest(wu_file.read_text(encoding="utf-8"))
-    except ManifestParseError as exc:
-        print(f"ERROR: Cannot scope diff for '{unit_id}': Changes Manifest is malformed: {exc}", file=sys.stderr)
-        return None
-    return sorted({row.file for row in rows if BacklogManager._is_real_manifest_path(row.file)})
-
-
-def _render_task_commit_hunks(unit_id: str, repo_path: Path, pathspec: list[str]) -> list[str] | None:
-    """Return Manifest-scoped ``git show`` hunks for this unit's own commit(s).
-
-    Replaces the unconditional ``git show HEAD`` substitution ADR-12 originally
-    specified (superseded in place, db-247/FR-13): in single-branch + defer_pr
-    mode, HEAD may belong to a sibling task that committed after this unit's own
-    commit landed, so post-commit attribution MUST resolve this unit's own
-    commit(s) by subject (``^<unit_id>:``, the exact prefix ``cmd_git_ops`` writes
-    every commit message with) instead of trusting HEAD. A task may carry more
-    than one commit of its own (an initial commit plus a later
-    ``pr_review_resolution`` fix commit); every matching commit is emitted, each
-    scoped to the Manifest pathspec so the combined query is
-    ``git show --format= <sha> -- <manifest_paths>``.
-
-    Returns ``None`` (having already printed the fail-fast diagnostic to stderr)
-    when no commit subject matches -- there is no HEAD fallback.
-    """
-    rc, stdout, _ = run_command(
-        ["git", "log", "--grep", f"^{unit_id}:", "--format=%H"],
-        cwd=repo_path,
+    _, branch_out, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
+    branch = branch_out.strip()
+    return "\n".join(
+        [
+            f"ERROR: get-diff (defer_pr, post-commit): no commit found for work unit '{unit_id}' on branch '{branch}'.",
+            f"The working tree is clean but no commit subject matches '^{unit_id}:'. This task's changes were not",
+            "committed under its own name (possibly bundled into a sibling's commit, or the commit is missing).",
+            f"Inspect with: git log --grep '^{unit_id}:' --format='%H %s' in {repo_path}.",
+        ]
     )
-    shas = [line.strip() for line in stdout.splitlines() if line.strip()] if rc == 0 else []
-    if not shas:
-        _, branch_out, _ = run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_path)
-        branch = branch_out.strip()
-        print(
-            "\n".join(
-                [
-                    f"ERROR: get-diff (defer_pr, post-commit): no commit found for work unit "
-                    f"'{unit_id}' on branch '{branch}'.",
-                    "The working tree is clean but no commit subject matches "
-                    f"'^{unit_id}:'. This task's changes were not",
-                    "committed under its own name (possibly bundled into a sibling's "
-                    "commit, or the commit is missing).",
-                    f"Inspect with: git log --grep '^{unit_id}:' --format='%H %s' in {repo_path}.",
-                ]
-            ),
-            file=sys.stderr,
-        )
-        return None
 
-    hunks: list[str] = []
-    for sha in shas:
+
+def _append_defer_pr_task_commit_hunks(
+    unit_id: str, repo_path: Path, scope: ScopeResult, pathspec: list[str], parts: list[str]
+) -> int | None:
+    """Append this unit's own commit-sha hunk(s) to ``parts`` in defer_pr mode.
+
+    Only called by :func:`cmd_get_diff` when ``parts`` (staged + unstaged)
+    is already empty. Returns ``None`` on success (``parts`` mutated in
+    place); returns ``1`` (having already printed the fail-fast diagnostic)
+    when ``scope`` carries no commit sha to substitute -- there is no HEAD
+    fallback (db-247).
+    """
+    if not scope.commit_shas:
+        print(_no_task_commit_found_message(unit_id, repo_path), file=sys.stderr)
+        return 1
+    for sha in scope.commit_shas:
         rc, stdout, _ = run_command(["git", "show", "--format=", sha, *pathspec], cwd=repo_path)
         if rc == 0 and stdout.strip():
-            hunks.append(stdout)
-    return hunks
+            parts.append(stdout)
+    return None
+
+
+def _append_branch_vs_default_hunk(
+    canonical_repo: str, repo_path: Path, pathspec: list[str], parts: list[str]
+) -> int | None:
+    """Append the branch-vs-default hunk to ``parts`` in per_task_branch mode.
+
+    Returns ``None`` on success (``parts`` mutated in place); returns ``1``
+    (having already printed the fail-fast diagnostic) when the default
+    branch cannot be resolved.
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        print(
+            f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
+            "Run 'git remote set-head origin --auto' to configure it.",
+            file=sys.stderr,
+        )
+        return 1
+    rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}", *pathspec], cwd=repo_path)
+    if rc == 0 and stdout.strip():
+        parts.append(stdout)
+    return None
+
+
+def _resolve_scope_mode() -> str:
+    """Return the ADR-12 scope mode for the current run.
+
+    ``MODE_DEFER_PR`` when ``DEVBENCH_DEFER_PR`` resolves true, else
+    ``MODE_PER_TASK_BRANCH``. Every scope-resolving gate/verb
+    (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
+    reachability gate, :func:`cmd_check_shared_file_impact`, the
+    fixture-consistency gate, the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3, and the store-factory
+    scaffold generator, :func:`cmd_scaffold_store_factory`, E9-F1-S1-T2)
+    calls this single helper instead of re-deriving the same two-branch
+    ternary, so the mode-selection rule can never drift between call sites
+    (spec 4.3, ADR-12).
+    """
+    from devbench.config import DEFER_PR
+
+    return MODE_DEFER_PR if DEFER_PR else MODE_PER_TASK_BRANCH
+
+
+def _resolve_scope_or_report(unit_id: str, repo_path: Path, mode: str, *, message_prefix: str) -> ScopeResult | None:
+    """Resolve ``unit_id``'s scope via :func:`resolve_changed_files`, or ``None`` on failure.
+
+    Shared by every gate/verb that needs the unit's ADR-12 mode-aware scope
+    (:func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`, the
+    reachability gate, :func:`cmd_check_shared_file_impact`, the
+    fixture-consistency gate, the write-path audit gate,
+    :func:`cmd_check_write_path`, E7-F2-S1-T3, and the store-factory
+    scaffold generator, :func:`cmd_scaffold_store_factory`, E9-F1-S1-T2;
+    spec 4.3, AC-9) so every
+    consumer resolves scope through the single mode-aware implementation
+    and reports a
+    resolution failure through one shared error path, never a divergent
+    per-caller try/except copy. Each caller passes its own operator-facing
+    ``message_prefix`` (e.g. ``"Cannot scope diff for '<unit>'"`` or
+    ``"cannot resolve scope for unit <unit>"``) so existing callers'
+    wording is preserved exactly while a new caller can state its own verb.
+
+    ``FileNotFoundError`` is caught alongside ``ValueError``/``RuntimeError``:
+    :func:`resolve_changed_files` can propagate it (via
+    ``work_unit_scope._load_manifest_paths``) when the unit's work-unit file
+    is deleted in a same-process race between the backlog parse and the
+    manifest read; every caller of this helper gets a formed ``ERROR: ...``
+    line for that case instead of an uncaught traceback.
+
+    On failure, the verbatim ERROR is already printed to stderr; the caller
+    must return 1 without printing anything further.
+    """
+    from devbench.backlog.manifest import ManifestParseError
+
+    try:
+        return resolve_changed_files(unit_id, repo_path, mode)
+    except ManifestParseError as exc:
+        print(f"ERROR: {message_prefix}: Changes Manifest is malformed: {exc}", file=sys.stderr)
+        return None
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        print(f"ERROR: {message_prefix}: {exc}", file=sys.stderr)
+        return None
+
+
+# Shared ``message_prefix`` template for the four :func:`_resolve_scope_or_report`
+# callers (:func:`_prepare_shared_file_impact_scope_and_registry`,
+# :func:`_finalize_fixture_consistency_result`, :func:`cmd_check_write_path`,
+# :func:`cmd_scaffold_store_factory`) that
+# have no gate-specific wording of their own to preserve, so the identical prefix
+# text can never drift between the four call sites (doc_review round-2 W4,
+# E6-F2-S1-T2; extended to a third caller by E7-F2-S1-T3, code_review round 1
+# Blocking; extended to a fourth caller by E9-F1-S1-T2).
+_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str = "cannot resolve scope for unit {unit_id}"
 
 
 def _resolve_unit_repo_and_path(unit_id: str) -> tuple[WorkUnit, str, Path] | None:
     """Return ``(unit, canonical_repo, repo_path)`` for ``unit_id``, or ``None`` on failure.
 
-    Shared by :func:`cmd_get_diff` and :func:`cmd_check_manifest_scope` so both
-    verbs report "unit not found" / "no local path configured" identically.
-    Prints the ERROR itself; the caller's job is only to propagate a non-zero
-    exit code.
+    Shared by :func:`cmd_get_diff`, :func:`cmd_check_manifest_scope`,
+    :func:`cmd_check_reachability`, :func:`_prepare_shared_file_impact_run`
+    (on behalf of :func:`cmd_check_shared_file_impact`),
+    :func:`cmd_check_write_path`, :func:`cmd_request_amendment` and
+    :func:`cmd_scaffold_store_factory` (E9-F1-S1-T2) so all
+    seven callers report "unit not found" / "no local path configured"
+    identically. Prints the ERROR itself; the caller's job is only to
+    propagate a non-zero exit code.
     """
     parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
     units = parser.parse_index()
@@ -4489,19 +4590,21 @@ def cmd_get_diff(unit_id: str) -> int:
     """Return the combined git diff for the work unit's target repo.
 
     Mode-aware per ADR-12, and Manifest-scoped per db-296/db-247 (spec FR-12,
-    FR-13). Every git query below is restricted to the unit's real Changes
-    Manifest paths (:func:`_load_manifest_paths_or_report`) so a sibling task's
-    dirty residue in the shared checkout can never leak into this unit's diff.
+    FR-13, 4.3). Scope (which files, which ADR-12 mode, and -- in defer_pr
+    mode -- this unit's own commit sha(s)) is resolved through the single
+    shared implementation, :func:`devbench.work_unit_scope.resolve_changed_files`
+    (spec 4.3, AC-9), so a sibling task's dirty residue in the shared
+    checkout can never leak into this unit's diff and every scope consumer
+    agrees on the same answer.
 
     In the default per-task-branch mode, emits staged + unstaged +
     branch-vs-default + untracked hunks, all pathspec-scoped. In defer_pr mode
     (single_branch + defer_pr: true), the branch-vs-default hunk is omitted
     because it accumulates every prior task's commits on the shared branch;
     instead the function emits staged + unstaged + untracked, and when both
-    staged and unstaged are empty (a post-commit judge invocation) resolves
-    and emits this unit's own commit(s) via
-    :func:`_render_task_commit_hunks` instead of the old unconditional
-    ``git show HEAD``.
+    staged and unstaged are empty (a post-commit judge invocation) emits
+    ``git show`` hunks for the scope's resolved commit sha(s) instead of the
+    old unconditional ``git show HEAD``.
 
     A missing work-unit file or a malformed Changes Manifest fails fast. An
     empty (verification-only) Manifest returns ``(no changes)`` -- never an
@@ -4510,20 +4613,19 @@ def cmd_get_diff(unit_id: str) -> int:
     Used by plugin agents instead of running raw git commands so they do not
     need to know the repo path or the mode.
     """
-    from devbench.config import DEFER_PR
-
     resolved = _resolve_unit_repo_and_path(unit_id)
     if resolved is None:
         return 1
     unit, canonical_repo, repo_path = resolved
 
-    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
-    if manifest_paths is None:
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
+    if scope is None:
         return 1
-    if not manifest_paths:
+    if not scope.files:
         print("(no changes)")
         return 0
-    pathspec = ["--", *manifest_paths]
+    pathspec = ["--", *scope.files]
 
     parts: list[str] = []
 
@@ -4535,26 +4637,17 @@ def cmd_get_diff(unit_id: str) -> int:
     if rc == 0 and stdout.strip():
         parts.append(stdout)
 
-    if DEFER_PR:
+    if scope.mode == MODE_DEFER_PR:
         if not parts:
-            task_commit_hunks = _render_task_commit_hunks(unit_id, repo_path, pathspec)
-            if task_commit_hunks is None:
-                return 1
-            parts.extend(task_commit_hunks)
+            error = _append_defer_pr_task_commit_hunks(unit_id, repo_path, scope, pathspec, parts)
+            if error is not None:
+                return error
     else:
-        default_branch = _resolve_default_branch(canonical_repo, repo_path)
-        if default_branch is None:
-            print(
-                f"ERROR: Cannot determine default branch for '{canonical_repo}'. "
-                "Run 'git remote set-head origin --auto' to configure it.",
-                file=sys.stderr,
-            )
-            return 1
-        rc, stdout, _ = run_command(["git", "diff", f"origin/{default_branch}", *pathspec], cwd=repo_path)
-        if rc == 0 and stdout.strip():
-            parts.append(stdout)
+        error = _append_branch_vs_default_hunk(canonical_repo, repo_path, pathspec, parts)
+        if error is not None:
+            return error
 
-    parts.extend(_render_untracked_hunks(repo_path, allowed=set(manifest_paths)))
+    parts.extend(_render_untracked_hunks(repo_path, allowed=set(scope.files)))
 
     print("\n".join(parts) if parts else "(no changes)")
     return 0
@@ -4568,7 +4661,8 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
     changes-manifest judge shells out to this verb to get a deterministic
     staged-vs-Manifest signal that a judged read of the diff cannot drift from,
     now that ``get-diff`` is Manifest-scoped and a staged-but-unmanifested file
-    no longer appears in the diff it reads (FR-11-A2).
+    no longer appears in the diff it reads (FR-11-A2). Scope is resolved
+    through the same shared implementation ``get-diff`` uses (spec 4.3, AC-9).
 
     Prints the out-of-Manifest staged paths (embedded in the underlying
     ``RuntimeError``) and exits non-zero when the staged set is not within the
@@ -4582,18 +4676,813 @@ def cmd_check_manifest_scope(unit_id: str) -> int:
         return 1
     unit, _canonical_repo, repo_path = resolved
 
-    manifest_paths = _load_manifest_paths_or_report(unit_id, _resolve_unit_file(unit))
-    if manifest_paths is None:
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
+    if scope is None:
         return 1
 
     try:
-        assert_staged_matches_manifest(repo_path, manifest_paths)
+        assert_staged_matches_manifest(repo_path, scope.files)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     print(f"check-manifest-scope: staged set for '{unit_id}' is within the Changes Manifest.")
     return 0
+
+
+def _resolve_ancestry_repo_context(unit_id: str) -> tuple[str, Path] | None:
+    """Resolve *unit_id* to its canonical repo + local checkout path for check-ancestry.
+
+    Returns ``None`` (after printing its own ``ERROR:`` to stderr) when the
+    unit is unknown or the repo has no configured local path. Split out of
+    :func:`cmd_check_ancestry` purely to keep that function's return-count
+    within the project's complexity lint budget.
+    """
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return None
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return None
+    return canonical_repo, repo_path
+
+
+def _gate_disabled_line(gate_name: str) -> str:
+    """Render the spec 4.1 ``{"gate": "<gate_name>", "status": "disabled"}`` line.
+
+    Single formatter shared by every gate command so the disabled-line
+    shape can never drift between gates; the status value comes from
+    ``constants.GATE_STATUS_DISABLED``, not a gate-local literal.
+    """
+    return json.dumps({"gate": gate_name, "status": GATE_STATUS_DISABLED})
+
+
+def _gate_status_line(gate_name: str, status: str, findings: int, **extra_fields: object) -> str:
+    """Render the spec 5.2 gate status-line JSON for an enabled run of *gate_name*.
+
+    Single formatter shared by every gate command so the base field
+    set/order (``gate``, ``tier``, ``status``, ``findings``) can never
+    drift between gates. ``**extra_fields`` carries each gate's own
+    additional fields (ancestry's ``mode``/``dependency_ref``/
+    ``target_ref``/``scope_hash``; reachability's ``scope_hash``;
+    shared_file_impact's ``scope_hash``; write_path_audit's ``flag``/
+    ``verdict``), appended in the order passed.
+    """
+    payload: dict[str, object] = {
+        "gate": gate_name,
+        "tier": GATE_TIERS[gate_name],
+        "status": status,
+        "findings": findings,
+    }
+    payload.update(extra_fields)
+    return json.dumps(payload)
+
+
+def _load_gate_config_or_report(gate_name: str, canonical_repo: str) -> "ResolvedGateConfig | int":
+    """Load config and resolve *gate_name*'s config for *canonical_repo* (spec 4.1, D-15).
+
+    Single gate-agnostic loader shared by every gate command: an ``int``
+    result means "already handled -- return this exit code as-is" (the
+    loader's own fail-fast ``ERROR:`` message, or the spec 5.2
+    ``{"gate": "<gate_name>", "status": "disabled"}`` line, is already
+    printed); a ``ResolvedGateConfig`` result means the gate is enabled and
+    the caller should proceed.
+    """
+    from devbench.config import resolve_gate_env_override
+    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    try:
+        runtime_config = load_runtime_config(cfg_path, os.environ)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    gate_config = resolve_gate_config(
+        gate_name,
+        canonical_repo,
+        runtime_config,
+        resolve_gate_env_override(gate_name),
+    )
+    if not gate_config.values["enabled"]:
+        print(_gate_disabled_line(gate_name))
+        return 0
+    return gate_config
+
+
+# Gate mode vocabulary for check-ancestry (spec
+# integration-reality-gates-hardening.md sections 4.1, 4.5, 5.2; AC-ANC-*).
+# Local, gate-scoped constants -- the gate NAME itself is
+# ``constants.GATE_ANCESTRY`` (imported above), the single canonical
+# definition ``GATE_NAMES``/``GATE_TIERS`` are built from, so this module's
+# gate-name comparisons/lookups can never drift from a second, hand-typed
+# copy of the literal "ancestry" (code_review FAIL, round 1: a
+# module-private mirror of this same literal had drifted into a THIRD
+# undetected copy in ``devbench.backlog.manager``). The status vocabulary
+# itself (``GATE_STATUS_DISABLED``/``PASS``/``FAIL``) is likewise imported,
+# not re-declared, and shared by every gate command through
+# :func:`_gate_status_line`/:func:`_gate_disabled_line`; only the
+# ancestry-specific MODE values are declared here, once, rather than as
+# inline literals scattered through :func:`cmd_check_ancestry`.
+_ANCESTRY_MODE_STRICT: str = "strict"
+_ANCESTRY_MODE_SQUASH_PR: str = "squash-pr"
+_ANCESTRY_MODE_NONE: str = "none"
+
+
+@dataclass(frozen=True)
+class _SquashProbeResult:
+    """Outcome of :func:`_probe_squash_merged_pr` (spec 4.5, 317-D02).
+
+    ``found=False`` is a legitimate, non-error result (the search
+    genuinely turned up no merged PR); a probe that could not even run
+    (``gh``/``git`` failure, unparseable output) returns ``None`` from
+    :func:`_probe_squash_merged_pr` instead of this type, so a hard
+    failure can never be mistaken for "no PR found" (spec 3.5 fallback
+    ban).
+    """
+
+    found: bool
+    pr_number: int | None
+
+
+def _resolve_ancestry_remote(canonical_repo: str, repo_path: Path) -> tuple[str, str] | None:
+    """Resolve *canonical_repo*'s configured tracking remote and its default branch.
+
+    Reads ``git config --get branch.<default-branch>.remote`` in
+    *repo_path* rather than assuming the literal ``"origin"`` (spec 4.5,
+    AC-ANC-004): a repo whose tracking remote uses a different name is
+    never silently checked against a ref that does not exist. The default
+    branch is returned alongside the remote so :func:`cmd_check_ancestry`
+    and the squash-PR probe (spec 4.5's ``--base <default-branch>``) share
+    one resolution instead of each re-deriving it.
+
+    Returns ``None`` (after printing its own ``ERROR:`` to stderr) when the
+    default branch cannot be resolved, or when the branch has no single
+    configured remote (unset or ambiguous).
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        print(
+            f"ERROR: Cannot determine default branch for '{canonical_repo}' to resolve its tracking "
+            "remote. Set 'default_branch' for this repo in devbench.yaml, or run "
+            "'git remote set-head <remote-name> --auto' for the repo's configured tracking remote.",
+            file=sys.stderr,
+        )
+        return None
+
+    rc, stdout, _stderr = run_command(
+        ["git", "config", "--get", f"branch.{default_branch}.remote"],
+        cwd=repo_path,
+    )
+    remote = stdout.strip()
+    if rc != 0 or not remote:
+        print(
+            f"ERROR: Cannot resolve tracking remote for '{canonical_repo}' branch '{default_branch}'. "
+            f"Set it with 'git config branch.{default_branch}.remote <remote-name>'.",
+            file=sys.stderr,
+        )
+        return None
+    return remote, default_branch
+
+
+def _probe_squash_merged_pr(dependency_ref: str, default_branch: str, repo_path: Path) -> _SquashProbeResult | None:
+    """Probe whether *dependency_ref* landed via a squash-merged/rebased PR (spec 4.5, 317-D02).
+
+    Complements the strict ``git merge-base --is-ancestor`` probe, which
+    cannot see a squash-merged, rebased, or fix-pack-landed dependency's
+    original commits: a merge-base "not ancestor" answer reports a false
+    ``BLOCKED`` for a dependency that is fully delivered on the shared
+    trunk under a different set of commit hashes.
+
+    Resolves *dependency_ref* to a commit SHA (``git rev-parse``), then
+    searches for a merged PR carrying that SHA via ``gh pr list --search
+    "<sha>" --state merged --base <default-branch> --json
+    number,mergedAt,title``.
+
+    Returns:
+        A :class:`_SquashProbeResult` with ``found=True`` when a merged PR
+        is found, or ``found=False`` when the search legitimately returns
+        no results (not an error -- an empty result is a real "not yet
+        merged this way either" answer). Returns ``None`` (after printing
+        its own ``ERROR:`` to stderr) when the ``git rev-parse`` or ``gh
+        pr list`` call itself fails, or its output cannot be parsed as the
+        expected JSON array -- callers must treat this as a hard failure
+        (spec 3.5), never silently reporting "not found".
+    """
+    rc, stdout, stderr = run_command(["git", "rev-parse", dependency_ref], cwd=repo_path)
+    if rc != 0 or not stdout.strip():
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': could not resolve to a commit "
+            f"SHA: {stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    sha = stdout.strip()
+
+    rc, stdout, stderr = run_command(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--search",
+            sha,
+            "--state",
+            "merged",
+            "--base",
+            default_branch,
+            "--json",
+            "number,mergedAt,title",
+        ],
+        cwd=repo_path,
+    )
+    if rc != 0:
+        print(f"ERROR: squash-merge probe failed for '{dependency_ref}': {stderr.strip()}", file=sys.stderr)
+        return None
+
+    return _parse_squash_probe_response(stdout, dependency_ref)
+
+
+def _parse_squash_probe_response(stdout: str, dependency_ref: str) -> _SquashProbeResult | None:
+    """Parse `gh pr list --json number,mergedAt,title`'s stdout into a :class:`_SquashProbeResult`.
+
+    Split out of :func:`_probe_squash_merged_pr` purely to keep that
+    function's return-count within the project's complexity lint budget.
+    Every shape that is not a genuine, well-formed "zero or more merged
+    PRs" answer is a hard failure (spec 3.5) -- never coerced into
+    ``found=False``.
+    """
+    try:
+        prs = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': could not parse 'gh pr list' "
+            f"output as JSON: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    if not isinstance(prs, list):
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': unexpected 'gh pr list' output "
+            f"shape (expected a JSON array): {stdout.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    if not prs:
+        return _SquashProbeResult(found=False, pr_number=None)
+
+    first = prs[0]
+    if not isinstance(first, dict) or not isinstance(first.get("number"), int):
+        print(
+            f"ERROR: squash-merge probe failed for '{dependency_ref}': 'gh pr list' result missing a "
+            f"numeric 'number' field: {stdout.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    return _SquashProbeResult(found=True, pr_number=first["number"])
+
+
+def _ancestry_status_line(
+    status: str, findings: int, mode: str, dependency_ref: str, resolved_target_ref: str, scope_hash: str
+) -> str:
+    """Render the spec 5.2 gate status line for an enabled ``check-ancestry`` run.
+
+    Thin ancestry-specific wrapper around the shared
+    :func:`_gate_status_line` formatter (also used by
+    :func:`cmd_check_reachability`) so the base field set/order (``gate``,
+    ``tier``, ``status``, ``findings``) can never drift between gates,
+    while the three terminal-decision branches in
+    :func:`cmd_check_ancestry` (strict pass, squash-pr pass, BLOCKED) keep
+    a single call shape for ancestry's own ``mode``/``dependency_ref``/
+    ``target_ref``/``scope_hash`` fields. *scope_hash* is the SAME value
+    :func:`_write_ancestry_gate_pass_record` persisted for a passing run
+    (AC-REC-007), or the empty string for the BLOCKED terminal decision,
+    which persists no record.
+    """
+    return _gate_status_line(
+        GATE_ANCESTRY,
+        status,
+        findings,
+        mode=mode,
+        dependency_ref=dependency_ref,
+        target_ref=resolved_target_ref,
+        scope_hash=scope_hash,
+    )
+
+
+def _print_ancestry_probe_outcomes(
+    dependency_ref: str,
+    resolved_target_ref: str,
+    strict_ancestor: bool,
+    squash_result: _SquashProbeResult | None,
+) -> None:
+    """Print both ancestry probes' human-readable outcomes (spec 4.5, AC-ANC-002).
+
+    Shared by every terminal decision :func:`cmd_check_ancestry` reaches
+    through a genuine probe result (strict pass, squash-pr pass, or
+    BLOCKED) so an operator always sees which probe answered what --
+    never a single probe's result standing in silently for the whole
+    decision (spec 3.5 fallback ban). *squash_result* is ``None`` when the
+    squash-PR probe never ran because the strict probe already passed.
+    """
+    strict_outcome = "ancestor" if strict_ancestor else "not an ancestor"
+    print(f"Strict probe (git merge-base --is-ancestor {dependency_ref} {resolved_target_ref}): {strict_outcome}")
+
+    if squash_result is None:
+        squash_outcome = "not run (strict probe already passed)"
+    elif squash_result.found:
+        squash_outcome = f"merged via PR #{squash_result.pr_number}"
+    else:
+        squash_outcome = "no merged PR found"
+    print(f"Squash-PR probe (gh pr list --search <sha> --state merged): {squash_outcome}")
+
+
+def _resolve_ancestry_wu_file_and_manifest(unit_id: str) -> "tuple[Path, list[ManifestRow]] | int":
+    """Resolve *unit_id*'s work-unit file and parse its Changes Manifest.
+
+    Split out of :func:`_write_ancestry_gate_pass_record` purely to keep
+    that function's return-count within the project's complexity lint
+    budget: every early-exit condition below that used to live inline in
+    the caller is now internal to this helper.
+
+    Returns:
+        ``(wu_file, manifest_rows)`` on success. An already fully-handled
+        exit code (``1``; the failure has already printed its own
+        ``ERROR:`` message) when the unit is unknown, the work-unit file
+        does not exist or cannot be read, or its Changes Manifest cannot
+        be parsed.
+    """
+    from devbench.backlog.manifest import ManifestParseError, parse_manifest
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: unit not found",
+            file=sys.stderr,
+        )
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    if not wu_file.is_file():
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: "
+            f"work unit file not found at {wu_file}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        manifest_rows = parse_manifest(wu_content)
+    except ManifestParseError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    return wu_file, manifest_rows
+
+
+# A stable, out-of-band scope-hash input folded in for a Manifest row that
+# names a real (non-sentinel) path not yet present in the checkout at
+# check-ancestry time -- the normal shape of a generated ancestry-gate
+# task's own report-file "add" row on its FIRST execution (the Approach's
+# final step writes that file; it provably does not exist before then --
+# see `_compute_ancestry_scope_hash`). Never a valid `git hash-object`
+# output (those are 40 lowercase hex chars for SHA-1 blobs), so it can
+# never collide with a real blob hash once the file is created.
+_ABSENT_MANIFEST_FILE_SCOPE_MARKER: str = "<absent-at-check-time>"
+
+
+def _compute_ancestry_scope_hash(repo_path: Path, manifest_rows: "list[ManifestRow]", target_ref: str) -> str:
+    """Assemble and hash the ancestry gate's scope-hash inputs from a real git checkout.
+
+    The SINGLE implementation of the four-step assembly spec 4.2/4.5
+    requires -- per-Manifest-file ``git hash-object`` (or the defined
+    absent-file substitute below), ``git rev-parse`` of *target_ref*, and
+    :func:`devbench.gate_records.compute_scope_hash` -- shared by
+    :func:`_write_ancestry_gate_pass_record` (the initial write, called
+    with the target ref it just resolved and probed) and
+    :meth:`devbench.backlog.manager.BacklogManager._recompute_gate_scope_hash`
+    (the ``mark-done`` freshness recompute, called via a lazy import with
+    the ref read back from the persisted ``[GATE_ANCESTRY_TARGET_REF]``
+    marker). Before this function existed the two call sites each
+    re-implemented this assembly independently, with different subprocess
+    timeout policies, and nothing proved they agreed byte-for-byte
+    (code_review FAIL, round 1) -- routing both through this one function
+    makes that drift structurally impossible.
+
+    A Manifest row naming a path that is ABSENT from the checkout (not a
+    sentinel, a real declared path that simply does not exist on disk yet)
+    is a DEFINED, deterministic input to the digest via
+    :data:`_ABSENT_MANIFEST_FILE_SCOPE_MARKER`, never a hard error and
+    never a silent skip: a silent skip would let the digest stay stable
+    while a declared deliverable is created or edited, defeating the very
+    freshness check this gate exists to provide. Folding in a fixed marker
+    that can never equal a real blob hash means the digest changes the
+    instant the file is created (its real blob hash then replaces the
+    marker) or edited afterward. This is the canonical generated
+    ancestry-gate task's own first-run shape: its Manifest's sole row names
+    its own report file (``docs/gate-reports/<id>-ancestry.md``), which the
+    Approach's final step writes -- so it provably does not exist at
+    check-ancestry time (``plugin-authoring/devbench-authoring/skills/spec-to-backlog/SKILL.md``,
+    ``docs/cross-backlog-dependencies.md``).
+
+    Sentinel rows (e.g. a legacy literal ``(none)`` row, which
+    :func:`devbench.backlog.manifest.parse_manifest` still returns as a
+    real row) are filtered via
+    :meth:`devbench.backlog.manager.BacklogManager._is_real_manifest_path`
+    -- the same predicate every other Manifest-scope reader in the
+    codebase (``work_unit_scope.real_manifest_paths``,
+    ``backlog.proposal``) uses -- so a sentinel contributes nothing to the
+    digest, consistently with the rest of the codebase.
+
+    Args:
+        repo_path: Local repo checkout root every git call runs against.
+        manifest_rows: The unit's parsed Changes Manifest rows. May
+            contain no real (non-sentinel) file rows: ancestry's own scope
+            always also includes the target ref, so a Manifest with no
+            real file rows is not itself an error here.
+        target_ref: The exact ref string to resolve -- either the caller's
+            explicit override or the ``<remote>/<default-branch>``
+            fallback (:func:`_write_ancestry_gate_pass_record`), or the ref
+            persisted in the ``[GATE_ANCESTRY_TARGET_REF]`` marker
+            (``_recompute_gate_scope_hash``).
+
+    Returns:
+        The resulting scope hash.
+
+    Raises:
+        RuntimeError: A ``git hash-object`` call for a Manifest file that
+            DOES exist in the checkout, or the ``git rev-parse`` call for
+            *target_ref*, exited non-zero or returned empty output. A
+            Manifest row naming a file simply absent from the checkout is
+            NOT an error (see above).
+    """
+    from devbench.gate_records import compute_scope_hash
+
+    file_blob_hashes: dict[str, str] = {}
+    for row in manifest_rows:
+        if not BacklogManager._is_real_manifest_path(row.file):
+            continue
+        if not (repo_path / row.file).is_file():
+            file_blob_hashes[row.file] = _ABSENT_MANIFEST_FILE_SCOPE_MARKER
+            continue
+        rc, stdout, stderr = run_command(["git", "hash-object", "--", row.file], cwd=repo_path)
+        if rc != 0 or not stdout.strip():
+            raise RuntimeError(f"git hash-object failed for {row.file!r}: {stderr.strip()}")
+        file_blob_hashes[row.file] = stdout.strip()
+
+    rc, stdout, stderr = run_command(["git", "rev-parse", target_ref], cwd=repo_path)
+    if rc != 0 or not stdout.strip():
+        raise RuntimeError(f"git rev-parse failed for target ref {target_ref!r}: {stderr.strip()}")
+    target_ref_sha = stdout.strip()
+
+    return compute_scope_hash(file_blob_hashes, target_ref_sha=target_ref_sha)
+
+
+def _write_ancestry_gate_pass_record(unit_id: str, repo_path: Path, resolved_target_ref: str) -> str | int:
+    """Persist ``[GATE_PASS ancestry]`` for a passing enabled ``check-ancestry`` run.
+
+    Spec 3.6/4.2: a machine-blocking gate result is only trustworthy once
+    the gate command itself -- never agent prose -- writes the record.
+    Spec 4.5 (internal issue #12 AC3): the persisted scope hash folds in
+    *resolved_target_ref*'s CURRENT commit sha, computed by
+    :func:`_compute_ancestry_scope_hash` (the single shared assembly, see
+    its own docstring), alongside the unit's own Changes-Manifest file
+    blob hashes. Also writes a
+    :func:`devbench.gate_records.compose_ancestry_target_ref_marker`
+    companion record naming *resolved_target_ref* ITSELF (not just its
+    sha): ``check-ancestry`` accepts an OPTIONAL explicit ``<target-ref>``
+    override, so the ref actually probed is not always the repo's default
+    branch, and
+    :meth:`devbench.backlog.manager.BacklogManager._recompute_gate_scope_hash`
+    reads this companion marker back at ``mark-done`` freshness-recompute
+    time instead of re-deriving the default branch -- so a run that used an
+    explicit override recomputes the SAME ref later, never a different one
+    that would make the record read as permanently stale. The unit's
+    Changes Manifest may name no real (non-sentinel) files -- either
+    because it is genuinely empty/sentinel-only (a legacy literal
+    ``(none)`` row) or because its one row (a generated ancestry-gate
+    task's Manifest genuinely carries exactly one ``add`` row naming its
+    own report file, ``docs/gate-reports/<id>-ancestry.md``) names a file
+    that does not exist in the checkout yet -- the Approach's final step
+    writes it on first execution, so it provably does NOT exist at
+    check-ancestry time. Neither shape is an error here: ancestry's own
+    scope always also includes the target ref, and
+    :func:`_compute_ancestry_scope_hash` folds an absent declared file
+    into the digest as a defined input rather than skipping it (see its
+    own docstring).
+
+    The ``[GATE_PASS ancestry]`` record and its ``[GATE_ANCESTRY_TARGET_REF]``
+    companion are persisted in a SINGLE atomic write
+    (:meth:`devbench.backlog.manager.BacklogManager._append_audit_markers_before_comments`),
+    never two sequential ones -- a reader that finds the first marker
+    without the second treats the record as permanently unresolvable
+    (``BacklogManager._resolve_ancestry_target_ref``), so a failure
+    partway through writing them would otherwise leave exactly that kind
+    of partial record (code_review FAIL, round 1).
+
+    Args:
+        unit_id: The work-unit id whose file the record is appended to.
+        repo_path: Local checkout path of the unit's target repo.
+        resolved_target_ref: The ref :func:`cmd_check_ancestry` actually
+            probed against (either the caller's explicit override or the
+            ``<remote>/<default-branch>`` fallback).
+
+    Returns:
+        The persisted scope hash on success. On failure, prints its own
+        ``ERROR:`` naming the work-unit file path to stderr and returns
+        ``1`` -- never raises past this boundary (a ``RuntimeError`` from
+        :func:`_compute_ancestry_scope_hash` or an ``OSError`` from the
+        audit-marker write are both caught here), and never leaves a
+        partial record (the two markers share one atomic write).
+    """
+    from devbench.backlog.manager import BacklogManager
+    from devbench.gate_records import compose_ancestry_target_ref_marker, compose_gate_pass_record
+
+    resolved = _resolve_ancestry_wu_file_and_manifest(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    wu_file, manifest_rows = resolved
+
+    try:
+        scope_hash = _compute_ancestry_scope_hash(repo_path, manifest_rows, resolved_target_ref)
+    except RuntimeError as exc:
+        print(f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+
+    marker = compose_gate_pass_record(GATE_ANCESTRY, scope_hash)
+    target_ref_marker = compose_ancestry_target_ref_marker(resolved_target_ref)
+    backlog_manager = BacklogManager()
+    try:
+        backlog_manager._append_audit_markers_before_comments(wu_file, [marker, target_ref_marker])
+    except OSError as exc:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {GATE_ANCESTRY}] record for {unit_id}: {wu_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return scope_hash
+
+
+def cmd_check_ancestry(unit_id: str, dependency_ref: str, target_ref: str = "") -> int:
+    """Verify a declared work-group dependency has actually merged, via real git ancestry.
+
+    This is the **canonical, single-source-of-truth check** for "is a declared
+    prerequisite deliverable" across the pipeline (see
+    ``docs/cross-backlog-dependencies.md``). It exists so that
+    ``spec-to-backlog``-generated ancestry-gate tasks, and any other tooling
+    that needs the same answer, all shell out to one well-tested command
+    instead of inventing a weaker proxy (e.g. checking for a local
+    snapshot/report file, which can go stale or never existed).
+
+    Command: ``check-ancestry <unit-id> <dependency-ref> [<target-ref>]``
+    (spec 4.5; machine-blocking per ``constants.GATE_TIERS``). Gate
+    enablement is read exclusively through
+    ``resolve_gate_config("ancestry", repo)`` (spec 4.1's single read
+    path): when the gate is disabled (or unconfigured) for the unit's
+    repo, prints exactly ``{"gate":"ancestry","status":"disabled"}`` and
+    returns 0 before any git call (AC-ANC-006). On an enabled run, the
+    spec 5.2 status line -- ``{"gate","tier","status","findings","mode",
+    "dependency_ref","target_ref","scope_hash"}`` -- is the FIRST stdout
+    line (AC-ANC-007), followed by both probes' human-readable outcomes.
+    ``scope_hash`` is the same digest persisted in the ``[GATE_PASS
+    ancestry]`` record on a passing run (AC-REC-007, spec 4.5); it is the
+    empty string on the BLOCKED (``status: "fail"``) line, which persists
+    no record.
+
+    **Work-unit-file side effect (spec 3.6/4.2).** A passing enabled run
+    appends exactly one ``[GATE_PASS ancestry] <iso-utc> <scope-hash>``
+    marker, together with its ``[GATE_ANCESTRY_TARGET_REF] <target-ref>``
+    companion marker, into the unit's own work-unit file -- in the audit
+    section that survives ``read-unit --strip-comments`` (spec 4.3), never
+    under ``## Comments`` (see :func:`_write_ancestry_gate_pass_record`).
+    A failing, error, or disabled run writes no record.
+
+    **Two-probe contract (spec 4.5, 317-D02, AC-17).** A strict
+    ``git merge-base --is-ancestor <dependency_ref> <target_ref>`` probe
+    runs first. When it reports the dependency IS an ancestor (rc=0), the
+    gate passes with ``mode: "strict"``. When it reports rc=1 ("not an
+    ancestor" -- the strict, commit-graph-only answer a squash-merged,
+    rebased, or fix-pack-landed dependency can never satisfy), a second
+    probe searches for the dependency's merged PR via ``gh pr list
+    --search "<sha>" --state merged --base <default-branch>``
+    (:func:`_probe_squash_merged_pr`); finding one passes the gate with
+    ``mode: "squash-pr"``. Finding neither blocks the gate (``status:
+    "fail"``). Both probes' outcomes are always printed together on every
+    terminal decision (spec 3.5 fallback ban -- never a silent hand-off
+    from one probe to the other). ``git merge-base --is-ancestor``
+    returning rc>=2 (or the ``run_command`` sentinel 127 for a missing/
+    timed-out git) means git itself could not answer the question --
+    treated as a hard failure, never reported as "not merged", and the
+    squash-PR probe is never invoked in that case.
+
+    *dependency_ref* should be a fully qualified, fetchable ref (e.g.
+    ``<remote>/<dependency-branch>`` or a commit SHA). This function does
+    not invent a remote-tracking prefix for a bare branch name.
+    *target_ref* defaults to ``<remote>/<default-branch>`` when omitted,
+    where ``<remote>`` is resolved from the repo's own git configuration
+    (:func:`_resolve_ancestry_remote`, spec 4.5, AC-ANC-004) rather than
+    assumed to be the literal ``"origin"``.
+
+    ``git fetch <remote>`` runs before either probe so a stale local view
+    cannot produce a false answer; a fetch failure is FATAL (spec 3.5)
+    -- ``ERROR: git fetch '<remote>' failed: <stderr>`` on stderr, exit 1,
+    and neither probe runs against stale refs.
+
+    Exit contract (spec Section 7; unlike most devbench commands, which
+    return 0 and encode failure only in JSON): 0 for a pass (either
+    probe), 1 for a BLOCKED result or any error that prevents a decision
+    (unknown work unit, unresolvable repo/default-branch/remote, fetch
+    failure, a probe that could not run, an invalid git ref), 2 for the
+    usage error of an empty *dependency_ref*. A PASSING probe decision can
+    ALSO still exit 1 with no status line printed, when the subsequent
+    record write fails (:func:`_write_ancestry_gate_pass_record`): the
+    work-unit file is missing or unreadable/unwritable, its ``##
+    Changes Manifest`` section cannot be parsed, a Manifest file's ``git
+    hash-object`` fails, or ``git rev-parse`` fails to resolve the target
+    ref -- a probe result that cannot be durably recorded is never
+    reported as a pass (spec 3.6: the gate command's OWN write is what
+    makes a result trustworthy).
+
+    Usage: check-ancestry <unit_id> <dependency-ref> [<target-ref>]
+    """
+    prepared = _prepare_ancestry_probe_context(unit_id, dependency_ref, target_ref)
+    if isinstance(prepared, int):
+        return prepared
+    remote, default_branch, repo_path, resolved_target_ref = prepared
+
+    fetch_rc, _fetch_stdout, fetch_stderr = run_command(["git", "fetch", remote], cwd=repo_path)
+    if fetch_rc != 0:
+        print(f"ERROR: git fetch '{remote}' failed: {fetch_stderr.strip()}", file=sys.stderr)
+        return 1
+
+    rc, _stdout, stderr = run_command(
+        ["git", "merge-base", "--is-ancestor", dependency_ref, resolved_target_ref],
+        cwd=repo_path,
+    )
+
+    if rc == 0:
+        written = _write_ancestry_gate_pass_record(unit_id, repo_path, resolved_target_ref)
+        if isinstance(written, int):
+            return written
+        print(
+            _ancestry_status_line(
+                GATE_STATUS_PASS, 0, _ANCESTRY_MODE_STRICT, dependency_ref, resolved_target_ref, written
+            )
+        )
+        _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, True, None)
+        return 0
+
+    if rc == 1:
+        return _resolve_ancestry_not_ancestor(unit_id, dependency_ref, resolved_target_ref, default_branch, repo_path)
+
+    # rc > 1 (or the run_command sentinel 127 for a missing/timed-out git)
+    # means git itself could not answer the question -- unknown ref, not a
+    # commit-ish, or the executable is missing. Treat as a hard failure
+    # rather than silently reporting "not merged"; the squash-PR probe is
+    # never invoked here since the strict probe did not produce a real
+    # "not an ancestor" answer to complement.
+    print(
+        f"ERROR: ancestry probe could not be evaluated (rc={rc}): 'git merge-base --is-ancestor "
+        f"{dependency_ref} {resolved_target_ref}': {stderr.strip()}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _prepare_ancestry_probe_context(
+    unit_id: str, dependency_ref: str, target_ref: str
+) -> tuple[str, str, Path, str] | int:
+    """Resolve everything :func:`cmd_check_ancestry` needs before running either probe.
+
+    Split out purely to keep that function's return-count within the
+    project's complexity lint budget (mirrors the existing
+    ``_resolve_*_or_report``-style helpers this module already uses for
+    the same reason). Bundles every early-exit condition -- empty
+    *dependency_ref* (usage error, exit 2), an unresolvable work
+    unit/repo, a disabled gate, and an unresolvable remote/default-branch
+    -- into one caller-side ``isinstance(..., int)`` check.
+
+    Returns:
+        ``(remote, default_branch, repo_path, resolved_target_ref)`` when
+        every resolution step succeeds and the gate is enabled; otherwise
+        the ``int`` exit code the caller should return as-is (the
+        offending step has already printed its own diagnostic).
+    """
+    if not dependency_ref.strip():
+        print("ERROR: check-ancestry requires a non-empty dependency ref", file=sys.stderr)
+        return 2
+
+    resolved = _resolve_ancestry_repo_context(unit_id)
+    if resolved is None:
+        return 1
+    canonical_repo, repo_path = resolved
+
+    gate_config = _load_gate_config_or_report(GATE_ANCESTRY, canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    resolved_remote = _resolve_ancestry_remote(canonical_repo, repo_path)
+    if resolved_remote is None:
+        return 1
+    remote, default_branch = resolved_remote
+
+    resolved_target_ref = target_ref.strip() or f"{remote}/{default_branch}"
+    return remote, default_branch, repo_path, resolved_target_ref
+
+
+def _resolve_ancestry_not_ancestor(
+    unit_id: str, dependency_ref: str, resolved_target_ref: str, default_branch: str, repo_path: Path
+) -> int:
+    """Handle the strict probe's rc=1 ("not an ancestor") terminal branch.
+
+    Split out of :func:`cmd_check_ancestry` purely to keep that function's
+    return-count within the project's complexity lint budget. Runs the
+    squash-PR probe (spec 4.5, 317-D02) and reports whichever of "pass via
+    squash-pr" or "BLOCKED" it settles on, always printing both probes'
+    outcomes together (AC-ANC-002).
+    """
+    squash_result = _probe_squash_merged_pr(dependency_ref, default_branch, repo_path)
+    if squash_result is None:
+        return 1
+
+    if squash_result.found:
+        written = _write_ancestry_gate_pass_record(unit_id, repo_path, resolved_target_ref)
+        if isinstance(written, int):
+            return written
+        print(
+            _ancestry_status_line(
+                GATE_STATUS_PASS, 0, _ANCESTRY_MODE_SQUASH_PR, dependency_ref, resolved_target_ref, written
+            )
+        )
+        _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
+        return 0
+
+    print(_ancestry_status_line(GATE_STATUS_FAIL, 1, _ANCESTRY_MODE_NONE, dependency_ref, resolved_target_ref, ""))
+    _print_ancestry_probe_outcomes(dependency_ref, resolved_target_ref, False, squash_result)
+    print(
+        f"BLOCKED: '{dependency_ref}' is not yet an ancestor of '{resolved_target_ref}', and no merged "
+        "PR carrying its commit was found either. The declared dependency has not merged. Do not "
+        "proceed with any other task in this backlog until this check passes.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _select_test_command(repo_path: Path) -> list[str]:
+    """Return the test-suite command to run in *repo_path*.
+
+    Uses ``make test`` when the repo has a Makefile with a ``test`` target,
+    otherwise falls back to a bare ``pytest`` invocation. Shared by
+    :func:`cmd_run_tests` (task-scoped evidence for the test-reviewer judge)
+    and :func:`cmd_check_shared_file_impact` (full-suite regression gate),
+    which always run the same command -- the two commands differ in how the
+    result is interpreted, not in what gets invoked.
+
+    Delegates to :func:`_select_test_command_with_recipe` and discards the
+    ``make -n test`` dry-run recipe that helper also returns -- callers
+    that need to resolve *which* runner a ``make test`` command wraps (i.e.
+    :func:`_resolve_full_suite_command`) must call that helper directly
+    instead, so the dry run only ever runs once per resolution.
+    """
+    cmd, _make_recipe = _select_test_command_with_recipe(repo_path)
+    return cmd
+
+
+def _select_test_command_with_recipe(repo_path: Path) -> tuple[list[str], str]:
+    """Return ``(cmd, make_recipe)`` for *repo_path*.
+
+    *cmd* is exactly :func:`_select_test_command`'s return value. *make_recipe*
+    is the ``make -n test`` dry-run stdout when *cmd* is ``["make", "test"]``
+    (the literal, unexpanded-further recipe line(s) that target resolves to),
+    or ``""`` when *cmd* is the bare ``pytest`` fallback. A Makefile ``test``
+    target can wrap any runner behind an arbitrary recipe (``uv run pytest
+    ...``, ``go test ./...``, a shell wrapper script, ...), so the runner
+    family a ``make test`` command resolves to cannot be read off
+    ``["make", "test"]`` itself -- :func:`_resolve_runner_key` resolves it
+    by matching a registered runner's invoker token against *make_recipe*'s
+    tokens (token containment, not "what the recipe actually invokes";
+    see that function's docstring for the exact rule and its limitations).
+    """
+    rc, stdout, _stderr = run_command(["make", "-n", "test"], cwd=repo_path)
+    if rc == 0:
+        return ["make", "test"], stdout
+    return ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"], ""
 
 
 def cmd_run_tests(unit_id: str) -> int:
@@ -4603,6 +5492,16 @@ def cmd_run_tests(unit_id: str) -> int:
     otherwise falls back to ``pytest``.  Exits non-zero if the test run fails.
 
     Used by the test-reviewer agent to obtain test execution evidence.
+
+    Note: this always invokes the full suite command (`_select_test_command`);
+    it is not scoped to the work unit's Changes Manifest. What IS scoped by
+    convention is which parts of the *output* an executor/reviewer treats as
+    this task's responsibility -- nothing here enforces that at the tooling
+    level. When a task's diff touches a shared/high-fan-in file (per
+    `gates.repos.<repo>.shared_file_impact.patterns` in devbench.yaml),
+    `check-shared-file-impact` should be used instead: it runs this same
+    command but diffs the failure set against a stored baseline and blocks
+    on newly-introduced failures.
     """
     from devbench.config import TEST_TIMEOUT
 
@@ -4620,13 +5519,3746 @@ def cmd_run_tests(unit_id: str) -> int:
         print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
         return 1
 
-    rc, stdout, _ = run_command(["make", "-n", "test"], cwd=repo_path)
-    cmd = ["make", "test"] if rc == 0 else ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+    cmd = _select_test_command(repo_path)
 
     rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
     combined = "\n".join(part for part in (stdout, stderr) if part.strip())
     print(combined if combined else "(no output)")
     return rc
+
+
+# Reachability check (caylent-solutions/devbench-internal-backlog#10, spec
+# `integration-reality-gates-hardening.md` 4.4; machine-blocking,
+# `constants.GATE_TIERS`).
+#
+# A grep-based heuristic is deliberately language-agnostic: devbench's target
+# repos span many stacks, so a hardcoded JS/TS import-graph walker would not
+# generalise. The tool's job is only to surface cheap candidates; the LLM
+# code-reviewer makes the final judgment call (dynamic imports, barrel
+# re-exports, and lazy route splits are known false-positive shapes it can
+# rule out that a grep cannot).
+#
+# Which extensions are source, which paths are tests, and which filenames
+# are entry points is answered once, by `devbench.source_classification`
+# (spec 4.3, D-3) -- this module no longer declares its own copies.
+#
+# The matcher is word-boundary and source-classified (register 315-D01,
+# 315-D02): `git grep --word-regexp --fixed-strings` so a symbol named
+# `Card` is never satisfied by `Cardinal` or `discardCards`, restricted to
+# pathspecs derived from `source_classification.SOURCE_EXTENSIONS` so a
+# mention in `CHANGELOG.md` or a design doc can never clear an orphan. The
+# old source-comment escape-hatch marker (register finding 5, AC-FUNC-006)
+# is gone; `uv run devbench log-waiver ... --gate reachability` (spec 4.9,
+# PM-5) is the only way to clear a finding without fixing the wiring, and it
+# always leaves an audited record.
+#
+# Transitive reachability (issue #10 AC2, spec 4.4 bullet 2): a referrer
+# clears the candidate only when the referrer is itself reachable from the
+# configured `gates.reachability.entry_points` set
+# (`_is_reachable_from_entry_points`, cycle-safe via a visited set); a
+# candidate whose every referrer is itself unreachable is reported
+# `[POTENTIALLY UNREACHABLE via orphan-chain]`, distinct from the
+# no-referrer-at-all `[POTENTIALLY UNREACHABLE]` shape. `entry_points`
+# defaults, when unconfigured, to `source_classification`'s entry-point
+# stem convention rather than an empty walk (D-17, AC-FUNC-006).
+
+_REACHABILITY_GATE_NAME: str = "reachability"
+
+# Reachability is machine-blocking (`constants.GATE_TIERS`, spec Section
+# 3.6/D-6): the operator is the only waiver authority. `_reachability_prepare_run`
+# filters `gate_records.gate_waiver_targets`'s full records down to this
+# attribution ONLY before a target can be reported `[WAIVED]`, excluded from
+# the blocking `findings` count, or contribute to a clean run that persists a
+# `[GATE_PASS reachability]` record -- an executor-attributed waiver alone
+# must never launder into a record `mark-done`'s generic gate-record
+# invariant (`BacklogManager._check_gate_pass_done_invariant`) would then
+# accept. Derived from `constants.GATE_WAIVER_ATTRIBUTION_OPERATOR`, the
+# single-sourced attribution vocabulary `devbench.backlog.manager` (both
+# `compose_gate_waiver_record` and this same done-gate invariant) also
+# consumes, rather than a second hand-copied literal.
+_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION: str = GATE_WAIVER_ATTRIBUTION_OPERATOR
+
+# `git grep` exit codes at or above this value are a genuine plumbing
+# failure (spec 4.4 bullet 3, Section 7); rc=1 is "no match" data, never an
+# error, and is never swallowed by a `continue`.
+_REACHABILITY_GIT_GREP_FAILURE_THRESHOLD: int = 2
+
+# How many importer paths `_reachability_ok_block` lists by name before
+# collapsing the remainder into a count -- a named constant so the limit is
+# declared once rather than repeated as an inline literal at each of its
+# three use sites.
+_REACHABILITY_IMPORTER_DISPLAY_LIMIT: int = 10
+
+_REACHABILITY_EXPORT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"export\s+default\s+(?:function|class)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"export\s+(?:const|function|class|let|var)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*def\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*func\s+([A-Za-z_]\w*)", re.MULTILINE),
+    re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?class\s+([A-Za-z_]\w*)", re.MULTILINE),
+)
+
+_REACHABILITY_EXPORT_BRACE_RE = re.compile(r"export\s*\{([^}]+)\}")
+
+
+def _is_reachability_test_path(rel_path: str) -> bool:
+    """Return True when *rel_path* is a test, spec, story, or fixture file.
+
+    Used both to exclude such files from the candidate set and to exclude
+    them when counting importers -- a file referenced only by its own
+    test/story file is exactly the orphan pattern this check exists to
+    catch. Delegates to :func:`devbench.source_classification.is_test_path`
+    (spec 4.3, D-3).
+    """
+    return is_test_path(rel_path)
+
+
+def _is_reachability_candidate(rel_path: str) -> bool:
+    """Return True when *rel_path* is a source file this check should examine."""
+    normalized = rel_path.replace("\\", "/")
+    suffix = "." + normalized.rsplit(".", 1)[-1].lower() if "." in normalized.rsplit("/", 1)[-1] else ""
+    if not is_source_extension(suffix):
+        return False
+    if _is_reachability_test_path(normalized):
+        return False
+    filename = normalized.rsplit("/", 1)[-1]
+    stem = filename[: -len(suffix)] if suffix else filename
+    return not is_entry_point_stem(stem)
+
+
+def _derive_reachability_basename_symbol(rel_path: str) -> str:
+    """Return the artifact name implied by *rel_path*'s basename.
+
+    ``Foo/index.tsx`` derives ``Foo`` (the directory name) rather than
+    ``index``, since barrel-file components are conventionally imported by
+    their containing folder's name.
+    """
+    normalized = rel_path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    filename = parts[-1] if parts else normalized
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    if stem.lower() == "index" and len(parts) > 1:
+        return parts[-2]
+    return stem
+
+
+def _extract_reachability_symbols(content: str, rel_path: str) -> list[str]:
+    """Return candidate exported symbol names for a file: basename + regex-extracted exports."""
+    symbols = {_derive_reachability_basename_symbol(rel_path)}
+
+    for pattern in _REACHABILITY_EXPORT_PATTERNS:
+        for match in pattern.finditer(content):
+            name = match.group(1)
+            if name:
+                symbols.add(name)
+
+    brace_match = _REACHABILITY_EXPORT_BRACE_RE.search(content)
+    if brace_match:
+        for token in brace_match.group(1).split(","):
+            name = token.strip().split(" as ")[0].strip()
+            if name and re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+                symbols.add(name)
+
+    return sorted(s for s in symbols if s)
+
+
+def _reachability_search_pathspecs() -> list[str]:
+    """Return the git pathspec globs restricting the importer search to classified source files.
+
+    One ``*.<ext>`` glob per extension in
+    :data:`devbench.source_classification.SOURCE_EXTENSIONS` (spec 4.4
+    bullet 1, register 315-D02): a mention of the symbol in prose
+    (``CHANGELOG.md``, a design doc, a work-unit markdown file) can never
+    clear an orphan, because those extensions are never in the search's
+    pathspec at all.
+    """
+    return sorted(f"*.{ext.lstrip('.')}" for ext in SOURCE_EXTENSIONS)
+
+
+def _search_reachability_importers(repo_path: Path, rel_path: str, symbols: list[str]) -> list[str]:
+    """Return non-test, source-classified files (excluding *rel_path*) that reference any of *symbols*.
+
+    Searches tracked and untracked files via a word-boundary, fixed-string
+    ``git grep`` (``--word-regexp --fixed-strings``; spec 4.4 bullet 1,
+    register 315-D01): a symbol named ``Card`` is never satisfied by
+    ``Cardinal`` or ``discardCards``, because ``--word-regexp`` requires no
+    identifier character on either side of the match. The search is
+    restricted to :func:`_reachability_search_pathspecs`'s source-classified
+    globs (register 315-D02), so a hit inside a non-source file can never
+    occur. A hit inside a test/spec/story/fixture file (per
+    :func:`_is_reachability_test_path`) is dropped -- a reference from a
+    file's own test suite does not make it reachable from the app.
+
+    ``git grep`` rc semantics (spec 4.4 bullet 3, Section 7): rc=0 is a
+    match, rc=1 is "no match" (data, not an error, and never swallowed by a
+    bare ``continue``), and rc>=2 is a genuine plumbing failure raised here
+    as :class:`RuntimeError` with the raw stderr attached so the caller can
+    fail loud instead of silently treating a broken search as "no
+    importers".
+
+    Raises:
+        RuntimeError: ``git grep`` exited rc>=2 for any symbol.
+    """
+    pathspecs = _reachability_search_pathspecs()
+    importers: set[str] = set()
+    for symbol in symbols:
+        cmd = [
+            "git",
+            "grep",
+            "--word-regexp",
+            "--fixed-strings",
+            "--files-with-matches",
+            "--untracked",
+            "-e",
+            symbol,
+            "--",
+            *pathspecs,
+        ]
+        rc, stdout, stderr = run_command(cmd, cwd=repo_path)
+        if rc >= _REACHABILITY_GIT_GREP_FAILURE_THRESHOLD:
+            raise RuntimeError(stderr.strip() or f"'{' '.join(cmd)}' exited {rc} with no stderr output")
+        if rc == 1:
+            continue
+        for line in stdout.splitlines():
+            hit = line.strip()
+            if not hit or hit == rel_path:
+                continue
+            if _is_reachability_test_path(hit):
+                continue
+            importers.add(hit)
+    return sorted(importers)
+
+
+def _matches_reachability_entry_point(rel_path: str, entry_points: tuple[str, ...]) -> bool:
+    """Return True when *rel_path* is one of the resolved ``entry_points`` roots.
+
+    Two independent match shapes share one predicate (issue #10 AC2, spec
+    4.4 bullet 2): an explicit, operator-configured ``entry_points`` value
+    (``gates.reachability.entry_points``, spec 4.1's "a list of
+    repo-relative paths" contract) matches *rel_path* literally, case-
+    sensitively, exactly like a real filesystem path. The
+    ``source_classification``-derived built-in default
+    (``config_loader.resolve_gate_config``'s ``entry_points`` field when
+    absent from config, AC-FUNC-006) instead carries bare filename-stem
+    conventions (``main``, ``app``, ``index``, ...) and matches against
+    *rel_path*'s own basename stem, lower-cased to match
+    :func:`devbench.source_classification.is_entry_point_stem`'s existing
+    case-insensitive convention (a component named ``App.tsx`` is a
+    recognised composition root regardless of case). The caller never needs
+    to know which of the two shapes applies -- both resolve through the
+    same ``entry_points`` tuple returned by ``resolve_gate_config``.
+    """
+    normalized = rel_path.replace("\\", "/")
+    if normalized in entry_points:
+        return True
+    filename = normalized.rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return stem.lower() in entry_points
+
+
+class _ReachabilityReferrerReadError(Exception):
+    """Raised when a referrer file cannot be read during the entry-point
+    reachability walk (:func:`_is_reachable_from_entry_points`).
+
+    Carries the referrer's own repo-relative path and the original read
+    failure so :func:`_reachability_scan_candidates` can render a
+    ``[LOAD_ERROR]`` finding naming the ACTUAL unreadable file (code_review
+    round-2 FAIL_FAST finding: cli.py:4888-4891 used to catch the read
+    failure unbound and return the default value ``False``, silently
+    converting "this referrer could not be read" into "this referrer is
+    unreachable"). This mirrors the only other ``except (OSError,
+    UnicodeDecodeError))`` site in this module -- the top-level candidate
+    read at the head of :func:`_reachability_scan_candidates`, which
+    already renders a counted ``[LOAD_ERROR]`` block instead of guessing a
+    verdict -- so a referrer that cannot be read gets the identical
+    fail-loud contract instead of a silent, wrong ``False``.
+    """
+
+    def __init__(self, rel_path: str, cause: OSError | UnicodeDecodeError) -> None:
+        super().__init__(f"{rel_path}: {cause}")
+        self.rel_path = rel_path
+        self.cause = cause
+
+
+def _is_reachable_from_entry_points(
+    repo_path: Path, rel_path: str, entry_points: tuple[str, ...], visited: set[str] | None = None
+) -> bool:
+    """Return True when *rel_path* is transitively reachable from *entry_points*.
+
+    Issue #10 AC2 / spec 4.4 bullet 2: a referencing file counts toward
+    clearing an orphan candidate only when the referencing file is ITSELF
+    reachable from the configured entry-point set. Reachability is defined
+    recursively over the same import-edge relation
+    :func:`_search_reachability_importers` already computes for the
+    top-level candidate: *rel_path* is reachable when it IS a configured
+    entry point (:func:`_matches_reachability_entry_point`), or when at
+    least one of ITS OWN non-test importers is itself reachable. Walking
+    "importers of X" back toward the entry-point set is equivalent to
+    walking "imports" forward from the entry-point set (spec 4.4 bullet 2's
+    "follow import and require edges") without a second, forward
+    graph-construction implementation.
+
+    *visited* bounds the walk against a mutual-import cycle (AC-FUNC-004):
+    every path visited in the current walk is recorded before recursing, so
+    a cycle terminates as "not reachable via this branch" rather than
+    recursing forever. Callers never pass *visited* explicitly -- it exists
+    so the function can thread the same set through its own recursive
+    calls; a fresh, empty set is created per top-level call.
+
+    Args:
+        repo_path: Absolute path to the target repo checkout.
+        rel_path: Repo-relative path being tested for reachability.
+        entry_points: The resolved ``gates.reachability.entry_points``
+            value (``resolve_gate_config("reachability", repo).values
+            ["entry_points"]``).
+        visited: Internal recursion state; leave at the default.
+
+    Returns:
+        True when *rel_path* is an entry point, or is (transitively)
+        imported by one. False when the walk exhausts every referrer
+        without reaching an entry point, or when *rel_path* does not exist
+        on disk.
+
+    Raises:
+        _ReachabilityReferrerReadError: *rel_path* exists on disk but
+            cannot be read (permission failure or non-UTF-8 decode
+            failure). The caller must not treat this as "unreachable" --
+            see the exception's own docstring.
+        RuntimeError: ``git grep`` exited rc>=2 while searching for one of
+            *rel_path*'s own importers (propagated from
+            :func:`_search_reachability_importers`, same fail-loud contract
+            as the top-level candidate search).
+    """
+    if visited is None:
+        visited = set()
+    if rel_path in visited:
+        return False
+    visited.add(rel_path)
+
+    if _matches_reachability_entry_point(rel_path, entry_points):
+        return True
+
+    abs_path = repo_path / rel_path
+    if not abs_path.is_file():
+        return False
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _ReachabilityReferrerReadError(rel_path, exc) from exc
+
+    symbols = _extract_reachability_symbols(content, rel_path)
+    importers = _search_reachability_importers(repo_path, rel_path, symbols)
+    return any(_is_reachable_from_entry_points(repo_path, importer, entry_points, visited) for importer in importers)
+
+
+def _reachability_ok_block(rel_path: str, symbols: list[str], importers: list[str]) -> str:
+    """Render the ``[OK]`` report block for a candidate with at least one importer."""
+    lines = [
+        f"[OK] {rel_path}",
+        f"  Symbols checked: {', '.join(symbols)}",
+        f"  Non-test importers found: {len(importers)}",
+    ]
+    for importer in importers[:_REACHABILITY_IMPORTER_DISPLAY_LIMIT]:
+        lines.append(f"    - {importer}")
+    if len(importers) > _REACHABILITY_IMPORTER_DISPLAY_LIMIT:
+        lines.append(f"    ... and {len(importers) - _REACHABILITY_IMPORTER_DISPLAY_LIMIT} more")
+    return "\n".join(lines)
+
+
+def _reachability_unreachable_block(rel_path: str, symbols: list[str], canonical_repo: str) -> str:
+    """Render the ``[POTENTIALLY UNREACHABLE]`` report block for an orphan candidate.
+
+    Points the remediation at ``log-waiver`` (spec 4.9, PM-5) instead of the
+    deleted source-comment escape-hatch marker (register finding 5,
+    AC-FUNC-006).
+    """
+    return "\n".join(
+        [
+            f"[POTENTIALLY UNREACHABLE] {rel_path}",
+            f"  Symbols checked: {', '.join(symbols)}",
+            "  Non-test importers found: 0",
+            "  No reference to these symbols was found outside test/story files in "
+            f"'{canonical_repo}'. Confirm this artifact is wired into the app's real "
+            "composition root (route table, parent container, shell), or record a legitimate "
+            "deferral with 'uv run devbench log-waiver <judge> <unit-id> --gate reachability "
+            "--target <path> --reason <reason> --operator'.",
+        ]
+    )
+
+
+def _reachability_orphan_chain_block(
+    rel_path: str, symbols: list[str], importers: list[str], canonical_repo: str
+) -> str:
+    """Render the ``[POTENTIALLY UNREACHABLE via orphan-chain]`` report block (issue #10 AC2, spec 4.4 bullet 2).
+
+    Distinct from :func:`_reachability_unreachable_block`: *rel_path* DOES
+    have at least one non-test importer -- unlike the no-referrer-at-all
+    shape -- but every one of those importers is itself unreachable from
+    ``gates.reachability.entry_points``
+    (:func:`_is_reachable_from_entry_points`), so the reference chain never
+    actually terminates at a real composition root.
+    """
+    lines = [
+        f"[POTENTIALLY UNREACHABLE via orphan-chain] {rel_path}",
+        f"  Symbols checked: {', '.join(symbols)}",
+        f"  Non-test importers found: {len(importers)} (none reachable from a configured entry point)",
+    ]
+    for importer in importers[:_REACHABILITY_IMPORTER_DISPLAY_LIMIT]:
+        lines.append(f"    - {importer}")
+    if len(importers) > _REACHABILITY_IMPORTER_DISPLAY_LIMIT:
+        lines.append(f"    ... and {len(importers) - _REACHABILITY_IMPORTER_DISPLAY_LIMIT} more")
+    lines.append(
+        "  Every referrer above is itself unreachable from a configured entry point "
+        f"('gates.reachability.entry_points') in '{canonical_repo}'. Wire one of the referrers into "
+        "the app's real composition root (route table, parent container, shell), or record a "
+        "legitimate deferral with 'uv run devbench log-waiver <judge> <unit-id> --gate reachability "
+        "--target <path> --reason <reason> --operator'."
+    )
+    return "\n".join(lines)
+
+
+def _reachability_missing_entry_point(repo_path: Path, entry_points: tuple[str, ...], provenance: str) -> str | None:
+    """Return the first configured ``entry_points`` path missing from *repo_path*, or None.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    branch/return count within ruff's thresholds. Always returns ``None``
+    for the built-in (stem-based) default (*provenance* ==
+    :data:`GATE_PROVENANCE_BUILTIN`): those entries are matching
+    conventions, not literal paths, so no existence check applies to them
+    (spec Section 7 fail-fast rule, AC-FUNC-005 error path).
+
+    Defense-in-depth containment check (code_review round-2
+    MISSING_AC_EVIDENCE finding), independent of
+    :func:`devbench.config_loader._parse_reachability_entry_points`'s own
+    absolute/``..`` rejection at the config-parse boundary: a bare
+    ``(repo_path / entry_point).is_file()`` check is not by itself a safe
+    existence guard, because pathlib's ``/`` operator DISCARDS
+    *repo_path* whenever *entry_point* is absolute
+    (``Path('/tmp/x') / '/etc/hostname' == Path('/etc/hostname')``), so an
+    absolute or ``..``-escaping path could otherwise satisfy ``.is_file()``
+    against a file OUTSIDE the checkout and defeat the very guard this
+    function exists to provide. Every candidate is therefore resolved and
+    required to stay inside *repo_path* before the existence check runs.
+    """
+    if provenance == GATE_PROVENANCE_BUILTIN:
+        return None
+    resolved_repo_path = repo_path.resolve()
+    for entry_point in entry_points:
+        candidate = (repo_path / entry_point).resolve()
+        if not candidate.is_relative_to(resolved_repo_path):
+            return entry_point
+        if not candidate.is_file():
+            return entry_point
+    return None
+
+
+def _reachability_load_error_block(rel_path: str, exc: OSError | UnicodeDecodeError) -> str:
+    """Render the ``[LOAD_ERROR]`` report block for a candidate that could not be read.
+
+    Replaces the old silent ``[SKIPPED]`` branch (spec 4.4 bullet 4): an
+    unreadable candidate is now a counted finding that drives exit 1, not a
+    silent pass. *exc* is either a permission/IO failure (``OSError``) or a
+    non-UTF-8 decode failure (``UnicodeDecodeError``, which is a
+    ``ValueError`` subclass, not an ``OSError`` -- both are "candidate could
+    not be read" per AC-FUNC-005, and neither may crash the gate uncaught).
+    """
+    return f"[LOAD_ERROR] {rel_path}\n  Could not read file: {exc}"
+
+
+def _gate_override_repos(gate: str, runtime_config: "RuntimeConfig") -> list[str]:
+    """Return the repos carrying an explicit override object for *gate*, sorted.
+
+    "Carrying an override" means ``gates.repos.<repo>.<gate>`` is present at
+    all in the parsed config (a non-``None`` override object) -- even one
+    that only sets a structural field like ``shared_file_impact.patterns``
+    and leaves ``enabled`` inheriting the project level. This is the set
+    rendered in the ``devbench gates`` "repos" column (AC-E2-F1-S2-T1-2),
+    distinct from ``_gate_resolution_repo`` below (which repo's ``enabled``
+    override actually drives the row's resolved status).
+
+    Args:
+        gate: Gate name; one of ``constants.GATE_NAMES``.
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        Sorted list of ``org/repo`` names with an override for *gate*; empty
+        when none carry one.
+    """
+    return sorted(
+        repo for repo, overrides in runtime_config.gates.repos.items() if getattr(overrides, gate) is not None
+    )
+
+
+def _gate_resolution_repo(gate: str, override_repos: list[str], runtime_config: "RuntimeConfig") -> str:
+    """Pick the repo whose override should drive *gate*'s resolved status.
+
+    ``devbench gates`` renders one row per gate, not one row per repo, so
+    when multiple repos carry an override for the same gate this picks the
+    first (sorted, so deterministic) repo whose override actually sets
+    ``enabled`` -- the only field ``resolve_gate_config`` uses to compute
+    the row's ``status``/``provenance`` columns. Falls back to the first
+    override repo (still "carrying an override", just not one that changes
+    ``enabled``) when none of them set it, or to ``""`` (a no-op repo key
+    that matches no entry in ``runtime_config.gates.repos``) when *gate* has
+    no override at all -- ``resolve_gate_config`` then resolves purely from
+    the project/built-in/env layers.
+
+    Args:
+        gate: Gate name; one of ``constants.GATE_NAMES``.
+        override_repos: Result of ``_gate_override_repos(gate, runtime_config)``.
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The repo name to pass as ``resolve_gate_config``'s ``repo`` argument.
+    """
+    for repo in override_repos:
+        override = getattr(runtime_config.gates.repos[repo], gate)
+        if getattr(override, "enabled", None) is not None:
+            return repo
+    return override_repos[0] if override_repos else ""
+
+
+def _format_gates_table(records: Sequence[tuple[str, "ResolvedGateConfig", list[str]]]) -> list[str]:
+    """Render the ``devbench gates`` table from resolved gate records.
+
+    Column widths are computed from the actual header/cell content on every
+    call (``str.ljust`` never truncates), so a future column addition needs
+    no re-layout of this function.
+
+    The ``tier`` column (spec G2 worked example; E2-F2-S1-T2) is looked up
+    from ``constants.GATE_TIERS`` by gate name rather than threaded through
+    *records* as a fourth tuple element -- the tier is a static fact about
+    the gate name, not something ``resolve_gate_config`` resolves, so it
+    needs no extra plumbing through the caller's row-collection loop.
+
+    Args:
+        records: ``(gate, resolved, override_repos)`` triples in row order --
+            ``resolved`` is the ``ResolvedGateConfig`` returned by
+            ``resolve_gate_config`` for that gate (only the ``enabled``
+            field/provenance are rendered from it), and ``override_repos``
+            is ``_gate_override_repos``'s result for that gate.
+
+    Returns:
+        Rendered lines: the header row followed by one row per record.
+    """
+    from devbench.constants import GATE_TIERS
+
+    header = ("gate", "tier", "status", "repos", "provenance")
+    rows = [
+        (
+            gate,
+            GATE_TIERS[gate],
+            "enabled" if resolved.values["enabled"] else "disabled",
+            ", ".join(override_repos) if override_repos else "-",
+            resolved.provenance["enabled"],
+        )
+        for gate, resolved, override_repos in records
+    ]
+    all_rows = [header, *rows]
+    widths = [max(len(row[i]) for row in all_rows) for i in range(len(header))]
+    return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)) for row in all_rows]
+
+
+def cmd_gates() -> int:
+    """Render the read-only ``devbench gates`` overview table (spec G2, 4.1; AC-4, AC-27).
+
+    Iterates the eight declared gates (``constants.GATE_NAMES``, in
+    declaration order) and resolves each one's ``enabled`` status and
+    provenance exclusively through ``config_loader.resolve_gate_config`` --
+    the ONLY sanctioned read path for gate configuration (AC-27); this
+    command never reads ``RuntimeConfig.gates`` fields directly. The
+    rendered ``tier`` column (``machine-blocking`` or ``judge-evidence``) is
+    looked up from ``constants.GATE_TIERS`` (spec 4.2, D-6), completing the
+    G2 worked-example table shape. Total and read-only: renders all eight
+    rows even when the workspace has no ``gates:`` key at all, since an
+    absent block loads into the all-disabled built-in tree (D-17).
+
+    Reloads the config file fresh from disk (mirrors ``cmd_check``) instead
+    of trusting the process-wide ``RUNTIME_CONFIG`` singleton, so a config
+    load failure is caught HERE with the loader's own clean, single-line
+    message on stderr rather than letting the raw exception escape
+    uncaught (spec Section 7: errors on stderr, no stack traces for
+    expected failures).
+
+    Returns:
+        0 with the rendered table on stdout. 1 with the loader's own
+        fail-fast message on stderr and nothing on stdout when the config
+        file is missing or fails YAML/schema validation.
+    """
+    from devbench.config import resolve_gate_env_override
+    from devbench.config_loader import load_runtime_config, resolve_config_path, resolve_gate_config
+    from devbench.constants import GATE_NAMES as _GATE_ROW_ORDER
+
+    cfg_path = resolve_config_path(None, os.environ, WORKSPACE_ROOT)
+    try:
+        runtime_config = load_runtime_config(cfg_path, os.environ)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    records: list[tuple[str, ResolvedGateConfig, list[str]]] = []
+    for gate in _GATE_ROW_ORDER:
+        override_repos = _gate_override_repos(gate, runtime_config)
+        resolution_repo = _gate_resolution_repo(gate, override_repos, runtime_config)
+        resolved = resolve_gate_config(gate, resolution_repo, runtime_config, resolve_gate_env_override(gate))
+        records.append((gate, resolved, override_repos))
+
+    for line in _format_gates_table(records):
+        print(line)
+    return 0
+
+
+def _reachability_waived_block(target: str, reason: str) -> str:
+    """Render the ``[WAIVED]`` report block for a candidate an operator has waived (spec 4.9, Section 2 G7)."""
+    return f"[WAIVED] {target} -- {reason}"
+
+
+def _reachability_scan_candidates(
+    repo_path: Path,
+    candidates: list[str],
+    entry_points: tuple[str, ...],
+    canonical_repo: str,
+    waived: Mapping[str, str],
+) -> tuple[list[str], int, int, int] | None:
+    """Scan *candidates* for reachability, rendering one report block per file.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    return/branch count within ruff's thresholds.
+
+    A candidate named in *waived* (``{target: reason}``, already filtered by
+    the caller -- :func:`_reachability_prepare_run` -- down to
+    ``_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION``-attributed records from
+    :func:`devbench.gate_records.gate_waiver_targets`; this function trusts
+    that filtering and performs none of its own) is rendered as a
+    ``[WAIVED] <target> -- <reason>`` block and never counted towards
+    ``unreachable_count``/``load_error_count`` -- an operator waiver clears
+    the finding regardless of what the underlying reachability search would
+    otherwise have concluded (spec 4.9, Section 2 G7), so no reachability
+    work is performed for a waived candidate at all. A target with only an
+    executor-attributed waiver on file is NOT in *waived* (reachability is
+    machine-blocking, spec Section 3.6/D-6) and is scanned normally below,
+    exactly as if no waiver existed.
+
+    Returns:
+        ``(report_lines, unreachable_count, load_error_count, waived_count)``
+        on success. ``None`` after printing the loud ``git grep`` failure
+        message (spec Section 7) when :func:`_search_reachability_importers`
+        raises ``RuntimeError`` for any candidate -- the caller exits 1 in
+        that case with no further output.
+
+    A referrer that cannot be read during the entry-point walk
+    (:class:`_ReachabilityReferrerReadError`, raised by
+    :func:`_is_reachable_from_entry_points`) is rendered as a counted
+    ``[LOAD_ERROR]`` block naming the REFERRER that failed to read -- not
+    folded into a false ``[OK]``/orphan-chain verdict for *rel_path* --
+    matching the identical fail-loud contract already used for the
+    top-level candidate read a few lines above.
+    """
+    report_lines: list[str] = []
+    unreachable_count = 0
+    load_error_count = 0
+    waived_count = 0
+    for rel_path in candidates:
+        if rel_path in waived:
+            waived_count += 1
+            report_lines.append(_reachability_waived_block(rel_path, waived[rel_path]))
+            continue
+
+        abs_path = repo_path / rel_path
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            load_error_count += 1
+            report_lines.append(_reachability_load_error_block(rel_path, exc))
+            continue
+
+        symbols = _extract_reachability_symbols(content, rel_path)
+        try:
+            importers = _search_reachability_importers(repo_path, rel_path, symbols)
+            reachable_importers = [
+                importer for importer in importers if _is_reachable_from_entry_points(repo_path, importer, entry_points)
+            ]
+        except _ReachabilityReferrerReadError as exc:
+            load_error_count += 1
+            report_lines.append(_reachability_load_error_block(exc.rel_path, exc.cause))
+            continue
+        except RuntimeError as exc:
+            print(f"ERROR: git grep failed: {exc}", file=sys.stderr)
+            return None
+
+        if not importers:
+            unreachable_count += 1
+            report_lines.append(_reachability_unreachable_block(rel_path, symbols, canonical_repo))
+        elif reachable_importers:
+            report_lines.append(_reachability_ok_block(rel_path, symbols, importers))
+        else:
+            unreachable_count += 1
+            report_lines.append(_reachability_orphan_chain_block(rel_path, symbols, importers, canonical_repo))
+
+    return report_lines, unreachable_count, load_error_count, waived_count
+
+
+def _reachability_prepare_run(
+    unit_id: str,
+    repo_path: Path,
+    unit: WorkUnit,
+    gate_config: "ResolvedGateConfig",
+) -> tuple[Path, tuple[str, ...], dict[str, str], ScopeResult] | int:
+    """Resolve everything :func:`cmd_check_reachability` needs before it can scan a
+    single candidate: the entry-point containment check, the waived-target
+    mapping (spec 4.9, Section 2 G7) and the resolved Manifest scope.
+
+    Extracted out of :func:`cmd_check_reachability` to keep that function's
+    return/branch count within ruff's thresholds -- every early-exit branch
+    below that used to live inline in the caller is now internal to this
+    helper and no longer inflates the caller's own return-statement count.
+
+    Returns:
+        ``(wu_file, entry_points, waived, scope)`` on success, with *waived*
+        already filtered to ``_REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION``-
+        attributed records only (spec Section 3.6/D-6: reachability is
+        machine-blocking, so an executor cannot self-certify a waiver). An
+        already fully-handled exit code (``1``; the failure has already
+        printed its own ``ERROR:`` message, and -- per the fail-fast
+        contract -- no status line) when the entry-point containment check,
+        the waiver read or the scope resolution fails.
+    """
+    from devbench.gate_records import gate_waiver_targets
+
+    entry_points = cast("tuple[str, ...]", gate_config.values["entry_points"])
+    missing_entry_point = _reachability_missing_entry_point(
+        repo_path, entry_points, gate_config.provenance["entry_points"]
+    )
+    if missing_entry_point is not None:
+        print(
+            f"ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
+            f"{missing_entry_point}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Waiver adoption (spec 4.9, Section 2 G7): resolved before scope so a
+    # malformed `[GATE_WAIVER reachability]` marker fails loud before any
+    # further work is done, and before any status line is printed (spec
+    # Section 7 fail-fast rule). `gate_waiver_targets` is the sole reader for
+    # this marker family (`devbench.gate_records`); a malformed marker is
+    # never silently treated as "no waiver". Reachability is machine-blocking
+    # (spec Section 3.6/D-6), so an executor-attributed record is read (never
+    # silently dropped as "malformed") but excluded here from *waived* --
+    # only an operator-attributed record can clear a candidate. Filtering
+    # here, once, means every downstream consumer of *waived*
+    # (`_reachability_scan_candidates`, the clean-run `[GATE_PASS]` write
+    # below) sees only records that are actually allowed to clear a finding.
+    wu_file = _resolve_work_unit_file(unit)
+    try:
+        wu_content = wu_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"ERROR: Cannot read work unit file for {unit_id}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        waiver_records = gate_waiver_targets(wu_content, _REACHABILITY_GATE_NAME)
+    except ValueError as exc:
+        print(f"ERROR: malformed [GATE_WAIVER {_REACHABILITY_GATE_NAME}] marker in {unit_id}: {exc}", file=sys.stderr)
+        return 1
+    waived = {
+        target: record.reason
+        for target, record in waiver_records.items()
+        if record.attribution == _REACHABILITY_WAIVER_REQUIRED_ATTRIBUTION
+    }
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=f"Cannot scope diff for '{unit_id}'")
+    if scope is None:
+        return 1
+
+    return wu_file, entry_points, waived, scope
+
+
+def cmd_check_reachability(unit_id: str) -> int:
+    """Reachability gate: does *unit_id*'s Changes Manifest carry an orphaned source file?
+
+    Command: ``check-reachability <unit-id>`` (spec 4.4; machine-blocking
+    per ``constants.GATE_TIERS``). Heuristic, language-agnostic evidence for
+    the code-reviewer's ``UNREACHABLE_ARTIFACT`` check
+    (caylent-solutions/devbench-internal-backlog#10): for every file in the
+    unit's own Changes Manifest -- resolved through the single shared
+    :func:`devbench.work_unit_scope.resolve_changed_files` (spec 4.3,
+    AC-9), never a raw diff scan -- that :func:`_is_reachability_candidate`
+    accepts AND that still exists on disk (a Manifest path a prior stage of
+    this same unit deleted is not a candidate at all -- a deleted artifact
+    cannot be an orphan), derives candidate exported-symbol names (file
+    basename plus regex-extracted exports) and searches the rest of the
+    target repo -- tracked and untracked, restricted to
+    :func:`_reachability_search_pathspecs`'s source-classified pathspecs --
+    for a word-boundary reference (register 315-D01/315-D02). A file
+    outside the unit's Changes Manifest is never itself a *candidate*
+    (candidates come solely from :func:`resolve_changed_files`), but such
+    a file IS named as a referrer inside an ``[OK]``, orphan-chain or
+    ``[LOAD_ERROR]`` finding (AC-FUNC-009 governs candidate selection
+    only, not referrer naming).
+
+    Transitive reachability (issue #10 AC2, spec 4.4 bullet 2): a referrer
+    found by the search above clears the candidate only when the referrer
+    is ITSELF reachable from the resolved ``gates.reachability.entry_points``
+    set (:func:`_is_reachable_from_entry_points`), walked with a
+    cycle-safe visited set. A candidate with a referrer, but where every
+    referrer is unreachable, is reported ``[POTENTIALLY UNREACHABLE via
+    orphan-chain]`` rather than ``[OK]``. ``entry_points`` is read
+    exclusively through ``resolve_gate_config("reachability", repo)``
+    (AC-FUNC-007); an explicit, project-configured entry point that does
+    not exist in the repo checkout fails the whole run loudly before any
+    candidate is examined (spec Section 7 fail-fast rule) rather than
+    silently walking an empty graph.
+
+    This is deliberately a heuristic, not a final verdict: a grep miss can
+    be a false positive (dynamic ``import()``, barrel re-export the regex
+    missed, lazy route split). The tool's job is only to surface candidates
+    cheaply; the reviewing LLM makes the final call and can rule a
+    candidate a false positive, and the operator can record a legitimate
+    deferral with ``uv run devbench log-waiver <judge> <unit-id> --gate
+    reachability --target <t> --reason <r> --operator`` (spec 4.9, PM-5).
+    The old source-comment escape-hatch marker this command used to honour
+    is gone (register finding 5, AC-FUNC-006): no path can clear an
+    artifact without an audited waiver record.
+
+    Prints the spec 5.2 gate status line as the FIRST stdout line:
+    ``{"gate":"reachability","status":"disabled"}`` and exits 0 when the
+    gate is disabled (or unconfigured) for the unit's repo (spec 4.1 final
+    bullet, AC-4); otherwise
+    ``{"gate":"reachability","tier":"machine-blocking","status":"pass"|"fail",
+    "findings":<int>,"scope_hash":"<sha256>"}`` (AC-FUNC-008) followed by
+    the human-readable findings. ``findings`` counts both
+    ``[POTENTIALLY UNREACHABLE]`` orphans (including the orphan-chain
+    shape) and ``[LOAD_ERROR]`` unreadable candidates -- a permission
+    failure or a non-UTF-8 decode failure alike (spec 4.4 bullet 4,
+    AC-FUNC-005) -- the old silent ``[SKIPPED]`` branch is gone.
+
+    Returns:
+        0 when the gate is disabled, or an enabled run finds zero findings.
+        1 when the work unit or repo cannot be resolved, when the config
+        file fails to load, when a configured (non-built-in)
+        ``gates.reachability.entry_points`` path does not exist in the repo
+        checkout, when scope resolution fails (no status line printed in
+        that case), when ``git grep`` fails loudly (rc>=2, no status line
+        printed), or when an enabled run has at least one finding.
+    """
+    from devbench.gate_records import compose_gate_pass_record
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    unit, canonical_repo, repo_path = resolved
+
+    gate_config = _load_gate_config_or_report(_REACHABILITY_GATE_NAME, canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    prepared = _reachability_prepare_run(unit_id, repo_path, unit, gate_config)
+    if isinstance(prepared, int):
+        return prepared
+    wu_file, entry_points, waived, scope = prepared
+
+    # `scope.files` legitimately carries a Manifest path with no on-disk file
+    # -- e.g. a file a prior stage of this same unit deleted, which the
+    # complete-replacement standard mandates (see
+    # `work_unit_scope._compute_files_scope_hash`). A path that does not
+    # exist in the work tree is not a reachability candidate at all: a
+    # deleted artifact cannot be an orphan, so it is filtered out here,
+    # before any read is attempted, rather than surfaced as a `[LOAD_ERROR]`
+    # finding. `[LOAD_ERROR]` stays reserved for a candidate that IS present
+    # but cannot be read (permission or decode failure).
+    candidates = [
+        rel_path
+        for rel_path in scope.files
+        if _is_reachability_candidate(rel_path) and (repo_path / rel_path).is_file()
+    ]
+
+    if not candidates:
+        report_lines = ["No classified source files found in this work unit's Changes Manifest."]
+        unreachable_count = 0
+        load_error_count = 0
+    else:
+        scanned = _reachability_scan_candidates(repo_path, candidates, entry_points, canonical_repo, waived)
+        if scanned is None:
+            return 1
+        candidate_lines, unreachable_count, load_error_count, waived_count = scanned
+        report_lines = [f"Candidate artifacts examined: {len(candidates)}", *candidate_lines]
+        report_lines.append(
+            f"Summary: {len(candidates)} candidate(s) examined, {unreachable_count} potentially "
+            f"unreachable, {load_error_count} load error(s), {waived_count} waived."
+        )
+
+    total_findings = unreachable_count + load_error_count
+    status = GATE_STATUS_FAIL if total_findings else GATE_STATUS_PASS
+
+    if total_findings == 0 and scope.files:
+        # Persisted machine record (spec 4.2, 4.4 final bullet): a clean
+        # enabled run writes `[GATE_PASS reachability]` so `mark-done`'s
+        # generic gate hook (`BacklogManager._check_gate_pass_done_invariant`)
+        # can later require it. `compose_gate_pass_record` is the sole
+        # authorized builder of the marker text (AC-E2-F2-S1-T1-6); no other
+        # path in this command formats that text by hand. An empty Changes
+        # Manifest (`scope.files` empty, `scope.scope_hash == ""`) has no
+        # scope to persist a hash for, so no record is written for it --
+        # mirroring `compute_scope_hash`'s own refusal to hash an empty
+        # change set.
+        if not wu_file.is_file():
+            print(
+                f"ERROR: Cannot write [GATE_PASS {_REACHABILITY_GATE_NAME}] record for {unit_id}: "
+                f"work unit file not found at {wu_file}",
+                file=sys.stderr,
+            )
+            return 1
+        from devbench.backlog.manager import BacklogManager
+
+        marker = compose_gate_pass_record(_REACHABILITY_GATE_NAME, scope.scope_hash)
+        BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
+    print(_gate_status_line(_REACHABILITY_GATE_NAME, status, total_findings, scope_hash=scope.scope_hash))
+    print(f"Reachability check for {unit_id} (repo: {canonical_repo})")
+    for line in report_lines:
+        print(line)
+        print()
+
+    return 1 if total_findings else 0
+
+
+# Per-runner failing-test extraction for the shared-file regression gate
+# (spec 4.6, finding 318-D4). Each pattern is owned by exactly one parser
+# function below and matched against that runner's own characteristic
+# failure-line shape -- there is no shared "try every pattern and guess"
+# path. `_resolve_runner_key` resolves the runner FAMILY (which parser
+# applies), which is a narrower guarantee than "what actually ran": a
+# direct invocation is matched on its command's own leading token(s)
+# (unambiguous by construction), but a `make test` command is resolved by
+# TOKEN CONTAINMENT over the target's dry-run recipe -- a registered
+# runner's invoker token appearing ANYWHERE in the recipe selects that
+# runner's parser, even when the recipe's actual last word is an uncovered
+# wrapper script (e.g. `npm ci && ./scripts/run-tests.sh` still resolves to
+# the npm/jest parser on the `npm` token) or invokes nothing at all (e.g.
+# `echo skipping pytest` resolves to the pytest parser on the word
+# `pytest`). See `_resolve_runner_key` for the exact matching rule and its
+# known limitations, and `cmd_check_shared_file_impact`'s docstring item 7
+# for the disclosed tradeoff.
+_PYTEST_FAILURE_LINE = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_GO_TEST_FAILURE_LINE = re.compile(r"^---\s+FAIL:\s+(\S+)", re.MULTILINE)
+_JEST_FAILURE_LINE = re.compile(r"^\s*(?:✕|✗)\s+(.+?)\s*$", re.MULTILINE)
+
+# npm/yarn/npx-invoked jest form (`npm test`, `npm run test`, `yarn test`,
+# `npx jest`, ...). Two different consumers read this frozenset with two
+# different matching rules: `_RunnerSpec.matches` (direct invocation)
+# anchors it to the command's LEADING token only, since the underlying
+# `jest`/`mocha` binary is rarely invoked directly in a target repo's
+# configured test command; `_RunnerSpec.wraps` (a `make test` target's
+# recipe) accepts the token at ANY position, mirroring `_recipe_invokes_go_test`'s
+# documented any-position rule for `go test` -- a recipe commonly prefixes
+# the runner with a working-directory change or an environment variable.
+_NPM_JEST_INVOKERS: frozenset[str] = frozenset({"npm", "yarn", "npx"})
+
+
+def _matched_shared_files(changed_files: list[str], patterns: tuple[str, ...]) -> list[str]:
+    """Return the subset of *changed_files* matching any glob in *patterns*.
+
+    Patterns are ``fnmatch``-style and matched against POSIX-relative paths
+    (the same shape :attr:`devbench.work_unit_scope.ScopeResult.files`
+    carries -- :func:`cmd_check_shared_file_impact` is this function's only
+    caller, and passes ``scope.files``, spec 4.3). Sorted + de-duplicated
+    for stable output.
+    """
+    return sorted({f for f in changed_files for pattern in patterns if fnmatch.fnmatch(f, pattern)})
+
+
+#: Extensions :func:`_resolve_shared_file_import_target` treats as the JS/TS
+#: family for the *resolution* step (never the scanning grammar itself, which
+#: stays in ``source_classification``, AC-5) -- imported from
+#: :data:`devbench.source_classification.JS_TS_FAMILY_EXTENSIONS`, the single
+#: place this family is declared (round-2 code_review finding: a second,
+#: hand-copied tuple here could drift silently from the scanning dispatch's own
+#: family grouping with no failing test).
+_SHARED_FILE_JS_RESOLVE_EXTS: tuple[str, ...] = JS_TS_FAMILY_EXTENSIONS
+_SHARED_FILE_PY_RESOLVE_EXTS: tuple[str, ...] = (".py",)
+
+#: Directory-entry filename stems (spec 4.6, round-1 A3 finding): a directory-form
+#: import (``from mypkg import X`` naming the package itself, ``import {A} from
+#: './lib'`` naming a barrel directory) resolves to the package/directory's entry
+#: file, mirroring the convention each ecosystem already uses.
+_SHARED_FILE_PY_ENTRY_STEM = "__init__"
+_SHARED_FILE_JS_ENTRY_STEM = "index"
+
+
+def _iter_shared_file_scan_candidates(repo_path: Path) -> dict[str, Path]:
+    """Return ``{repo-relative POSIX path: absolute Path}`` for every classified
+    source file under *repo_path*.
+
+    Delegates enumeration and pruning entirely to
+    :func:`devbench.source_classification.iter_classified_source_files` (spec
+    4.6 round-1 A2 finding's pruning-during-the-walk behaviour; E6-F2-S1-T1
+    round-1 code_review Blocking 6 DRY fix -- this module previously
+    hand-copied that walk's body verbatim). This function's own job is only
+    to key the shared walk's absolute-path results by their repo-relative
+    POSIX path, the shape :func:`_derive_shared_file_registry` and its
+    callers need; the walk itself (including
+    :data:`devbench.source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS`
+    pruning and the :func:`is_source_extension` dispatch) lives in exactly
+    one place now -- round-2 code_review finding W3: this module no longer
+    keeps its own ``_SHARED_FILE_SCAN_EXCLUDED_DIRS`` alias for that
+    constant, since delegating the walk left it with zero production
+    consumers.
+
+    Raises:
+        RuntimeError: ``ERROR: import scan failed for directory <path>: <reason>``
+            the moment the shared walk cannot list a directory under
+            *repo_path* (permission denied or similar) -- E6-F2-S1-T1 round-2
+            code_review/test_review/changes_manifest finding: delegating to
+            :func:`iter_classified_source_files` also imports that function's
+            ``onerror=_reraise_walk_error`` policy, which raises the
+            directory-listing ``OSError`` instead of silently skipping the
+            subtree; that ``OSError`` is converted here into this gate's own
+            documented error shape (spec Section 7) so it is caught by
+            :func:`_derive_shared_file_registry`'s only caller
+            (:func:`_prepare_shared_file_impact_run`, which catches
+            ``RuntimeError``) rather than escaping as an unhandled
+            traceback. ``<path>`` is repo-RELATIVE (W-a, round-3 code_review
+            finding), falling back to the raw absolute path only when the
+            reported directory is not actually a descendant of *repo_path*
+            (mirroring ``fixture_consistency``'s identical fallback) --
+            matching this same error shape's sibling file-level message
+            below, rather than one being absolute-path-prefixed while the
+            other is repo-relative.
+    """
+    candidates: dict[str, Path] = {}
+    try:
+        classified_source_files = iter_classified_source_files(repo_path)
+    except OSError as exc:
+        raw_directory = Path(getattr(exc, "filename", None) or repo_path)
+        if raw_directory == repo_path:
+            # W3 (E6-F2-S1-T1 round-4 doc_review + code_review): the unreadable directory IS
+            # the repo root itself -- ``raw_directory.relative_to(repo_path)`` collapses to
+            # ``Path('.')``, whose ``.as_posix()`` is the bare, unhelpful string ``'.'``. Name
+            # the repo root path itself instead, exactly mirroring
+            # ``fixture_consistency._check_source_literals``'s own identical W-b special case
+            # (round-3 code_review), so the two documented-as-matching sibling messages
+            # genuinely match rather than one emitting a bare dot.
+            directory = str(repo_path)
+        else:
+            try:
+                # Repo-relative (W-a, E6-F2-S1-T1 round-3 code_review finding): matches this
+                # function's own sibling file-level message below (``import scan failed for
+                # {rel}: {exc}``) and fixture_consistency._MSG_SOURCE_SCAN_DIRECTORY_FAILED's
+                # ``directory`` slot, rather than one of the three being absolute-path-prefixed
+                # while the other two are repo-relative.
+                directory = raw_directory.relative_to(repo_path).as_posix()
+            except ValueError:
+                directory = str(raw_directory)
+        raise RuntimeError(f"ERROR: import scan failed for directory {directory}: {exc}") from exc
+    for abs_path in classified_source_files:
+        rel = abs_path.relative_to(repo_path).as_posix()
+        candidates[rel] = abs_path
+    return candidates
+
+
+def _shared_file_source_roots(repo_path: Path) -> tuple[str, ...]:
+    """Return the repo-relative directory prefixes an ABSOLUTE import target is
+    resolved against (spec 4.6, round-1 A1 finding).
+
+    Always includes the repo root itself (``""``). Also includes ``"src"`` when a
+    top-level ``src/`` directory exists -- the common Python/JS src-layout
+    convention (PEP 517/518, and this very repo) under which an absolute import
+    (e.g. ``devbench.utils.io``) omits the ``src`` prefix its own file still
+    carries on disk. This is a small, fixed, principled allowlist, never "every
+    directory in the tree" -- the latter degenerates back into crediting any file
+    with a matching basename regardless of where it lives, exactly the round-1 A1
+    defect this function exists to avoid reintroducing.
+    """
+    roots = [""]
+    if (repo_path / "src").is_dir():
+        roots.append("src")
+    return tuple(roots)
+
+
+def _match_shared_file_module_path(
+    prefix: str, candidates: set[str], exts: tuple[str, ...], entry_stem: str | None
+) -> set[str]:
+    """Return every *candidates* member at repo-relative *prefix*: *prefix* ITSELF
+    when the raw target already carried its own extension (PHP/Ruby ``require``
+    paths commonly spell out ``lib/shared.php`` in full, unlike Python/JS's
+    extension-less module specifiers -- no scanned candidate is ever
+    extension-less, since :func:`devbench.source_classification.is_source_extension`
+    never classifies one, so this can only ever match a target that already named
+    a real extension), a plain file (``<prefix><ext>``), or, for a directory-form
+    import (spec 4.6, round-1 A3 finding), that directory's *entry_stem* file
+    (``<prefix>/<entry_stem><ext>``).
+
+    *entry_stem* is ``None`` for languages with no directory-entry convention this
+    scan resolves (Go, Ruby, PHP, JVM, C#, Swift) -- only the directory-entry form
+    is skipped for those; the exact-path and plain-file (``<prefix><ext>``) forms
+    are still tried.
+
+    A *prefix* that normalises to the empty string or ``"."`` (the repo root
+    itself) always returns an empty set below, so a directory-form target
+    naming the repo root's own entry file is never credited -- a conservative
+    under-credit, never a false match.
+    """
+    if prefix in ("", "."):
+        return set()
+    matches = {prefix} if prefix in candidates else set()
+    matches |= {f"{prefix}{ext}" for ext in exts if f"{prefix}{ext}" in candidates}
+    if entry_stem is not None:
+        matches |= {f"{prefix}/{entry_stem}{ext}" for ext in exts if f"{prefix}/{entry_stem}{ext}" in candidates}
+    return matches
+
+
+def _resolve_python_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve one Python :func:`extract_import_targets` target to its on-disk
+    candidate(s) (spec 4.6, round-1 A1/A3 findings).
+
+    A leading-dot target (``.pkg``, ``..pkg``) is a RELATIVE import: each dot
+    beyond the first pops one more directory off the importing file's own
+    directory (Python's own relative-import level semantics), so it is only ever
+    matched against a file reachable from the importer's own package -- never an
+    unrelated same-stem file elsewhere in the tree. A dotted target with no
+    leading dot is resolved as an ABSOLUTE module path against each of
+    *source_roots* in turn -- never against a bare global basename index, which is
+    the round-1 defect that let five stdlib ``import types`` statements credit an
+    unrelated ``mylib/types.py`` with zero real importers.
+    """
+    if target.startswith("."):
+        level = len(target) - len(target.lstrip("."))
+        remainder = target[level:]
+        importer_dir = posixpath.dirname(importer_rel)
+        base_parts = [part for part in importer_dir.split("/") if part] if importer_dir else []
+        pops = level - 1
+        if pops > len(base_parts):
+            return set()
+        base_dir = "/".join(base_parts[: len(base_parts) - pops]) if pops else importer_dir
+        segment = remainder.replace(".", "/") if remainder else ""
+        joined = f"{base_dir}/{segment}" if base_dir and segment else (base_dir or segment)
+        prefix = posixpath.normpath(joined) if joined else ""
+        return _match_shared_file_module_path(
+            prefix, candidates, _SHARED_FILE_PY_RESOLVE_EXTS, _SHARED_FILE_PY_ENTRY_STEM
+        )
+
+    segment = target.replace(".", "/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{segment}") if root else posixpath.normpath(segment)
+        matches |= _match_shared_file_module_path(
+            prefix, candidates, _SHARED_FILE_PY_RESOLVE_EXTS, _SHARED_FILE_PY_ENTRY_STEM
+        )
+    return matches
+
+
+def _resolve_relative_path_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], exts: tuple[str, ...], entry_stem: str | None
+) -> set[str]:
+    """Resolve a ``/``-separated target with a leading ``.`` or ``/`` (spec 4.6,
+    round-1 A1/A3 findings) -- JS/TS, Ruby's ``require_relative``, and a relative
+    PHP ``require``/``include`` all share this shape. A leading-``.`` target
+    resolves against the IMPORTING file's own directory; a leading-``/`` target
+    resolves against the repo ROOT ONLY, never a ``src/`` fallback -- the two
+    prefixes are NOT equivalent.
+
+    A bare (non-relative) target is deliberately never resolved here: for a JS
+    bare specifier or a Ruby ``require`` gem name it is an external package this
+    scan has no business crediting, so treating it as unresolved is what stops a
+    same-named local file from being falsely credited (round-1 A1). Ruby's
+    ``require_relative`` can by language definition never name a gem, but
+    ``extract_import_targets`` does not distinguish it from ``require`` (both
+    share :data:`devbench.source_classification._RUBY_IMPORT_TARGET_RE`), so a
+    canonical ``require_relative 'shared'`` written without a leading ``./`` is
+    also left unresolved here, casting no fan-in vote even though it always
+    names a file relative to the importer.
+    """
+    normalized = target.replace("\\", "/")
+    if not normalized.startswith((".", "/")):
+        return set()
+    importer_dir = posixpath.dirname(importer_rel)
+    if normalized.startswith("/"):
+        prefix = posixpath.normpath(normalized.lstrip("/"))
+    else:
+        joined = f"{importer_dir}/{normalized}" if importer_dir else normalized
+        prefix = posixpath.normpath(joined)
+    return _match_shared_file_module_path(prefix, candidates, exts, entry_stem)
+
+
+def _resolve_absolute_path_shared_file_target(
+    target: str, candidates: set[str], source_roots: tuple[str, ...], exts: tuple[str, ...]
+) -> set[str]:
+    """Resolve a ``/``-separated target with NO relative-import syntax of its own
+    against each of *source_roots* -- Go's ``import "myproj/shared"`` grammar
+    never emits a leading ``.``/``/``; every Go import path is already project- or
+    module-absolute, so it is resolved the same way an absolute Python dotted
+    path is (spec 4.6, round-1 A1 finding), never against a bare basename index.
+    """
+    normalized = target.replace("\\", "/").strip("/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{normalized}") if root else posixpath.normpath(normalized)
+        matches |= _match_shared_file_module_path(prefix, candidates, exts, None)
+    return matches
+
+
+def _resolve_dotted_absolute_shared_file_target(
+    target: str, candidates: set[str], source_roots: tuple[str, ...], exts: tuple[str, ...]
+) -> set[str]:
+    """Resolve a fully-qualified DOTTED namespace target (Java/Kotlin ``import``,
+    C# ``using``, Swift ``import``) against each of *source_roots* -- the
+    non-relative branch of :func:`_resolve_python_shared_file_target`, generalised
+    to languages whose import grammar this scan extracts has no relative form.
+    """
+    segment = target.replace(".", "/")
+    matches: set[str] = set()
+    for root in source_roots:
+        prefix = posixpath.normpath(f"{root}/{segment}") if root else posixpath.normpath(segment)
+        matches |= _match_shared_file_module_path(prefix, candidates, exts, None)
+    return matches
+
+
+def _resolve_php_shared_file_target(
+    importer_rel: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve a PHP ``require``/``include``/``use`` target (spec 4.6, round-1 A1 finding).
+
+    PHP mixes two grammars ``extract_import_targets`` does not distinguish: a
+    relative-or-bare path (``require``/``include``) and a backslash-separated
+    namespace (``use``). Both are normalised from ``\\`` to ``/`` BEFORE the
+    leading character is tested, so a ``use`` namespace written with a leading
+    backslash (``\\Lib\\Shared``) normalises to a leading ``/`` and is resolved
+    by the leading-``/`` branch below, NOT treated as bare. Once normalised: a
+    leading ``.`` target is resolved against the importing file's own
+    directory, exactly like JS/Ruby; a leading ``/`` target is resolved against
+    the repo ROOT ONLY, never a ``src/`` fallback, exactly like the sibling
+    resolver's leading-``/`` bucket -- the two prefixes are NOT equivalent. A
+    target with neither a leading ``.`` nor a leading ``/`` after normalisation
+    (either grammar -- a bare ``require`` path or a ``use`` namespace with no
+    leading backslash, e.g. ``Lib\\Shared``) is resolved against
+    :func:`_shared_file_source_roots`, exactly like Go's always-absolute import
+    paths -- never a bare global basename index.
+    """
+    normalized_target = target.replace("\\", "/")
+    if normalized_target.startswith((".", "/")):
+        return _resolve_relative_path_shared_file_target(importer_rel, normalized_target, candidates, (".php",), None)
+    return _resolve_absolute_path_shared_file_target(normalized_target, candidates, source_roots, (".php",))
+
+
+#: Per-suffix ``(exts, entry_stem)`` config for :func:`_resolve_relative_path_shared_file_target`
+#: (spec 4.6, round-1 A1/A3 findings): the JS/TS family shares one ext tuple and directory-entry
+#: stem across six suffixes; Ruby's ``.rb`` has no directory-entry convention this scan resolves.
+_SHARED_FILE_RELATIVE_RESOLVE_CONFIG: dict[str, tuple[tuple[str, ...], str | None]] = {
+    **dict.fromkeys(_SHARED_FILE_JS_RESOLVE_EXTS, (_SHARED_FILE_JS_RESOLVE_EXTS, _SHARED_FILE_JS_ENTRY_STEM)),
+    ".rb": ((".rb",), None),
+}
+
+#: Per-suffix ext tuple for :func:`_resolve_dotted_absolute_shared_file_target` (spec 4.6,
+#: round-1 A1 finding): Java and Kotlin each match only their own extension.
+_SHARED_FILE_DOTTED_ABSOLUTE_EXTS: dict[str, tuple[str, ...]] = {
+    ".java": (".java",),
+    ".kt": (".kt",),
+    ".cs": (".cs",),
+    ".swift": (".swift",),
+}
+
+
+def _resolve_shared_file_import_target(
+    importer_rel: str, suffix: str, target: str, candidates: set[str], source_roots: tuple[str, ...]
+) -> set[str]:
+    """Resolve one raw import *target* (as :func:`extract_import_targets` returned
+    it, from a file with *suffix*) to the set of on-disk repo-relative paths it
+    names (spec 4.6, round-1 A1/A3 findings).
+
+    Dispatches by language family, never by a shared global basename index:
+    Python and JVM/C#/Swift use dotted namespace resolution (Python additionally
+    supports relative ``.``/``..`` targets); JS/TS and Ruby split a leading-``.``
+    target (resolved against the importer's own directory) from a leading-``/``
+    target (resolved against the repo root only, never a ``src/`` fallback) and
+    leave a bare target unresolved (:data:`_SHARED_FILE_RELATIVE_RESOLVE_CONFIG`);
+    PHP mixes those two relative shapes with the absolute fallback
+    (:func:`_resolve_php_shared_file_target`); Go resolves its always-absolute
+    import paths against :func:`_shared_file_source_roots`. An unmapped suffix
+    (today only ``.vue``, whose imports this scanner does not parse, per
+    :data:`devbench.source_classification.SOURCE_EXTENSIONS`) resolves to
+    nothing rather than guessing.
+    """
+    suffix = suffix.lower()
+    if suffix == ".py":
+        return _resolve_python_shared_file_target(importer_rel, target, candidates, source_roots)
+    if suffix in _SHARED_FILE_RELATIVE_RESOLVE_CONFIG:
+        exts, entry_stem = _SHARED_FILE_RELATIVE_RESOLVE_CONFIG[suffix]
+        return _resolve_relative_path_shared_file_target(importer_rel, target, candidates, exts, entry_stem)
+    if suffix == ".go":
+        return _resolve_absolute_path_shared_file_target(target, candidates, source_roots, (".go",))
+    if suffix == ".php":
+        return _resolve_php_shared_file_target(importer_rel, target, candidates, source_roots)
+    if suffix in _SHARED_FILE_DOTTED_ABSOLUTE_EXTS:
+        return _resolve_dotted_absolute_shared_file_target(
+            target, candidates, source_roots, _SHARED_FILE_DOTTED_ABSOLUTE_EXTS[suffix]
+        )
+    return set()
+
+
+def _derive_shared_file_registry(repo_path: Path, threshold: int) -> set[str]:
+    """Compute the auto-derived shared-file registry for *repo_path* (spec 4.6, issue #13 AC4).
+
+    Walks every classified source file under *repo_path*
+    (:func:`_iter_shared_file_scan_candidates`, pruning vendored/dependency trees
+    DURING the walk -- spec 4.6, round-1 A2 finding), extracts each file's
+    import/require targets via
+    :func:`devbench.source_classification.extract_import_targets` (AC-5: the
+    scanning grammar itself lives entirely in ``source_classification`` -- this
+    function only resolves and counts), and resolves each target to the other
+    repo file(s) it actually names via
+    :func:`_resolve_shared_file_import_target` -- never a global bare-basename
+    index, but language-appropriate resolution partitioned by LANGUAGE FAMILY
+    FIRST, not by the target's leading character alone: for Python, the JS/TS
+    family, Ruby and PHP, a leading-``.`` target resolves against the
+    importing file's own directory, and a leading-``/`` target resolves
+    against the repo root ONLY (never a ``src/`` fallback) -- this
+    leading-``/`` bucket does not arise for Python in practice, since
+    Python's own extractor never emits a ``/``-prefixed target; for Go,
+    Java/Kotlin, C# and Swift, resolution is ALWAYS against
+    :func:`_shared_file_source_roots` regardless of the target's own leading
+    character, a leading ``.`` included and a leading ``/`` included, since
+    none of those languages' import grammars has a relative form; a
+    bare/absolute Python or PHP target with neither prefix is likewise always
+    resolved against :func:`_shared_file_source_roots`; a bare/aliased JS/TS
+    or Ruby target with neither prefix is deliberately never resolved and
+    casts no fan-in vote (round-1 A1 finding: the previous basename-only
+    approach credited an unrelated ``mylib/types.py`` from five stdlib ``import
+    types`` statements, and separately derived nothing at all for
+    ``mypkg/__init__.py`` and ``lib/index.js``, both fixed by this resolution
+    step -- round-1 A1/A3).
+
+    A target that resolves to MORE than one on-disk candidate is never credited
+    to any of them (an unresolvable ambiguity, not a guess) -- a
+    ``WARNING: ...`` line naming the target and every candidate it could not
+    choose between is printed to stderr so the refusal is visible rather than
+    silent (round-1 A1 finding). A target that resolves to nothing in the repo
+    (a stdlib/third-party import, or a target this scan's language-appropriate
+    resolution genuinely cannot place) casts no fan-in vote at all -- not an
+    error, exactly like an unmapped source extension already casts no vote.
+
+    A resolved target file's fan-in is the number of DISTINCT importing files that
+    named it -- multiple import statements in the SAME file count once. Returns the
+    set of repo-relative POSIX paths whose fan-in count is strictly greater than
+    *threshold* (AC-1: "more than `fan_in_threshold`", not "at least").
+
+    Args:
+        repo_path: Repo checkout root to scan.
+        threshold: The fan-in count a file's distinct-importer count must exceed to
+            be included (``gates.shared_file_impact.fan_in_threshold``, resolved by
+            the caller through ``resolve_gate_config``, never read here).
+
+    Raises:
+        RuntimeError: ``ERROR: import scan failed for <path>: <reason>`` (AC-7) the
+            moment any classified source file cannot be read (permission error,
+            broken symlink, decode failure) -- raised before any derived set is
+            returned, so a scan that cannot read every candidate file never reports
+            a partial answer as if it were complete. A dangling symlink whose target
+            resolves INSIDE *repo_path* is included: neither
+            :func:`_iter_shared_file_scan_candidates` nor the
+            :func:`devbench.source_classification.iter_classified_source_files` it
+            delegates to filters on ``Path.is_file()`` (which would silently swallow
+            a broken symlink's ``OSError``), so reading one reaches this same
+            ``read_text`` call and raises here. A symlink (dangling or not) whose
+            TARGET resolves OUTSIDE *repo_path* is a separate case (SECURITY,
+            security_review round-3 MEDIUM finding, E6-F2-S1-T1): it is excluded from
+            the candidate list entirely by
+            :func:`devbench.source_classification.iter_classified_source_files`'s own
+            resolved-real-path boundary check, so it never reaches ``read_text`` and
+            never raises here at all -- a symlink pointing outside the checkout is
+            never a read (or read-error) primitive for this scan.
+            An unreadable DIRECTORY under *repo_path* is a separate case that
+            never reaches ``read_text`` at all: ``ERROR: import scan failed for
+            directory <path>: <reason>`` (E6-F2-S1-T1 round-2 finding) is raised
+            by :func:`_iter_shared_file_scan_candidates` itself the moment the
+            underlying walk cannot list that directory, before any candidate
+            file is even enumerated.
+    """
+    candidates = _iter_shared_file_scan_candidates(repo_path)
+    candidate_paths: set[str] = set(candidates)
+    source_roots = _shared_file_source_roots(repo_path)
+
+    importers_by_target: dict[str, set[str]] = {}
+    ambiguous_refusals: dict[str, set[str]] = {}
+    for rel, path in candidates.items():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"ERROR: import scan failed for {rel}: {exc}") from exc
+        suffix = path.suffix.lower()
+        for raw_target in extract_import_targets(path.suffix, text):
+            resolved = _resolve_shared_file_import_target(rel, suffix, raw_target, candidate_paths, source_roots)
+            resolved.discard(rel)
+            if not resolved:
+                continue
+            if len(resolved) > 1:
+                ambiguous_refusals.setdefault(raw_target, set()).update(resolved)
+                continue
+            (target_rel,) = resolved
+            importers_by_target.setdefault(target_rel, set()).add(rel)
+
+    for target in sorted(ambiguous_refusals):
+        candidates_repr = ", ".join(sorted(ambiguous_refusals[target]))
+        print(
+            f"WARNING: import target '{target}' resolves to more than one file "
+            f"({candidates_repr}); refusing to credit any of them toward fan-in",
+            file=sys.stderr,
+        )
+
+    return {target for target, importers in importers_by_target.items() if len(importers) > threshold}
+
+
+def _extract_node_ids(pattern: re.Pattern[str], output: str) -> set[str]:
+    """Return the stripped first capture group of every *pattern* match in *output*.
+
+    Shared by every `_SHARED_FILE_RUNNER_PARSERS` entry below -- each parser
+    owns its own compiled *pattern* (one characteristic failure-line shape
+    per runner family), but the "find every match, strip it, de-duplicate
+    into a set" mechanics are identical across all of them, so that part
+    lives once here rather than being copy-pasted per parser.
+    """
+    return {match.group(1).strip() for match in pattern.finditer(output)}
+
+
+def _parse_pytest_failures(output: str) -> set[str]:
+    """Extract failing pytest node ids from *output*.
+
+    Matches pytest's short test summary line (``FAILED <node-id> ...``,
+    emitted by the default and ``-q`` reporters) -- one match per failing
+    node id.
+    """
+    return _extract_node_ids(_PYTEST_FAILURE_LINE, output)
+
+
+def _parse_go_test_failures(output: str) -> set[str]:
+    """Extract failing Go test names from *output*.
+
+    Matches ``go test``'s ``--- FAIL: <TestName> (<duration>)`` line -- one
+    match per failing test name.
+    """
+    return _extract_node_ids(_GO_TEST_FAILURE_LINE, output)
+
+
+def _parse_jest_failures(output: str) -> set[str]:
+    """Extract failing jest/mocha-style spec descriptions from *output*.
+
+    Matches the ``✕``/``✗`` glyph line jest/mocha reporters print for each
+    failing spec -- one match per failing spec description (including any
+    trailing duration annotation the reporter appends, e.g. ``(15 ms)``).
+    """
+    return _extract_node_ids(_JEST_FAILURE_LINE, output)
+
+
+class _RunnerSpec(NamedTuple):
+    """One `_SHARED_FILE_RUNNER_PARSERS` registry entry.
+
+    ``matches`` recognises *test_command* (normalised to a ``tuple[str,
+    ...]``, never the suite output) as belonging to this runner family when
+    the repo's configured test command invokes the runner directly (e.g.
+    ``["pytest", ...]``).
+
+    ``wraps`` recognises the SAME runner family from the ``shlex.split``
+    tokens of a ``make test`` target's dry-run recipe (``make -n test``'s
+    stdout), by TOKEN CONTAINMENT: this runner's invoker token matching
+    anywhere in the recipe's tokens. A Makefile ``test`` target can wrap
+    any runner behind an arbitrary recipe line (``uv run pytest ...``,
+    ``go test ./...``, a shell wrapper script, an entirely unregistered
+    runner, ...), so the runner family a ``["make", "test"]`` command
+    resolves to can never be read off that literal command -- it is
+    resolved by matching each registry entry's ``wraps`` predicate against
+    the recipe's tokens, one at a time, unlike ``matches``, which anchors
+    on the command's own leading token(s) for a direct invocation. Token
+    containment is a strictly weaker guarantee than "what the recipe
+    actually invokes": a registered runner's invoker token appearing
+    anywhere in the recipe (including inside an uncovered wrapper script's
+    arguments, or a recipe that never runs that runner at all) still
+    selects that runner's parser. See `_resolve_runner_key`'s docstring for
+    the disclosed cases this does not handle correctly.
+
+    ``parse`` extracts the exact set of failing node ids from that runner's
+    combined stdout/stderr, shared by both invocation shapes since the
+    output format belongs to the runner, not to how it was invoked.
+
+    Keeping all three on one entry (rather than separately-keyed mappings
+    that could drift apart) is what makes `_resolve_runner_key` an actual
+    extension point (SOLID/OCP): adding a runner is exactly one new entry
+    here, never an edit to `_resolve_runner_key` itself, for both the
+    direct-invocation and the make-wrapped resolution path.
+    """
+
+    matches: Callable[[tuple[str, ...]], bool]
+    wraps: Callable[[tuple[str, ...]], bool]
+    parse: Callable[[str], set[str]]
+
+
+def _recipe_invokes_go_test(tokens: tuple[str, ...]) -> bool:
+    """True when *tokens* (a ``make -n test`` recipe line, whitespace-split via
+    :func:`shlex.split` with ``comments=True``) contains the consecutive ``go test``
+    invocation anywhere -- not only as the first two tokens, since a recipe commonly
+    prefixes the runner with a working-directory change or a version manager (e.g.
+    ``cd pkg && go test ./...``). Token containment, not proof that ``go test`` is
+    what the recipe's *last* command actually runs -- see `_resolve_runner_key`'s
+    docstring for the disclosed limitation this shares with every other `wraps`
+    predicate in this registry.
+    """
+    return any(tokens[i : i + 2] == ("go", "test") for i in range(len(tokens) - 1))
+
+
+# Explicit registry (spec 4.6, finding 318-D4): `_resolve_runner_key` below iterates
+# this mapping and returns the key whose `matches` predicate accepts the repo's
+# directly-configured test command -- or, when that command is `["make", "test"]`,
+# the SOLE key whose `wraps` predicate accepts the tokens of that target's dry-run
+# recipe (`make -n test`'s stdout, captured once by `_select_test_command_with_recipe`;
+# tokenised via `shlex.split(..., comments=True)` so a trailing recipe comment is never
+# matched). Zero matching entries, or more than one, both raise `UnknownTestRunnerError`
+# naming the full configured command -- no match because the runner is unregistered, more
+# than one match because which runner the recipe invokes is genuinely ambiguous from token
+# containment alone -- before any suite subprocess is spawned.
+#
+# `_select_test_command` has exactly two possible return values (see that function's
+# docstring): `["make", "test"]` when the repo's Makefile has a `test` target, or a
+# bare `pytest` invocation otherwise. `["make", "test"]` is NOT a fourth runner family
+# of its own and is never a registry key here -- a Makefile `test` target can wrap any
+# of the runners below, or none of them, so which one it wraps is resolved from its
+# recipe, never assumed to be pytest. `go test` and the npm/yarn/npx-invoked jest form
+# are registered for the direct (non-`make`-wrapped) invocation shape a repo's test
+# command is expected to take once a non-Python target repo is onboarded -- fixed per
+# the Definition of Ready, not a speculative addition -- and are equally reachable
+# through a Makefile-wrapped recipe via `wraps`.
+_SHARED_FILE_RUNNER_PARSERS: Mapping[str, _RunnerSpec] = {
+    "pytest": _RunnerSpec(
+        matches=lambda cmd: cmd[:1] == ("pytest",),
+        wraps=lambda tokens: "pytest" in tokens,
+        parse=_parse_pytest_failures,
+    ),
+    "go test": _RunnerSpec(
+        matches=lambda cmd: cmd[:2] == ("go", "test"),
+        wraps=_recipe_invokes_go_test,
+        parse=_parse_go_test_failures,
+    ),
+    "npm/jest": _RunnerSpec(
+        matches=lambda cmd: bool(cmd[:1]) and cmd[0] in _NPM_JEST_INVOKERS,
+        wraps=lambda tokens: any(token in _NPM_JEST_INVOKERS for token in tokens),
+        parse=_parse_jest_failures,
+    ),
+}
+
+
+class UnknownTestRunnerError(ValueError):
+    """Raised by `_resolve_runner_key` when a test command matches no
+    `_SHARED_FILE_RUNNER_PARSERS` entry (spec 4.6, finding 318-D4).
+
+    A dedicated `ValueError` subclass rather than the builtin: callers that
+    only need "this is a bad-input error" can still catch `ValueError`, but
+    `cmd_check_shared_file_impact` catches this type specifically instead of
+    the builtin, so an unrelated `ValueError` raised deeper in the gate
+    (e.g. a `json.JSONDecodeError` that somehow escaped
+    `_load_shared_file_baseline`'s own conversion to `RuntimeError`) is
+    never misreported as an unrecognised-runner error.
+    """
+
+
+def _resolve_runner_key(test_command: Sequence[str], make_recipe: str = "") -> str:
+    """Return the `_SHARED_FILE_RUNNER_PARSERS` key matching *test_command*.
+
+    Normalises *test_command* to a ``tuple`` before matching, so every
+    sequence the `Sequence[str]` annotation admits -- a ``list[str]`` or a
+    ``tuple[str, ...]`` alike -- resolves identically.
+
+    When *test_command* is ``["make", "test"]``, the runner family cannot be
+    read off the command itself -- a Makefile ``test`` target can wrap any
+    runner behind an arbitrary recipe -- so it is resolved from
+    *make_recipe* instead (the ``make -n test`` dry-run stdout
+    :func:`_select_test_command_with_recipe` already captured): each
+    registry entry's `_RunnerSpec.wraps` predicate is matched against
+    *make_recipe*'s tokens, split via ``shlex.split(make_recipe,
+    comments=True)`` so a trailing ``#``-comment on the recipe line (an
+    ordinary, valid Makefile recipe annotation) is stripped before matching
+    rather than tokenised alongside the real recipe -- a comment cannot
+    silently steer resolution toward a runner name it happens to mention,
+    and English punctuation inside the comment (an apostrophe, for example)
+    is never handed to shlex's quote-balancing at all. Because `wraps` (unlike
+    `matches`) accepts a token appearing anywhere in the recipe, more than
+    one registry entry's `wraps` predicate can accept the SAME recipe (e.g.
+    a monorepo `test` target running both a Go suite and a Python suite) --
+    that is ambiguous, not resolvable by "first match wins", so it is
+    raised rather than silently resolved to whichever entry happens to
+    iterate first (spec 3.5 bans guessing). Otherwise, iterates
+    `_SHARED_FILE_RUNNER_PARSERS` and returns the first key whose
+    `_RunnerSpec.matches` predicate accepts *test_command* directly --
+    never depends on a suite having run either way. A direct invocation can
+    never be ambiguous this way: each `matches` predicate anchors on the
+    command's own leading token(s), which is unique per registered runner
+    by construction.
+
+    Raises `UnknownTestRunnerError` naming the full command (spec 4.6,
+    finding 318-D4) when no runner family matches, so the caller can report
+    the exact configured command that has no registered parser instead of
+    guessing or degrading -- on the `make test` no-match path, the message
+    also names the normalised recipe text that was inspected, so a recipe
+    that genuinely runs a registered runner but tokenizes oddly (e.g. an
+    unquoted mid-word `#` inside a path or flag, which `shlex(comments=True)`
+    treats as a comment start) is diagnosable rather than a bare "make test"
+    with nothing pointing at why. Also raises `UnknownTestRunnerError` naming both
+    the recipe and every matching candidate when more than one registry
+    entry's `wraps` predicate accepts the same recipe. Also raises
+    `UnknownTestRunnerError` -- never the builtin `shlex.split`-raised
+    `ValueError` uncaught -- when *make_recipe* itself is not
+    shell-tokenizable (e.g. an unmatched quote/apostrophe outside of a
+    comment), so a malformed-but-real recipe still reaches a single formed
+    spec Section 7 `ERROR: ...` line instead of a traceback.
+    """
+    cmd = tuple(test_command)
+    if cmd[:2] == ("make", "test"):
+        try:
+            recipe_tokens = tuple(shlex.split(make_recipe, comments=True))
+        except ValueError as exc:
+            raise UnknownTestRunnerError(
+                f"ERROR: cannot parse test output for runner '{' '.join(cmd)}' (recipe not shell-tokenizable: {exc})"
+            ) from exc
+        matching_keys = [key for key, spec in _SHARED_FILE_RUNNER_PARSERS.items() if spec.wraps(recipe_tokens)]
+        recipe_text = " ".join(make_recipe.split())
+        if len(matching_keys) > 1:
+            raise UnknownTestRunnerError(
+                f"ERROR: cannot parse test output for runner '{' '.join(cmd)}': "
+                f"recipe '{recipe_text}' matches multiple registered runners "
+                f"({', '.join(sorted(matching_keys))}), which is ambiguous"
+            )
+        if matching_keys:
+            return matching_keys[0]
+        raise UnknownTestRunnerError(
+            f"ERROR: cannot parse test output for runner '{' '.join(cmd)}': recipe '{recipe_text}' "
+            "matches no registered runner"
+        )
+    for key, spec in _SHARED_FILE_RUNNER_PARSERS.items():
+        if spec.matches(cmd):
+            return key
+    raise UnknownTestRunnerError(f"ERROR: cannot parse test output for runner '{' '.join(cmd)}'")
+
+
+def _resolve_runner_parser(test_command: Sequence[str], make_recipe: str = "") -> Callable[[str], set[str]]:
+    """Return the parser callable registered for *test_command*'s runner family.
+
+    Delegates matching to `_resolve_runner_key` -- raises the same
+    `UnknownTestRunnerError` when *test_command* (and, for a ``["make",
+    "test"]`` command, *make_recipe*) has no registered parser.
+    """
+    return _SHARED_FILE_RUNNER_PARSERS[_resolve_runner_key(test_command, make_recipe)].parse
+
+
+def _shared_file_baseline_path(canonical_repo: str, branch_point: str) -> Path:
+    """Return the per-repo, per-branch-point baseline file path (spec 5.4).
+
+    ``.devbench/test-baselines/<canonical-repo>/<branch-point-sha>.json``,
+    under the workspace's ``.devbench`` state dir. Keying by *branch_point*
+    (rather than only by repo, as PR #318 did) is what makes the baseline a
+    pre-change snapshot instead of a single mutable per-repo record: every
+    distinct branch point a task diverges from gets its own file, so two
+    tasks that diverged at different commits never read or clobber one
+    another's baseline.
+    """
+    safe_name = canonical_repo.replace("/", "__")
+    return WORKSPACE_ROOT / ".devbench" / "test-baselines" / safe_name / f"{branch_point}.json"
+
+
+def _resolve_branch_point_sha(repo_path: Path, canonical_repo: str, unit_id: str) -> str:
+    """Return the merge-base commit SHA between ``HEAD`` and the repo's default branch.
+
+    This is the "branch point" spec 4.6 anchors the pre-change baseline to:
+    the last commit ``HEAD`` and ``origin/<default-branch>`` share, i.e.
+    where the unit's branch diverged. Never returns a partial or assumed
+    SHA (spec Section 7) -- raises ``RuntimeError`` (never falls back to
+    ``HEAD`` or an empty string) when the default branch cannot be resolved
+    or ``git merge-base`` exits non-zero, carrying the git stderr so the
+    caller's error message is actionable.
+    """
+    default_branch = _resolve_default_branch(canonical_repo, repo_path)
+    if default_branch is None:
+        raise RuntimeError(
+            f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: "
+            f"could not resolve a default branch for '{canonical_repo}'"
+        )
+    rc, stdout, stderr = run_command(["git", "merge-base", "HEAD", f"origin/{default_branch}"], cwd=repo_path)
+    if rc != 0:
+        raise RuntimeError(f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: {stderr.strip()}")
+    sha = stdout.strip()
+    if not sha:
+        raise RuntimeError(f"ERROR: git merge-base failed for unit {unit_id} in {repo_path}: empty merge-base output")
+    return sha
+
+
+def _shared_file_baseline_lock_path(path: Path) -> Path:
+    """Return the sibling lock-file path for baseline *path* (``<path>.lock``).
+
+    A *separate* inode from *path* itself -- never the baseline JSON file --
+    so :func:`flock_path` composes correctly with :func:`atomic_write_text`'s
+    temp-then-rename swap: a writer holds this lock-file's inode for the
+    full duration of the write while the target JSON file is replaced
+    atomically underneath it, and a racing reader or writer opens the *same*
+    lock-file path (not a temp file, not the post-rename target) so it
+    always contends for the same inode as the writer currently holds.
+    """
+    return path.with_name(path.name + ".lock")
+
+
+def _load_shared_file_baseline(path: Path, *, branch_point: str, unit_id: str) -> dict[str, Any] | None:
+    """Return the parsed baseline JSON at *path*, or ``None`` when no baseline exists yet.
+
+    Never silently re-bootstraps (finding 318-D2): raises ``RuntimeError``
+    -- and leaves *path* untouched -- when the file exists but is not
+    parseable JSON, is not a JSON object, or its stored ``branch_point``
+    disagrees with *branch_point* (the merge-base this run just resolved).
+    A stale or hand-edited baseline must never be able to silently mask a
+    regression the way a fresh bootstrap would.
+
+    Reads under a shared ``flock`` (:func:`flock_path` on
+    :func:`_shared_file_baseline_lock_path`, ``shared=True``) so a reader can
+    never observe a write in progress -- it either blocks until the writer's
+    exclusive lock is released, or (since :func:`_write_shared_file_baseline`
+    writes via ``atomic_write_text``'s temp-then-rename swap) simply opens
+    *path* after the rename has already made the new content visible
+    whole. Either way this function never sees a torn file.
+    """
+    if not path.exists():
+        return None
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, shared=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"ERROR: shared-file baseline {path} is corrupt and will not be rewritten; "
+                "inspect it, then re-run check-shared-file-impact"
+            ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"ERROR: shared-file baseline {path} is corrupt and will not be rewritten; "
+            "inspect it, then re-run check-shared-file-impact"
+        )
+    stored_branch_point = data.get("branch_point")
+    if stored_branch_point != branch_point:
+        raise RuntimeError(
+            f"ERROR: stored baseline branch_point {stored_branch_point} does not match "
+            f"the resolved merge-base {branch_point} for unit {unit_id}"
+        )
+    return data
+
+
+def _build_shared_file_baseline_record(*, branch_point: str, runner: str, failing: set[str]) -> dict[str, Any]:
+    """Build the spec 5.4 baseline record: exactly ``schema_version``, ``captured_at``,
+    ``branch_point``, ``runner`` and ``failing``.
+
+    *runner* is the resolved `_SHARED_FILE_RUNNER_PARSERS` registry key
+    (e.g. ``"pytest"``), not the raw command list, so a later run against a
+    different runner key is detected as a mismatch (AC-4) rather than
+    silently compared. The single writer both the merge-base capture path
+    in :func:`_evaluate_shared_file_gate` and any future baseline producer
+    (e.g. an auto-derived cache) share, so the on-disk record shape has one
+    place that can drift from spec 5.4 rather than two independently
+    hand-assembled dicts.
+    """
+    return {
+        "schema_version": 1,
+        "captured_at": datetime.now(tz=UTC).isoformat(),
+        "branch_point": branch_point,
+        "runner": runner,
+        "failing": sorted(failing),
+    }
+
+
+def _write_shared_file_baseline(path: Path, record: Mapping[str, Any]) -> None:
+    """Persist *record* as the baseline JSON at *path* atomically, under an exclusive lock.
+
+    Holds an exclusive :func:`flock_path` lock on *path*'s sibling
+    ``<path>.lock`` file (never *path* itself) for the full duration of the
+    write, then writes *path* via :func:`atomic_write_text` (temp-then-rename)
+    while still holding the lock. This is deliberately the composition spec
+    `integration-reality-gates-hardening.md` Section 3 calls for --
+    ``atomic_write_text`` for "baselines, generated files" plus a *sibling*
+    ``flock`` helper for "baseline write locking", not a from-scratch
+    in-place-write-under-lock re-implementation:
+
+    - The write itself is atomic (temp-then-rename), so a reader that opens
+      *path* without taking the read-side lock still never observes a
+      partially-written file -- it sees either the complete prior content or
+      the complete new content, never a truncated in-between state.
+    - The lock is taken on a path distinct from *path*, so the rename does
+      not invalidate anyone's held lock: a second racing writer opens the
+      *same* ``<path>.lock`` inode (not a fresh one) and blocks until this
+      write's ``with`` block releases it (318 lost-update finding).
+    - The wait is bounded by :data:`SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`
+      rather than an unbounded blocking acquire, so a stuck holder produces
+      a loud ``TimeoutError`` naming the lock path instead of hanging the
+      gate forever (fail-fast).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(dict(record), indent=2, sort_keys=True) + "\n"
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS):
+        atomic_write_text(path, payload)
+
+
+def _shared_file_derived_registry_cache_path(canonical_repo: str, branch_point: str) -> Path:
+    """Return the auto-derived registry cache path, ALONGSIDE the baseline record (spec 4.6, AC-6).
+
+    A sibling of :func:`_shared_file_baseline_path`'s own
+    ``<branch-point-sha>.json`` in the same per-repo directory --
+    ``<branch-point-sha>.derived-registry.json`` -- so "cached alongside the
+    baseline record" is literal: same directory, same branch-point key, a
+    distinct file rather than a new key merged into the baseline record's
+    own spec 5.4 shape (which stays exactly ``schema_version``,
+    ``captured_at``, ``branch_point``, ``runner``, ``failing``).
+    """
+    baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
+    return baseline_path.with_name(f"{baseline_path.stem}.derived-registry.json")
+
+
+def _write_shared_file_derived_registry_cache(
+    path: Path, *, branch_point: str, fan_in_threshold: int, derived_registry: set[str]
+) -> None:
+    """Persist the auto-derived registry cache at *path*, atomically, under an exclusive lock.
+
+    Same ``atomic_write_text`` + sibling-``flock_path`` composition
+    :func:`_write_shared_file_baseline` uses, on this cache's own path and
+    its own sibling lock file (never contending with the baseline
+    record's lock) -- see that function's docstring for the full
+    lost-update rationale.
+
+    Unlike the baseline record (a pre-change snapshot written ONCE per
+    branch point, then read-only for the rest of that branch point's
+    life), this cache is OVERWRITTEN on every `check-shared-file-impact`
+    run that enters :func:`_evaluate_shared_file_gate` (i.e. a MATCHED
+    invocation) with `auto_derive_registry` enabled -- a no-match run reaches
+    its own PASS verdict without ever calling this function: the derived set
+    reflects the CURRENT tree's import fan-in, so a later matched run's
+    derived set can legitimately differ from an earlier one's, and each
+    matched run's own write is the source of truth for "what registry was in
+    effect when THAT matched run's verdict was reached" (spec 4.6).
+
+    This cache is WRITE-ONLY as of this unit (round-1 test_review F3 finding,
+    intentional): nothing in ``src/`` reads this file back. It exists purely as a
+    forensic artifact an OPERATOR reads directly off disk during an investigation
+    ("what did the derived set look like when this verdict was reached") -- AC-6's
+    "recoverable" is about human recoverability, not a runtime dependency any
+    devbench command re-reads. Because nothing reads it, the corrupt-cache/
+    stale-cache handling `_load_shared_file_baseline` has for the BASELINE record
+    is deliberately not mirrored here: there is no code path for a corrupt or
+    stale derived-registry cache to feed into, so there is nothing for it to
+    corrupt.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "captured_at": datetime.now(tz=UTC).isoformat(),
+        "branch_point": branch_point,
+        "fan_in_threshold": fan_in_threshold,
+        "derived_registry": sorted(derived_registry),
+    }
+    payload = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    lock_path = _shared_file_baseline_lock_path(path)
+    with flock_path(lock_path, SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS):
+        atomic_write_text(path, payload)
+
+
+def _resolve_full_suite_command(repo_path: Path) -> tuple[list[str], str, Callable[[str], set[str]]]:
+    """Select *repo_path*'s configured test command and resolve its runner key and parser.
+
+    Returns ``(cmd, runner_key, parser)``. Does NOT run the suite -- this is
+    deliberately the cheap half of :func:`_run_full_suite_and_parse_failures`
+    split out on its own, so :func:`_evaluate_shared_file_gate` can learn
+    *runner_key* (to compare against a stored baseline's ``runner`` field)
+    before spending a full-suite run on a baseline that turns out not to be
+    comparable anyway. Resolves *cmd* and its ``make -n test`` dry-run
+    recipe (when applicable) via :func:`_select_test_command_with_recipe` in
+    a single dry run, then resolves *runner_key* from that recipe when *cmd*
+    is ``["make", "test"]`` (never assumed to be pytest). An unrecognised
+    command raises `UnknownTestRunnerError` naming *cmd* here, before any
+    suite subprocess is spawned (spec 4.6, finding 318-D4).
+    """
+    cmd, make_recipe = _select_test_command_with_recipe(repo_path)
+    runner_key = _resolve_runner_key(cmd, make_recipe)
+    parser = _SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+    return cmd, runner_key, parser
+
+
+def _run_full_suite_and_parse_failures(
+    repo_path: Path,
+    *,
+    resolved: tuple[list[str], str, Callable[[str], set[str]]] | None = None,
+) -> tuple[list[str], int, str, str, set[str], str]:
+    """Select and run the full-suite command in *repo_path*, then parse per-test failures.
+
+    Returns ``(cmd, rc, stdout, stderr, failing, runner_key)``. Shared by
+    :func:`_capture_shared_file_baseline` (the branch-point capture run, in
+    an isolated worktree) and :func:`_evaluate_shared_file_gate` (the
+    current-tree run) -- the two callers differ in whose tree they run the
+    suite against and in how the resulting failure set is used afterward,
+    not in how the suite command is selected, resolved or run, so this is
+    the single place that logic lives.
+
+    *resolved*, when given, is an already-computed ``(cmd, runner_key,
+    parser)`` triple from :func:`_resolve_full_suite_command` -- passed by
+    :func:`_evaluate_shared_file_gate`, which must resolve the runner key
+    BEFORE this call in order to compare it against a stored baseline's
+    ``runner`` field, so this function does not redundantly re-resolve (and
+    re-invoke `_select_test_command`'s own ``make -n test`` dry run) when
+    the caller already has. When omitted (the
+    :func:`_capture_shared_file_baseline` caller), resolution happens here,
+    still strictly before the suite subprocess is spawned.
+    """
+    from devbench.config import TEST_TIMEOUT
+
+    cmd, runner_key, parser = resolved if resolved is not None else _resolve_full_suite_command(repo_path)
+    rc, stdout, stderr = run_command(cmd, cwd=repo_path, timeout=TEST_TIMEOUT)
+    combined_output = "\n".join(part for part in (stdout, stderr) if part.strip())
+    failing = parser(combined_output)
+    return cmd, rc, stdout, stderr, failing, runner_key
+
+
+def _capture_shared_file_baseline(repo_path: Path, branch_point: str, unit_id: str) -> tuple[set[str], str]:
+    """Run the full suite at *branch_point* in an isolated worktree; return ``(failing, runner_key)``.
+
+    Uses ``git worktree add --detach`` so capturing the pre-change baseline
+    never touches *repo_path*'s own working tree (the caller's staged/
+    unstaged changes, or an in-progress task's dirty tree) -- checking out
+    *branch_point* directly in *repo_path* would discard that state.
+
+    Fail-fast on every path (spec Section 7) -- never silently leaves a
+    stale worktree registered against the repo, and never persists an
+    unattributed result as a baseline:
+
+    - Checkout failure raises ``RuntimeError`` with the git stderr; nothing
+      was registered, so the ``mkdtemp`` scratch directory is removed.
+    - An unrecognised runner (`_run_full_suite_and_parse_failures` raising
+      `UnknownTestRunnerError`, spec 4.6) propagates before the suite
+      subprocess is spawned; the worktree is still cleaned up because the
+      call happens inside the ``try`` block below.
+    - Once the worktree is registered, the suite run and its removal are
+      wrapped in ``try``/``finally`` so removal is attempted even if the
+      suite run itself raises or is interrupted.
+    - A capture run that exits non-zero yet whose registered parser found
+      no failing node ids (e.g. the runner could not even start, surfaced
+      as ``run_command``'s rc 127 command-not-found/timeout convention)
+      raises ``RuntimeError`` naming the runner and its stderr rather than
+      letting the caller persist an empty failing set as the permanent,
+      never-rewritten pre-change baseline for this branch point.
+    - Worktree removal failure raises ``RuntimeError`` naming ``git
+      worktree prune`` as the remediation, and -- unlike a checkout
+      failure -- does NOT delete the scratch directory: ``git worktree
+      remove`` failing leaves the registration in ``repo_path``'s
+      ``.git/worktrees`` in place, so deleting the directory out from under
+      that registration would orphan it with no path left to inspect or
+      hand to ``git worktree remove --force`` again.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="devbench-shared-file-baseline-"))
+    worktree_path = tmp_dir / "worktree"
+    rc, _stdout, stderr = run_command(
+        ["git", "worktree", "add", "--detach", str(worktree_path), branch_point], cwd=repo_path
+    )
+    if rc != 0:
+        shutil.rmtree(tmp_dir)
+        raise RuntimeError(
+            f"ERROR: could not check out branch point {branch_point} for unit {unit_id} "
+            f"in {repo_path}: {stderr.strip()}"
+        )
+
+    try:
+        cmd, test_rc, stdout, test_stderr, failing, runner_key = _run_full_suite_and_parse_failures(worktree_path)
+        if test_rc != 0 and not failing:
+            raise RuntimeError(
+                f"ERROR: shared-file baseline capture for unit {unit_id} could not attribute "
+                f"per-test failures for runner {cmd} at branch point {branch_point} "
+                f"(exit {test_rc}): {(test_stderr.strip() or stdout.strip()) or '<no output>'}"
+            )
+    finally:
+        remove_rc, _remove_stdout, remove_stderr = run_command(
+            ["git", "worktree", "remove", "--force", str(worktree_path)], cwd=repo_path
+        )
+        if remove_rc != 0:
+            raise RuntimeError(
+                f"ERROR: could not remove baseline-capture worktree {worktree_path} for unit "
+                f"{unit_id} in {repo_path}: {remove_stderr.strip()}. The worktree directory was "
+                f"left in place (not deleted) because its registration in {repo_path} survives a "
+                f"failed removal; run 'git worktree prune' in {repo_path} once {worktree_path} "
+                "has been inspected."
+            )
+        shutil.rmtree(tmp_dir)
+
+    return failing, runner_key
+
+
+# Shared-file-impact-gate verdict record (spec 4.6, finding 318-D13
+# remediation, round 5 redesign). `cmd_check_shared_file_impact` persists
+# its own outcome here rather than leaving `assert-shared-file-impact.sh`
+# to re-derive it by re-parsing `tool_input.command` (an agent-authored
+# shell string -- wrapper forms, quoting, heredocs) or `tool_response.stdout`
+# (a composed string -- `2>&1`, `| tail`, multi-document output). Four
+# review rounds of sed/jq heuristics against those two surfaces each closed
+# one fail-open and opened another; the process that actually KNOWS the
+# verdict is this one, so it is the one that writes it down, and the hook
+# becomes a plain "is there an unresolved record" read with no command or
+# stdout parsing at all. See the module docstring on
+# `plugin/devbench-orchestrate/scripts/assert-shared-file-impact.sh` for the
+# consuming half of this contract.
+#
+# Staleness bound, corrected (round-5 code_review/test_review finding A1,
+# block-then-pass clobber): a record is bounded to affecting at most the
+# events that occur before it is next CONSUMED (read and deleted) by the
+# hook, never a fixed count of "one Bash call". `_write_shared_file_impact_verdict`
+# refuses to overwrite an on-disk `"block"` status with anything -- see its
+# own docstring -- so an unconsumed `"block"` from one unit's invocation
+# cannot be silently replaced by a later, unrelated unit's `"pending"`/`"pass"`
+# writes (the exact shape of two `check-shared-file-impact` invocations
+# chained in a single Bash tool call, which fire only ONE PostToolUse event
+# for both). Separately (finding B1, documented in full on the hook script's
+# own header): a Bash tool call that exits non-zero -- which is exactly what
+# a blocking `check-shared-file-impact` invocation itself does -- emits a
+# `PostToolUseFailure` event, not `PostToolUse`; `hooks.json` (ref, a
+# DEFERRED file this unit's Manifest does not touch) registers this hook on
+# `PostToolUse` only, so the hook never fires on the gate's OWN invocation
+# when it blocks. Combined with the non-clobbering write above, this means a
+# block is not lost -- it is observed on the next Bash tool call whose
+# PostToolUse event actually reaches this hook, which could be later than
+# the very next Bash call if intervening calls also exit non-zero, rather
+# than being guaranteed to be exactly the next one.
+#
+# Residual gap in the same finding A1 family, closed in this change: the
+# non-clobbering write above protects only an unconsumed `"block"`. An
+# unconsumed `"pending"` -- left behind when an invocation writes its
+# opening `"pending"` and then CRASHES before reaching a clean `"pass"`/
+# `"block"` verdict, exactly the "started but the verdict cannot be
+# determined" case spec 3.5 requires to fail closed -- was still freely
+# overwritten by a DIFFERENT, later invocation's own clean `"pass"` write
+# (the identical single-shared-PostToolUse-event shape as the block case
+# above: `check-shared-file-impact <unit-a> ; check-shared-file-impact
+# <unit-b>`, unit A dying mid-run, unit B legitimately passing). Every
+# `check-shared-file-impact` invocation now carries its own identity
+# (`_shared_file_impact_invocation_id`, a fresh PID+counter value generated
+# once per invocation and threaded through every write that invocation
+# makes) recorded as the record's 4th line; `_write_shared_file_impact_verdict`
+# now also refuses to overwrite an on-disk `"pending"` whose recorded
+# invocation id differs from the id it is writing under. A SINGLE
+# invocation's own `"pending"` -> `"pass"`/`"block"` transition carries the
+# SAME id on both writes, so it is never treated as foreign and an ordinary
+# passing run is unaffected; only a genuinely DIFFERENT invocation's write
+# is refused -- UNLESS that foreign write is itself a `"block"`. A foreign
+# `"block"` write is always let through, never refused (code_review round-6
+# finding): `"block"` is itself the sticky, terminal status protected by the
+# guard above, so escalating an unconsumed foreign `"pending"` straight to
+# `"block"` loses nothing -- it replaces one fail-closed state with a
+# strictly stronger one and the record becomes sticky under its own `"block"`
+# rule the instant the write lands. Refusing that escalation (the round-6
+# regression this note now corrects) instead silently discarded the
+# escalating invocation's genuine failing verdict and left the record
+# pointing at the crashed invocation, which is worse than either write
+# alone. Only a foreign `"pending"` or `"pass"` write over an unconsumed
+# `"pending"` is refused; a foreign `"pending"` write cannot first silently
+# adopt the slot (and thereby make its own later terminal `"pending"`/`"pass"`
+# write look "same-invocation") before that terminal write is even
+# attempted.
+# Canonical name of the shared-file-impact gate (spec 4.6; constants.GATE_TIERS key).
+# Declared once here, mirroring `_REACHABILITY_GATE_NAME`'s role for the reachability
+# gate, so every gate-name comparison/lookup/marker-write this command makes shares the
+# SAME symbol instead of a hand-typed literal that could drift.
+_SHARED_FILE_IMPACT_GATE_NAME: str = "shared_file_impact"
+
+_SHARED_FILE_IMPACT_VERDICT_FILENAME: str = "shared-file-impact-verdict"
+_SHARED_FILE_IMPACT_VERDICT_PENDING: str = "pending"
+_SHARED_FILE_IMPACT_VERDICT_PASS: str = "pass"
+_SHARED_FILE_IMPACT_VERDICT_BLOCK: str = "block"
+_SHARED_FILE_IMPACT_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {_SHARED_FILE_IMPACT_VERDICT_PENDING, _SHARED_FILE_IMPACT_VERDICT_PASS, _SHARED_FILE_IMPACT_VERDICT_BLOCK}
+)
+# Backs `_shared_file_impact_invocation_id` below -- a plain, module-level
+# `itertools.count()` rather than a per-call `uuid4()`/timestamp, since the
+# only property this correlator needs is "distinct within this process,
+# stable across ONE invocation's own writes" (see that function's own
+# docstring); it is never compared across process boundaries without the
+# PID component also matching.
+# The annotation is quoted deliberately: `itertools.count` is not
+# subscriptable at runtime on any CPython version. Python 3.14 defers
+# annotation evaluation (PEP 649) so an unquoted form appears to work
+# locally, but 3.12 -- the floor in `requires-python` and the version CI
+# runs -- evaluates module-level annotations eagerly and raises
+# TypeError at import. Quoting keeps the type visible to mypy without
+# evaluating it.
+_SHARED_FILE_IMPACT_INVOCATION_COUNTER: "itertools.count[int]" = itertools.count()
+
+
+def _shared_file_impact_invocation_id() -> str:
+    """Return a fresh identity for one `check-shared-file-impact` invocation.
+
+    Round-5 finding A1 family, residual-gap fix (see the module comment
+    above the verdict-record constants for the full rationale). Combines
+    this process's PID with a monotonically increasing in-process counter:
+    in real use each `check-shared-file-impact` invocation is its own OS
+    process (a new PID), so the PID distinguishes it from every OTHER
+    invocation running concurrently at the time -- this is a bound, not a
+    global uniqueness guarantee: PID reuse after wraparound, or two
+    invocations in separate PID namespaces (e.g. distinct containers each
+    numbering PIDs from 1), can produce a colliding id, and a colliding id
+    defeats the foreign-write guard for that pair (code_review round-6
+    finding). The counter exists only so two invocations simulated in the
+    SAME process (this module's own test suite calling
+    :func:`cmd_check_shared_file_impact` or
+    :func:`_write_shared_file_impact_verdict` more than once) still get
+    distinct ids despite sharing one PID; it does nothing to widen the bound
+    across separate processes.
+
+    Called exactly once per :func:`cmd_check_shared_file_impact` invocation
+    (at the very top, before the first ``"pending"`` write) and threaded
+    through every :func:`_write_shared_file_impact_verdict` call that
+    invocation makes, so all of that invocation's own writes -- and only
+    that invocation's own writes -- carry the identical value.
+    """
+    return f"{os.getpid()}-{next(_SHARED_FILE_IMPACT_INVOCATION_COUNTER)}"
+
+
+def _shared_file_impact_verdict_path(workspace_root: Path) -> Path:
+    """Return the shared-file-impact verdict record path, honouring ``DEVBENCH_SESSION_NAME``.
+
+    Delegates to :func:`_session_state_file_path` -- the same per-session
+    ``.devbench`` routing rule (spec 4.4.4) :func:`_session_scope_file_path`
+    already applies to ``scope.json`` -- so a second, unrelated per-session
+    state file does not reimplement the ``DEVBENCH_SESSION_NAME`` resolution
+    a third time.
+
+    Args:
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+
+    Returns:
+        The resolved record path.
+
+    Raises:
+        ValueError: If ``DEVBENCH_SESSION_NAME`` contains a ``..`` path segment.
+    """
+    return _session_state_file_path(workspace_root, _SHARED_FILE_IMPACT_VERDICT_FILENAME)
+
+
+def _shared_file_impact_verdict_write_is_blocked(record_path: Path, status: str, invocation_id: str) -> bool:
+    """Return whether writing *status* under *invocation_id* must be suppressed, given the record on disk.
+
+    Used only by :func:`_write_shared_file_impact_verdict`'s non-clobbering guard
+    (round-5 code_review/test_review finding A1, extended in that same change to
+    close the family's residual gap, and corrected in round 6 to stop discarding a
+    genuine escalation -- see the module comment above the verdict-record
+    constants). Two independent sticky conditions, both evaluated from the SAME
+    on-disk record read:
+
+    1. The on-disk status is ``"block"`` -- always blocked, regardless of *status*
+       or *invocation_id*. Only `assert-shared-file-impact.sh` (ref) consuming
+       (reading then deleting) the record clears this.
+    2. The on-disk status is ``"pending"``, *status* is NOT ``"block"``, AND the
+       record's recorded invocation id (line 4) differs from *invocation_id* --
+       blocked, because that ``"pending"`` was opened by a DIFFERENT invocation
+       that has not yet reached its own clean verdict (or crashed before doing
+       so), and this write is neither that invocation's own continuation nor a
+       genuine escalation to the strongest verdict. When *status* IS ``"block"``,
+       this condition never blocks: a foreign ``"block"`` write over an
+       unconsumed ``"pending"`` is always let through, because ``"block"`` is
+       itself the sticky, terminal status condition 1 protects -- escalating
+       ``"pending"`` straight to ``"block"`` replaces one fail-closed state with
+       a strictly stronger one and loses no information a hook consumer would
+       ever have read out of the crashed invocation's stuck ``"pending"``.
+       Refusing that escalation would instead silently discard the escalating
+       invocation's own genuine failing verdict while leaving the record
+       pointing at the crashed invocation -- worse than either write alone, and
+       the exact defect this round's fix removes. When the on-disk ``"pending"``
+       carries the SAME *invocation_id* (any *status*), this is that
+       invocation's own opening write being followed by its own terminal write
+       -- not blocked.
+
+    A record that does not exist, cannot be read, is empty, or (case 2 only)
+    carries fewer than 4 lines (a record written before this field existed, or a
+    test double using the file's own ``_write_record`` helper) is never treated
+    as blocking that condition -- there is nothing, or nothing comparable, to
+    protect.
+    """
+    try:
+        lines = record_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if not lines:
+        return False
+    existing_status = lines[0]
+    if existing_status == _SHARED_FILE_IMPACT_VERDICT_BLOCK:
+        return True
+    if (
+        existing_status == _SHARED_FILE_IMPACT_VERDICT_PENDING
+        and status != _SHARED_FILE_IMPACT_VERDICT_BLOCK
+        and len(lines) >= 4
+    ):
+        return lines[3] != invocation_id
+    return False
+
+
+def _write_shared_file_impact_verdict(status: str, *, workspace_root: Path, unit_id: str, invocation_id: str) -> None:
+    """Persist *status* to the shared-file-impact verdict record, atomically.
+
+    `cmd_check_shared_file_impact` calls this function from four distinct call
+    sites (the unconditional opening ``"pending"`` write, the no-match no-op
+    ``"pass"`` write, the blocking-gate ``"block"`` write, and the passing-gate
+    ``"pass"`` write), but at most TWO of those four ever execute for a single
+    invocation: the opening ``"pending"`` write always runs first, followed by
+    exactly one of the three ``"pass"``/``"block"`` clean-exit writes -- never
+    both, and never on an error path (unit not found, no local repo path
+    configured, the config file failed to load, a scope-resolution error,
+    the import-fan-in scan failed, `_evaluate_shared_file_gate`
+    raising `RuntimeError`/`UnknownTestRunnerError`/`TimeoutError`, an
+    uncaught exception, or the due `[GATE_PASS shared_file_impact]` record
+    write failing -- the work-unit file cannot be located on disk, or the
+    audit-marker append itself raises `OSError`), so
+    a run that started but could not reach a clean
+    verdict leaves the record at ``"pending"`` -- `assert-shared-file-impact.sh`
+    fails CLOSED on that value, exactly the "started but the verdict cannot be
+    determined" case spec 3.5 requires not to fail open. `cmd_check_shared_file_impact`
+    generates exactly one *invocation_id* (`_shared_file_impact_invocation_id`)
+    at the very top of that call and passes the SAME value to both of its own
+    writes.
+
+    Non-clobbering guard (round-5 code_review/test_review finding A1, this
+    change's extension of the same finding family, and round-6's correction of
+    that extension -- :func:`_shared_file_impact_verdict_write_is_blocked`): if
+    the on-disk record's CURRENT status is ``"block"``, this write is a silent
+    no-op -- an unconsumed ``"block"`` verdict from one `check-shared-file-impact`
+    invocation must never be overwritten by a DIFFERENT, later invocation's own
+    ``"pending"``/``"pass"``/``"block"`` write. The same is now true of an
+    unconsumed ``"pending"`` whose recorded invocation id differs from
+    *invocation_id*: it must never be overwritten by a DIFFERENT invocation's
+    own ``"pending"`` or ``"pass"`` write either, closing the residual gap where
+    a crashed invocation's stuck ``"pending"`` used to be silently erased by a
+    later, unrelated invocation's clean ``"pass"``. The one write this second
+    guard deliberately lets through despite the invocation id differing is a
+    foreign ``"block"``: escalating an unconsumed ``"pending"`` straight to
+    ``"block"`` is never refused, because ``"block"`` immediately becomes the
+    new sticky status the first guard above protects, so nothing is lost by
+    letting it land (round-6 fix; refusing it used to silently discard the
+    escalating invocation's own genuine failing verdict). Without these guards,
+    two invocations chained in a single Bash tool call (e.g.
+    `check-shared-file-impact <unit-a> ; check-shared-file-impact <unit-b>`)
+    fire only ONE PostToolUse event for the whole call, and unit B's own writes
+    would silently erase unit A's unresolved verdict before the hook ever reads
+    it -- a one-line bypass either way. Neither guard interferes with a SINGLE
+    invocation's own ordinary ``"pending"`` -> ``"pass"``/``"block"`` transition:
+    that transition only ever clobbers a status THIS SAME invocation itself
+    just wrote (its own ``"pending"``, carrying its own *invocation_id*), never
+    a foreign ``"block"`` or a foreign-id ``"pending"``. The only way to clear a
+    sticky record is for `assert-shared-file-impact.sh` (ref) to consume it
+    (read then delete) -- see that script's own header for the staleness bound
+    this produces.
+
+    Uses :func:`devbench.utils.io.atomic_write_text` (temp-then-rename) so a
+    concurrent reader (the hook) never observes a partially written record.
+
+    Args:
+        status: One of ``_SHARED_FILE_IMPACT_VERDICT_STATUSES``.
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+        unit_id: The work unit id this verdict belongs to, recorded only for
+            the hook's own diagnostic message -- never read back by Python.
+        invocation_id: This invocation's own identity
+            (`_shared_file_impact_invocation_id`), recorded as the record's
+            4th line and compared only by the non-clobbering guard above --
+            the hook never reads or cares about this field. Required (round-6
+            fix): two callers that both omitted it used to collide on the same
+            empty-string value and silently defeat the foreign-pending guard
+            against each other, so there is no safe default -- every caller,
+            including this module's own test suite, must supply a value that
+            is unique to the invocation it represents.
+
+    Raises:
+        ValueError: If *status* is not a declared status -- an internal
+            invariant (every call site in this module passes a module
+            constant), never user input.
+        OSError: If the record cannot be written (permissions, disk full,
+            etc.) -- propagated unchanged, never swallowed.
+    """
+    if status not in _SHARED_FILE_IMPACT_VERDICT_STATUSES:
+        raise ValueError(
+            f"Internal error: {status!r} is not a declared shared-file-impact verdict status "
+            f"(expected one of {sorted(_SHARED_FILE_IMPACT_VERDICT_STATUSES)})."
+        )
+    record_path = _shared_file_impact_verdict_path(workspace_root)
+    if _shared_file_impact_verdict_write_is_blocked(record_path, status, invocation_id):
+        return
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"{status}\n{unit_id}\n{datetime.now(UTC).isoformat()}\n{invocation_id}\n"
+    atomic_write_text(record_path, content)
+
+
+def _shared_file_gate_attributable(node_id: str, scope_files: frozenset[str]) -> bool:
+    """Return whether a failing *node_id* is attributable to *scope_files* (spec 4.3).
+
+    Only the ``pytest`` entry in ``_SHARED_FILE_RUNNER_PARSERS`` is DESIGNED to
+    emit node ids shaped ``"<file>::<test>"``; ``_parse_pytest_failures`` is the
+    sole producer that always emits that shape (see ``_RUNNER_PARSER_SAMPLES``
+    in ``tests/test_cli.py`` for all three registered runners' actual output
+    shapes). The ``go test`` and ``npm/jest`` parsers (``_parse_go_test_failures``,
+    ``_parse_jest_failures``) ORDINARILY emit bare test/description names with
+    no file segment at all, so there is usually no file to compare against
+    *scope_files* for those two runners' output -- such a node id is treated as
+    attributable rather than silently dropped, since this module can never
+    prove it is OUT of scope (fail-fast: never silently narrow a finding this
+    function cannot actually attribute away). This is NOT an absolute
+    guarantee, only the common case: ``_GO_TEST_FAILURE_LINE`` captures a bare
+    ``\\S+`` token and ``_JEST_FAILURE_LINE`` captures the raw ``.+?`` description
+    text after the failure marker, so a go test name or jest description that
+    happens to contain a literal ``"::"`` (e.g. ``TestThing/case::weird``) is
+    still split on it below exactly like a real pytest node id, and the
+    leading fragment -- not a real file path -- is then checked against scope
+    and can be silently excluded from attribution if it does not happen to
+    match a scope file.
+
+    A node id that does carry a ``"::"`` (whether a real ``"<file>::<test>"``
+    pytest shape, or a go test/jest name that merely happens to contain the
+    same two characters) is attributable only when the text before the first
+    ``"::"`` is a member of *scope_files* -- the unit's own
+    :class:`devbench.work_unit_scope.ScopeResult.files` (spec 4.3's attribution
+    rule: a repo-wide gate reports repo-wide RESULTS but attributes BLAME only
+    within the unit's own scope, D-7).
+    """
+    if "::" not in node_id:
+        return True
+    file_part = node_id.split("::", 1)[0]
+    return file_part in scope_files
+
+
+def _evaluate_shared_file_gate(
+    *,
+    unit_id: str,
+    canonical_repo: str,
+    repo_path: Path,
+    matched_files: list[str],
+    scope_files: list[str],
+    auto_derive_registry: bool,
+    fan_in_threshold: int,
+    derived_registry: set[str],
+) -> tuple[dict[str, Any], int]:
+    """Run the full suite and diff it against the pre-change baseline for a matched shared-file impact.
+
+    *auto_derive_registry*/*fan_in_threshold*/*derived_registry* (spec 4.6, issue #13
+    AC4) are the caller's already-resolved (``resolve_gate_config``) auto-derivation
+    settings and already-computed derived set (:func:`_derive_shared_file_registry`).
+    All three are required keyword-only arguments with no defaults (round-1
+    code_review C2 finding): the sole production caller
+    (:func:`cmd_check_shared_file_impact`) always supplies all three, and a default
+    would mask a caller bug rather than surface it -- ``fan_in_threshold=0`` is a
+    value this gate's own config validation explicitly rejects, yet a default would
+    let it be written verbatim into the cache; an ``Optional`` ``derived_registry``
+    defaulting to ``None`` would need an in-body ``... if ... is not None else
+    set()`` fallback that silently caches an EMPTY derived registry as if it were
+    the registry actually in effect. When *auto_derive_registry* is true, the derived set is added to the returned
+    payload (``"derived_registry"``) and cached to disk ALONGSIDE the baseline record
+    (:func:`_write_shared_file_derived_registry_cache`, AC-6) once the branch point is
+    resolved below -- this is the point a verdict is actually being reached, so it is
+    where "what registry was in effect when a verdict was reached" is recoverable
+    from. A no-match invocation (this function's caller, :func:`cmd_check_shared_file_impact`,
+    never entered this function at all) never resolves a branch point and so never
+    writes this cache -- there is no baseline for it to sit "alongside" on that path.
+
+    Isolates the "a shared file WAS touched" branch of
+    :func:`cmd_check_shared_file_impact` into its own function purely to
+    keep the caller's cyclomatic/return-statement complexity low; the
+    capture / block / pass decision described in that function's docstring
+    lives here. Returns ``(json_payload, exit_code)``.
+
+    ``scope_files`` is the unit's own
+    :attr:`devbench.work_unit_scope.ScopeResult.files` (spec 4.3): the
+    current-tree suite run itself is never scoped by it (the full suite
+    always runs repo-wide, per ``_run_full_suite_and_parse_failures``
+    below), but it bounds which of that run's NEW failures
+    ``_shared_file_gate_attributable`` will let this function attribute to
+    ``unit_id`` -- see the attribution-rule paragraph just above the
+    ``new_failures`` computation near the end of this function.
+
+    Resolves the branch point, loads/validates the stored baseline, and
+    resolves the current tree's runner key -- all BEFORE running the
+    (expensive) full suite against the current tree -- fail-fast for every
+    prerequisite that is cheap to detect:
+
+    - A branch point that cannot be resolved, or a stored baseline that is
+      corrupt or branch-point-mismatched (spec 4.6, finding 318-D2), raises
+      ``RuntimeError`` immediately.
+    - An unrecognised test command (`_resolve_full_suite_command` raising
+      `UnknownTestRunnerError`, spec 4.6, finding 318-D4) raises before any
+      suite subprocess is spawned -- symmetric with the branch-point
+      capture run :func:`_capture_shared_file_baseline` may perform below,
+      which resolves its own runner key the same way, before its own suite
+      run.
+    - A resolved but mismatched runner (the stored baseline's ``runner``
+      key differs from the currently-resolved one, AC-4) is detected here,
+      before the current-tree suite runs: resolving the runner key never
+      requires running a suite (`_resolve_full_suite_command` only invokes
+      `_select_test_command_with_recipe`'s cheap ``make -n test`` dry run,
+      never the full suite), and the baseline is already loaded by this
+      point, so nothing about a mismatch is only knowable after the fact.
+      This costs zero full-suite runs on the mismatch path.
+
+    None of the three checks above write a baseline.
+
+    When no baseline exists yet for the branch point, capture happens AFTER
+    the current-tree suite has run (see below); that placement remains a
+    deliberate choice, not a forced one -- the baseline's absence is
+    already known beforehand, since it was loaded above. The runner
+    resolved by that fresh capture (run against the branch-point worktree,
+    which may carry a different Makefile than the current tree) is checked
+    against the current tree's resolved runner too, so a unit that adds or
+    removes a Makefile ``test`` target between the branch point and HEAD
+    still cannot diff two incomparable failure sets under a single freshly
+    written baseline. :func:`_capture_shared_file_baseline` can raise ``RuntimeError`` on
+    three paths, and they do not all cost the same number of full-suite
+    runs: a branch-point worktree checkout failure raises before the
+    capture's own suite run ever starts (the ``git worktree add`` call
+    fails and the function returns via its early ``raise``, never entering
+    the ``try`` block that runs the suite), so that path costs only the
+    current-tree suite run already spent above -- one full-suite run. An
+    unattributed capture run (non-zero exit with no parsed failures) only
+    happens after the capture's own suite run has completed, so that path
+    costs the current-tree suite run plus the branch-point capture's own
+    suite run -- two full-suite runs -- before the operator sees the
+    error. A worktree-removal failure (naming ``git worktree prune`` as the
+    remediation) is attempted from the ``finally`` block regardless of how
+    the ``try`` block above it exited, so it does NOT always cost two
+    full-suite runs: when the branch-point tree resolves to no registered
+    runner (`UnknownTestRunnerError` propagating before the capture's own
+    suite is spawned, per the second bullet above), a subsequent removal
+    failure supersedes that propagating error and the path costs only the
+    current-tree suite run already spent above -- one full-suite run. It
+    costs two full-suite runs only when the capture's own suite run did
+    complete (whether cleanly or via the unattributed-capture-run error
+    above) before removal was attempted.
+
+    The current-tree suite run itself is held to the same "never silently
+    persist an unattributed result" rule the branch-point capture always
+    has: a current-tree run that exits non-zero yet whose registered
+    parser attributes zero failing node ids (e.g. a pytest collection or
+    import error, which prints ``ERROR tests/x.py`` rather than a
+    ``FAILED`` short-summary line the registered parser matches) raises
+    ``RuntimeError`` rather than treating an unattributed failure as if the
+    suite had passed cleanly (spec 3.5 bans exactly this degraded-but-
+    passing outcome).
+
+    Every ``RuntimeError`` this function raises or propagates is never
+    caught here; it is caught by the caller, which prints it to stderr and
+    exits 1. ``_load_shared_file_baseline`` and ``_write_shared_file_baseline``
+    can also propagate ``TimeoutError`` (a stuck ``flock_path`` holder)
+    rather than ``RuntimeError`` -- also never caught here, also caught by
+    the caller.
+    """
+    branch_point = _resolve_branch_point_sha(repo_path, canonical_repo, unit_id)
+    baseline_path = _shared_file_baseline_path(canonical_repo, branch_point)
+    baseline = _load_shared_file_baseline(baseline_path, branch_point=branch_point, unit_id=unit_id)
+
+    if auto_derive_registry:
+        _write_shared_file_derived_registry_cache(
+            _shared_file_derived_registry_cache_path(canonical_repo, branch_point),
+            branch_point=branch_point,
+            fan_in_threshold=fan_in_threshold,
+            derived_registry=derived_registry,
+        )
+
+    resolved = _resolve_full_suite_command(repo_path)
+    _cmd, runner_key, _parser = resolved
+
+    if baseline is not None:
+        stored_runner = baseline.get("runner")
+        if stored_runner != runner_key:
+            raise RuntimeError(
+                f"ERROR: baseline was captured with runner '{stored_runner}' but the repo is "
+                f"configured for '{runner_key}'; failure sets are not comparable across runners"
+            )
+
+    cmd, rc, stdout, stderr, current_failing, _runner_key = _run_full_suite_and_parse_failures(
+        repo_path, resolved=resolved
+    )
+    if rc != 0 and not current_failing:
+        raise RuntimeError(
+            f"ERROR: shared-file gate for unit {unit_id} could not attribute per-test failures "
+            f"for runner {cmd} in {repo_path} (exit {rc}): {(stderr.strip() or stdout.strip()) or '<no output>'}"
+        )
+
+    base_payload: dict[str, Any] = {
+        "unit_id": unit_id,
+        "repo": canonical_repo,
+        "shared_file_impact": True,
+        "matched_files": matched_files,
+        "full_suite_command": cmd,
+        "full_suite_exit_code": rc,
+        "baseline_path": str(baseline_path),
+        "branch_point": branch_point,
+    }
+    if auto_derive_registry:
+        base_payload["derived_registry"] = sorted(derived_registry)
+
+    if baseline is None:
+        captured_failing, captured_runner_key = _capture_shared_file_baseline(repo_path, branch_point, unit_id)
+        if captured_runner_key != runner_key:
+            raise RuntimeError(
+                f"ERROR: baseline was captured with runner '{captured_runner_key}' but the repo is "
+                f"configured for '{runner_key}'; failure sets are not comparable across runners"
+            )
+        record = _build_shared_file_baseline_record(
+            branch_point=branch_point, runner=captured_runner_key, failing=captured_failing
+        )
+        _write_shared_file_baseline(baseline_path, record)
+        baseline = record
+
+    baseline_failing: set[str] = set(baseline.get("failing") or [])
+    new_failures_all = current_failing - baseline_failing
+
+    # Attribution rule (spec 4.3, D-7): the RESULT above (`full_suite_exit_code`,
+    # `current_failing`) is always the real repo-wide run; BLAME (`new_failures`,
+    # the verdict this function returns) is restricted to failures
+    # `_shared_file_gate_attributable` can attribute to `scope_files` -- the unit's
+    # own Changes Manifest. A new failure whose file is outside that scope is still
+    # visible in `unattributed_new_failures` below (repo-wide result, per G6), but
+    # never blocks this unit and is never named in `new_failures`.
+    scope_file_set = frozenset(scope_files)
+    new_failures = sorted(f for f in new_failures_all if _shared_file_gate_attributable(f, scope_file_set))
+    unattributed_new_failures = sorted(new_failures_all - set(new_failures))
+
+    if new_failures:
+        payload = {
+            **base_payload,
+            "verdict": "block",
+            "new_failures": new_failures,
+            "pre_existing_failures": sorted(current_failing & baseline_failing),
+            "unattributed_new_failures": unattributed_new_failures,
+        }
+        return payload, 1
+
+    payload = {
+        **base_payload,
+        "verdict": "pass",
+        "failing_tests": sorted(current_failing),
+        "unattributed_new_failures": unattributed_new_failures,
+    }
+    return payload, 0
+
+
+def _resolve_shared_file_impact_gate_config(
+    canonical_repo: str, *, unit_id: str, invocation_id: str
+) -> "ResolvedGateConfig | int":
+    """Resolve the ``shared_file_impact`` gate's config, or an already-handled exit code.
+
+    Thin wrapper around :func:`_load_gate_config_or_report` -- the SAME helper
+    `check-ancestry`/`check-reachability` both use (spec 4.1, D-15) -- kept as its
+    own function purely so :func:`cmd_check_shared_file_impact` stays within ruff's
+    return/branch-count budget (PLR0911/PLR0912); the wrapping itself previously
+    lived inline in that function. Calling the shared helper instead of a second,
+    hand-rolled ``resolve_gate_config`` call fixes a real bug (round-1 code_review C1
+    finding): the inline version never checked ``enabled`` at all, so an
+    operator-configured ``enabled: false`` could not actually disable this gate.
+
+    An ``int`` result is already fully handled (its own ``ERROR:``/disabled line
+    already printed by the wrapped helper). ``0`` is the disabled-gate clean exit,
+    for which THIS function additionally writes the command's own PASS verdict
+    record so the PostToolUse hook does not stay blocked on ``"pending"`` forever.
+    ``1`` is a genuine config-load error, which leaves the verdict at ``"pending"``
+    on purpose, matching every other error-return path
+    :func:`cmd_check_shared_file_impact` has (see that function's own docstring). A
+    ``ResolvedGateConfig`` result means the gate is enabled and the caller should
+    proceed.
+    """
+    gate_config = _load_gate_config_or_report(_SHARED_FILE_IMPACT_GATE_NAME, canonical_repo)
+    if isinstance(gate_config, int) and gate_config == 0:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
+    return gate_config
+
+
+def _write_gate_pass_record(gate_name: str, unit: WorkUnit, unit_id: str, scope: "ScopeResult") -> int | None:
+    """Persist ``[GATE_PASS <gate_name>]`` for a passing enabled run (spec 4.2, 5.3).
+
+    Shared by every machine-blocking gate whose command resolves a ``ScopeResult`` and
+    persists a passing record through it: ``shared_file_impact``
+    (:func:`_emit_shared_file_impact_status`'s ONE call site, covering both of its
+    passing exits -- the no-match no-op and a matched run with zero attributable new
+    failures) and ``fixture_consistency``
+    (:func:`_finalize_fixture_consistency_result`). Extracted (code_review round-1,
+    E6-F2-S1-T2 Blocking 2) because the two gates' write logic was a verbatim 22-line
+    duplicate differing only by which gate-name constant got substituted in -- exactly
+    the shape this DRY extraction now shares in one place. `compose_gate_pass_record`
+    (`devbench.gate_records`) is the sole authorized builder of the marker text
+    (AC-E2-F2-S1-T1-6); no caller of this function hand-formats it.
+    `BacklogManager._append_audit_marker_before_comments` is the sole writer of the
+    work-unit file itself -- the record is written by the command, never by agent prose.
+
+    An empty Changes Manifest (``scope.files`` empty, ``scope.scope_hash == ""``) has no
+    scope to persist a hash for, so the caller must skip calling this at all in that case
+    (mirroring `compute_scope_hash`'s own refusal to hash an empty change set) --
+    this function does not re-check that condition itself.
+
+    Args:
+        gate_name: The gate whose record is being persisted, e.g.
+            ``_SHARED_FILE_IMPACT_GATE_NAME`` or ``_FIXTURE_CONSISTENCY_GATE_NAME`` --
+            embedded verbatim in both the marker text and any ``ERROR: ...`` message
+            this function prints.
+        unit: The calling unit's resolved :class:`WorkUnit`, used to locate its
+            work-unit file (:func:`_resolve_work_unit_file`).
+        unit_id: The calling unit's id, used only for the ``ERROR: ...`` message text.
+        scope: The calling unit's resolved :class:`ScopeResult` (non-empty by the
+            caller-side precondition above); its ``scope_hash`` is what gets persisted.
+
+    Returns:
+        ``None`` on a successful write. ``1`` (already printed its own ``ERROR: ...``
+        message to stderr, and nothing to stdout yet) when the work-unit file cannot be
+        located on disk, or when the audit-marker append itself raises ``OSError``
+        (e.g. a permission error or a full disk) -- mirroring
+        :func:`_write_ancestry_gate_pass_record`'s own ``OSError`` guard, this never
+        surfaces as a raw traceback.
+    """
+    from devbench.backlog.manager import BacklogManager
+    from devbench.gate_records import compose_gate_pass_record
+
+    wu_file = _resolve_work_unit_file(unit)
+    if not wu_file.is_file():
+        print(
+            f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: work unit file not found at {wu_file}",
+            file=sys.stderr,
+        )
+        return 1
+
+    marker = compose_gate_pass_record(gate_name, scope.scope_hash)
+    try:
+        BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+    except OSError as exc:
+        print(
+            f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: {wu_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def _emit_shared_file_impact_status(
+    unit: WorkUnit, unit_id: str, scope: "ScopeResult", status: str, findings: int, payload: dict[str, Any]
+) -> int | None:
+    """Write the ``[GATE_PASS shared_file_impact]`` record (spec 4.2, 5.3) on a passing
+    status with a non-empty scope, then print the spec 5.2 status line followed by the
+    findings payload.
+
+    The single call site :func:`cmd_check_shared_file_impact` uses for all three of its
+    reached-a-verdict exits (the no-match no-op, a matched run with zero attributable new
+    failures, and a matched run that blocks) -- collapsing the write-then-print sequence
+    here rather than repeating it per branch keeps the caller's own return/branch count
+    within ruff's thresholds (PLR0911/PLR0912) and means the record-write-before-any-print
+    ordering (mirroring `cmd_check_reachability`'s own ordering: a write failure must never
+    leave partial stdout behind) can never drift between call sites.
+
+    Returns:
+        ``None`` when the caller should continue normally (either no record was due, or
+        the write succeeded). ``1`` (already printed its own ``ERROR: ...``; nothing else
+        printed) when a due record could not be written.
+    """
+    if status == GATE_STATUS_PASS and scope.files:
+        write_result = _write_gate_pass_record(_SHARED_FILE_IMPACT_GATE_NAME, unit, unit_id, scope)
+        if write_result is not None:
+            return write_result
+    print(_gate_status_line(_SHARED_FILE_IMPACT_GATE_NAME, status, findings, scope_hash=scope.scope_hash))
+    print(json.dumps(payload, indent=2))
+    return None
+
+
+def _prepare_shared_file_impact_scope_and_registry(
+    unit_id: str,
+    repo_path: Path,
+    *,
+    auto_derive_registry: bool,
+    fan_in_threshold: int,
+) -> "tuple[ScopeResult, set[str]] | int":
+    """Resolve this unit's changed-file scope and, when enabled, the auto-derived registry.
+
+    Extracted out of :func:`cmd_check_shared_file_impact` to keep that function's
+    return-statement count within ruff's threshold (PLR0911); the two early-exit
+    branches this absorbs (scope-resolution failure, import-scan failure) used to
+    live inline in the caller. Both must resolve BEFORE any pattern/derived-file
+    matching decision is made, so they are prepared together here.
+
+    Scope resolution shares the single scope-resolution error path every other
+    scope-resolving gate/verb uses (`_resolve_scope_or_report`, spec 4.3, AC-9)
+    rather than re-implementing the try/except locally: `ValueError` (unknown unit
+    id, bad repo path, or a `ManifestParseError` subclass instance), `RuntimeError`
+    (git plumbing rc>=2) and `FileNotFoundError` (the unit's work-unit file deleted
+    in a same-process race between the backlog parse and the manifest read) are
+    every error type `work_unit_scope.resolve_changed_files` can raise or
+    propagate; each already carries a fully-formed, actionable message, so it is
+    surfaced verbatim rather than re-derived.
+
+    Returns:
+        ``(scope, derived_registry)`` on success. ``1`` (already printed its own
+        ``ERROR:`` message) on either failure.
+    """
+    mode = _resolve_scope_mode()
+    message_prefix = _GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    scope = _resolve_scope_or_report(unit_id, repo_path, mode, message_prefix=message_prefix)
+    if scope is None:
+        return 1
+
+    derived_registry: set[str] = set()
+    if auto_derive_registry:
+        try:
+            derived_registry = _derive_shared_file_registry(repo_path, fan_in_threshold)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    return scope, derived_registry
+
+
+@dataclass(frozen=True)
+class _SharedFileImpactRun:
+    """Everything :func:`cmd_check_shared_file_impact` needs before it can decide
+    match/no-match, resolved by :func:`_prepare_shared_file_impact_run`.
+
+    A named, frozen dataclass rather than a positional tuple (E5-F3-S1-T1 round-1
+    code_review idiomatic-code finding): an 8-element positional tuple unpacked
+    immediately into 8 locals is the exact shape that invites a silent
+    reordering bug at the single call site, one `mypy` only partially protects
+    against (adjacent `bool`/`int`/`str`-ish slots); a named-attribute dataclass
+    cannot be misordered, and `frozen=True` additionally makes each field
+    immutable after construction.
+    """
+
+    unit: WorkUnit
+    canonical_repo: str
+    repo_path: Path
+    patterns: tuple[str, ...]
+    auto_derive_registry: bool
+    fan_in_threshold: int
+    scope: ScopeResult
+    derived_registry: set[str]
+
+
+def _prepare_shared_file_impact_run(unit_id: str, invocation_id: str) -> "_SharedFileImpactRun | int":
+    """Resolve everything :func:`cmd_check_shared_file_impact` needs before it can
+    decide match/no-match: the unit/repo/local-path, the resolved gate config, the
+    per-repo ``patterns`` override, and the Manifest scope plus (when enabled) the
+    auto-derived registry.
+
+    Collapses three independent early-exit checks
+    (:func:`_resolve_unit_repo_and_path`, :func:`_resolve_shared_file_impact_gate_config`,
+    :func:`_prepare_shared_file_impact_scope_and_registry`) into ONE caller-side
+    ``isinstance`` check, keeping :func:`cmd_check_shared_file_impact`'s own
+    return/branch count within ruff's PLR0911/PLR0912 thresholds -- each of the three
+    used to be checked inline in that function.
+
+    Returns:
+        A :class:`_SharedFileImpactRun` on success. An ``int`` when any step already
+        fully handled its own exit (its own ``ERROR:``/disabled line already printed).
+    """
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    unit, canonical_repo, repo_path = resolved
+
+    gate_config = _resolve_shared_file_impact_gate_config(canonical_repo, unit_id=unit_id, invocation_id=invocation_id)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    # `patterns` has no project/env layer of its own (spec 4.1: it is a per-repo-only
+    # override, never resolved by `resolve_gate_config`'s multi-layer merge), so it is
+    # read directly off `RUNTIME_CONFIG.gates.repos` -- `auto_derive_registry` and
+    # `fan_in_threshold` below come from *gate_config* instead, never a second,
+    # independently-loaded config snapshot.
+    gate_repo_override = RUNTIME_CONFIG.gates.repos.get(canonical_repo)
+    shared_file_impact_override = gate_repo_override.shared_file_impact if gate_repo_override is not None else None
+    patterns = shared_file_impact_override.patterns if shared_file_impact_override is not None else ()
+
+    auto_derive_registry = bool(gate_config.values["auto_derive_registry"])
+    fan_in_threshold = cast("int", gate_config.values["fan_in_threshold"])
+
+    prepared = _prepare_shared_file_impact_scope_and_registry(
+        unit_id, repo_path, auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+    )
+    if isinstance(prepared, int):
+        return prepared
+    scope, derived_registry = prepared
+
+    return _SharedFileImpactRun(
+        unit=unit,
+        canonical_repo=canonical_repo,
+        repo_path=repo_path,
+        patterns=patterns,
+        auto_derive_registry=auto_derive_registry,
+        fan_in_threshold=fan_in_threshold,
+        scope=scope,
+        derived_registry=derived_registry,
+    )
+
+
+def cmd_check_shared_file_impact(unit_id: str) -> int:
+    """Gate a work unit's diff against the shared-file full-suite regression policy.
+
+    A task's regression verification (`run-tests`) is not scoped by the
+    Changes Manifest at the tooling level -- it always runs the full suite
+    command (`_select_test_command`) -- but nothing forces an executor to
+    actually invoke a full run, or to notice that a shared/high-fan-in file
+    (an app shell, a shared hook, a widely-consumed component) was touched.
+    A task can pass its own narrow verification while silently breaking
+    hundreds of already-passing tests elsewhere, discovered only when some
+    later, unrelated task happens to run the full suite. This command closes
+    that gap for repos with `gates.repos.<repo>.shared_file_impact.patterns`
+    configured in devbench.yaml:
+
+    0. Prints the spec 5.2 gate status line as the FIRST stdout line:
+       `{"gate": "shared_file_impact", "status": "disabled"}` (the exact bytes
+       `json.dumps` with its default separators emits) and exits 0 (spec 4.1,
+       AC-4) when the gate is disabled or unconfigured for the unit's repo -- via
+       the same shared `_load_gate_config_or_report` helper `check-ancestry`/
+       `check-reachability` use; otherwise
+       `{"gate": "shared_file_impact", "tier": "machine-blocking", "status": "pass"|"fail",
+       "findings": <int>, "scope_hash": "<sha256>"}` followed by the JSON findings
+       payload (items 1-3 below). `findings` is `0` on every passing exit (the
+       no-match no-op, and a matched run with zero attributable new failures) and
+       the count of `new_failures` on a blocking exit. A passing run with a
+       non-empty Changes Manifest additionally persists
+       `[GATE_PASS shared_file_impact] <iso-utc> <scope-hash>` to the unit's audit
+       trail (spec 4.2, 5.3) through `devbench.gate_records.compose_gate_pass_record`
+       -- the sole authorized builder of that marker text -- so the record is
+       always written by this command, never by agent prose; a blocking run writes
+       no record. `BacklogManager._check_gate_pass_done_invariant` (already
+       generic across every `constants.GATE_TIERS` machine-blocking gate) is what
+       `mark-done` consults for this record: an enabled gate with no fresh record
+       and no operator `[GATE_WAIVER shared_file_impact]` refuses naming the exact
+       remediation command, and a Changes-Manifest edit after the record was
+       written changes the recomputed scope hash and makes the record read as
+       stale.
+    1. Resolves the work unit's changed-file set through
+       `work_unit_scope.resolve_changed_files(unit_id, repo_path, mode)`
+       (spec 4.3, AC-9) -- the unit's own ADR-12 mode-aware Changes Manifest
+       scope, never a raw working-tree scan, so a file left dirty in the
+       checkout by a different, unrelated task can neither trigger this gate
+       nor be blamed for a failure that has nothing to do with this unit
+       (318-D7).
+    2. Cross-references the resolved scope's files against the repo's
+       `shared_file_impact.patterns` glob list. No match: no-op (exit 0,
+       `shared_file_impact: false`); the task's normal `run-tests` evidence
+       stands.
+    3. On a match (`_evaluate_shared_file_gate`): resolves the unit's branch
+       point (`_resolve_branch_point_sha`, `git merge-base HEAD
+       origin/<default-branch>`), runs the full-suite command against the
+       CURRENT tree, and diffs its per-test failures (parsed by the
+       runner-specific parser callable that `_resolve_full_suite_command`
+       resolves -- it resolves the runner key via `_resolve_runner_key` and
+       takes that registry entry's `parse` callable directly, spec 4.6;
+       `_resolve_runner_parser` performs the equivalent lookup and exists
+       per this unit's Definition of Done, but the gate path itself does
+       not call it, to avoid a second resolution pass)
+       against a pre-change baseline stored at
+       `<workspace>/.devbench/test-baselines/<repo>/<branch-point-sha>.json`
+       (spec 5.4). When no baseline exists yet for that branch point, one is
+       captured now by running the same suite in an isolated `git worktree`
+       checked out AT the branch point (`_capture_shared_file_baseline`) --
+       never from the current, already-changed tree -- so the baseline is
+       always a pre-change snapshot, never post-change. Blocks (exit 1)
+       only on tests failing now that were NOT already failing at the
+       branch point AND that `_shared_file_gate_attributable` can attribute
+       to the unit's own scope (spec 4.3 attribution rule, item 3a) -- so
+       this does not stall on pre-existing/flaky failures. The blocking
+       output names the offending tests AND `unit_id`, attributing the
+       regression to the task that introduced it.
+    3a. Attribution (spec 4.3, D-7, AC-9): the full-suite RESULT reported
+       above (`full_suite_exit_code`, and every failing node id the
+       registered parser attributes) is always repo-wide -- the suite
+       itself is never scoped. Which of that run's NEW failures actually
+       BLOCK this unit is narrower: only a node id `_shared_file_gate_attributable`
+       can attribute to the unit's own `ScopeResult.files` (its Changes
+       Manifest) is named in `new_failures`/blocks the gate; every other new
+       failure is still visible in the payload's `unattributed_new_failures`
+       list (repo-wide result, not silently dropped) but never blocks. Only
+       the `pytest` parser's node ids (`"<file>::<test>"`) are DESIGNED to
+       carry a file segment to check against scope; `go test` and jest node
+       ids ordinarily carry no file segment and so are attributable -- but
+       this is not an absolute guarantee (a go test name or jest description
+       that happens to contain a literal `::` is still split on it by the
+       same file-segment check, and the leading fragment can then be checked
+       against scope like a real file path) -- see
+       `_shared_file_gate_attributable`'s docstring for the exact rule.
+    4. A baseline file that exists but fails to parse, or whose stored
+       `branch_point` disagrees with the resolved merge-base, is a loud
+       error (exit 1, stderr) and is never rewritten (spec 4.6, finding
+       318-D2) -- there is no silent re-bootstrap path. A baseline whose
+       stored `runner` registry key disagrees with the currently-resolved
+       one is likewise a loud error (exit 1, stderr, AC-4) -- failure sets
+       captured under one runner are never diffed against another. This
+       runner-mismatch check applies twice, on two distinct paths that can
+       raise at different points: once against an EXISTING stored baseline
+       (checked before the current-tree suite runs, so this path costs zero
+       full-suite runs), and, separately, when no baseline yet exists and
+       one is FRESHLY captured from an isolated branch-point worktree (see
+       item 3) -- that worktree may carry a different Makefile than the
+       current tree, so the freshly-resolved runner is checked against the
+       current tree's resolved runner too, after the capture's own suite
+       run but before the fresh baseline is written, so an incomparable
+       baseline is never persisted to disk.
+    5. A branch point that cannot be resolved (`_resolve_branch_point_sha`,
+       `git merge-base` exiting non-zero or the configured default branch
+       not existing, AC-6) is a loud error (exit 1, stderr) naming the
+       unit and the git failure, raised before any full-suite run starts.
+    6. A `flock_path` acquisition that times out while loading or writing
+       the baseline (a stuck lock holder past
+       `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`) is a loud error (exit 1,
+       stderr, "ERROR: could not acquire the shared-file baseline lock for
+       unit `unit_id`") rather than hanging the gate forever.
+    7. The repo's configured test command (`_select_test_command`) is
+       resolved to a runner parser through the explicit
+       `_SHARED_FILE_RUNNER_PARSERS` registry (spec 4.6, finding 318-D4) --
+       a bare `pytest` invocation, a `go test` invocation, or the
+       npm/yarn/npx-invoked jest form, matched directly on the command's
+       own leading token(s). A `make test` command is resolved by TOKEN
+       CONTAINMENT: each registry entry's invoker token is matched against
+       the `shlex.split` tokens of its dry-run recipe (`make -n test`,
+       comment-stripped), not against proof of what the recipe's last
+       command actually runs -- it is not assumed to wrap pytest, but a
+       registered runner's token appearing anywhere in the recipe (inside
+       an uncovered wrapper script's own arguments, or a recipe that never
+       runs that runner at all) still selects that runner's parser; see
+       `_resolve_runner_key`'s docstring for the exact rule and its
+       disclosed limitations. A command (or, for `make test`, a recipe)
+       matching no registered runner, or matching more than one (a recipe
+       containing more than one registered runner's invoker token, e.g. one
+       invoking both `go test` and `pytest` -- not necessarily ambiguous to
+       a human, e.g. a Python repo's recipe that installs JS dependencies
+       before running pytest also trips this), is `ERROR: cannot parse
+       test output for runner '<cmd>'` on stderr, exit 1, raised before
+       that run's own suite subprocess is spawned -- for the CURRENT-tree
+       run and for a branch-point capture alike -- so
+       neither case produces a partial or guessed result.
+    8. A current-tree suite run that exits non-zero yet whose registered
+       parser attributes zero failing node ids (e.g. a pytest collection or
+       import error, which never prints a `FAILED` short-summary line) is a
+       loud error (exit 1, stderr) rather than a `verdict: "pass"` over a
+       suite that could not actually be read -- symmetric with the
+       equivalent guard `_capture_shared_file_baseline` has always had on
+       the branch-point capture run (spec 3.5).
+
+    Registry auto-derivation (spec 4.6, issue #13 AC4): the shared-file set is a
+    hand-maintained glob registry by default, but `gates.shared_file_impact
+    .auto_derive_registry: true` ADDITIONALLY computes it from the repo's import
+    graph -- files imported/required by more than `fan_in_threshold` distinct
+    modules, via `source_classification.extract_import_targets`'s
+    language-appropriate scanning and `_derive_shared_file_registry`'s
+    location-relative resolution (for Python, the JS/TS family, Ruby and PHP:
+    against the importing file's own directory for a leading-`.` target, and
+    against the repo root ONLY, never a `src/` fallback, for a leading-`/`
+    target -- this leading-`/` bucket does not arise for Python in practice,
+    since Python's own extractor never emits a `/`-prefixed target; for Go,
+    Java/Kotlin, C#, and Swift: ALWAYS against the repo root
+    and a top-level `src/` directory regardless of the target's own leading
+    character, a leading `.` included, since none of those languages' import
+    grammars has a relative form; for a bare/absolute Python, PHP, Go,
+    Java/Kotlin, C#, or Swift target with neither prefix: likewise against the
+    repo root and a top-level `src/` directory -- never a bare global basename
+    index; a bare/aliased JS/TS or Ruby target with neither prefix is
+    deliberately never resolved and casts no fan-in vote) and fan-in count.
+    This is ADDITIVE, never a replacement: the
+    hand-maintained `patterns` list above still matches even when the scanner did
+    not derive a given file, and a derived file matches even with an empty hand
+    list. Because derivation only ever considers files
+    `source_classification.is_source_extension` classifies as source, a shared
+    file with a non-source extension can never be derived and must stay
+    hand-listed regardless of `auto_derive_registry`. `enabled`,
+    `auto_derive_registry` and `fan_in_threshold` are all read exclusively through
+    `_load_gate_config_or_report`/`resolve_gate_config("shared_file_impact", repo)`
+    (AC-27, spec 4.1) -- the same resolver `check-ancestry`/`check-reachability` use
+    (round-1 code_review C1 finding). The derived set is printed in this command's
+    JSON payload (`"derived_registry"`) on every invocation of an ENABLED gate
+    that reaches a verdict (pass or block) with `auto_derive_registry` enabled,
+    matched or not -- an invocation that raises before a verdict (e.g. an
+    unrecognised full-suite runner), and an invocation where `enabled` is
+    `false` (which writes its own PASS verdict record via
+    `_resolve_shared_file_impact_gate_config` and returns before any payload is
+    built, regardless of `auto_derive_registry`), both print no payload at all.
+    It is additionally cached
+    alongside the baseline record, as `<branch-point-sha>.derived-registry.json`
+    (a sibling of the baseline record's own `<branch-point-sha>.json`, in the
+    same per-repo directory -- never `<baseline_path>.derived-registry.json`
+    literally appended, which would resolve to a nonexistent
+    `<sha>.json.derived-registry.json`), via
+    `_write_shared_file_derived_registry_cache` -- ONLY on the matched path (once
+    a branch point/baseline is actually resolved), and as soon as that baseline
+    is loaded, BEFORE the full-suite command itself is even resolved: a matched
+    invocation that later raises (an unrecognised runner, a baseline/runner
+    mismatch) still leaves this cache written even though it aborts with no
+    comparison and no printed payload. A no-match run never resolves a branch
+    point at all, so there is no baseline for this cache to sit "alongside" on
+    that path (round-1 doc_review D1 finding: this cache is not written
+    unconditionally, and does not need to be, since the printed payload already
+    covers the no-match case). This cache is write-only: no devbench command
+    reads it back; it exists so an operator can recover what registry was in
+    effect for a given verdict by inspecting the file directly on disk -- see
+    `docs/devbench-yaml-reference.md` for the full contract.
+
+    Known limitation (v1, documented rather than hidden): the runner-parser
+    registry (item 7) ships with exactly three entries
+    (`pytest`, `go test`, npm/yarn/npx-invoked jest); a repo whose
+    configured test command (or, for `make test`, whose recipe) matches
+    none of those has no path to a passing gate run until a matching entry
+    is added to `_SHARED_FILE_RUNNER_PARSERS` -- adding one is the only
+    change required (`_resolve_runner_key` iterates the registry itself,
+    for both direct and `make`-wrapped resolution, and never restates the
+    runner list, so it never needs editing to onboard a new runner family).
+
+    A second, distinct known limitation applies only to the `make test`
+    resolution path in item 7: it is TOKEN CONTAINMENT over the dry-run
+    recipe, not proof of what the recipe's last command actually invokes.
+    Two failure directions follow from that, both silent rather than a
+    loud error, and neither is the no-match direction item 7 already
+    covers: (1) a recipe that runs a registered runner's invoker token
+    only inside an uncovered wrapper script's own arguments (e.g. `npm ci
+    && ./scripts/run-tests.sh`) resolves to that runner's parser even
+    though the wrapper script -- not the registered runner -- is what
+    actually determines pass/fail; (2) a recipe that mentions a runner's
+    name without invoking it at all (e.g. `echo skipping pytest`) resolves
+    to that runner's parser over output the recipe never produced. Only
+    the case where MORE THAN ONE registered runner's token matches the
+    same recipe is upgraded to a loud `UnknownTestRunnerError` (item 7);
+    these two single-match cases are not detected. A Makefile `test`
+    target that delegates to a wrapper script or an equivalent
+    indirection is the concrete case a config author must avoid for this
+    gate to be trustworthy -- this constraint is not yet reflected in
+    `docs/devbench-yaml-reference.md`'s `shared_file_impact` section (a
+    documentation gap recorded in this unit's escalation log, not a stale
+    reference here).
+
+    Verdict record (spec 4.6, finding 318-D13 remediation, round 5
+    redesign): before doing anything else, this command writes a
+    ``"pending"`` shared-file-impact verdict record
+    (`_write_shared_file_impact_verdict`) that
+    `plugin/devbench-orchestrate/scripts/assert-shared-file-impact.sh`
+    reads back on the very next Bash PostToolUse event -- fail-closed
+    (blocked) while it still reads ``"pending"``, allowed once it reads
+    ``"pass"``, blocked (with the offending tests named) once it reads
+    ``"block"``. The record is overwritten with a clean ``"pass"``/``"block"``
+    verdict only on the two clean-exit paths below (a no-match no-op, or
+    `_evaluate_shared_file_gate` returning a result); every error-return
+    path (unit not found, no local repo path, the config file failed to
+    load, a scope-resolution error, the import-fan-in scan failed,
+    `_evaluate_shared_file_gate` raising, or the due
+    `[GATE_PASS shared_file_impact]` record write failing -- the
+    work-unit file cannot be located on disk, or the audit-marker append
+    itself raises `OSError`) leaves the record at
+    ``"pending"`` on purpose, so the hook never has to re-derive this command's own
+    outcome by re-parsing `tool_input.command` or `tool_response.stdout`.
+    Every write this invocation makes -- the opening ``"pending"`` and
+    whichever clean-exit write follows it -- carries the SAME
+    `_shared_file_impact_invocation_id`, generated exactly once here, so
+    `_write_shared_file_impact_verdict`'s non-clobbering guard can tell this
+    invocation's own transition apart from a foreign one (round-5 finding A1
+    family; see that function's own docstring).
+    """
+    invocation_id = _shared_file_impact_invocation_id()
+    _write_shared_file_impact_verdict(
+        _SHARED_FILE_IMPACT_VERDICT_PENDING, workspace_root=WORKSPACE_ROOT, unit_id=unit_id, invocation_id=invocation_id
+    )
+
+    prepared = _prepare_shared_file_impact_run(unit_id, invocation_id)
+    if isinstance(prepared, int):
+        return prepared
+    unit = prepared.unit
+    canonical_repo = prepared.canonical_repo
+    repo_path = prepared.repo_path
+    patterns = prepared.patterns
+    auto_derive_registry = prepared.auto_derive_registry
+    fan_in_threshold = prepared.fan_in_threshold
+    scope = prepared.scope
+    derived_registry = prepared.derived_registry
+
+    matched_files = _matched_shared_files(scope.files, patterns) if patterns else []
+    if derived_registry:
+        matched_files = sorted(set(matched_files) | (set(scope.files) & derived_registry))
+
+    if not matched_files:
+        payload: dict[str, Any] = {
+            "unit_id": unit_id,
+            "repo": canonical_repo,
+            "shared_file_impact": False,
+            "changed_files": scope.files,
+        }
+        if not patterns and not auto_derive_registry:
+            payload["reason"] = "no gates.repos.<repo>.shared_file_impact.patterns configured for this repo"
+        if auto_derive_registry:
+            payload["derived_registry"] = sorted(derived_registry)
+        emit_result = _emit_shared_file_impact_status(unit, unit_id, scope, GATE_STATUS_PASS, 0, payload)
+        if emit_result is not None:
+            return emit_result
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
+        return 0
+
+    try:
+        result_payload, rc = _evaluate_shared_file_gate(
+            unit_id=unit_id,
+            canonical_repo=canonical_repo,
+            repo_path=repo_path,
+            matched_files=matched_files,
+            scope_files=scope.files,
+            auto_derive_registry=auto_derive_registry,
+            fan_in_threshold=fan_in_threshold,
+            derived_registry=derived_registry,
+        )
+    except (RuntimeError, UnknownTestRunnerError, TimeoutError) as exc:
+        # RuntimeError and UnknownTestRunnerError already carry a fully-formed `ERROR: ...`
+        # message (UnknownTestRunnerError specifically from `_resolve_runner_key` naming an
+        # unrecognised test command, spec 4.6, finding 318-D4). Catching the dedicated
+        # `UnknownTestRunnerError` subclass here -- never the builtin `ValueError` -- means an
+        # unrelated `ValueError` raised deeper in the gate is never misreported as this error.
+        # TimeoutError does not carry a formed message: flock_path (via
+        # _load_shared_file_baseline / _write_shared_file_baseline) raises it, an OSError
+        # subclass rather than a RuntimeError, when a stuck lock holder is not released
+        # within SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS, so it is wrapped here to still be
+        # a single spec Section 7 `ERROR: ...` line instead of an uncaught traceback.
+        message = (
+            str(exc)
+            if isinstance(exc, (RuntimeError, UnknownTestRunnerError))
+            else (f"ERROR: could not acquire the shared-file baseline lock for unit {unit_id}: {exc}")
+        )
+        print(message, file=sys.stderr)
+        return 1
+
+    status = GATE_STATUS_PASS if rc == 0 else GATE_STATUS_FAIL
+    findings = 0 if rc == 0 else len(result_payload.get("new_failures", []))
+    emit_result = _emit_shared_file_impact_status(unit, unit_id, scope, status, findings, result_payload)
+    if emit_result is not None:
+        return emit_result
+
+    if rc != 0:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_BLOCK,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
+        print(
+            f"ERROR: {unit_id} touches shared file(s) {matched_files} and introduces "
+            f"{len(result_payload.get('new_failures', []))} new full-suite failure(s) not present "
+            f"in the baseline: {result_payload.get('new_failures')}. "
+            "Fix these before this task can be marked done.",
+            file=sys.stderr,
+        )
+    else:
+        _write_shared_file_impact_verdict(
+            _SHARED_FILE_IMPACT_VERDICT_PASS,
+            workspace_root=WORKSPACE_ROOT,
+            unit_id=unit_id,
+            invocation_id=invocation_id,
+        )
+    return rc
+
+
+# Fixture-consistency is a machine-blocking gate (`constants.GATE_TIERS`).
+# Named once here, alongside `_REACHABILITY_GATE_NAME`/
+# `_SHARED_FILE_IMPACT_GATE_NAME` above, so `cmd_check_fixture_consistency`
+# never re-types the literal "fixture_consistency" a second time.
+_FIXTURE_CONSISTENCY_GATE_NAME: str = "fixture_consistency"
+
+# Spec 5.2 declares the enabled-run status vocabulary as
+# `"<pass|fail|error>"`; `constants.GATE_STATUS_DISABLED`/`_PASS`/`_FAIL`/
+# `_ERROR` cover all four values every gate command needs. fixture_consistency
+# is the first gate whose command can hard-stop on a MISCONFIGURED run rather
+# than merely a failing one -- a configured `identifier_field` that matches
+# zero canonical records, or an enabled gate with an empty resolved `scan`
+# list (spec 4.7 322-D02/D05). Unlike the ancestry-only `_ANCESTRY_MODE_*`
+# constants above, the status vocabulary itself is imported from
+# `constants.py`, not re-declared here -- it is shared by every gate command
+# through `_gate_status_line`/`_gate_disabled_line`.
+
+
+def _resolve_fixture_consistency_repo_path(unit_id: str) -> tuple[WorkUnit, str, Path] | int:
+    """Resolve everything :func:`cmd_check_fixture_consistency` needs before running the check.
+
+    Split out purely to keep that function's return-count within the
+    project's complexity lint budget (mirrors the existing
+    ``_prepare_ancestry_probe_context``-style helpers this module already
+    uses for the same reason). Bundles every early-exit condition -- a
+    usage-error (empty) *unit_id* (spec Section 7, exit 2, mirroring
+    ``cmd_check_ancestry``'s empty ``dependency_ref`` guard), an
+    unresolvable work unit, and a repo with no configured local path --
+    into one caller-side ``isinstance(..., int)`` check.
+
+    Returns:
+        A ``(unit, canonical_repo, repo_path)`` triple when every resolution
+        step succeeds -- *unit* is the resolved :class:`WorkUnit` itself,
+        needed by the caller (E6-F2-S1-T2) to locate the work-unit file a
+        passing run persists its ``[GATE_PASS fixture_consistency]`` record
+        to (:func:`_resolve_work_unit_file`); *canonical_repo* is the
+        ``resolve_gate_config`` repo argument the caller needs to resolve
+        ``extract_source_literals`` (spec 4.1, AC-27; E6-F2-S1-T1 doc_review
+        round-1 D4); *repo_path* the resolved local checkout ``Path``;
+        otherwise the ``int`` exit code the caller should return as-is (the
+        offending step has already printed its own diagnostic).
+    """
+    if not unit_id.strip():
+        print("ERROR: check-fixture-consistency requires a non-empty <unit-id>", file=sys.stderr)
+        return 2
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    canonical_repo = resolve_repo(unit.repo)
+    validate_repo(canonical_repo)
+    repo_path = REPO_LOCAL_PATHS.get(canonical_repo)
+    if repo_path is None:
+        print(f"ERROR: No local path configured for repo '{canonical_repo}'", file=sys.stderr)
+        return 1
+
+    return unit, canonical_repo, Path(repo_path)
+
+
+def cmd_check_fixture_consistency(unit_id: str) -> int:
+    """Cross-reference the work unit's target repo's mock/fixture files against its canonical dataset.
+
+    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog cross-reference lint): a
+    feature's data-fetch logic is frequently correct but reads from a mock/fixture lookup table
+    whose keys were fabricated, keyed in the wrong namespace, or left
+    incomplete relative to the project's canonical shared fixture dataset --
+    functionally dead or crash-on-save for real records even though the
+    underlying logic is sound.
+
+    Opt-in and project-specific: devbench cannot infer a target repo's
+    fixture-file layout, so this is a deliberate no-op unless the workspace
+    configures ``gates.fixture_consistency.canonical_sources`` in
+    ``backlog/config/devbench.yaml``. When configured, scans every
+    ``gates.fixture_consistency.scan`` target for identifier literals
+    absent from its designated canonical source, and checks each canonical
+    source's distinct-identifier count against an optional
+    ``expected_count`` (backfill coverage).
+
+    Prints the spec 5.2 gate status line as the FIRST stdout line for every
+    run that reaches a findings-based or config-error verdict:
+    ``{"gate":"fixture_consistency", "status":"disabled"}`` and exits 0
+    when no ``canonical_sources`` are configured (spec 4.1); otherwise
+    ``{"gate":"fixture_consistency", "tier":"machine-blocking",
+    "status":"pass"|"fail"|"error", "findings":<int>}`` followed by the
+    human-readable findings (spec 4.7 hardening, register findings
+    322-D02/D03/D05). SIX terminals never reach that verdict at all and
+    write ZERO bytes to stdout, printing only ``ERROR: ...`` to stderr: an
+    empty-or-whitespace *unit_id* (exit 2), an unresolvable *unit_id*
+    (exit 1), a repo with no configured local path (exit 1) (all three
+    from :func:`_resolve_fixture_consistency_repo_path`), scope resolution
+    for the calling unit failing (exit 1,
+    :func:`_finalize_fixture_consistency_result`'s own
+    ``_resolve_scope_or_report`` call, E6-F2-S1-T2), and a due
+    ``[GATE_PASS fixture_consistency]`` record failing to be written
+    (exit 1, :func:`_write_gate_pass_record`,
+    E6-F2-S1-T2) -- either because the unit's own work-unit file cannot be
+    located on disk, or because the audit-marker append itself raises
+    ``OSError``. There is no status line to be "first" on any of those six
+    paths.
+
+    - ``status`` is ``"error"`` -- never a passing status line -- when the
+      resolved config cannot produce a meaningful check at all: a
+      configured ``identifier_field`` that matches zero records in a
+      canonical source (a typo, or an empty canonical set for any other
+      reason); the gate configured with a non-empty ``canonical_sources``
+      and an empty resolved ``scan`` list; a fixture (canonical source or
+      scan target) carrying a malformed in-fixture ``allow_missing``
+      marker (wrong shape, or a missing/empty ``reason``); an
+      ``allow_missing`` marker attached to a record whose configured
+      ``identifier_field`` resolves no value (spec 4.7 bullet 5,
+      E6-F1-S1-T2); or ``extract_source_literals`` enabled with zero
+      classified source files in scope (spec 4.7 bullet 4, E6-F2-S1-T1 --
+      see ``fixture_consistency.FixtureConsistencyConfigError``'s own
+      docstring for the authoritative five-path enumeration). All five
+      raise a ``fixture_consistency.FixtureConsistencyConfigError``
+      (checked before any file is read for the empty-scan case; discovered
+      mid-parse of the offending fixture for the two marker cases) and are
+      caught here, printed as the one-line ``ERROR: ...`` diagnostic on
+      stderr (it names the problem -- e.g. ``identifier field 'idd'
+      matched zero records in catalog.json`` -- rather than prescribing a
+      fix; the message's file/field names are themselves the actionable
+      detail), exit 1. The status line's ``findings`` is hard-coded ``0``
+      on this path -- any ``FixtureFinding``s already accumulated for
+      canonical sources processed before the raise (e.g. a ``load_error``
+      on an earlier source) are discarded, not reported, since the run as
+      a whole never reached a meaningful findings-based verdict.
+    - ``status`` is ``"fail"`` when the check ran to completion and found at
+      least one ATTRIBUTABLE blocking finding -- a ``kind`` in
+      ``fixture_consistency.BLOCKING_FINDING_KINDS`` (``missing_key``,
+      ``coverage_shortfall``, ``load_error``) that
+      :func:`_fixture_finding_is_attributable` does not exclude (see the
+      Attribution paragraph below) -- ``load_error`` now also covers a
+      canonical/scan file configured with an extension other than
+      ``.json``/``.yaml``/``.yml`` (spec 4.7 bullet 3; no implicit
+      JSON-parse fallback is attempted for any other extension), exit 1.
+    - ``status`` is ``"pass"`` when the check ran to completion with zero
+      ATTRIBUTABLE blocking findings, exit 0 -- a run whose only findings are
+      informational ``waiver_applied`` entries (spec 4.7 bullet 5,
+      E6-F1-S1-T2: a record's in-fixture ``allow_missing`` marker
+      suppressed what would otherwise have been a ``missing_key`` finding)
+      still passes, because a validly waived record is not an unresolved
+      cross-reference problem (AC-E6-F1-S1-T2-1); so does a run whose only
+      blocking finding(s) are ``missing_key`` findings this command excludes
+      from attribution (spec 4.3; E6-F2-S1-T2 AC-6). The ``"findings"`` count
+      on the status line is the TOTAL finding count (blocking and
+      informational together, i.e. ``len(findings)``), not just the
+      attributable-blocking count -- it tells the reader how many
+      ``[<kind>] ...`` lines to expect below, and every finding (including
+      every applied waiver and every non-attributable blocking finding) is
+      printed on BOTH the pass and the fail path, so nothing this command
+      found is ever silently hidden from the report even when it does not
+      block the gate (AC-E6-F1-S1-T2-2, E6-F2-S1-T2 AC-6).
+
+    Attribution (spec 4.3, D-7; E6-F2-S1-T2 AC-6): this check's SCAN itself
+    stays exactly as described above -- entirely repo-wide, over the
+    workspace-wide configured ``gates.fixture_consistency.canonical_sources``/
+    ``scan`` file set, independent of which unit happens to invoke it, and
+    every finding that scan produces is always printed (see the previous
+    paragraph). Which of those findings can actually BLOCK this run --
+    and, transitively, whether a ``[GATE_PASS fixture_consistency]`` record
+    gets persisted below -- is narrower: a ``missing_key`` finding
+    (:func:`_fixture_finding_is_attributable`) blocks only when the fixture
+    or source file it names is a member of the CALLING unit's own resolved
+    Changes-Manifest scope (``work_unit_scope.resolve_changed_files``, the
+    same shared helper ``check-reachability``/``check-shared-file-impact``
+    use, spec 4.3, AC-9); a ``missing_key`` finding naming a file outside
+    that scope is reported (as above) but never counted toward ``status``,
+    matching spec 4.3's "repo-wide RESULTS, blame only within scope" rule.
+    ``coverage_shortfall`` and ``load_error`` are NOT filtered by scope --
+    both describe a canonical dataset or fixture-file problem that is not
+    naturally "in" any one unit's own changed-file set (a coverage
+    shortfall is a property of the whole canonical source; a load error
+    means the file could not be read AT ALL, so there is no reliable
+    identifier value to attribute it by), so either always blocks whichever
+    unit's run happens to observe it, exactly as before this attribution
+    rule existed.
+
+    Scope hash (spec 4.2, 5.2; design decision, E6-F2-S1-T2): the JSON
+    status line above still carries no ``scope_hash`` field, unlike
+    ``check-reachability``/``check-shared-file-impact`` -- this check's own
+    SCAN remains genuinely repo-wide, not scoped to the calling unit's
+    Changes Manifest, so there is still no meaningful "the scope this run
+    covered" hash to report on the line a human reads. But the
+    ``[GATE_PASS fixture_consistency]`` record persisted below (see the next
+    paragraph) DOES carry a ``scope_hash`` -- computed via the same
+    ``work_unit_scope.resolve_changed_files``/``ScopeResult.scope_hash``
+    the attribution rule above already resolves -- because
+    ``mark-done``'s existing, fully generic
+    ``BacklogManager._check_gate_pass_done_invariant`` recomputes every
+    non-``ancestry`` machine-blocking gate's scope hash the SAME way (over
+    the calling unit's current Changes Manifest file-blob-hashes,
+    ``BacklogManager._recompute_gate_scope_hash``), regardless of which
+    gate wrote the record. A record with no scope hash to compare against
+    could never be validated for freshness by that shared invariant, so a
+    later edit to an in-scope file would never invalidate it (AC-3 would be
+    unsatisfiable) -- the persisted record's scope hash is therefore over
+    the calling unit's own Changes Manifest specifically so
+    ``mark-done``'s existing, ungated recompute logic can validate it,
+    exactly like every other non-``ancestry`` gate, even though the CHECK
+    that earned the record is not itself scoped by that Manifest. A run
+    with an empty resolved scope (``ScopeResult.files`` empty, e.g. a unit
+    whose Changes Manifest is empty) has no scope to persist a hash for, so
+    a passing run in that case persists no record at all (mirrors
+    ``_emit_shared_file_impact_status``'s identical empty-scope
+    skip) -- such a unit can only satisfy ``mark-done``'s requirement for
+    this gate via an operator ``[GATE_WAIVER fixture_consistency]``.
+
+    This command persists a ``[GATE_PASS fixture_consistency]`` record
+    (composed by ``gate_records.compose_gate_pass_record``, the sole
+    authorized builder of that marker text, and appended to the unit's
+    audit trail by ``BacklogManager._append_audit_marker_before_comments``)
+    on every passing run whose resolved scope is non-empty -- closing the
+    gap this docstring used to describe (no command wrote this record at
+    all, leaving an operator waiver as the only route through ``mark-done``
+    for a unit whose repo resolves this gate enabled). ``mark-done`` DOES
+    require a fresh ``[GATE_PASS fixture_consistency]`` record (or operator
+    ``[GATE_WAIVER fixture_consistency]``) whenever
+    ``gates.fixture_consistency`` resolves enabled for the unit's repo:
+    ``constants.GATE_TIERS`` marks ``fixture_consistency`` machine-blocking,
+    and ``BacklogManager._check_gate_pass_done_invariant`` iterates every
+    machine-blocking gate and refuses ``mark-done`` on the missing-record
+    case, matching ``docs/cli-reference.md``'s done-gate section -- this is
+    ALREADY fully generic across every machine-blocking gate (E6-F2-S1-T2
+    adds no gate-specific branch to that invariant at all; it only makes
+    this command a genuine writer for the ``fixture_consistency`` case that
+    invariant already covered).
+
+    Used as review evidence by the test-reviewer agent.
+    """
+    from dataclasses import replace as _replace
+
+    from devbench.config_loader import resolve_gate_config
+    from devbench.fixture_consistency import FixtureConsistencyConfigError, check_fixture_consistency
+
+    resolved = _resolve_fixture_consistency_repo_path(unit_id)
+    if isinstance(resolved, int):
+        return resolved
+    unit, canonical_repo, repo_path = resolved
+
+    fixture_config = RUNTIME_CONFIG.gates.fixture_consistency
+    if not fixture_config.canonical_sources:
+        print(_gate_disabled_line(_FIXTURE_CONSISTENCY_GATE_NAME))
+        return 0
+
+    # `extract_source_literals` is a resolver-managed field (AC-27;
+    # `constants.GATE_FIELD_DEFAULTS["fixture_consistency"]`) -- read it
+    # exclusively through `resolve_gate_config`, never off
+    # `RUNTIME_CONFIG.gates.fixture_consistency` directly (E6-F2-S1-T1
+    # doc_review round-1 D4). `canonical_sources`/`scan` stay read directly
+    # above: they are project/per-repo-only structural config with no
+    # built-in default to resolve against (`constants.py`'s own
+    # `GATE_FIELD_DEFAULTS` docstring), so they are outside AC-27's scope.
+    resolved_gate_config = resolve_gate_config(_FIXTURE_CONSISTENCY_GATE_NAME, canonical_repo, RUNTIME_CONFIG)
+    resolved_extract_source_literals = bool(resolved_gate_config.values["extract_source_literals"])
+    if resolved_extract_source_literals != fixture_config.extract_source_literals:
+        fixture_config = _replace(fixture_config, extract_source_literals=resolved_extract_source_literals)
+
+    try:
+        findings = check_fixture_consistency(repo_path, fixture_config)
+    except FixtureConsistencyConfigError as exc:
+        # The empty-scan-list (322-D05), zero-match-identifier-field
+        # (322-D02/D03), malformed-in-fixture-`allow_missing`-marker,
+        # unmatchable-`allow_missing`-marker (spec 4.7 bullet 5,
+        # E6-F1-S1-T2), and zero-classified-source-files-with-
+        # `extract_source_literals`-enabled (spec 4.7 bullet 4,
+        # E6-F2-S1-T1; see `fixture_consistency.FixtureConsistencyConfigError`'s
+        # own docstring for the authoritative five-path enumeration) config
+        # errors are the ONLY exceptions of this specific type that ever
+        # escape `check_fixture_consistency` -- every parse-time
+        # `ValueError` (malformed JSON/YAML, an unrecognized extension) is
+        # already caught internally and converted into a `load_error`
+        # finding, and none of those is a `FixtureConsistencyConfigError`,
+        # so narrowing the catch to this subclass (rather than the bare
+        # builtin `ValueError`) means an unrelated `ValueError` can never
+        # be mis-handled as a config error here -- it propagates as an
+        # uncaught exception instead, exactly as every other unexpected
+        # failure in this command does.
+        print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, GATE_STATUS_ERROR, 0))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    return _finalize_fixture_consistency_result(unit, unit_id, repo_path, fixture_config, findings)
+
+
+def _finalize_fixture_consistency_result(
+    unit: WorkUnit,
+    unit_id: str,
+    repo_path: Path,
+    fixture_config: "FixtureConsistencyConfig",
+    findings: "list[FixtureFinding]",
+) -> int:
+    """Resolve scope, apply attribution, persist a passing record, and print the verdict.
+
+    Split out of :func:`cmd_check_fixture_consistency` purely to keep that function's
+    return-count within the project's complexity lint budget (mirrors the existing
+    ``_prepare_ancestry_probe_context``-style helpers this module already uses for the
+    same reason) -- resolves ``unit_id``'s scope (spec 4.3, AC-9), applies the
+    attribution rule to *findings* (:func:`_fixture_finding_is_attributable`), persists
+    ``[GATE_PASS fixture_consistency]`` on a passing run with non-empty scope
+    (:func:`_write_gate_pass_record`), and prints the spec 5.2 status
+    line followed by the human-readable findings.
+    """
+    from devbench.fixture_consistency import BLOCKING_FINDING_KINDS
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+    scope_files = frozenset(scope.files)
+
+    blocking_findings = [
+        finding
+        for finding in findings
+        if finding.kind in BLOCKING_FINDING_KINDS and _fixture_finding_is_attributable(finding, scope_files)
+    ]
+    status = GATE_STATUS_FAIL if blocking_findings else GATE_STATUS_PASS
+
+    if status == GATE_STATUS_PASS and scope.files:
+        write_result = _write_gate_pass_record(_FIXTURE_CONSISTENCY_GATE_NAME, unit, unit_id, scope)
+        if write_result is not None:
+            return write_result
+
+    print(_gate_status_line(_FIXTURE_CONSISTENCY_GATE_NAME, status, len(findings)))
+    if status == GATE_STATUS_PASS:
+        sources = ", ".join(source.path for source in fixture_config.canonical_sources)
+        print(f"OK: fixture-catalog cross-reference check passed against canonical source(s): {sources}")
+        _print_fixture_findings(findings)
+        return 0
+
+    print("FAIL: fixture-catalog cross-reference check found issue(s):")
+    _print_fixture_findings(findings)
+    return 1
+
+
+def _print_fixture_findings(findings: "list[FixtureFinding]") -> None:
+    """Print every ``FixtureFinding`` (blocking and informational alike) on its own line.
+
+    Shared by both the pass and the fail branch of ``cmd_check_fixture_consistency``:
+    a ``waiver_applied`` finding (spec 4.7 bullet 5, E6-F1-S1-T2) must stay visible on
+    BOTH paths -- an applied waiver is review evidence regardless of whether the run
+    also happens to contain a blocking finding -- so there is exactly one print loop
+    rather than two copies that could drift.
+    """
+    for finding in findings:
+        print(f"  [{finding.kind}] {finding.message}")
+
+
+def _fixture_finding_is_attributable(finding: "FixtureFinding", scope_files: frozenset[str]) -> bool:
+    """Return whether *finding* can block the CALLING unit's own gate run (spec 4.3, AC-6).
+
+    Mirrors `_shared_file_gate_attributable`'s role for the shared-file-impact gate:
+    this check's own scan is repo-wide (every configured canonical source/scan target,
+    independent of any one unit), but spec 4.3's attribution rule limits which of those
+    repo-wide findings may actually BLOCK a given unit's run to findings that name a
+    file in that unit's own resolved Changes-Manifest scope
+    (`work_unit_scope.ScopeResult.files`).
+
+    SECURITY (security_review, E6-F2-S1-T2 round 5 HIGH): this function used to recover
+    the offending path by re-parsing `finding.message` with a regex anchored on
+    `fixture_consistency._MSG_MISSING_KEY`/`_MSG_SOURCE_LITERAL_MISSING_KEY`'s leading
+    `Fixture '<location>'`/`Source file '<location>'` fragment. That message is free text
+    interpolated into a single-quoted slot with no escaping, so a fixture whose own file
+    name legally contains an apostrophe (`o'brien.json`) truncated the regex capture at
+    the first `'`, producing a path (`tests/fixtures/o`) that is never a member of
+    *scope_files* even when the real file is -- an IN-SCOPE finding was silently
+    misattributed as out-of-scope, which stopped it blocking. `FixtureFinding.location`
+    (see its own docstring) removes that entire re-parsing surface: it is set directly by
+    the producing call site, `_check_scan_targets`/`_check_source_literals`, so there is
+    no free text to mis-split on any character a path may legally contain (apostrophe,
+    colon, newline, `..`, or any other value).
+
+    SECURITY (security_review AND code_review, E6-F2-S1-T2, orchestrator-directed closure
+    of a second bypass reaching the SAME end state as the round-5 HIGH above): `location`
+    and every member of *scope_files* used to be compared with NO canonicalisation --
+    `config_loader` stores a scan target's configured `path` verbatim, so a scan target
+    declared as `./mock.json` or `sub/../mock.json` compared unequal to the SAME file's
+    canonical `mock.json` Manifest spelling, again silently misattributing an in-scope
+    finding as out-of-scope. Both operands are now run through
+    `fixture_consistency.normalize_repo_relative_path` before comparison -- a purely
+    lexical operation (built on `posixpath.normpath`) that never touches the filesystem
+    (so it cannot resolve a symlink and change which unit a finding is attributed to) and
+    never case-folds (so a path differing only in case stays distinct). See that
+    function's own docstring for why an escaping `..` or an absolute path can never be
+    normalised into matching a genuine repo-relative Manifest entry.
+
+    Only `missing_key` findings are scope-filtered at all -- a `coverage_shortfall`
+    describes a whole canonical source's aggregate count, and a `load_error` means the
+    offending file could not even be read, so neither has a single reliable file to
+    attribute by; both remain unconditionally attributable (`True`) regardless of
+    `finding.location`'s value, exactly as before this attribution rule existed. A
+    `missing_key` finding whose `location` is `None` is also treated as attributable
+    (fail-closed, not fail-fast: nothing here aborts early, the run continues and the
+    unparseable finding is simply retained as blocking rather than excused) -- this
+    function must never silently narrow away a finding it cannot actually prove is out
+    of scope (mirrors `_shared_file_gate_attributable`'s identical "cannot attribute
+    away" rule). Today both `missing_key` producers populate `location` unconditionally,
+    so this branch is defensive: it protects against a future third `missing_key`
+    producer that forgets to set the field, not against a parse failure (there is no
+    parse step left to fail).
+    """
+    from devbench.fixture_consistency import FINDING_KIND_MISSING_KEY, normalize_repo_relative_path
+
+    if finding.kind != FINDING_KIND_MISSING_KEY:
+        return True
+    if finding.location is None:
+        return True
+    normalized_scope_files = {normalize_repo_relative_path(path) for path in scope_files}
+    return normalize_repo_relative_path(finding.location) in normalized_scope_files
+
+
+# ---------------------------------------------------------------------------
+# Write-path audit gate (spec `integration-reality-gates-hardening.md`
+# section 4.8; caylent-solutions/devbench-internal-backlog#16; from #321;
+# judge-evidence tier). CLI-ifies the `plugin_helpers` module a
+# `python -c` one-liner previously invoked directly -- spec 4.8 rejects
+# that shape as an unversioned interface -- while keeping `audit_write_path`
+# importable for the `spec-to-backlog` skill's Step 3b narrative.
+# ---------------------------------------------------------------------------
+
+_WRITE_PATH_AUDIT_GATE_NAME: str = "write_path_audit"
+
+
+def _parse_unit_id_and_required_flag_argv(
+    argv: tuple[str, ...], *, verb: str, flag: str, value_placeholder: str
+) -> tuple[str, str] | int:
+    """Parse the shared ``<unit-id> <flag> <value>`` grammar: one positional unit id
+    plus one required flag value (spec 4.8, 4.9(b), Section 14).
+
+    Shared by :func:`cmd_check_write_path` (``verb="check-write-path"``,
+    ``flag="--flag"``, spec 4.8) and :func:`cmd_scaffold_store_factory`
+    (``verb="scaffold-store-factory"``, ``flag="--out"``, spec 4.9(b),
+    E9-F1-S1-T2). Extracted in E9-F1-S1-T2 round 2 (code_review Blocking,
+    DRY): before this extraction, ``scaffold-store-factory`` shipped a
+    second, line-for-line copy of ``check-write-path``'s parser -- same
+    ``args=list(argv)`` scan, same positional list, same empty-token skip,
+    same flag branch via :func:`_consume_gate_verb_flag_value`, same
+    ``arg.startswith("--")`` unknown-flag branch, same
+    ``len(positional) != 1`` check, same empty-value check -- with only the
+    flag literal, one local variable name and two usage strings differing.
+    A THIRD verb needing this identical ``<id> <flag> <value>`` grammar
+    reuses this function directly instead of typing a third copy.
+
+    Args:
+        argv: The verb's raw argv (after the verb token itself).
+        verb: The verb name, used in the two usage-error messages, e.g.
+            ``"check-write-path"``.
+        flag: The required flag's literal spelling, e.g. ``"--flag"``.
+        value_placeholder: The flag value's placeholder in the usage-error
+            messages, e.g. ``"<name>"``.
+
+    Returns:
+        ``(unit_id, value)`` on success. On a usage failure -- a missing or
+        duplicated positional unit id, an unknown flag, or a missing/empty
+        *flag* value -- returns the ``2`` usage-error exit code (already
+        printed to stderr via :func:`_gate_verb_usage_error`), reusing the
+        SAME shared usage-error shape and flag-value consumption
+        ``log-waiver``/``log-newly-reachable`` already own
+        (:func:`_gate_verb_usage_error`, :func:`_consume_gate_verb_flag_value`).
+    """
+    args = list(argv)
+    positional: list[str] = []
+    value = ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == flag:
+            consumed = _consume_gate_verb_flag_value(args, i, flag)
+            if isinstance(consumed, int):
+                return consumed
+            value, i = consumed
+            continue
+        if arg.startswith("--"):
+            return _gate_verb_usage_error(f"unknown flag: {arg}")
+        positional.append(arg)
+        i += 1
+
+    if len(positional) != 1:
+        return _gate_verb_usage_error(f"{verb} requires exactly one unit id: {verb} <id> {flag} {value_placeholder}")
+    if not value:
+        return _gate_verb_usage_error(f"{flag} is required: {verb} <id> {flag} {value_placeholder}")
+    return positional[0], value
+
+
+def cmd_check_write_path(*argv: str) -> int:
+    """Write-path audit gate: check-write-path <unit-id> --flag <name> (spec 4.8; judge-evidence).
+
+    CLI-ifies :func:`devbench.plugin_helpers.permission_flag_writepath.audit_write_path`
+    -- the ``spec-to-backlog`` skill's Step 3b previously invoked it only
+    through a ``python -c`` one-liner (see that module's own docstring),
+    which spec 4.8 rejects as an unversioned interface. ``audit_write_path``
+    stays importable for the skill's own narrative (AC-WP-001); this verb
+    is the versioned surface every OTHER caller (a human, CI, a review
+    judge) should use instead.
+
+    Resolves *unit-id* to its repo through the same shared
+    :func:`_resolve_unit_repo_and_path` helper :func:`cmd_check_reachability`
+    calls directly and :func:`_prepare_shared_file_impact_run` (on behalf of
+    :func:`cmd_check_shared_file_impact`) calls indirectly -- verified
+    against the shipped file, not every gate command: :func:`cmd_check_ancestry`
+    and :func:`cmd_check_fixture_consistency` resolve their unit through a
+    different path (the latter via :func:`_resolve_fixture_consistency_repo_path`)
+    and are NOT callers of this helper. This verb then resolves
+    ``gates.write_path_audit.enabled`` exclusively through
+    :func:`_load_gate_config_or_report` (i.e. ``config_loader.resolve_gate_config``,
+    spec 4.1's single read path) -- never by reaching into raw config. When
+    the gate is disabled or unconfigured for the unit's repo, prints exactly
+    ``{"gate": "write_path_audit", "status": "disabled"}`` and exits 0 (spec
+    4.1, AC-WP-006) before ``--flag`` is ever audited.
+
+    Attribution (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3): once enabled, this
+    verb resolves *unit-id*'s own Changes-Manifest scope through the SAME
+    shared :func:`_resolve_scope_or_report` (i.e.
+    :func:`devbench.work_unit_scope.resolve_changed_files`) every other
+    scope-resolving gate/verb uses, and passes it to :func:`audit_write_path`
+    as its ``scope`` keyword argument. The underlying scan stays repo-wide
+    (this audit reports repo-wide RESULTS: ``verdict``/``mentions``/
+    ``assignment_sites`` in :meth:`WritePathAudit.render`'s header, and the
+    ``verdict``/``findings``/``status`` fields on the spec 5.2 status line
+    below, are ALL unaffected by scope) -- only the itemized findings
+    :meth:`WritePathAudit.render` prints are BLAME-limited to *unit-id*'s
+    own scope, matching the pattern already used by the machine-blocking
+    gates (``_shared_file_gate_attributable``/#318,
+    ``_fixture_finding_is_attributable``/#322): a live write in a file
+    outside this unit's own scope drives the SAME verdict a fully unscoped
+    run would reach, but is never named in the printed findings.
+
+    An enabled run audits ``--flag <name>`` against the resolved repo
+    checkout and prints the spec 5.2 status line as the FIRST stdout line
+    -- ``{"gate": "write_path_audit", "tier": "judge-evidence", "status":
+    "pass"|"fail", "findings": <int>, "flag": "<name>", "verdict": "<verdict>"}``
+    -- followed by the audit's human-readable findings
+    (:meth:`WritePathAudit.render`).
+
+    Verdict-to-status mapping (AC-WP-005, AC-WP-006): ``live`` is
+    ``status="pass"`` (a confirmed runtime write path exists);
+    ``indeterminate`` is ALSO ``status="pass"`` -- an unresolved shape is
+    reported with its evidence lines but never auto-blocks, closing the
+    old always-block-on-unknown behaviour that produced the
+    every-repo-blocks defect (spec 4.8) -- exiting 0 in both cases.
+    ``default``, ``no_write_path`` and ``not_found`` are each
+    ``status="fail"`` (the referenced flag has no verified live write
+    path -- the genuine finding this gate exists to surface), exiting 1.
+
+    Returns:
+        0 when the gate is disabled/unconfigured, or an enabled run's
+        verdict is ``live``/``indeterminate``. 1 when the unit id is
+        unknown, the repo has no configured local path, the gate config
+        fails to load, scope resolution fails (no status line printed in
+        that case; the ERROR is already on stderr), or an enabled run's
+        verdict is ``default``/``no_write_path``/``not_found``. 2 on a
+        usage error (missing/duplicated unit id, unknown flag, or a
+        missing/empty ``--flag`` value).
+    """
+    parsed = _parse_unit_id_and_required_flag_argv(
+        argv, verb="check-write-path", flag="--flag", value_placeholder="<name>"
+    )
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, flag_name = parsed
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _unit, canonical_repo, repo_path = resolved
+
+    gate_config = _load_gate_config_or_report(_WRITE_PATH_AUDIT_GATE_NAME, canonical_repo)
+    if isinstance(gate_config, int):
+        return gate_config
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+
+    from devbench.plugin_helpers.permission_flag_writepath import (
+        VERDICT_INDETERMINATE,
+        VERDICT_LIVE,
+        audit_write_path,
+    )
+
+    audit = audit_write_path(repo_path, flag_name, scope=frozenset(scope.files))
+
+    if audit.verdict in (VERDICT_LIVE, VERDICT_INDETERMINATE):
+        status = GATE_STATUS_PASS
+        findings = 0
+    else:
+        status = GATE_STATUS_FAIL
+        findings = 1
+
+    print(_gate_status_line(_WRITE_PATH_AUDIT_GATE_NAME, status, findings, flag=flag_name, verdict=audit.verdict))
+    print(audit.render())
+
+    return 1 if status == GATE_STATUS_FAIL else 0
 
 
 def _reject_em_dash(field_name: str, text: str) -> int | None:
@@ -5042,6 +9674,478 @@ def _resolve_work_unit_file(unit: WorkUnit) -> Path:
     if not wu_file.exists():
         wu_file = WORKSPACE_ROOT / unit.file_path
     return wu_file
+
+
+def _gate_verb_usage_error(message: str) -> int:
+    """Print ``ERROR: <message>`` to stderr and return exit code 2.
+
+    The exit-2 usage-error shape spec `integration-reality-gates-hardening.md`
+    section 4.9 defines for the structured gate-marker verbs (``log-waiver``;
+    mirrored by ``log-newly-reachable``, E2-F4-S1-T2: "log-newly-reachable
+    mirrors these semantics for its fields"): every usage failure -- an
+    unknown judge/gate name, an empty required field, or a machine-blocking
+    gate waived without ``--operator`` -- exits 2 naming the offending
+    argument. :func:`_parse_unit_id_and_required_flag_argv` (spec 4.8,
+    4.9(b), Section 14) is a THIRD caller, shared by BOTH
+    ``check-write-path`` (spec 4.8) and ``scaffold-store-factory`` (spec
+    4.9(b), E9-F1-S1-T2): ``check-write-path`` is a gate CHECK verb and
+    ``scaffold-store-factory`` is a generator verb -- neither is one of the
+    structured gate-MARKER verbs section 4.9 scopes this shape to -- their
+    use here is an incidental reuse of the same exit-2 shape for their own
+    (unrelated) usage grammars, not a claim that either is a gate-marker
+    verb.
+    Centralising the shape here means all four verbs' usage errors can
+    never drift (their argument sets differ, but the exit code and stderr
+    shape must not). "Four" counts VERBS (log-waiver, log-newly-reachable,
+    check-write-path, scaffold-store-factory), not calling functions --
+    counting call sites by grep
+    yields a larger, unrelated number, and the count-per-verb is not
+    uniform: ``log-waiver`` and ``log-newly-reachable`` each reach this
+    helper from TWO functions of their own (a ``_parse_*_argv`` grammar
+    function and a separate ``_validate_*_semantics`` function),
+    while ``check-write-path`` and ``scaffold-store-factory`` SHARE exactly
+    ONE function, :func:`_parse_unit_id_and_required_flag_argv`
+    (E9-F1-S1-T2 round 2, code_review Blocking DRY fix: extracted after
+    ``scaffold-store-factory`` shipped as a line-for-line copy of
+    ``check-write-path``'s own parser) -- their only other route here
+    is through the SHARED :func:`_consume_gate_verb_flag_value` helper, not
+    a second dedicated function of their own, since neither has a semantics
+    validation step beyond argument parsing.
+
+    Args:
+        message: Already names the offending argument, e.g. ``"--reason is
+            required and must be non-empty"``.
+
+    Returns:
+        ``2``.
+    """
+    print(f"ERROR: {message}", file=sys.stderr)
+    return 2
+
+
+def _consume_gate_verb_flag_value(args: list[str], i: int, flag: str) -> tuple[str, int] | int:
+    """Return ``(value, next_index)`` for *flag*'s value at ``args[i + 1]``.
+
+    Shared by every flag-scanning function that needs the "flag requires a
+    value" usage error: :func:`_scan_log_waiver_flags`
+    (``--gate``/``--target``/``--reason``) and
+    :func:`_scan_log_newly_reachable_flags` (``--path``/``--method``/``--result``)
+    behind the two structured gate-marker verbs, and
+    :func:`_parse_unit_id_and_required_flag_argv` behind BOTH the
+    ``check-write-path`` gate CHECK verb (``--flag``, spec 4.8) and the
+    ``scaffold-store-factory`` generator verb (``--out``, spec 4.9(b)) -- so
+    the value-consumption logic
+    has exactly one definition across all three callers instead of being
+    duplicated per verb (E2-F4-S1-T2 REFACTOR: was
+    ``_consume_log_waiver_flag_value``, generalised once
+    ``log-newly-reachable`` needed the identical behaviour; a third,
+    unrelated-verb caller followed in E7-F1-S1-T1 and was itself
+    generalised in E9-F1-S1-T2 round 2 to serve a second, unrelated verb --
+    ``scaffold-store-factory`` -- instead of that verb duplicating its own
+    26-line grammar parser).
+
+    Returns:
+        ``(value, i + 2)`` on success, or the ``2`` usage-error exit code
+        (already printed to stderr via :func:`_gate_verb_usage_error`) when
+        *flag* has no following token or the following token is empty.
+    """
+    if i + 1 >= len(args) or not args[i + 1]:
+        return _gate_verb_usage_error(f"{flag} requires a value")
+    return args[i + 1], i + 2
+
+
+def _scan_log_waiver_flags(argv: tuple[str, ...]) -> tuple[list[str], str, str, str, bool] | int:
+    """Scan ``log-waiver``'s argv into positionals plus its four flags.
+
+    Returns:
+        ``(positional, gate, target, reason, operator)`` on success (empty
+        string for any flag not supplied). On a missing flag value, returns
+        the ``2`` usage-error exit code already printed to stderr.
+    """
+    positional: list[str] = []
+    gate = ""
+    target = ""
+    reason = ""
+    operator = False
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg in ("--gate", "--target", "--reason"):
+            consumed = _consume_gate_verb_flag_value(args, i, arg)
+            if isinstance(consumed, int):
+                return consumed
+            value, i = consumed
+            if arg == "--gate":
+                gate = value
+            elif arg == "--target":
+                target = value
+            else:
+                reason = value
+            continue
+        if arg == "--operator":
+            operator = True
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+    return positional, gate, target, reason, operator
+
+
+def _parse_log_waiver_argv(
+    argv: tuple[str, ...],
+) -> tuple[str, str, str, str, str, bool] | int:
+    """Parse ``log-waiver <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]``.
+
+    Returns:
+        ``(judge, unit_id, gate, target, reason, operator)`` on success.
+        On a usage error (missing positional, missing/empty flag value),
+        prints an ``ERROR: ...`` naming the offending argument via
+        :func:`_gate_verb_usage_error` and returns ``2`` for the caller to
+        return directly.
+    """
+    scanned = _scan_log_waiver_flags(argv)
+    if isinstance(scanned, int):
+        return scanned
+    positional, gate, target, reason, operator = scanned
+
+    if len(positional) < 2:
+        return _gate_verb_usage_error(
+            "log-waiver requires <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]"
+        )
+    judge, unit_id = positional[0], positional[1]
+
+    if not gate:
+        return _gate_verb_usage_error("--gate is required")
+    if not target or not target.strip():
+        return _gate_verb_usage_error("--target is required and must be non-empty")
+    if not reason or not reason.strip():
+        return _gate_verb_usage_error("--reason is required and must be non-empty")
+
+    return judge, unit_id, gate, target, reason, operator
+
+
+def _validate_log_waiver_semantics(judge: str, gate: str, operator: bool) -> int | None:
+    """Validate ``<judge>``/``--gate`` against their vocabularies and the machine-blocking/``--operator`` rule.
+
+    Args:
+        judge: The ``<judge>`` positional argument.
+        gate: The ``--gate`` flag value.
+        operator: Whether ``--operator`` was supplied.
+
+    Returns:
+        The ``2`` usage-error exit code (already printed to stderr) on the
+        first violation, or ``None`` when the combination is valid.
+    """
+    if judge not in ALL_REQUIRED_JUDGE_NAMES:
+        valid = ", ".join(sorted(ALL_REQUIRED_JUDGE_NAMES))
+        return _gate_verb_usage_error(f"unknown judge {judge!r}; valid choices are: {valid}.")
+
+    if gate not in GATE_TIERS:
+        valid = ", ".join(sorted(GATE_TIERS))
+        return _gate_verb_usage_error(f"--gate names an unknown gate {gate!r}; declared gates are: {valid}.")
+
+    if GATE_TIERS[gate] == GATE_TIER_MACHINE_BLOCKING and not operator:
+        return _gate_verb_usage_error(
+            f"--operator is required to waive machine-blocking gate {gate!r} "
+            "(spec Section 3.6: the operator is the only waiver authority for a machine-blocking gate)."
+        )
+
+    return None
+
+
+def cmd_log_waiver(*argv: str) -> int:
+    """Record a structured ``[GATE_WAIVER <gate>]`` waiver marker (spec 4.9, 5.3).
+
+    Usage::
+
+        log-waiver <judge> <unit-id> --gate <g> --target <t> --reason <r> [--operator]
+
+    Writes ``[GATE_WAIVER <gate>] <iso-utc> <target> <operator|executor>
+    <reason>`` (spec 5.3 field order, composed by
+    ``devbench.backlog.manager.compose_gate_waiver_record`` -- the sole
+    authorized builder, mirroring ``devbench.gate_records.compose_gate_pass_record``'s
+    role for ``[GATE_PASS]``) into the unit's ``## TDD Cycle Log`` section
+    (via ``BacklogManager._append_audit_marker_before_comments``), the audit
+    surface that survives every review judge's ``read-unit --strip-comments``
+    Evidence fetch (PM-6 evidence-horizon rule, E2-F3-S1-T2). ``## Comments``
+    itself is stripped by that fetch and would make the marker invisible to
+    the very judges spec 3.6 says must weigh it.
+
+    Trust model (spec Section 3.6): the operator is the only waiver
+    authority for a machine-blocking gate
+    (``constants.GATE_TIER_MACHINE_BLOCKING``); a machine-blocking gate
+    waived without ``--operator`` is a usage error. A judge-evidence gate
+    accepts either attribution.
+
+    Args:
+        argv: ``<judge> <unit-id> --gate <g> --target <t> --reason <r>
+            [--operator]``. ``<judge>`` must be one of the five canonical
+            review judges (``constants.ALL_REQUIRED_JUDGE_NAMES`` -- the
+            same vocabulary ``log-verdict`` validates against, per spec
+            4.9's "single source of truth" requirement). ``--reason`` is
+            validated by ``_validate_agent_free_text`` (em-dash, control
+            characters, bracketed TDD-phase tags all rejected).
+
+    Returns:
+        ``0`` on success (the marker was written; stdout carries a JSON
+        summary). ``1`` when the unit does not exist, or when ``--reason``
+        fails the free-text boundary validation. ``2`` (usage error, naming
+        the offending argument) when ``<judge>`` or ``--gate`` names an
+        unknown value, a required field is missing or empty, or a
+        machine-blocking gate is waived without ``--operator``.
+    """
+    parsed = _parse_log_waiver_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    judge, unit_id, gate, target, reason, operator = parsed
+
+    rc = _validate_log_waiver_semantics(judge, gate, operator)
+    if rc is not None:
+        return rc
+
+    rc = _validate_agent_free_text("reason", reason)
+    if rc is not None:
+        return rc
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    attribution = GATE_WAIVER_ATTRIBUTION_OPERATOR if operator else GATE_WAIVER_ATTRIBUTION_EXECUTOR
+    marker = compose_gate_waiver_record(gate, target, attribution, reason)
+    BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
+    logger.info("GATE_WAIVER %s recorded for %s (judge=%s, attribution=%s)", gate, unit_id, judge, attribution)
+    print(
+        json.dumps(
+            {
+                "unit_id": unit_id,
+                "judge": judge,
+                "gate": gate,
+                "target": target,
+                "attribution": attribution,
+            }
+        )
+    )
+    return 0
+
+
+# Accepted `--method` values for `log-newly-reachable` (spec 4.9(a), 5.3; PR #320's
+# proposed schema; AC-E2-F4-S1-T2-5). Named constants (not inline literals) so the CLI
+# and its docs (`docs/cli-reference.md`) can never drift, mirroring how `GATE_TIERS` /
+# `ALL_REQUIRED_JUDGE_NAMES` back `log-waiver`'s vocabularies. The four values mirror
+# `docs/newly-reachable-paths.md`'s "What counts as live verification" categories:
+# exercising the path by hand, or via one of this repo's three test tiers.
+NEWLY_REACHABLE_METHOD_MANUAL: str = "manual"
+NEWLY_REACHABLE_METHOD_UNIT_TEST: str = "unit_test"
+NEWLY_REACHABLE_METHOD_INTEGRATION_TEST: str = "integration_test"
+NEWLY_REACHABLE_METHOD_FUNCTIONAL_TEST: str = "functional_test"
+NEWLY_REACHABLE_METHODS: frozenset[str] = frozenset(
+    {
+        NEWLY_REACHABLE_METHOD_MANUAL,
+        NEWLY_REACHABLE_METHOD_UNIT_TEST,
+        NEWLY_REACHABLE_METHOD_INTEGRATION_TEST,
+        NEWLY_REACHABLE_METHOD_FUNCTIONAL_TEST,
+    }
+)
+
+# Accepted `--result` values for `log-newly-reachable` (spec 4.9(a), 5.3;
+# AC-E2-F4-S1-T2-5): the path either behaves as expected once reached, or the live
+# verification surfaced a new, independent defect (`docs/newly-reachable-paths.md`:
+# "If verification surfaces a new, independent defect in a newly-reachable path, the
+# executor does not silently mark the task done").
+NEWLY_REACHABLE_RESULT_VERIFIED: str = "verified"
+NEWLY_REACHABLE_RESULT_BROKEN: str = "broken"
+NEWLY_REACHABLE_RESULTS: frozenset[str] = frozenset({NEWLY_REACHABLE_RESULT_VERIFIED, NEWLY_REACHABLE_RESULT_BROKEN})
+
+
+def _scan_log_newly_reachable_flags(argv: tuple[str, ...]) -> tuple[list[str], str, str, str] | int:
+    """Scan ``log-newly-reachable``'s argv into positionals plus its three flags.
+
+    Returns:
+        ``(positional, path, method, result)`` on success (empty string for any flag
+        not supplied). On a missing flag value, returns the ``2`` usage-error exit
+        code already printed to stderr.
+    """
+    positional: list[str] = []
+    path = ""
+    method = ""
+    result = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg in ("--path", "--method", "--result"):
+            consumed = _consume_gate_verb_flag_value(args, i, arg)
+            if isinstance(consumed, int):
+                return consumed
+            value, i = consumed
+            if arg == "--path":
+                path = value
+            elif arg == "--method":
+                method = value
+            else:
+                result = value
+            continue
+        positional.append(arg)
+        i += 1
+    return positional, path, method, result
+
+
+def _parse_log_newly_reachable_argv(
+    argv: tuple[str, ...],
+) -> tuple[str, str, str, str] | int:
+    """Parse ``log-newly-reachable <unit-id> --path <p> --method <m> --result <r>``.
+
+    Returns:
+        ``(unit_id, path, method, result)`` on success. On a usage error (missing
+        positional, missing/empty flag value), prints an ``ERROR: ...`` naming the
+        offending argument via :func:`_gate_verb_usage_error` and returns ``2`` for
+        the caller to return directly.
+    """
+    scanned = _scan_log_newly_reachable_flags(argv)
+    if isinstance(scanned, int):
+        return scanned
+    positional, path, method, result = scanned
+
+    if len(positional) < 1:
+        return _gate_verb_usage_error("log-newly-reachable requires <unit-id> --path <p> --method <m> --result <r>")
+    unit_id = positional[0]
+
+    if not path or not path.strip():
+        return _gate_verb_usage_error("--path is required and must be non-empty")
+    if not method:
+        return _gate_verb_usage_error("--method is required")
+    if not result:
+        return _gate_verb_usage_error("--result is required")
+
+    return unit_id, path, method, result
+
+
+def _validate_log_newly_reachable_semantics(method: str, result: str) -> int | None:
+    """Validate ``--method``/``--result`` against their declared vocabularies.
+
+    Args:
+        method: The ``--method`` flag value.
+        result: The ``--result`` flag value.
+
+    Returns:
+        The ``2`` usage-error exit code (already printed to stderr) on the first
+        violation, or ``None`` when both are valid.
+    """
+    if method not in NEWLY_REACHABLE_METHODS:
+        valid = ", ".join(sorted(NEWLY_REACHABLE_METHODS))
+        return _gate_verb_usage_error(f"--method names an unknown method {method!r}; valid choices are: {valid}.")
+
+    if result not in NEWLY_REACHABLE_RESULTS:
+        valid = ", ".join(sorted(NEWLY_REACHABLE_RESULTS))
+        return _gate_verb_usage_error(f"--result names an unknown result {result!r}; valid choices are: {valid}.")
+
+    return None
+
+
+def compose_newly_reachable_record(path: str, method: str, result: str) -> str:
+    """Compose the single-line ``[NEWLY_REACHABLE] <path> <method> <result>`` marker (spec 5.3).
+
+    The sole authorized builder of the ``[NEWLY_REACHABLE]`` marker text: ``cli.cmd_log_newly_reachable``
+    calls this function rather than formatting the tag itself, mirroring
+    ``devbench.backlog.manager.compose_gate_waiver_record``'s role for ``[GATE_WAIVER]``.
+
+    Args:
+        path: The specific code path made newly reachable. Must be a single
+            non-empty token with no whitespace -- the marker grammar is
+            space-delimited positional fields, so a whitespace-bearing path would
+            corrupt the field boundary on read-back.
+        method: One of :data:`NEWLY_REACHABLE_METHODS`.
+        result: One of :data:`NEWLY_REACHABLE_RESULTS`.
+
+    Returns:
+        The exact one-line marker text (no trailing newline).
+
+    Raises:
+        ValueError: If ``path`` is empty or contains whitespace, ``method`` is not
+            declared, or ``result`` is not declared. The CLI boundary
+            (:func:`_parse_log_newly_reachable_argv`,
+            :func:`_validate_log_newly_reachable_semantics`) already rejects these
+            cases before this function is ever called from :func:`cmd_log_newly_reachable`;
+            these checks are defense in depth for any other caller.
+    """
+    if not path or any(ch.isspace() for ch in path):
+        raise ValueError(f"path must be a single non-empty token with no whitespace; got {path!r}.")
+    if method not in NEWLY_REACHABLE_METHODS:
+        valid_methods = ", ".join(sorted(NEWLY_REACHABLE_METHODS))
+        raise ValueError(f"Unknown method {method!r}; declared methods are: {valid_methods}.")
+    if result not in NEWLY_REACHABLE_RESULTS:
+        valid_results = ", ".join(sorted(NEWLY_REACHABLE_RESULTS))
+        raise ValueError(f"Unknown result {result!r}; declared results are: {valid_results}.")
+
+    return f"[NEWLY_REACHABLE] {path} {method} {result}"
+
+
+def cmd_log_newly_reachable(*argv: str) -> int:
+    """Record a structured ``[NEWLY_REACHABLE]`` marker (spec 4.9(a), 5.3; AC-21).
+
+    Usage::
+
+        log-newly-reachable <unit-id> --path <p> --method <m> --result <r>
+
+    Writes ``[NEWLY_REACHABLE] <path> <method> <result>`` (spec 5.3 field order,
+    composed by :func:`compose_newly_reachable_record` -- the sole authorized
+    builder) into the unit's ``## TDD Cycle Log`` section (via
+    ``BacklogManager._append_audit_marker_before_comments``, the same insertion
+    point ``log-waiver`` uses), the audit surface that survives every review
+    judge's ``read-unit --strip-comments`` Evidence fetch (PM-6 evidence-horizon
+    rule, E2-F3-S1-T2). ``## Comments`` itself is stripped by that fetch, so the
+    prose ``[NEWLY_REACHABLE]`` convention ``docs/newly-reachable-paths.md``
+    previously documented (written via ``log-comment`` into ``## Comments``) was
+    invisible to the very judges spec 4.3 requires to weigh it; this verb replaces
+    that convention with a validated, judge-visible structured marker.
+
+    Args:
+        argv: ``<unit-id> --path <p> --method <m> --result <r>``. ``--method``
+            must be one of :data:`NEWLY_REACHABLE_METHODS`; ``--result`` must be
+            one of :data:`NEWLY_REACHABLE_RESULTS`.
+
+    Returns:
+        ``0`` on success (the marker was written; stdout carries a JSON summary).
+        ``1`` when the unit does not exist. ``2`` (usage error, naming the
+        offending argument) when a required field is missing or empty, or
+        ``--method``/``--result`` names an unknown value.
+    """
+    parsed = _parse_log_newly_reachable_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, path, method, result = parsed
+
+    rc = _validate_log_newly_reachable_semantics(method, result)
+    if rc is not None:
+        return rc
+
+    parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+    units = parser.parse_index()
+    unit = _find_unit(units, unit_id)
+    if unit is None:
+        print(f"ERROR: Work unit '{unit_id}' not found in backlog", file=sys.stderr)
+        return 1
+
+    wu_file = _resolve_work_unit_file(unit)
+    marker = compose_newly_reachable_record(path, method, result)
+    BacklogManager()._append_audit_marker_before_comments(wu_file, marker)
+
+    logger.info("NEWLY_REACHABLE recorded for %s (path=%s, method=%s, result=%s)", unit_id, path, method, result)
+    print(json.dumps({"unit_id": unit_id, "path": path, "method": method, "result": result}))
+    return 0
 
 
 def build_red_observed_message(exit_code: int | None, test_node_id: str, failure_digest: str) -> str:
@@ -7203,8 +12307,50 @@ def _handle_finalize_ci_result(
     return 2
 
 
-def cmd_git_ops_finalize(repo_name: str) -> int:
+def _parse_git_ops_finalize_argv(argv: tuple[str, ...] | list[str]) -> tuple[str, str] | int:
+    """Parse ``git-ops-finalize <repo> [--provenance <path>]`` argv.
+
+    Returns a ``(repo_name, provenance_flag)`` tuple on success, where
+    ``provenance_flag`` is the empty string when ``--provenance`` was not
+    passed (D-17: the flag is optional -- ``git_ops.provenance_path`` alone
+    suffices for unattended ``auto_finalize`` runs). Returns an integer
+    non-zero exit code on parse error, with the error message already
+    written to stderr.
+    """
+    repo_name = ""
+    provenance_flag = ""
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--provenance":
+            if i + 1 >= len(args) or not args[i + 1]:
+                print("ERROR: --provenance requires a value", file=sys.stderr)
+                return 1
+            provenance_flag = args[i + 1]
+            i += 2
+            continue
+        if not repo_name:
+            repo_name = arg
+            i += 1
+            continue
+        print(f"ERROR: unexpected argument {arg!r}", file=sys.stderr)
+        return 1
+    if not repo_name:
+        print("ERROR: git-ops-finalize requires <repo> [--provenance <path>]", file=sys.stderr)
+        return 1
+    return repo_name, provenance_flag
+
+
+def cmd_git_ops_finalize(*argv: str) -> int:
     """Push the single branch and create a PR after all deferred commits.
+
+    Usage::
+
+        git-ops-finalize <repo> [--provenance <path>]
 
     Used after all work units are complete in single-branch / defer-PR mode.
     Pushes the accumulated commits to the remote and creates a pull request.
@@ -7218,9 +12364,25 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
     - FAILED_UNKNOWN: blocks the most-recent in-review / done task, returns 2.
     - TIMEOUT: logs ``[CI_WATCH_TIMEOUT]`` and returns 2 without status changes.
 
+    The PR body is composed by
+    :meth:`~devbench.github.git_ops.GitOpsService.compose_finalize_pr_body`
+    (spec 4.13; D-17). ``--provenance <path>`` overrides
+    ``git_ops.provenance_path`` for this single invocation; when neither is
+    set, the body is the plain body ``git-ops-finalize`` has always
+    produced. An unresolvable provenance map (missing, unreadable, invalid
+    JSON, or zero mapped issues) fails loudly (exit 1, naming the path)
+    BEFORE any push happens -- it never silently falls back to the plain
+    body.
+
     Arguments:
-        repo_name: Repository name (short or fully-qualified).
+        argv: ``<repo>`` (required; short or fully-qualified) followed by
+            an optional ``--provenance <path>`` flag.
     """
+    parsed = _parse_git_ops_finalize_argv(argv)
+    if isinstance(parsed, int):
+        return parsed
+    repo_name, provenance_flag = parsed
+
     from devbench.config import DEFER_PR, SINGLE_BRANCH
 
     if not SINGLE_BRANCH:
@@ -7247,11 +12409,35 @@ def cmd_git_ops_finalize(repo_name: str) -> int:
 
     branch = format_single_branch_name(SINGLE_BRANCH, get_effective_branch_prefix(canonical_repo, RUNTIME_CONFIG))
     pr_title = FINALIZE_PR_TITLE_TEMPLATE.format(branch=branch)
-    pr_body = (
-        f"Accumulated commits from DevBench single-branch execution.\n\nBranch: `{branch}`\nRepo: `{canonical_repo}`"
-    )
+
+    # D-17: --provenance beats git_ops.provenance_path beats the plain-body
+    # default (None). No DEVBENCH_* env override exists for this key.
+    # GitOpsConfig.provenance_path is documented as "relative to the repo
+    # working tree, or absolute" -- anchor a relative value to repo_path
+    # (already resolved above), matching the sibling repo-scoped calls below
+    # (commit_and_push, find_open_pr, create_pr) rather than resolving
+    # against the devbench process CWD, which is the workspace root under an
+    # unattended auto_finalize run and would silently point at the wrong
+    # file in a multi-repo workspace.
+    effective_provenance_raw = provenance_flag or RUNTIME_CONFIG.git_ops.provenance_path
+    provenance_path: Path | None = None
+    if effective_provenance_raw:
+        raw_provenance_path = Path(effective_provenance_raw)
+        provenance_path = raw_provenance_path if raw_provenance_path.is_absolute() else repo_path / raw_provenance_path
 
     ops = GitOpsService()
+
+    try:
+        pr_body = ops.compose_finalize_pr_body(
+            repo=canonical_repo,
+            branch=branch,
+            title=pr_title,
+            provenance_path=provenance_path,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     mgr = BacklogManager()
 
     ops.commit_and_push(
@@ -8817,6 +14003,9 @@ def _should_restart_after_premature_turn_end(restarts_used: int, max_restarts: i
     return True
 
 
+#: Audit markers for the premature-turn-end bounded-restart path. Siblings of
+
+
 class _OrchestrateLoopResult(NamedTuple):
     """Outcome of :func:`_drive_orchestrate_with_quota_resume`.
 
@@ -10174,6 +15363,40 @@ def cmd_prepare_plugin_shadow() -> int:
     return 0
 
 
+def _session_state_file_path(workspace_root: Path, filename: str) -> Path:
+    """Return ``<workspace_root>/.devbench/<filename>``, honouring ``DEVBENCH_SESSION_NAME``.
+
+    When a session name is active, the file lives at:
+    ``<workspace>/.devbench/sessions/<name>/<filename>``
+
+    When no session is active, the file lives at:
+    ``<workspace>/.devbench/<filename>``
+
+    Generalises the per-session ``DEVBENCH_SESSION_NAME`` routing rule (spec
+    4.4.4) that was previously spelled out only inline in
+    :func:`_session_scope_file_path`, so a second, unrelated per-session
+    state file (:func:`_shared_file_impact_verdict_path`) does not
+    reimplement the same session-name resolution and ``..`` path-traversal
+    guard a second time.
+
+    Args:
+        workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
+        filename: The bare filename to place under the resolved directory.
+
+    Returns:
+        The resolved ``Path`` for the current session context.
+
+    Raises:
+        ValueError: If ``DEVBENCH_SESSION_NAME`` contains ``..`` path segments.
+    """
+    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
+    if not session_name:
+        return workspace_root / ".devbench" / filename
+    if ".." in Path(session_name).parts:
+        raise ValueError(f"DEVBENCH_SESSION_NAME contains invalid path segment '..': {session_name!r}")
+    return workspace_root / ".devbench" / "sessions" / session_name / filename
+
+
 def _session_scope_file_path(workspace_root: Path) -> Path:
     """Return the scope.json path, honouring ``DEVBENCH_SESSION_NAME`` when set.
 
@@ -10182,6 +15405,12 @@ def _session_scope_file_path(workspace_root: Path) -> Path:
 
     When no session is active, scope.json lives at:
     ``<workspace>/.devbench/scope.json``
+
+    Delegates to :func:`_session_state_file_path` for the routing rule
+    itself (see that function's docstring); this wrapper exists so every
+    existing caller keeps its scope.json-specific name and return-path
+    parity with :func:`_scope_file_path` is preserved for the no-session
+    case (both resolve to ``<workspace_root>/.devbench/scope.json``).
 
     Args:
         workspace_root: The workspace root (typically ``WORKSPACE_ROOT``).
@@ -10192,12 +15421,7 @@ def _session_scope_file_path(workspace_root: Path) -> Path:
     Raises:
         ValueError: If ``DEVBENCH_SESSION_NAME`` contains ``..`` path segments.
     """
-    session_name = os.environ.get("DEVBENCH_SESSION_NAME", "").strip()
-    if not session_name:
-        return _scope_file_path(workspace_root)
-    if ".." in Path(session_name).parts:
-        raise ValueError(f"DEVBENCH_SESSION_NAME contains invalid path segment '..': {session_name!r}")
-    return workspace_root / ".devbench" / "sessions" / session_name / "scope.json"
+    return _session_state_file_path(workspace_root, "scope.json")
 
 
 def _scope_set(include: str, exclude: str, workspace_root: Path) -> int:
@@ -13009,6 +18233,15 @@ def _canonicalize_add_dep_row(
         atomic_write_text(blocked_file, content.replace(placeholder, real_row, 1))
 
 
+# Canonical work-unit-task-id grammar shared by every ``cli.py`` argv
+# parser that validates a bare task id (``add-dep``, ``wire-gate``). A
+# single module-level compiled constant so the two copies can never drift
+# from one another (DRY). ``src/devbench/plugin_helpers/backlog_post_processor.py``
+# keeps its own independent ``_TASK_ID_RE`` -- that module has no import
+# relationship with ``cli.py`` and is out of scope for this consolidation.
+_WORK_UNIT_TASK_ID_RE: re.Pattern[str] = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+
+
 def _parse_add_dep_argv(argv: tuple[str, ...], verb: str = "add-dep") -> tuple[str | None, str, str]:
     """Parse the two-task-id-plus-``--reason`` grammar shared by add-dep and remove-dep.
 
@@ -13019,7 +18252,7 @@ def _parse_add_dep_argv(argv: tuple[str, ...], verb: str = "add-dep") -> tuple[s
     Returns ``(blocked_id, blocker_id, reason)``. Returns ``(None, "", "")``
     after printing a usage error to stderr so the caller can ``return 1``.
     """
-    task_id_re = re.compile(r"^E\d+-F\d+-S\d+-T\d+$")
+    task_id_re = _WORK_UNIT_TASK_ID_RE
     positional: list[str] = []
     reason = ""
     i = 0
@@ -13056,6 +18289,293 @@ def _parse_add_dep_argv(argv: tuple[str, ...], verb: str = "add-dep") -> tuple[s
             )
             return None, "", ""
     return blocked_id, blocker_id, reason
+
+
+# The canonical title suffix `spec-to-backlog`'s "Authoring the ancestry-gate
+# task" template (plugin-authoring/devbench-authoring/skills/spec-to-backlog/
+# SKILL.md) gives every generated gate task: `# E0-F<N>-S1-T1: Verify
+# <dependency-name> dependency has merged (ancestry gate)`. `wire-gate` uses
+# this marker -- not the task's `## Task Type:` line, which a fresh parse of
+# an in-progress edit cannot rely on -- to recognise an existing dependency
+# edge as a PRIOR gate-task wiring rather than a genuine upstream
+# prerequisite (spec 4.9's "already wired to a different gate task" check).
+_ANCESTRY_GATE_TASK_TITLE_MARKER: str = "(ancestry gate)"
+
+
+def _is_ancestry_gate_task(unit_id: str, units_by_id: dict[str, WorkUnit]) -> bool:
+    """Return True if ``unit_id`` names a unit carrying the ancestry-gate title marker."""
+    unit = units_by_id.get(unit_id)
+    return unit is not None and _ANCESTRY_GATE_TASK_TITLE_MARKER in unit.title
+
+
+def _classify_wire_gate_candidate(
+    unit: WorkUnit, gate_task_id: str, units_by_id: dict[str, WorkUnit]
+) -> tuple[str, str]:
+    """Classify ``unit`` for ``--blocks-roots`` fan-in against ``gate_task_id``.
+
+    Returns ``(classification, detail)`` where ``classification`` is one of:
+
+    - ``"root"``: no OTHER real (non-``gate_task_id``) upstream dependency --
+      eligible for the fan-in edge. ``detail`` is ``""``.
+    - ``"not_root"``: at least one genuine, non-gate upstream dependency --
+      not a DAG root; excluded from wiring, not an error. ``detail`` is ``""``.
+    - ``"conflict"``: the unit already carries a dependency edge to a
+      DIFFERENT ancestry-gate task (spec 4.9). ``detail`` is that task's id.
+
+    Re-running ``wire-gate <gate_task_id> --blocks-roots`` on an
+    already-wired root is idempotent: that root's only remaining "real" dep
+    is ``gate_task_id`` itself, which is filtered out below, so it is still
+    classified ``"root"`` and the (already-idempotent) edge write is a no-op.
+    """
+    real_deps = [d for d in unit.dependencies if d.lower() != "none" and d != gate_task_id]
+    for dep_id in real_deps:
+        if _is_ancestry_gate_task(dep_id, units_by_id):
+            return "conflict", dep_id
+    if real_deps:
+        return "not_root", ""
+    return "root", ""
+
+
+def _parse_wire_gate_argv(argv: tuple[str, ...]) -> tuple[str | None, bool]:
+    """Parse the ``wire-gate`` flag grammar: ``<gate-task-id> --blocks-roots``.
+
+    Returns ``(gate_task_id, has_blocks_roots)``. Returns ``(None, False)``
+    after printing a usage error to stderr when the positional id is
+    missing/malformed, an unknown flag is given, or an extra positional
+    appears -- the caller returns 2 in that case. When the id parses but
+    ``--blocks-roots`` is absent, returns ``(gate_task_id, False)`` so the
+    caller can print the specific missing-flag message and return 2.
+    """
+    task_id_re = _WORK_UNIT_TASK_ID_RE
+    positional: list[str] = []
+    has_blocks_roots = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg:
+            i += 1
+            continue
+        if arg == "--blocks-roots":
+            has_blocks_roots = True
+            i += 1
+            continue
+        if arg.startswith("--"):
+            print(f"ERROR: unknown flag: {arg}", file=sys.stderr)
+            return None, False
+        positional.append(arg)
+        i += 1
+
+    if len(positional) != 1:
+        print(
+            "ERROR: wire-gate requires exactly one gate-task id: wire-gate <gate-task-id> --blocks-roots",
+            file=sys.stderr,
+        )
+        return None, False
+    gate_task_id = positional[0]
+    if not task_id_re.match(gate_task_id):
+        print(
+            f"ERROR: wire-gate: gate task id '{gate_task_id}' does not match E<N>-F<N>-S<N>-T<N> format",
+            file=sys.stderr,
+        )
+        return None, False
+    return gate_task_id, has_blocks_roots
+
+
+class _WireGateError(Exception):
+    """Internal control-flow exception carrying ``wire-gate``'s exit code + message.
+
+    ``cmd_wire_gate``'s helpers raise this the moment ANY spec-4.9
+    precondition fails (bad backlog index, unknown/terminal gate task, a
+    conflicting root, a missing root file, or a write failure) so the top
+    level command function has exactly one place that prints the error and
+    returns the exit code -- keeping ``cmd_wire_gate`` itself within the
+    branch/return complexity budget instead of an early-return per check.
+    """
+
+    def __init__(self, exit_code: int, message: str) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.message = message
+
+
+def _prepare_wire_gate(gate_task_id: str) -> tuple[WorkUnit, list[WorkUnit]]:
+    """Load the backlog, validate the gate task, and compute its DAG roots.
+
+    Raises :class:`_WireGateError` the moment any spec-4.9 precondition
+    fails, BEFORE any dependency edge is written: an unreadable backlog
+    index (including a root's ``.md`` file missing from disk --
+    ``BacklogParser.parse_index`` eagerly resolves every indexed unit's
+    file up front, so a missing root file surfaces here, not as a
+    separate later check), an unknown or already-terminal gate task, or a
+    root already wired to a DIFFERENT ancestry-gate task.
+    """
+    try:
+        parser = BacklogParser(backlog_root=BACKLOG_ROOT, backlog_index=BACKLOG_INDEX)
+        units = parser.parse_index()
+    except (FileNotFoundError, ValueError) as exc:
+        raise _WireGateError(1, f"wire-gate: cannot read backlog index: {exc}") from exc
+
+    units_by_id = {u.id: u for u in units}
+    gate_unit = units_by_id.get(gate_task_id)
+    if gate_unit is None:
+        raise _WireGateError(1, f"gate task '{gate_task_id}' not found in backlog")
+    if gate_unit.status in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED):
+        raise _WireGateError(
+            1,
+            f"gate task '{gate_task_id}' is already terminal (status={gate_unit.status.value}); "
+            "wiring a dependency on a terminal task is a no-op",
+        )
+
+    roots = _compute_wire_gate_roots(units, gate_task_id, units_by_id)
+    return gate_unit, roots
+
+
+def _is_gate_task_ancestor(unit_id: str, gate_task_id: str) -> bool:
+    """Return True if ``unit_id`` names an Epic/Feature/Story ancestor of ``gate_task_id``.
+
+    Work-unit ids are dash-delimited hierarchical segments (``E<N>``,
+    ``E<N>-F<N>``, ``E<N>-F<N>-S<N>``, ``E<N>-F<N>-S<N>-T<N>``), so
+    ``unit_id`` is an ancestor of ``gate_task_id`` iff ``gate_task_id``
+    starts with ``unit_id`` followed by the ``-`` segment separator --
+    matching the full segment, not merely a string prefix, so ``E1`` is
+    never mistaken for an ancestor of ``E10-F1-S1-T1``.
+
+    Every real ``spec-to-backlog``-generated tree indexes the gate task's
+    own parent Story and Feature (and Epic) as candidates. Without this
+    check ``_compute_wire_gate_roots`` wired the gate task into its own
+    ancestry on every real invocation, violating AC-WIRE-001's "and to no
+    other unit": an Epic/Feature/Story cannot meaningfully depend on one of
+    its own descendant Tasks.
+    """
+    return gate_task_id.startswith(f"{unit_id}-")
+
+
+def _compute_wire_gate_roots(
+    units: list[WorkUnit], gate_task_id: str, units_by_id: dict[str, WorkUnit]
+) -> list[WorkUnit]:
+    """Return every DAG root eligible for ``--blocks-roots`` fan-in, ID-sorted.
+
+    A root is any non-Epic unit (Task, Story, or Feature) that is neither
+    the gate task itself nor one of the gate task's own Epic/Feature/Story
+    ancestors (:func:`_is_gate_task_ancestor`), is not already in a
+    terminal status (``done`` / ``declined``), and has no OTHER real
+    upstream dependency -- see :func:`_classify_wire_gate_candidate`. Units
+    with a genuine unrelated dependency are excluded silently; that is
+    correct DAG-root exclusion, not an error.
+
+    Terminal-status exclusion (AC-WIRE-002): a root that has since reached
+    ``done`` / ``declined`` is dropped from the candidate set entirely
+    rather than wired. ``_write_add_dep_edge`` reuses ``add_dep``, whose
+    ``_block_wired_target`` step unconditionally force-writes ``##
+    Status: blocked`` on every wired unit with no status guard -- without
+    this exclusion, a re-run after a root completed its own work would
+    silently revert that root back to ``blocked``, an exit-0 call that
+    destroys completed work and contradicts the idempotency this verb
+    promises. A root already wired while non-terminal keeps its existing
+    ``## Dependencies`` row; it is simply never a candidate for a NEW write
+    once terminal.
+
+    Raises :class:`_WireGateError` the moment a candidate is already wired
+    to a DIFFERENT ancestry-gate task (spec 4.9), before any write.
+    """
+    roots: list[WorkUnit] = []
+    for unit in sorted(units, key=lambda u: u.id):
+        if (
+            unit.id == gate_task_id
+            or unit.unit_type is WorkUnitType.EPIC
+            or _is_gate_task_ancestor(unit.id, gate_task_id)
+            or unit.status in (WorkUnitStatus.DONE, WorkUnitStatus.DECLINED)
+        ):
+            continue
+        classification, detail = _classify_wire_gate_candidate(unit, gate_task_id, units_by_id)
+        if classification == "conflict":
+            raise _WireGateError(1, f"root '{unit.id}' is already wired to gate task '{detail}'")
+        if classification == "root":
+            roots.append(unit)
+    return roots
+
+
+def _write_wire_gate_edges(gate_task_id: str, gate_unit: WorkUnit, roots: list[WorkUnit]) -> list[str]:
+    """Write the fan-in edge for every root through the managed ``add-dep`` path.
+
+    Reuses :func:`_write_add_dep_edge` -- the same helper ``cmd_add_dep``
+    calls -- so every row lands in the exact canonical form
+    ``validate-backlog`` reads. Raises :class:`_WireGateError` naming the
+    root that failed to wire; already-validated roots wired earlier in this
+    call remain wired (idempotent re-run recovers cleanly).
+    """
+    wired_ids: list[str] = []
+    for root in roots:
+        try:
+            wired = _write_add_dep_edge(
+                backlog_root=BACKLOG_ROOT,
+                backlog_index=BACKLOG_INDEX,
+                blocked_task_id=root.id,
+                blocked_file=root.file_path,
+                blocker_task_id=gate_task_id,
+                blocker_unit=gate_unit,
+                reason=f"wire-gate {gate_task_id} --blocks-roots fan-in",
+            )
+        except (ProposalError, OSError, UnicodeDecodeError) as exc:
+            raise _WireGateError(
+                1, f"wire-gate: failed to wire '{root.id}' to gate task '{gate_task_id}': {exc}"
+            ) from exc
+        if not wired:
+            raise _WireGateError(1, f"wire-gate: failed to wire '{root.id}' to gate task '{gate_task_id}'")
+        wired_ids.append(root.id)
+    return wired_ids
+
+
+def cmd_wire_gate(*argv: str) -> int:
+    """Fan in an ancestry-gate task to every root of the intra-backlog dependency DAG.
+
+    Usage::
+
+        wire-gate <gate-task-id> --blocks-roots
+
+    Spec `integration-reality-gates-hardening.md` section 4.5 (317-D23) /
+    4.9. Replaces the O(N) LLM-authored ``## Dependencies`` row edits
+    `spec-to-backlog` previously prescribed for wiring a generated
+    ancestry-gate task into every root of the intra-backlog dependency DAG
+    with a single mechanical verb: this command computes the DAG roots
+    itself (:func:`_compute_wire_gate_roots`) and writes each edge through
+    the SAME managed dependency path ``cmd_add_dep`` already owns
+    (:func:`_write_add_dep_edge`), so every row lands in the exact canonical
+    form ``validate-backlog``'s Manifest Conflict Rule / dependency scan
+    reads -- it can never drift from hand-typed markdown.
+
+    Fail-fast (spec 4.9): every root is validated BEFORE any write --
+    unknown gate-task id, a root file missing from disk, or a root already
+    wired to a DIFFERENT ancestry-gate task are all reported and this call
+    exits 1 with ZERO dependency edges written for this invocation. Missing
+    ``--blocks-roots`` (the only supported mode today) is a usage error,
+    exit 2.
+
+    Idempotent: re-running with the same ``gate_task_id`` after a prior
+    successful run writes no duplicate rows and exits 0 (the already-wired
+    roots are still classified ``"root"``; the underlying edge write is
+    itself idempotent).
+    """
+    gate_task_id, has_blocks_roots = _parse_wire_gate_argv(argv)
+    if gate_task_id is None:
+        return 2
+    if not has_blocks_roots:
+        print(
+            "ERROR: wire-gate requires --blocks-roots: wire-gate <gate-task-id> --blocks-roots",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        gate_unit, roots = _prepare_wire_gate(gate_task_id)
+        wired_ids = _write_wire_gate_edges(gate_task_id, gate_unit, roots)
+    except _WireGateError as exc:
+        print(f"ERROR: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    logger.info("wire-gate: %s wired to %d root(s): %s", gate_task_id, len(wired_ids), ", ".join(wired_ids))
+    print(json.dumps({"gate_task": gate_task_id, "wired_roots": wired_ids}))
+    return 0
 
 
 def cmd_remove_dep(*argv: str) -> int:
@@ -13246,6 +18766,400 @@ def _print_reject_proposal_outcome(task_id: str, unmaterialised_source_id: str, 
     print(json.dumps(payload))
 
 
+# ---------------------------------------------------------------------------
+# `scaffold-store-factory` (E9-F1-S1-T2, issue #11 AC2 item 3, spec 4.9(b),
+# decision D-9): emits a composition-root store-factory test skeleton from
+# the store shape detected in a work unit's resolved Changes-Manifest scope.
+# See docs/composition-root-testing.md for the store-factory convention this
+# verb implements.
+# ---------------------------------------------------------------------------
+
+# Recognised store shapes. Adding a new shape means adding one entry to
+# `_STORE_SHAPE_MARKERS` and one matching entry to
+# `_STORE_FACTORY_SKELETON_TEMPLATES` -- `_detect_store_shape` and
+# `_render_store_factory_skeleton` never need to change (OCP).
+_STORE_SHAPE_REDUX: str = "redux"
+_STORE_SHAPE_ANGULAR_DI: str = "angular-di"
+
+# Marker substrings that identify each store shape when found in the
+# content of a file in the unit's resolved scope. Order is iteration order
+# (dict preserves insertion order), so the first shape whose markers match
+# ANY scope file wins when a scope could plausibly match more than one
+# shape's markers.
+_STORE_SHAPE_MARKERS: dict[str, tuple[str, ...]] = {
+    _STORE_SHAPE_REDUX: ("configureStore(", "combineReducers(", "createStore("),
+    _STORE_SHAPE_ANGULAR_DI: ("@NgModule", "TestBed.configureTestingModule"),
+}
+
+# Extensions plausibly containing real JS/TS source for the shapes
+# `_STORE_SHAPE_MARKERS` recognises today (code_review round 2, E9-F1-S1-T2,
+# Blocking: unqualified substring matching over EVERY scope file -- with no
+# extension constraint at all -- let Markdown prose and unrelated Python
+# source that merely MENTION a marker count as evidence of a real store.
+# Verified against this very repo: once this unit's own docs and source
+# mention "configureStore(" (in prose, comments and templates), an
+# unconstrained scan false-positively "detects" redux for a pure-Python
+# scope. Both recognised shapes today are JS/TS ecosystems, so detection is
+# constrained to plausible JS/TS source extensions; a marker occurring only
+# in a non-source scope file, e.g. a `.md` file, is not evidence of a real
+# store).
+_STORE_SHAPE_SOURCE_EXTENSIONS: tuple[str, ...] = (".ts", ".tsx", ".js", ".jsx")
+
+# Per-shape skeleton text, ``{unit_id}``-formatted at render time. Every
+# skeleton documents the real composition root it must be wired through
+# (docs/composition-root-testing.md) and leaves the repo-specific import
+# path as a TODO anchor -- devbench does not know the target repo's real
+# root reducer/module path, so it never guesses one (no fallback skeleton,
+# spec 4.9(b)). Comment lines use `//` (both recognised shapes today are
+# JS/TS ecosystems, code_review round 2 Advisory, E9-F1-S1-T2) rather than
+# `#`, so the emitted text is idiomatic for the worked example's `.ts`
+# output path even though it is still meant to be pasted into (or used to
+# seed) the target repo's own test file, not written out verbatim as a
+# complete, runnable test.
+_STORE_FACTORY_SKELETON_TEMPLATES: dict[str, str] = {
+    _STORE_SHAPE_REDUX: (
+        "// Composition-root store-factory test skeleton\n"
+        "// Generated by: uv run devbench scaffold-store-factory {unit_id} --out <path>\n"
+        "// Detected store shape: redux\n"
+        "//\n"
+        "// See docs/composition-root-testing.md for the full store-factory\n"
+        "// convention. This skeleton relates to, but does NOT by itself\n"
+        "// satisfy, the composition-root acceptance criterion -- every TODO\n"
+        "// below must be completed and the finished test must exercise the\n"
+        "// real composition root before test-reviewer's rubric item passes.\n"
+        "//\n"
+        "// TODO: import the application's REAL root reducer / store factory\n"
+        "// (the same module the production entry point assembles), not a\n"
+        "// configureStore()/combineReducers() call built solely for this test.\n"
+        "//\n"
+        "// TODO: mount the component under test through the real top-level\n"
+        "// <Provider store={{realStore}}> tree (or the smallest real ancestor,\n"
+        "// documented in this task's ### Approach per the smallest-real-ancestor\n"
+        "// exception) -- never an isolated render with a hand-built store.\n"
+    ),
+    _STORE_SHAPE_ANGULAR_DI: (
+        "// Composition-root store-factory test skeleton\n"
+        "// Generated by: uv run devbench scaffold-store-factory {unit_id} --out <path>\n"
+        "// Detected store shape: angular-di\n"
+        "//\n"
+        "// See docs/composition-root-testing.md for the full store-factory\n"
+        "// convention. This skeleton relates to, but does NOT by itself\n"
+        "// satisfy, the composition-root acceptance criterion -- every TODO\n"
+        "// below must be completed and the finished test must exercise the\n"
+        "// real composition root before test-reviewer's rubric item passes.\n"
+        "//\n"
+        "// TODO: configure TestBed with the application's REAL root NgModule /\n"
+        "// route tree and its actual DI providers, not hand-picked stand-ins\n"
+        "// for every dependency.\n"
+        "//\n"
+        "// TODO: mount the component under test through that real module tree\n"
+        "// (or the smallest real ancestor, documented in this task's\n"
+        "// ### Approach per the smallest-real-ancestor exception) -- never a\n"
+        "// TestBed configured with hand-picked stand-ins for every dependency.\n"
+    ),
+}
+
+
+class _StoreShapeScopeScan(NamedTuple):
+    """Categorised result of reading a work unit's scope for store-shape detection.
+
+    ``scanned`` is every scope file whose content was ACTUALLY READ --
+    extension in ``_STORE_SHAPE_SOURCE_EXTENSIONS``, present on disk, and
+    UTF-8 decodable -- with that content available in ``contents`` (keyed
+    by relative path). ``excluded_extension``, ``excluded_missing`` and
+    ``excluded_undecodable`` record every scope file that was NOT read,
+    and why, so a caller reporting a failure can name the files it
+    actually scanned without conflating them with files it never opened
+    (code_review round 3, E9-F1-S1-T2, Blocking: the prior single-list
+    "Files scanned" message named the WHOLE resolved scope, even though
+    most of it -- anything outside the extension allowlist -- was never
+    opened at all).
+    """
+
+    scanned: tuple[str, ...]
+    contents: dict[str, str]
+    excluded_extension: tuple[str, ...]
+    excluded_missing: tuple[str, ...]
+    excluded_undecodable: tuple[str, ...]
+
+
+def _scan_store_shape_scope_files(repo_path: Path, files: list[str]) -> _StoreShapeScopeScan:
+    """Read every scope file plausibly containing store-shape source, categorising the rest.
+
+    ``files`` is the unit's already-resolved Changes-Manifest scope (spec
+    4.3, :func:`devbench.work_unit_scope.resolve_changed_files`) -- this
+    function never scans the wider repo, only the files this unit actually
+    touches. Only files whose suffix is in ``_STORE_SHAPE_SOURCE_EXTENSIONS``
+    are read at all (code_review round 2, E9-F1-S1-T2, Blocking): a Markdown
+    file or an unrelated Python module that merely MENTIONS a marker
+    substring in prose or a comment is not evidence of a real store, and
+    unqualified substring matching over every scope file previously
+    false-positived a `redux` detection against this repo's own docs and
+    source. A file that no longer exists on disk (e.g. a Manifest-declared
+    delete) is categorised as excluded rather than raising; a non-UTF-8
+    file is also categorised as excluded rather than aborting detection
+    for the whole scope. An ``OSError`` (e.g. a permission failure)
+    reading a file that DOES exist is NOT swallowed here -- silently
+    treating an unreadable file as marker-free would report that file as
+    "scanned" on an eventual undetected-shape failure even though it was
+    never actually read, masking the real cause. It propagates to the
+    caller, which reports it explicitly and exits 1 (CLAUDE.md "no silent
+    failures").
+
+    Returns:
+        A :class:`_StoreShapeScopeScan` categorising every file in ``files``.
+
+    Raises:
+        OSError: A scope file exists but could not be read (e.g. a
+            permission failure).
+    """
+    scanned: list[str] = []
+    contents: dict[str, str] = {}
+    excluded_extension: list[str] = []
+    excluded_missing: list[str] = []
+    excluded_undecodable: list[str] = []
+    for relative_path in files:
+        abs_path = repo_path / relative_path
+        if abs_path.suffix not in _STORE_SHAPE_SOURCE_EXTENSIONS:
+            excluded_extension.append(relative_path)
+            continue
+        if not abs_path.is_file():
+            excluded_missing.append(relative_path)
+            continue
+        try:
+            contents[relative_path] = abs_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            excluded_undecodable.append(relative_path)
+            continue
+        scanned.append(relative_path)
+    return _StoreShapeScopeScan(
+        scanned=tuple(scanned),
+        contents=contents,
+        excluded_extension=tuple(excluded_extension),
+        excluded_missing=tuple(excluded_missing),
+        excluded_undecodable=tuple(excluded_undecodable),
+    )
+
+
+def _detect_store_shape(repo_path: Path, files: list[str]) -> str | None:
+    """Return the first store shape from ``_STORE_SHAPE_MARKERS`` found in ``files``.
+
+    Delegates the read/categorisation work to
+    :func:`_scan_store_shape_scope_files` (single read path, DRY), then
+    checks each recognised shape's markers, in ``_STORE_SHAPE_MARKERS``
+    iteration order, against every file that scan actually read.
+
+    Returns:
+        The detected shape name, or ``None`` when no scope file's content
+        matches any recognised shape's markers.
+
+    Raises:
+        OSError: A scope file exists but could not be read (e.g. a
+            permission failure).
+    """
+    scan = _scan_store_shape_scope_files(repo_path, files)
+    for shape, markers in _STORE_SHAPE_MARKERS.items():
+        for relative_path in scan.scanned:
+            if any(marker in scan.contents[relative_path] for marker in markers):
+                return shape
+    return None
+
+
+def _render_store_factory_skeleton(unit_id: str, shape: str) -> str:
+    """Render the store-factory test skeleton text for ``shape``, naming ``unit_id``."""
+    return _STORE_FACTORY_SKELETON_TEMPLATES[shape].format(unit_id=unit_id)
+
+
+def _undetected_store_shape_message(unit_id: str, scan: _StoreShapeScopeScan) -> str:
+    """Build the exit-1 message for an undetected store shape, naming only files actually read.
+
+    Extracted so the "no shape detected" message can distinguish the files
+    :func:`_detect_store_shape` actually opened (``scan.scanned``) from
+    every scope file it excluded, and why (code_review round 3,
+    E9-F1-S1-T2, Blocking): naming the WHOLE resolved scope under "Files
+    scanned" -- when most of it was never opened because its extension is
+    outside ``_STORE_SHAPE_SOURCE_EXTENSIONS`` -- masks the real cause the
+    same way the module's own ``OSError``-is-not-swallowed rationale
+    warns against for an unreadable file.
+    """
+    total_scope_files = (
+        len(scan.scanned) + len(scan.excluded_extension) + len(scan.excluded_missing) + len(scan.excluded_undecodable)
+    )
+    if scan.scanned:
+        scanned = ", ".join(scan.scanned)
+    elif total_scope_files == 0:
+        scanned = "(no files in unit scope)"
+    else:
+        scanned = "(none)"
+    extensions = ", ".join(_STORE_SHAPE_SOURCE_EXTENSIONS)
+    parts = [
+        f"ERROR: scaffold-store-factory: no recognised store shape detected for unit '{unit_id}'. "
+        f"Files scanned ({extensions} only): {scanned}."
+    ]
+    if scan.excluded_extension:
+        parts.append(
+            f"Excluded from scanning (extension not in the allowlist above): {', '.join(scan.excluded_extension)}."
+        )
+    if scan.excluded_missing:
+        parts.append(f"Excluded from scanning (not present on disk): {', '.join(scan.excluded_missing)}.")
+    if scan.excluded_undecodable:
+        parts.append(f"Excluded from scanning (not UTF-8 decodable): {', '.join(scan.excluded_undecodable)}.")
+    parts.append(
+        "See docs/composition-root-testing.md for the supported store shapes and the store-factory convention."
+    )
+    return " ".join(parts)
+
+
+def _detect_store_shape_or_report(repo_path: Path, files: list[str], unit_id: str) -> str | int:
+    """Detect ``unit_id``'s store shape, or report the failure and return exit code 1.
+
+    Extracted out of :func:`cmd_scaffold_store_factory` to keep that
+    function's return-statement count within ruff's threshold (PLR0911),
+    mirroring the existing ``_prepare_shared_file_impact_scope_and_registry``
+    -style helpers this module already uses for the same reason. Wraps
+    :func:`_detect_store_shape`, translating both of its failure modes --
+    an ``OSError`` reading a scope file that exists, and no scope file
+    matching any recognised shape -- into an already-printed ``ERROR: ...``
+    line and exit code ``1`` (spec 4.9(b)).
+
+    Returns:
+        The detected shape name on success, or ``1`` on either failure.
+    """
+    try:
+        shape = _detect_store_shape(repo_path, files)
+    except OSError as exc:
+        print(
+            f"ERROR: scaffold-store-factory: could not read scope file while detecting store shape "
+            f"for unit '{unit_id}': {exc}.",
+            file=sys.stderr,
+        )
+        return 1
+    if shape is None:
+        scan = _scan_store_shape_scope_files(repo_path, files)
+        print(_undetected_store_shape_message(unit_id, scan), file=sys.stderr)
+        return 1
+    return shape
+
+
+def _write_store_factory_skeleton_exclusive(out_path: Path, skeleton: str, shape: str, overwrite_refusal: str) -> int:
+    """Write ``skeleton`` to ``out_path`` via exclusive creation, or report the refusal.
+
+    Extracted out of :func:`cmd_scaffold_store_factory` to keep that
+    function's return-statement count within ruff's threshold (PLR0911).
+    ``--out``'s missing parent directories are created first
+    (``mkdir(parents=True, exist_ok=True)``); the write itself uses
+    exclusive creation (``Path.open(mode="x")``) so a file created in the
+    (narrow) TOCTOU window after :func:`cmd_scaffold_store_factory`'s
+    earlier ``out_path.exists()`` check is still refused by the filesystem
+    itself, never silently clobbered.
+
+    Returns:
+        ``0`` on a successful write (after printing the success line).
+        ``1`` when ``out_path`` already exists at write time (after
+        printing ``overwrite_refusal``).
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with out_path.open("x", encoding="utf-8") as handle:
+            handle.write(skeleton)
+    except FileExistsError:
+        print(overwrite_refusal, file=sys.stderr)
+        return 1
+    print(f"Wrote {out_path} (detected store shape: {shape})")
+    return 0
+
+
+def cmd_scaffold_store_factory(*argv: str) -> int:
+    """Emit a composition-root store-factory test skeleton (spec 4.9(b), issue #11 AC2 item 3).
+
+    Usage::
+
+        scaffold-store-factory <unit-id> --out <path>
+
+    Root-cause closure (decision D-9) of the store-factory convention PR
+    #316 deferred: resolves ``unit-id``'s changed files through the SAME
+    shared scope helper every other gate/verb uses
+    (:func:`_resolve_scope_or_report`, i.e.
+    :func:`devbench.work_unit_scope.resolve_changed_files`, spec 4.3) --
+    this command introduces no second scope-resolution path -- detects the
+    store shape from those files' content
+    (:func:`_detect_store_shape_or_report`), and writes the matching
+    skeleton (:func:`_render_store_factory_skeleton`,
+    :func:`_write_store_factory_skeleton_exclusive`) to ``--out`` only when
+    that path does not already exist.
+
+    Every failure path is loud (spec 4.9): a missing unit id, a missing
+    ``--out`` value, or an unrecognised flag is a usage error naming the
+    offending argument; an unknown unit id fails through the same
+    ``_resolve_unit_repo_and_path`` "not found" path every other gate/verb
+    uses; an ``--out`` path that already exists is refused without writing
+    (``--force`` is absent by design so a generated skeleton can never
+    silently overwrite hand-written test code); an undetectable store shape
+    names the files scanned and never falls back to a generic placeholder
+    skeleton; an unreadable scope file (``OSError``, e.g. a permission
+    failure) is reported by name rather than silently treated as
+    marker-free.
+
+    The refuse-to-overwrite guarantee is enforced twice. The
+    ``out_path.exists()`` check runs AFTER unit and scope resolution (so a
+    typo'd unit id or a scope-resolution failure -- e.g. a malformed
+    Changes Manifest -- is reported through its own normal error path
+    first, before the write is even considered) but BEFORE the shape
+    detection and write steps, giving a fast, friendly exit relative to
+    those two -- not relative to scope resolution (doc_review/code_review
+    round 2, E9-F1-S1-T2: a prior version of this docstring incorrectly
+    claimed the check ran before scope resolution). The final write
+    (:func:`_write_store_factory_skeleton_exclusive`) uses exclusive
+    creation so a file created in the (narrow) window between that check
+    and the write is still refused by the filesystem itself, never
+    silently clobbered (TOCTOU). ``--out``'s missing parent directories
+    are created (``mkdir(parents=True, exist_ok=True)``) before the
+    exclusive-create write.
+
+    Returns:
+        0 on a successful write. 1 when the unit id is unknown, the repo
+        has no configured local path, scope resolution fails, the ``--out``
+        path already exists, a scope file could not be read, or no
+        recognised store shape is detected. 2 on a usage error
+        (missing/duplicated unit id, unknown flag, or a missing/empty
+        ``--out`` value).
+    """
+    parsed = _parse_unit_id_and_required_flag_argv(
+        argv, verb="scaffold-store-factory", flag="--out", value_placeholder="<path>"
+    )
+    if isinstance(parsed, int):
+        return parsed
+    unit_id, out_path_str = parsed
+
+    resolved = _resolve_unit_repo_and_path(unit_id)
+    if resolved is None:
+        return 1
+    _unit, _canonical_repo, repo_path = resolved
+
+    mode = _resolve_scope_mode()
+    scope = _resolve_scope_or_report(
+        unit_id, repo_path, mode, message_prefix=_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX.format(unit_id=unit_id)
+    )
+    if scope is None:
+        return 1
+
+    out_path = Path(out_path_str)
+    overwrite_refusal = (
+        f"ERROR: scaffold-store-factory: output path '{out_path}' already exists; refusing to "
+        "overwrite (--force is absent by design; spec 4.9)."
+    )
+    if out_path.exists():
+        print(overwrite_refusal, file=sys.stderr)
+        return 1
+
+    shape = _detect_store_shape_or_report(repo_path, scope.files, unit_id)
+    if isinstance(shape, int):
+        return shape
+
+    skeleton = _render_store_factory_skeleton(unit_id, shape)
+    return _write_store_factory_skeleton_exclusive(out_path, skeleton, shape, overwrite_refusal)
+
+
 def _find_unit(units: list[WorkUnit], unit_id: str) -> WorkUnit | None:
     """Find a work unit by ID (case-insensitive)."""
     for unit in units:
@@ -13377,7 +19291,11 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
     ),
     "ensure-branch": (cmd_ensure_branch, 1, "Create or switch to work unit branch: ensure-branch <id>"),
     "git-ops": (cmd_git_ops, 1, "Run git operations for a work unit: git-ops <id>"),
-    "git-ops-finalize": (cmd_git_ops_finalize, 1, "Push single branch and create PR: git-ops-finalize <repo>"),
+    "git-ops-finalize": (
+        cmd_git_ops_finalize,
+        1,
+        "Push single branch and create PR: git-ops-finalize <repo> [--provenance <path>]",
+    ),
     "check-merge": (
         cmd_check_merge,
         1,
@@ -13385,6 +19303,20 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
             "Reconcile a pause-before-merge work unit's PR state (issue #101). "
             "Promotes to done on merged, blocks on closed-without-merge, "
             "no-ops on still-open: check-merge <id>"
+        ),
+    ),
+    "check-ancestry": (
+        cmd_check_ancestry,
+        2,
+        (
+            "Canonical git-ancestry check for a declared work-group dependency (machine-blocking "
+            "gate, see 'Gates' in docs/cli-reference.md). Passes via the strict probe "
+            "('git merge-base --is-ancestor <dependency-ref> <target-ref>', target-ref defaults "
+            "to <remote>/<default-branch> from repo config) or, when the strict probe reports "
+            "not-ancestor, via a squash-merged-PR probe ('gh pr list --search <sha> --state "
+            "merged --base <default-branch>'). Exit 0 on pass or when the gate is disabled for "
+            "the repo, exit 1 on a BLOCKED result or a probe error, exit 2 for a usage error "
+            "(empty dependency-ref): check-ancestry <id> <dependency-ref> [<target-ref>]"
         ),
     ),
     "cleanup-tracked-orphans": (
@@ -13545,7 +19477,55 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         "Print out-of-Manifest staged paths and exit non-zero on mismatch (read-only, "
         "deterministic; spec 4.C): check-manifest-scope <id>",
     ),
+    "gates": (
+        cmd_gates,
+        0,
+        "Show every gate's tier, status and repo overrides",
+    ),
+    "check-reachability": (
+        cmd_check_reachability,
+        1,
+        (
+            "Word-boundary, source-classified reachability gate over the unit's Changes "
+            "Manifest scope: check-reachability <id>. Blocks (exit 1) when a classified "
+            "candidate has no non-test importer or can't be read."
+        ),
+    ),
     "run-tests": (cmd_run_tests, 1, "Run test suite for work unit's repo: run-tests <id>"),
+    "check-shared-file-impact": (
+        cmd_check_shared_file_impact,
+        1,
+        (
+            "Full-suite regression gate for shared/high-fan-in files: "
+            "check-shared-file-impact <id>. No-op unless the diff touches a "
+            "gates.repos.<repo>.shared_file_impact.patterns match; blocks (exit 1) on new "
+            "failures vs. the stored baseline."
+        ),
+    ),
+    "check-fixture-consistency": (
+        cmd_check_fixture_consistency,
+        1,
+        (
+            "Cross-reference mock/fixture files against the configured canonical dataset "
+            "(no-op unless gates.fixture_consistency.canonical_sources is set): "
+            "check-fixture-consistency <id>"
+        ),
+    ),
+    "check-write-path": (
+        cmd_check_write_path,
+        0,
+        "Write-path audit: check-write-path <id> --flag <name>",
+    ),
+    "log-waiver": (
+        cmd_log_waiver,
+        2,
+        "Record a structured gate waiver: log-waiver <judge> <id> --gate <g> --target <t> --reason <r> [--operator]",
+    ),
+    "log-newly-reachable": (
+        cmd_log_newly_reachable,
+        1,
+        "Record a newly-reachable-path verification: log-newly-reachable <id> --path <p> --method <m> --result <r>",
+    ),
     "tdd-gate": (
         cmd_tdd_gate,
         1,
@@ -13620,6 +19600,16 @@ _COMMANDS: dict[str, tuple[Callable[..., int], int, str]] = {
         2,
         "Wire a cross-task BLOCKED_PENDING_PROPOSAL marker: add-dep <blocked-id> <blocker-id> [--reason <msg>]",
     ),
+    "wire-gate": (
+        cmd_wire_gate,
+        0,
+        "Fan an ancestry-gate task into every DAG root: wire-gate <gate-task-id> --blocks-roots",
+    ),
+    "scaffold-store-factory": (
+        cmd_scaffold_store_factory,
+        0,
+        "Emit a composition-root store-factory test skeleton: scaffold-store-factory <id> --out <path>",
+    ),
     "remove-dep": (
         cmd_remove_dep,
         2,
@@ -13662,6 +19652,15 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "watchdog",
         "notify-test",
         "add-dep",
+        # 317-D23 (E4-F1-S1-T2): owns its own <id> / --blocks-roots parsing,
+        # same rationale as add-dep above.
+        "wire-gate",
+        # E7-F1-S1-T1 (spec 4.8): owns its own <id> / --flag <name> parsing,
+        # same rationale as wire-gate above.
+        "check-write-path",
+        # E9-F1-S1-T2 (spec 4.9(b)): owns its own <id> / --out <path> parsing,
+        # same rationale as check-write-path above.
+        "scaffold-store-factory",
         "remove-dep",
         "decline",
         # FR-4.6 (E4-F4-S1-T2): variadic trailing test node ids.
@@ -13706,6 +19705,12 @@ _VARIADIC_COMMANDS: frozenset[str] = frozenset(
         "sessions",
         # Issue #192 E4-F5-S1-T2: stop --session <name> flag
         "stop",
+        # E2-F4-S1-T1: --gate/--target/--reason/--operator flags.
+        "log-waiver",
+        # E2-F4-S1-T2: --path/--method/--result flags.
+        "log-newly-reachable",
+        # E2-F9-S1-T1: --provenance <path> flag (spec 4.13; D-17).
+        "git-ops-finalize",
     }
 )
 

@@ -18,6 +18,63 @@ Examples observed in production:
 - Backlog A (`caylent-telemetry-spec/backlog/`) consumes Backlog B (`tf-modules-backlog/`) released terraform-modules tags. 16 Backlog A Tasks reference `caylent-solutions/terraform-modules` modules by tag. Backlog B has its own orchestrator and `BACKLOG.md`.
 - Backlog A consumes a kanon integration-test fix being authored by another agent in the kanon repo. The fix's completion is verified externally by the operator running kanon's test suite locally.
 
+## Special case: the producer is another devbench work group's branch
+
+The most common cross-backlog dependency in practice is one devbench work group's backlog declaring "Task X in this backlog must not start until work group Y's branch has merged into our shared target branch." Unlike the general external-producer case above (an artifact tag, a human sign-off, a fix authored by someone outside devbench), **this specific case is git-verifiable** -- devbench itself can answer "has Y merged" by checking real ancestry, so it does not need to fall back to an operator-verified manual blocker.
+
+`spec-to-backlog` auto-generates this as an **ancestry-gate task** rather than a manual blocker whenever a spec declares a work-group dependency (see the skill's Step 2/4a). The gate task is a normal, executable Task -- not a `DO NOT CLAIM` anchor -- placed at `E0-F<N>-S1-T1` by the same convention as a manual blocker (Workspace Bootstrap epic, new Feature per declared dependency):
+
+- **`## Task Type: chore`** (317-D01). This MUST be authored explicitly: an untyped task defaults to `validate-backlog` rule 21's RED-gated `behavior-fix`, which requires the executor to record an observed failing test before making the fix. A check-only gate task authors no code and can never produce that RED evidence, so an untyped (or `behavior-fix`-typed) gate task deadlocks permanently at the done transition. `chore` carries no RED-gate requirement.
+- **`## Changes Manifest`** names the task's own gate report file, e.g. `` `docs/gate-reports/<this-task-id>-ancestry.md` ``, as its sole deliverable, in place of the retired `(none)` placeholder that left the task with no recorded output at all. This is a genuine, if minimal, chore deliverable -- the fenced `### Approach` below writes it on first execution and overwrites it in place on any re-run.
+- **Fan-in.** Once every task file and `BACKLOG.md` exist, the gate is wired into the backlog with the mechanical invocation `devbench wire-gate <gate-task-id> --blocks-roots` (see [`cli-reference.md`](cli-reference.md#wire-gate)). This wires the gate into every root of the intra-backlog dependency DAG only -- not every Task in the tree. Every non-root Task remains unclaimable transitively, through its own DAG ancestry back up to a wired root, rather than via a direct `## Dependencies` row naming the gate task itself.
+
+````markdown
+### Approach
+
+Run the canonical dependency-deliverability check and report its result;
+do not attempt to satisfy this task's AC any other way:
+
+```bash
+devbench check-ancestry <this-task-id> <remote>/<dependency-branch>
+```
+
+`<remote>` is the producer repo's configured tracking remote (resolved from
+`git config --get branch.<default-branch>.remote`), not necessarily `origin`.
+
+- Exit 0 with `mode: "strict"` or `mode: "squash-pr"` in the status line:
+  the dependency has merged. Mark AC-DEP-001 met.
+- Exit 0 with `{"gate": "ancestry", "status": "disabled"}` on stdout: the
+  ancestry gate is NOT enabled for this repo (see `resolve_gate_config`
+  and the D-17 built-in default of disabled). This is not an answer to
+  "has the dependency merged" -- it means the question was never asked.
+  Do NOT mark AC-DEP-001 met on this output; enable
+  `gates.ancestry.enabled` for the repo and re-run, or treat the gate
+  task as blocked pending that configuration.
+- Exit 1 (a BLOCKED result, or an evaluation error): the dependency has
+  NOT merged (or ancestry could not be determined). Do not mark
+  AC-DEP-001 met. This task -- and every root task the gate has been
+  fanned into via `wire-gate` -- must remain unclaimed until a re-run of
+  the same command exits 0.
+- Exit 2: a usage error (for example an empty dependency ref). Fix the
+  invocation and re-run; this is not a verdict on the dependency.
+
+Once the check above reaches a terminal decision (exit 0 with
+`status: "pass"`, exit 0 with `status: "disabled"`, or exit 1), copy the
+printed `check-ancestry` status line verbatim into this task's gate
+report file (`docs/gate-reports/<this-task-id>-ancestry.md`, creating it
+on first execution and overwriting it in place on any re-run). This is
+the task's sole Manifest deliverable (317-D01) -- do not skip it even
+when the check's outcome is "not merged" or "gate disabled".
+````
+
+`devbench check-ancestry` (see [`cli-reference.md`](cli-reference.md#check-ancestry)) is **the one canonical command** for this question across the whole pipeline: it runs a strict `git merge-base --is-ancestor <dependency-ref> <target-ref>` probe against the real target repo, not a proxy such as checking for a local snapshot/report file. Every tool in this pipeline that needs to answer "is this prerequisite actually available" -- `spec-to-backlog`-generated gate tasks, `init-workgroup`-style pre-flight checks, merge-forecast/merge-resolve tooling -- should shell out to this command rather than reinvent the check.
+
+Because the gate is an ordinary Task, it is re-evaluated every time it is (re-)attempted -- including after the backlog is paused and resumed -- rather than being checked once at generation time and forgotten: the ADR-07 dependency mechanism keeps every dependent Task unclaimable as long as the gate has not reached a terminal-satisfying status, and a rejected/blocked gate task naturally gets re-attempted (re-running the same `check-ancestry` command) the next time the orchestrator or an operator revisits it.
+
+**Squash-aware verification (317-D02).** A strict `git merge-base --is-ancestor` probe is, by itself, a commit-graph-only check: it reports "not merged" for a dependency that is logically satisfied but was squash-merged, rebased, or landed via a fix-pack branch that doesn't carry the original branch's commit hashes. `devbench check-ancestry` does not stop there -- when the strict probe reports "not an ancestor", it runs a second probe that searches for the dependency's merged PR via `gh pr list --search "<sha>" --state merged --base <default-branch>`, independent of which commits survived the merge. A pass through this second probe is recorded in the status line as `mode: "squash-pr"`; both probes' outcomes are always printed together so an operator can see which probe answered what. There is no squash-merged, rebased, or fix-pack-landed topology that requires falling back to the manual-blocker idiom below -- only a producer that is not a devbench-tracked branch merge at all does.
+
+Use a plain manual blocker (not an ancestry gate) when the producer is NOT a devbench-tracked branch merge -- see the table in [`manual-blockers.md`](manual-blockers.md#when-to-use-a-manual-blocker-vs-a-regular-dependency).
+
 ## The pattern: anchor a manual blocker in this backlog
 
 Create a manual blocker (per `manual-blockers.md`) representing the external dependency. Wire every dependent Task in this backlog to it via `devbench add-dep`.

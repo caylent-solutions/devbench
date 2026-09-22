@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, cast
 
 if TYPE_CHECKING:
     from devbench.config_loader import RuntimeConfig
@@ -44,6 +44,7 @@ from devbench.constants import (
     COMMENT_AGENT_TEMPLATE,
     COMMENTS_SECTION_HEADER,
     DEFAULT_BLOCKED_RECOVERY_WINDOW_SECONDS,
+    DEFAULT_TASK_TYPE,
     DEPENDENCY_NONE_VALUES,
     STATUS_BLOCKED,
     STATUS_DECLINED,
@@ -57,6 +58,7 @@ from devbench.constants import (
     TASK_TYPE_DOCS,
     TASK_TYPE_REFACTOR,
     TASK_TYPE_TEST_ONLY,
+    VALID_TASK_TYPES,
 )
 from devbench.session import flock_backlog
 from devbench.utils.io import atomic_write_text
@@ -812,7 +814,17 @@ _BACKLOG_ROW_RE = re.compile(r"^\|\s*(\S+)\s*\|", re.MULTILINE)
 
 @dataclass(frozen=True)
 class ProposedTask:
-    """One task the blocker-resolver wants the factory to draft."""
+    """One task the blocker-resolver wants the factory to draft.
+
+    ``task_type`` (spec 4.9a) keys the newly-reachable-paths acceptance-
+    criterion auto-append in `generate_draft_md` (E8-F1-S1-T1, decision D-8):
+    it defaults to `constants.DEFAULT_TASK_TYPE` so every existing caller
+    (JSON proposals written before this field existed) keeps working
+    unchanged. `generate_draft_md` raises `ValueError` naming
+    `suggested_id` when the value falls outside `constants.VALID_TASK_TYPES`
+    rather than silently defaulting -- an unrecognised value is a caller
+    bug, not a neutral "not bug-fix-shaped" signal.
+    """
 
     suggested_id: str
     title: str
@@ -820,6 +832,7 @@ class ProposedTask:
     linked_scenarios: list[str]
     suggested_acs: list[str]
     suggested_approach: str
+    task_type: str = DEFAULT_TASK_TYPE
 
 
 @dataclass(frozen=True)
@@ -1397,15 +1410,79 @@ DRAFT_TEMPLATE: str = """\
 
 ## Definition of Done
 
-- [ ] All acceptance criteria checked
-- [ ] Tests green
-- [ ] Lint and format clean
-- [ ] Only files in Changes Manifest are staged with `git add`
+{definition_of_done}
 
 ## TDD Cycle Log
 
 ## Comments
 """
+
+
+_BASE_DEFINITION_OF_DONE: Final[tuple[str, ...]] = (
+    "All acceptance criteria checked",
+    "Tests green",
+    "Lint and format clean",
+    "Only files in Changes Manifest are staged with `git add`",
+)
+
+# Bug-fix-specific acceptance-criterion line (newly-reachable-paths gate; spec
+# 4.9a, 5.3). See docs/newly-reachable-paths.md for the full rationale: a
+# bug-fix task's Definition of Done is not satisfied by the original repro
+# passing alone -- it also requires the executor to enumerate and
+# live-verify the code paths the fix newly makes reachable.
+#
+# Emitted as an ACCEPTANCE CRITERION, not a Definition-of-Done checkbox
+# (spec 1.3 S1, findings 320-D04 and C-06): DoD checkboxes are auto-ticked
+# on the done transition, so a DoD line is a record and never a gate. An
+# acceptance criterion is a surface the review judges actually evaluate.
+# Auto-appended below whenever the proposed task's `task_type` resolves to
+# `constants.TASK_TYPE_BEHAVIOR_FIX`, so materialised drafts carry the
+# requirement before a human ever edits them. Keyed off the `## Task Type:`
+# taxonomy `manager.py` already validates, not a title heuristic -- and
+# names the `log-newly-reachable` verb the eventual executor actually
+# invokes, so E8-F1-S1-T2's prompt rewrite can quote this single
+# module-level constant without duplicating its wording.
+NEWLY_REACHABLE_PATHS_AC_ITEM: Final[str] = (
+    "Newly-reachable code paths enumerated and live-verified at smoke-test "
+    "level (not just re-confirmation of the original repro): log each one via "
+    "`uv run devbench log-newly-reachable <unit-id> --path <p> --method <m> "
+    "--result <r>` (spec 4.9a, 5.3; see docs/newly-reachable-paths.md)."
+)
+
+
+def _render_newly_reachable_ac_line(repo: str) -> str:
+    """Render the drafted newly-reachable-paths acceptance-criterion checklist line for *repo*.
+
+    Resolves the migrated cross-cutting-primitives registry
+    (``gates.newly_reachable_paths.paths``) exclusively through
+    :func:`devbench.config_loader.resolve_gate_config` (spec AC-27) -- this
+    is the ONLY point in this module that touches gate configuration, and it
+    never reads ``RUNTIME_CONFIG.gates`` directly. This is the config-backed
+    replacement for the retired free-text primitives registry file PR #320
+    read from disk under ``backlog/config/`` (spec 4.1 migration note,
+    decision C-03):
+    when the resolved registry is non-empty for *repo*, the drafted AC line
+    names the configured paths so the eventual executor knows which shared
+    primitives to cross-check; an empty/unconfigured registry omits the
+    clause entirely rather than emitting a hollow "none configured" line.
+
+    Args:
+        repo: Fully-qualified repository name (``org/repo``) the drafted
+            task targets -- the per-repo override layer key.
+
+    Returns:
+        A single ``- [ ] ...`` checklist line ready to append to the
+        drafted Acceptance Criteria section.
+    """
+    from devbench.config import RUNTIME_CONFIG
+    from devbench.config_loader import resolve_gate_config
+
+    resolved = resolve_gate_config("newly_reachable_paths", repo, RUNTIME_CONFIG)
+    paths = cast("tuple[str, ...]", resolved.values["paths"])
+    line = NEWLY_REACHABLE_PATHS_AC_ITEM
+    if paths:
+        line += f" Configured cross-cutting primitives for {repo}: {', '.join(paths)}."
+    return f"- [ ] {line}"
 
 
 def manifest_change_verb(repo: str, path: str) -> str:
@@ -1511,7 +1588,24 @@ def generate_draft_md(
     generated_at: str,
     status: str = STATUS_PROPOSED,
 ) -> str:
-    """Render the markdown content for one proposed task file."""
+    """Render the markdown content for one proposed task file.
+
+    Raises:
+        ValueError: if ``proposed.task_type`` is not one of
+            ``constants.VALID_TASK_TYPES``. Never silently falls back to the
+            default type -- an unrecognised value is a caller bug that must
+            surface loudly rather than silently exempting the drafted task
+            from the newly-reachable-paths gate. The message names
+            ``proposed.suggested_id`` so a failure inside
+            :func:`materialise_proposal`'s per-task loop is attributable to
+            the offending proposed task without cross-referencing the
+            surrounding proposal JSON.
+    """
+    if proposed.task_type not in VALID_TASK_TYPES:
+        raise ValueError(
+            f"Proposed task {proposed.suggested_id!r} has task_type={proposed.task_type!r}, which is "
+            f"not one of the declared task-type taxonomy: {sorted(VALID_TASK_TYPES)}."
+        )
     from devbench.config import RUNTIME_CONFIG
     from devbench.config_loader import format_branch_name, get_effective_branch_prefix
 
@@ -1522,6 +1616,14 @@ def generate_draft_md(
         if proposed.suggested_acs
         else "- [ ] AC-TODO-001 human must author AC"
     )
+    # Newly-reachable-paths requirement (spec 4.9a, decision D-8): emitted as
+    # an acceptance criterion -- not the Definition-of-Done auto-append the
+    # E1 cherry-pick shim left behind (spec 1.3 S1, findings 320-D04/C-06) --
+    # only for `behavior-fix`-typed drafts, so a `docs`/`chore`/`test-only`/
+    # `refactor`/`feature` task never inherits a verification obligation it
+    # cannot satisfy.
+    if proposed.task_type == TASK_TYPE_BEHAVIOR_FIX:
+        ac_lines = f"{ac_lines}\n{_render_newly_reachable_ac_line(repo)}"
     manifest_lines = (
         "\n".join(f"| `{path}` | {manifest_change_verb(repo, path)} |" for path in proposed.files_to_own)
         if proposed.files_to_own
@@ -1530,6 +1632,7 @@ def generate_draft_md(
         # can concretise, rather than a file literally named "TODO".
         else "| `<source-drift-fix-targets-determined-at-execution>` | modify |"
     )
+    definition_of_done = "\n".join(f"- [ ] {item}" for item in _BASE_DEFINITION_OF_DONE)
     return DRAFT_TEMPLATE.format(
         task_id=proposed.suggested_id,
         title=proposed.title,
@@ -1542,6 +1645,7 @@ def generate_draft_md(
         linked_scenarios=scenarios,
         acceptance_criteria=ac_lines,
         changes_manifest=manifest_lines,
+        definition_of_done=definition_of_done,
         task_type=infer_task_type(proposed.files_to_own),
     )
 

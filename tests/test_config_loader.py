@@ -19,6 +19,8 @@ import yaml
 from devbench.config_loader import (
     DEFAULT_CONFIG_SUBPATH,
     BacklogConfig,
+    FixtureCanonicalSource,
+    FixtureConsistencyConfig,
     GitOpsConfig,
     LimitConfig,
     RepoConfig,
@@ -923,6 +925,40 @@ class TestRuntimeConfigPopulation:
             f"Expected merge_strategy=None, got {result.repos['org/repo'].merge_strategy!r}"
         )
 
+    def test_repo_config_shared_file_patterns_key_removed_by_gates_migration(self, tmp_path: Path) -> None:
+        """
+        Given: YAML with the retired per-repo shared_file_patterns key (spec 4.1 migration)
+        When: load_runtime_config is called
+        Then: schema validation rejects it -- the key moved to
+              gates.repos.<org/repo>.shared_file_impact.patterns (AC-E2-F1-S1-T1-5)
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo:
+                default_branch: main
+                shared_file_patterns:
+                  - "src/app/Shell.tsx"
+                  - "src/hooks/useAuth.*"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"shared_file_patterns"):
+            load_runtime_config(cfg, {})
+
+    def test_repo_config_has_no_shared_file_patterns_field(self) -> None:
+        """
+        Given: the RepoConfig dataclass
+        When: its fields are inspected
+        Then: no shared_file_patterns field remains (spec 4.1 complete-replacement migration --
+              the per-repo shared-file registry now lives on GateSharedFileImpactOverride)
+        """
+        field_names = {f.name for f in dataclasses.fields(RepoConfig)}
+        assert "shared_file_patterns" not in field_names, (
+            f"RepoConfig still declares shared_file_patterns; expected it removed by the gates "
+            f"migration, got fields: {sorted(field_names)}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-10: config_loader.py does not read env vars
@@ -1636,6 +1672,75 @@ class TestBranchPrefixConfig:
             """,
         )
         with pytest.raises(ValueError, match="parent traversal"):
+            load_runtime_config(cfg, {})
+
+
+@pytest.mark.unit
+class TestGitOpsProvenancePathConfig:
+    """git_ops.provenance_path: parsing and validation (E2-F9-S1-T1, spec 4.13, D-17).
+
+    Persistent config key for the ``git-ops-finalize`` PR-body provenance map
+    (:meth:`devbench.github.git_ops.GitOpsService.compose_finalize_pr_body`).
+    Defaults to absent (``None``), which preserves the plain PR body. A
+    non-string value fails schema validation naming the dotted key and the
+    expected type.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_provenance_path_defaults_to_none(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path is None
+
+    def test_provenance_path_defaults_to_none_when_git_ops_empty(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops: {}
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path is None
+
+    def test_provenance_path_parsed_from_yaml(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              provenance_path: docs/release-notes/provenance-map.json
+            """,
+        )
+        result = load_runtime_config(cfg, {})
+        assert result.git_ops.provenance_path == "docs/release-notes/provenance-map.json"
+
+    def test_schema_rejects_non_string_provenance_path(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench:
+                default_branch: main
+            git_ops:
+              provenance_path: 123
+            """,
+        )
+        with pytest.raises(ValueError, match=r"git_ops\.provenance_path.*is not of type 'string'"):
             load_runtime_config(cfg, {})
 
 
@@ -4232,12 +4337,2073 @@ class TestSkillsConfig:
         assert rt.skills.exemplar_spec_path is None
 
 
+class TestFixtureConsistencyConfig:
+    """FixtureConsistencyConfig dataclass and ``gates.fixture_consistency:`` YAML section parsing.
+
+    caylent-solutions/devbench-internal-backlog#17 (fixture-catalog
+    cross-reference lint): opt-in per-workspace configuration naming
+    canonical fixture/dataset file(s) and the identifier field(s) other
+    mock/fixture files must stay consistent with. Absent section -> the
+    check is a no-op (empty canonical_sources). Nested under ``gates:``
+    (spec 4.1 migration) -- the pre-release top-level ``fixture_consistency:``
+    key is retired; see ``TestGatesMigrationRemovesPreReleaseKeys`` for the
+    zero-remaining-references drift guard.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_fixture_consistency_config_defaults(self) -> None:
+        """Given no args, FixtureConsistencyConfig holds empty tuples (opt-out no-op)."""
+        cfg = FixtureConsistencyConfig()
+        assert cfg.enabled is False
+        assert cfg.canonical_sources == ()
+        assert cfg.scan == ()
+        assert cfg.extract_source_literals is False
+
+    def test_runtime_config_has_gates_fixture_consistency_field(self) -> None:
+        """RuntimeConfig exposes ``gates.fixture_consistency`` populated with defaults."""
+        rt = RuntimeConfig()
+        assert isinstance(rt.gates.fixture_consistency, FixtureConsistencyConfig)
+        assert rt.gates.fixture_consistency.canonical_sources == ()
+
+    def test_absent_gates_section_falls_back_to_no_op_defaults(self, tmp_path: Path) -> None:
+        """A YAML config without a ``gates:`` section yields an empty, no-op fixture-consistency config."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.canonical_sources == ()
+        assert rt.gates.fixture_consistency.scan == ()
+
+    def test_single_canonical_source_and_scan_target_parse(self, tmp_path: Path) -> None:
+        """A single canonical_sources entry + scan target round-trip; canonical_source is inferred."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.canonical_sources == (
+            FixtureCanonicalSource(path="tests/fixtures/catalog.json", identifier_field="sku"),
+        )
+        assert len(rt.gates.fixture_consistency.scan) == 1
+        scan = rt.gates.fixture_consistency.scan[0]
+        assert scan.path == "tests/fixtures/mock_lookup.json"
+        assert scan.identifier_field == "sku"
+        # Inferred from the single configured canonical source.
+        assert scan.canonical_source == "tests/fixtures/catalog.json"
+
+    def test_expected_count_parses(self, tmp_path: Path) -> None:
+        """expected_count round-trips into FixtureCanonicalSource.
+
+        ``allow_missing`` used to round-trip here too, but that config key is retired (spec 4.7
+        bullet 5, E6-F1-S1-T2) and the ``FixtureScanTarget.allow_missing`` field itself is fully
+        removed: see ``TestGatesFixtureAllowMissingKeyRemoved`` for the config key's fail-fast
+        rejection and ``tests/test_fixture_consistency.py::TestInFixtureAllowMissingMarker`` for
+        the in-fixture marker that replaced it.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                    expected_count: 24
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.canonical_sources[0].expected_count == 24
+
+    def test_enabled_and_extract_source_literals_parse(self, tmp_path: Path) -> None:
+        """enabled and extract_source_literals (the new spec-4.1 tunables) round-trip."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                enabled: true
+                extract_source_literals: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.enabled is True
+        assert rt.gates.fixture_consistency.extract_source_literals is True
+
+    def test_multiple_canonical_sources_require_explicit_canonical_source_on_scan(self, tmp_path: Path) -> None:
+        """A scan entry omitting canonical_source is ambiguous when >1 canonical source is configured."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                  - path: tests/fixtures/vendors.json
+                    identifier_field: vendor_id
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+            """,
+        )
+        with pytest.raises(ValueError, match=r"does not set canonical_source.*ambiguous"):
+            load_runtime_config(cfg, {})
+
+    def test_multiple_canonical_sources_with_explicit_canonical_source_parses(self, tmp_path: Path) -> None:
+        """An explicit canonical_source resolves the ambiguity across multiple canonical sources."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                  - path: tests/fixtures/vendors.json
+                    identifier_field: vendor_id
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    canonical_source: tests/fixtures/catalog.json
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.scan[0].canonical_source == "tests/fixtures/catalog.json"
+
+    def test_scan_canonical_source_referencing_unknown_path_raises(self, tmp_path: Path) -> None:
+        """A canonical_source that does not match a configured canonical_sources[].path fails fast."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    canonical_source: tests/fixtures/does_not_exist.json
+            """,
+        )
+        with pytest.raises(ValueError, match=r"does not match any configured canonical_sources"):
+            load_runtime_config(cfg, {})
+
+    def test_expected_count_below_minimum_raises(self, tmp_path: Path) -> None:
+        """A non-positive expected_count fails schema validation (minimum: 1)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                    expected_count: 0
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_fixture_consistency_key(self, tmp_path: Path) -> None:
+        """JSON Schema ``additionalProperties: false`` rejects unknown ``gates.fixture_consistency:`` keys."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                unknown_field: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_field"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_canonical_source_missing_identifier_field(self, tmp_path: Path) -> None:
+        """canonical_sources entries require both path and identifier_field."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+            """,
+        )
+        with pytest.raises(ValueError, match=r"identifier_field"):
+            load_runtime_config(cfg, {})
+
+    def test_parse_fixture_consistency_config_raises_on_zero_expected_count_direct(self, tmp_path: Path) -> None:
+        """_parse_fixture_consistency_config defensive guard fires when the schema layer is bypassed."""
+        from devbench.config_loader import _parse_fixture_consistency_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"expected_count=0"):
+            _parse_fixture_consistency_config(
+                fake_path,
+                {
+                    "canonical_sources": [
+                        {"path": "tests/fixtures/catalog.json", "identifier_field": "sku", "expected_count": 0}
+                    ]
+                },
+            )
+
+    def test_parse_fixture_consistency_config_raises_on_non_boolean_enabled_direct(self, tmp_path: Path) -> None:
+        """_parse_fixture_consistency_config rejects a non-boolean enabled when the schema layer is bypassed."""
+        from devbench.config_loader import _parse_fixture_consistency_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.fixture_consistency\.enabled must be a boolean"):
+            _parse_fixture_consistency_config(fake_path, {"enabled": "yes"})
+
+
+class TestGatesFixtureAllowMissingKeyRemoved:
+    """spec 4.1 (8-step toggle checklist), spec 4.7 bullet 5, AC-E6-F1-S1-T2-4: the retired
+    ``gates.fixture_consistency.scan[].allow_missing`` workspace-config allowlist fails config
+    load with a message naming BOTH the removed key and its in-fixture marker replacement
+    (E6-F1-S1-T2 complete replacement -- the waiver now lives in the fixture artifact itself, see
+    ``tests/test_fixture_consistency.py::TestInFixtureAllowMissingMarker``). This is deliberately
+    NOT the JSON Schema's generic ``additionalProperties`` rejection: that message names only the
+    offending key, never the replacement, so ``config_loader.py`` intercepts the removed key
+    itself, before schema validation ever runs, to produce the more actionable message."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_residual_allow_missing_key_fails_load(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+            """,
+        )
+        with pytest.raises(ValueError):
+            load_runtime_config(cfg, {})
+
+    def test_error_names_removed_key_and_in_fixture_replacement(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+                      - SKU-EMPTY-STATE
+            """,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            load_runtime_config(cfg, {})
+
+        message = str(exc_info.value)
+        assert "gates.fixture_consistency.scan[].allow_missing" in message
+        assert "removed" in message.lower()
+        assert '"allow_missing": {"reason"' in message
+
+    def test_error_names_the_offending_scan_target_path(self, tmp_path: Path) -> None:
+        """The error names which scan target(s) still carry the removed key, not just the key
+        name in the abstract -- an operator with several scan entries needs to know which one(s)
+        to migrate."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                    allow_missing:
+                      - SKU-NOT-FOUND
+            """,
+        )
+        with pytest.raises(ValueError, match=r"tests/fixtures/mock_lookup\.json"):
+            load_runtime_config(cfg, {})
+
+    def test_config_without_the_removed_key_still_loads(self, tmp_path: Path) -> None:
+        """A workspace config that never set the retired key is unaffected (no false positive)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              fixture_consistency:
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.fixture_consistency.scan[0].path == "tests/fixtures/mock_lookup.json"
+
+
+class TestGatesConfigParsing:
+    """``gates:`` YAML section parsing into the frozen ``GatesConfig`` tree (spec 4.1; AC-4, AC-5).
+
+    Covers: successful parsing of a full block naming all eight gates with
+    their documented tunables, each fail-fast error path (unknown gate
+    name, wrong-typed value, per-repo override for an unconfigured repo),
+    and the absent-block all-disabled default tree.
+    """
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_full_gates_block_parses_all_eight_gates_with_documented_tunables(self, tmp_path: Path) -> None:
+        """A full gates: block (spec 4.1 example) parses into the frozen tree with every tunable."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+            gates:
+              reachability:
+                enabled: true
+              ancestry:
+                enabled: true
+              shared_file_impact:
+                enabled: true
+                auto_derive_registry: true
+                fan_in_threshold: 5
+              fixture_consistency:
+                enabled: true
+                canonical_sources:
+                  - path: tests/fixtures/catalog.json
+                    identifier_field: sku
+                scan:
+                  - path: tests/fixtures/mock_lookup.json
+                    identifier_field: sku
+                extract_source_literals: true
+              write_path_audit:
+                enabled: true
+              newly_reachable_paths:
+                enabled: true
+              composition_root:
+                enabled: true
+              layout_geometry:
+                enabled: true
+              repos:
+                caylent-solutions/devbench:
+                  shared_file_impact:
+                    enabled: true
+                    patterns:
+                      - "src/app/Shell.tsx"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        gates = rt.gates
+        assert gates.reachability.enabled is True
+        assert gates.ancestry.enabled is True
+        assert gates.shared_file_impact.enabled is True
+        assert gates.shared_file_impact.auto_derive_registry is True
+        assert gates.shared_file_impact.fan_in_threshold == 5
+        assert gates.fixture_consistency.enabled is True
+        assert gates.fixture_consistency.canonical_sources == (
+            FixtureCanonicalSource(path="tests/fixtures/catalog.json", identifier_field="sku"),
+        )
+        assert gates.fixture_consistency.extract_source_literals is True
+        assert gates.write_path_audit.enabled is True
+        assert gates.newly_reachable_paths.enabled is True
+        assert gates.composition_root.enabled is True
+        assert gates.layout_geometry.enabled is True
+        override = gates.repos["caylent-solutions/devbench"].shared_file_impact
+        assert override is not None
+        assert override.enabled is True
+        assert override.patterns == ("src/app/Shell.tsx",)
+
+    # -- gates.shared_file_impact.fan_in_threshold (spec 4.6, issue #13 AC4) --------
+
+    def test_fan_in_threshold_defaults_to_three(self, tmp_path: Path) -> None:
+        """Absent fan_in_threshold defaults to 3 (spec 4.6)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.shared_file_impact.fan_in_threshold == 3
+
+    def test_fan_in_threshold_explicit_value_parses(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                auto_derive_registry: true
+                fan_in_threshold: 7
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.shared_file_impact.fan_in_threshold == 7
+
+    def test_fan_in_threshold_non_integer_raises_naming_key(self, tmp_path: Path) -> None:
+        """A non-integer fan_in_threshold fails config load naming the offending key (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: "three"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_fan_in_threshold_zero_raises_naming_key(self, tmp_path: Path) -> None:
+        """A fan_in_threshold below 1 fails config load naming the offending key (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: 0
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_fan_in_threshold_negative_raises_naming_key(self, tmp_path: Path) -> None:
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                fan_in_threshold: -1
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_key_inside_shared_file_impact_block_raises_naming_key(self, tmp_path: Path) -> None:
+        """An unrecognised key nested inside gates.shared_file_impact fails load naming it (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              shared_file_impact:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*bogus_key"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_gate_name_raises_value_error_naming_key(self, tmp_path: Path) -> None:
+        """An unrecognised top-level gates.<name> key fails load naming the offending key (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              nosuchgate:
+                enabled: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"nosuchgate"):
+            load_runtime_config(cfg, {})
+
+    def test_wrong_typed_enabled_raises_value_error_naming_key_and_type(self, tmp_path: Path) -> None:
+        """A non-boolean gates.reachability.enabled fails load naming the key and expected type (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.reachability\.enabled.*boolean"):
+            load_runtime_config(cfg, {})
+
+    def test_repo_override_for_unconfigured_repo_raises_naming_repo(self, tmp_path: Path) -> None:
+        """A gates.repos override for a repo absent from the top-level repos: mapping fails naming the repo (AC-5)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+            gates:
+              repos:
+                caylent-solutions/absent:
+                  shared_file_impact:
+                    enabled: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"caylent-solutions/absent"):
+            load_runtime_config(cfg, {})
+
+    def test_absent_gates_block_yields_all_disabled_built_in_tree(self, tmp_path: Path) -> None:
+        """No gates: key at all loads into the all-disabled built-in tree, no error, no warning (AC-4)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.reachability.enabled is False
+        assert rt.gates.ancestry.enabled is False
+        assert rt.gates.shared_file_impact.enabled is False
+        assert rt.gates.shared_file_impact.fan_in_threshold == 3
+        assert rt.gates.fixture_consistency.enabled is False
+        assert rt.gates.write_path_audit.enabled is False
+        assert rt.gates.newly_reachable_paths.enabled is False
+        assert rt.gates.composition_root.enabled is False
+        assert rt.gates.layout_geometry.enabled is False
+        assert rt.gates.repos == {}
+
+    def test_repo_override_for_configured_repo_parses(self, tmp_path: Path) -> None:
+        """A gates.repos override for a repo present in repos: parses into GateRepoOverrides."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              repos:
+                org/repo:
+                  reachability:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        override = rt.gates.repos["org/repo"].reachability
+        assert override is not None
+        assert override.enabled is True
+
+    def test_repo_override_omitting_a_gate_leaves_it_none(self, tmp_path: Path) -> None:
+        """A per-repo override that only sets one gate leaves every other gate field None (not overridden)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              repos:
+                org/repo:
+                  reachability:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        overrides = rt.gates.repos["org/repo"]
+        assert overrides.ancestry is None
+        assert overrides.shared_file_impact is None
+        assert overrides.fixture_consistency is None
+
+    def test_repo_override_without_enabled_key_yields_none(self, tmp_path: Path) -> None:
+        """A gate override block that omits enabled yields enabled=None (inherit project level)."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              repos:
+                org/repo:
+                  shared_file_impact:
+                    patterns:
+                      - "src/app/Shell.tsx"
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        override = rt.gates.repos["org/repo"].shared_file_impact
+        assert override is not None
+        assert override.enabled is None
+        assert override.patterns == ("src/app/Shell.tsx",)
+
+    def test_unknown_repo_override_gate_name_raises_direct(self, tmp_path: Path) -> None:
+        """_parse_gates_config rejects an unknown gate name inside a per-repo override (defense in depth)."""
+        from devbench.config_loader import RepoConfig, _parse_gates_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"nosuchgate"):
+            _parse_gates_config(
+                fake_path,
+                {"repos": {"org/repo": {"nosuchgate": {"enabled": True}}}},
+                {"org/repo": RepoConfig()},
+            )
+
+    def test_unknown_top_level_gate_name_raises_direct(self, tmp_path: Path) -> None:
+        """_parse_gates_config rejects an unknown top-level gate name directly (defense in depth)."""
+        from devbench.config_loader import _parse_gates_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"nosuchgate"):
+            _parse_gates_config(fake_path, {"nosuchgate": {"enabled": True}}, {})
+
+
+class TestGatesConfigDefenseInDepthDirectCalls:
+    """Every gate-parser type/shape check is defense in depth: schema validation
+    (``additionalProperties: false`` and per-field ``type`` constraints) already
+    rejects these malformed shapes before ``load_runtime_config`` ever calls the
+    private ``_parse_*`` helpers below, so these branches are only reachable via
+    a direct call that bypasses the schema layer -- the same pattern the rest of
+    this module's ``_parse_*_config`` helpers use (see
+    ``test_parse_fixture_consistency_config_raises_on_zero_expected_count_direct``
+    on ``TestFixtureConsistencyConfig``).
+    """
+
+    def test_extract_source_literals_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_fixture_consistency_config
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.fixture_consistency\.extract_source_literals must be a boolean"):
+            _parse_fixture_consistency_config(fake_path, {"extract_source_literals": "yes"})
+
+    def test_simple_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        """Uses ``gates.ancestry`` as the exemplar label, not ``gates.reachability``
+        (test_review round-2 STALE_LABEL finding): reachability moved off
+        ``_parse_simple_gate_enabled`` onto its own ``_parse_reachability_gate``
+        once ``entry_points`` was added (issue #10 AC2, E3-F1-S1-T2), matching
+        the same re-pointing already applied to
+        ``TestResolveGateConfigPrecedence`` for the identical reason."""
+        from devbench.config_loader import _parse_simple_gate_enabled
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.ancestry must be a mapping"):
+            _parse_simple_gate_enabled(fake_path, "gates.ancestry", ["not", "a", "mapping"])
+
+    def test_shared_file_impact_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact must be a mapping"):
+            _parse_shared_file_impact_gate(fake_path, ["not", "a", "mapping"])
+
+    def test_shared_file_impact_auto_derive_registry_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.auto_derive_registry must be a boolean"):
+            _parse_shared_file_impact_gate(fake_path, {"auto_derive_registry": "yes"})
+
+    def test_shared_file_impact_fan_in_threshold_bool_raises_direct(self, tmp_path: Path) -> None:
+        """A bool is a Python int subclass but must never satisfy the integer check (defense in depth
+        beyond the schema layer, which already rejects bool for a `type: integer` property)."""
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": True})
+
+    def test_shared_file_impact_fan_in_threshold_non_integer_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": 2.5})
+
+    def test_shared_file_impact_fan_in_threshold_below_one_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_shared_file_impact_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.shared_file_impact\.fan_in_threshold must be an integer >= 1"):
+            _parse_shared_file_impact_gate(fake_path, {"fan_in_threshold": 0})
+
+    def test_gate_override_enabled_absent_key_returns_default_direct(self, tmp_path: Path) -> None:
+        """An override block present but omitting 'enabled' yields GateEnabledOverride() (enabled=None)."""
+        from devbench.config_loader import GateEnabledOverride, _parse_gate_override_enabled
+
+        fake_path = tmp_path / "cfg.yaml"
+        result = _parse_gate_override_enabled(fake_path, "gates.repos.org/repo.ancestry", {})
+        assert result == GateEnabledOverride(enabled=None)
+
+    def test_gate_override_enabled_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_enabled
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.repos\.org/repo\.ancestry\.enabled must be a boolean"):
+            _parse_gate_override_enabled(fake_path, "gates.repos.org/repo.ancestry", {"enabled": "yes"})
+
+    def test_gate_override_shared_file_impact_enabled_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_shared_file_impact
+
+        fake_path = tmp_path / "cfg.yaml"
+        key = "gates.repos.org/repo.shared_file_impact"
+        with pytest.raises(ValueError, match=r"gates\.repos\.org/repo\.shared_file_impact\.enabled must be a boolean"):
+            _parse_gate_override_shared_file_impact(fake_path, key, {"enabled": "yes"})
+
+    def test_one_gate_repo_override_gate_raw_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_one_gate_repo_override
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.repos\.org/repo\.ancestry must be a mapping"):
+            _parse_one_gate_repo_override(fake_path, "org/repo", {"ancestry": ["not", "a", "mapping"]})
+
+    def test_gate_repo_overrides_repo_gate_raw_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import RepoConfig, _parse_gate_repo_overrides
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.repos\.org/repo must be a mapping"):
+            _parse_gate_repo_overrides(fake_path, {"org/repo": ["not", "a", "mapping"]}, {"org/repo": RepoConfig()})
+
+    def test_one_gate_repo_override_covers_every_non_shared_file_impact_gate(self, tmp_path: Path) -> None:
+        """Every enabled-only per-repo override branch (ancestry, fixture_consistency,
+        write_path_audit, newly_reachable_paths, composition_root, layout_geometry)
+        parses correctly -- not just the reachability/shared_file_impact pair the
+        full-block round-trip test exercises."""
+        from devbench.config_loader import _parse_one_gate_repo_override
+
+        fake_path = tmp_path / "cfg.yaml"
+        raw = {
+            "ancestry": {"enabled": True},
+            "fixture_consistency": {"enabled": True},
+            "write_path_audit": {"enabled": True},
+            "newly_reachable_paths": {"enabled": True},
+            "composition_root": {"enabled": True},
+            "layout_geometry": {"enabled": True},
+        }
+        result = _parse_one_gate_repo_override(fake_path, "org/repo", raw)
+        assert result.ancestry is not None and result.ancestry.enabled is True
+        assert result.fixture_consistency is not None and result.fixture_consistency.enabled is True
+        assert result.write_path_audit is not None and result.write_path_audit.enabled is True
+        assert result.newly_reachable_paths is not None and result.newly_reachable_paths.enabled is True
+        assert result.composition_root is not None and result.composition_root.enabled is True
+        assert result.layout_geometry is not None and result.layout_geometry.enabled is True
+
+
+class TestGatesMigrationRemovesPreReleaseKeys:
+    """Spec 4.1 Migration (complete replacement): the pre-release keys
+    ``repos.<repo>.shared_file_patterns`` (#318) and top-level
+    ``fixture_consistency:`` (#322) are REMOVED with zero remaining
+    references in the config-model files this task owns (AC-E2-F1-S1-T1-5).
+    """
+
+    _MIGRATED_SURFACE_FILES: tuple[Path, ...] = (
+        Path(__file__).parent.parent / "src" / "devbench" / "config_loader.py",
+        Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json",
+        Path(__file__).parent.parent / "sample-config.yaml",
+        Path(__file__).parent.parent / "docs" / "devbench-yaml-reference.md",
+        Path(__file__).parent.parent / "src" / "devbench" / "cli.py",
+        Path(__file__).parent.parent / "tests" / "test_cli.py",
+        Path(__file__).parent.parent / "src" / "devbench" / "fixture_consistency.py",
+        Path(__file__).parent.parent / "docs" / "cli-reference.md",
+        Path(__file__).parent.parent / "docs" / "plugin-architecture.md",
+        Path(__file__).parent.parent / "docs" / "review-feedback-vocabulary.md",
+        Path(__file__).parent.parent / "plugin" / "devbench-orchestrate" / "agents" / "executor.md",
+        Path(__file__).parent.parent
+        / "plugin"
+        / "devbench-orchestrate"
+        / "agents"
+        / "review_team"
+        / "test-reviewer.md",
+        Path(__file__).parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / "assert-shared-file-impact.sh",
+    )
+
+    def test_discovers_at_least_eleven_migrated_surface_files(self) -> None:
+        """Guards against the parametrized checks below silently collecting too few files."""
+        assert len(self._MIGRATED_SURFACE_FILES) >= 11, (
+            f"Expected >=11 migrated-surface files, found {len(self._MIGRATED_SURFACE_FILES)}"
+        )
+
+    _BARE_SHARED_FILE_PATTERNS_RE = re.compile(r"\bshared_file_patterns\b")
+    _BARE_TOP_LEVEL_FIXTURE_CONSISTENCY_RE = re.compile(r"^#?\s?fixture_consistency\s*:", re.MULTILINE)
+
+    @pytest.mark.parametrize(
+        "surface_path",
+        _MIGRATED_SURFACE_FILES,
+        ids=[str(p.relative_to(Path(__file__).parent.parent)) for p in _MIGRATED_SURFACE_FILES],
+    )
+    def test_no_bare_shared_file_patterns_key_remains(self, surface_path: Path) -> None:
+        """No reference to the retired 'shared_file_patterns' identifier remains at all.
+
+        The migrated replacement field is named ``patterns`` (nested under
+        ``GateSharedFileImpactOverride`` / ``gates.repos.<org/repo>
+        .shared_file_impact.patterns``), a distinct identifier that never
+        collides with this word-bounded check -- so zero tolerance is
+        correct with no exceptions needed.
+        """
+        text = surface_path.read_text(encoding="utf-8")
+        matches = self._BARE_SHARED_FILE_PATTERNS_RE.findall(text)
+        assert not matches, (
+            f"{surface_path.relative_to(Path(__file__).parent.parent)} still references the retired "
+            f"'shared_file_patterns' key ({len(matches)} occurrence(s)); migrate to "
+            "gates.repos.<org/repo>.shared_file_impact.patterns."
+        )
+
+    @pytest.mark.parametrize(
+        "surface_path",
+        _MIGRATED_SURFACE_FILES,
+        ids=[str(p.relative_to(Path(__file__).parent.parent)) for p in _MIGRATED_SURFACE_FILES],
+    )
+    def test_no_bare_top_level_fixture_consistency_key_remains(self, surface_path: Path) -> None:
+        """No live top-level 'fixture_consistency:' key (active or commented) remains.
+
+        Matches only a line that STARTS (column 0, optionally after a
+        single '# ' comment prefix) with 'fixture_consistency:' -- the
+        exact shape of the retired top-level YAML surface (mirrors this
+        repo's own '^report:' convention in
+        tests/test_docs/test_config_examples_load.py). The migrated
+        surface is always nested (at least two spaces of indentation)
+        under 'gates:', so it never matches this column-0 anchor.
+        Deliberately does NOT flag every bare 'fixture_consistency'
+        substring: the Python attribute name ``GatesConfig.fixture_consistency``
+        / ``GateRepoOverrides.fixture_consistency`` legitimately appears
+        bare (un-prefixed) in docstrings and code describing that field,
+        and is not a YAML config key.
+        """
+        text = surface_path.read_text(encoding="utf-8")
+        matches = self._BARE_TOP_LEVEL_FIXTURE_CONSISTENCY_RE.findall(text)
+        assert not matches, (
+            f"{surface_path.relative_to(Path(__file__).parent.parent)} still shows the retired "
+            f"top-level 'fixture_consistency:' key ({len(matches)} occurrence(s)); migrate to "
+            "gates.fixture_consistency."
+        )
+
+
+class TestFixtureConsistencyAllowMissingKeyRemoved:
+    """spec 4.1 (8-step toggle checklist), spec 4.7 bullet 5, AC-E6-F1-S1-T2-5: a residual
+    ``allow_missing`` property under ``gates.fixture_consistency.scan[].items`` in
+    ``config-schema.json``, or a residual ``allow_missing:`` line in ``sample-config.yaml``'s
+    commented ``gates:`` block, must fail this drift guard -- the config-level waiver allowlist
+    is a complete replacement (E6-F1-S1-T2), not merely superseded, so neither surface may
+    silently reintroduce it.
+    """
+
+    _SCHEMA_PATH = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+    _SAMPLE_CONFIG_PATH = Path(__file__).parent.parent / "sample-config.yaml"
+
+    def test_schema_scan_item_properties_do_not_declare_allow_missing(self) -> None:
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        scan_item_properties = schema["properties"]["gates"]["properties"]["fixture_consistency"]["properties"]["scan"][
+            "items"
+        ]["properties"]
+        assert "allow_missing" not in scan_item_properties, (
+            f"{self._SCHEMA_PATH} still declares gates.fixture_consistency.scan[].allow_missing; "
+            "the config-level waiver was replaced by the in-fixture allow_missing marker "
+            "(spec 4.7 bullet 5)."
+        )
+
+    def test_sample_config_does_not_show_allow_missing(self) -> None:
+        """Matches only the retired YAML KEY shape (``allow_missing:`` on its own line), not
+        every prose mention of the term -- the replacement paragraph documenting the in-fixture
+        marker legitimately names it inside a JSON example, which is not a YAML config key."""
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        matches = re.findall(r"^#?\s*allow_missing:\s*$", text, re.MULTILINE)
+        assert not matches, (
+            f"{self._SAMPLE_CONFIG_PATH} still shows the retired allow_missing key under "
+            "gates.fixture_consistency; the waiver now lives in the fixture artifact itself "
+            "(spec 4.7 bullet 5)."
+        )
+
+
+class TestFixtureConsistencyExtractSourceLiteralsSchemaAndSampleDrift:
+    """spec 4.1 8-step toggle checklist; AC-E6-F2-S1-T1-7: ``extract_source_literals`` must be
+    declared in ``config-schema.json``'s ``gates.fixture_consistency.properties`` AND present in
+    the commented ``gates:`` block in ``sample-config.yaml``. ``gates.fixture_consistency`` is
+    ``additionalProperties: false``, so an operator who sets the key without the schema entry
+    fails config load outright the moment the schema declaration is missing -- these two
+    assertions are provably load-bearing (each dies if its respective file's key is removed, not
+    merely a documentation nicety)."""
+
+    _SCHEMA_PATH = Path(__file__).parent.parent / "src" / "devbench" / "config-schema.json"
+    _SAMPLE_CONFIG_PATH = Path(__file__).parent.parent / "sample-config.yaml"
+
+    def test_schema_declares_extract_source_literals_under_fixture_consistency(self) -> None:
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        fixture_consistency_properties = schema["properties"]["gates"]["properties"]["fixture_consistency"][
+            "properties"
+        ]
+        assert "extract_source_literals" in fixture_consistency_properties, (
+            f"{self._SCHEMA_PATH} does not declare gates.fixture_consistency.extract_source_literals; "
+            "gates.fixture_consistency's additionalProperties: false rejects the key at config-load "
+            "time until this schema entry is (re)added (spec 4.1 8-step toggle checklist)."
+        )
+        assert fixture_consistency_properties["extract_source_literals"]["type"] == "boolean"
+
+    def test_sample_config_documents_extract_source_literals_under_gates_fixture_consistency(self) -> None:
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        matches = re.findall(r"^#?\s*extract_source_literals:\s*(true|false)\s*$", text, re.MULTILINE)
+        assert matches, (
+            f"{self._SAMPLE_CONFIG_PATH} does not document gates.fixture_consistency."
+            "extract_source_literals in its commented gates: block (spec 4.1 8-step toggle checklist)."
+        )
+
+    def test_schema_description_documents_symlink_exclusion_and_redaction(self) -> None:
+        """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+        prose mirrored into ``config-schema.json``'s ``extract_source_literals`` description had
+        no drift pin at all -- stripping it killed no test. Scoped to this property's own
+        ``description`` string (not the whole schema file), so this dies only if THIS mirrored
+        copy drifts, independent of the canonical prose in
+        ``docs/devbench-yaml-reference.md``."""
+        schema = json.loads(self._SCHEMA_PATH.read_text(encoding="utf-8"))
+        description = schema["properties"]["gates"]["properties"]["fixture_consistency"]["properties"][
+            "extract_source_literals"
+        ]["description"]
+        assert "excluding any file symlink resolving outside the repo root" in description
+        assert "symlinked directory is never descended into" in description
+        assert "redacted unconditionally regardless of length" in description
+
+    def test_sample_config_comment_documents_symlink_exclusion_and_redaction(self) -> None:
+        """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+        prose mirrored into ``sample-config.yaml``'s commented ``extract_source_literals`` entry
+        had no drift pin at all -- stripping it killed no test. Scoped between the entry's own
+        ``# Heuristic scan mode`` comment lead-in and the ``extract_source_literals: false`` key
+        line, so this dies only if THIS mirrored copy drifts."""
+        text = self._SAMPLE_CONFIG_PATH.read_text(encoding="utf-8")
+        section = text.split("# Heuristic scan mode (spec 4.7 bullet 4")[1].split("extract_source_literals: false")[0]
+        assert "excluding any file symlink resolving outside" in section
+        assert "symlinked directory is never descended into" in section
+        assert "redacted unconditionally regardless of length" in section
+
+
+@pytest.mark.unit
+class TestFixtureConsistencyConfigDocstringDocumentsSymlinkExclusionAndRedaction:
+    """test_review round-4 WARN: the round-4/5 symlink-boundary and unconditional-redaction
+    prose mirrored into ``FixtureConsistencyConfig``'s ``extract_source_literals`` attribute
+    docstring (``src/devbench/config_loader.py``) had no drift pin at all -- stripping it killed
+    no test. Scoped to just the ``extract_source_literals`` attribute's own paragraph within the
+    dataclass docstring (not the whole module), so this dies only if THIS mirrored copy drifts."""
+
+    def test_attribute_docstring_documents_symlink_exclusion_and_redaction(self) -> None:
+        import inspect
+
+        doc = inspect.getdoc(FixtureConsistencyConfig)
+        assert doc is not None
+        section = doc.split("extract_source_literals: Enables")[1]
+        assert "and also excluding any file symlink whose resolved real" in section
+        assert "directory is never descended into) for identifier literals" in section
+        assert "redacted" in section
+        assert "unconditionally regardless of length" in section
+
+
+@pytest.mark.unit
+class TestGatesConfigDocstringDocumentsLayoutGeometryWaiverRoute:
+    """E10-F1-S1-T2 (spec 4.9c, 4.2, 4.9 PM-5): ``GatesConfig``'s ``layout_geometry``
+    attribute docstring names the gate's judge-evidence tier and its ``log-waiver``
+    exception route (mandatory reason, ``--operator`` not required), mirrored from
+    ``docs/devbench-yaml-reference.md``'s ``gates.layout_geometry`` section. Follows the
+    same drift-pin pattern as
+    ``TestFixtureConsistencyConfigDocstringDocumentsSymlinkExclusionAndRedaction`` above:
+    scoped to just the ``layout_geometry`` attribute's own paragraph within the dataclass
+    docstring, so this dies only if THIS mirrored copy drifts. Imports ``GatesConfig``
+    inside the test body (not at module level) so a scoped stash of
+    ``src/devbench/config_loader.py`` alone yields a collected FAILED assertion, never a
+    collection ERROR."""
+
+    def test_attribute_docstring_documents_judge_evidence_tier_and_waiver_route(self) -> None:
+        import inspect
+
+        from devbench.config_loader import GatesConfig
+
+        doc = inspect.getdoc(GatesConfig)
+        assert doc is not None
+        section = doc.split("layout_geometry: layout-geometry gate tunables")[1]
+        normalized = " ".join(section.split())
+        assert "no tunable beyond" in normalized
+        assert "Judge-evidence tier" in normalized
+        assert "never blocks ``mark-done``" in normalized
+        assert "browser geometry itself is verified outside devbench" in normalized
+        assert "``log-waiver``" in normalized
+        assert "mandatory non-empty" in normalized
+        assert "``--operator`` is NOT required" in normalized
+
+
+@pytest.mark.unit
+class TestLayoutGeometryGateConfigNamedRegressionPins:
+    """E10-F1-S1-T2 (spec 4.1, AC-4/AC-5/AC-27): the ``gates.layout_geometry``
+    four-layer precedence, fail-fast unknown-key/wrong-type error paths, and
+    per-repo field-wise override. The underlying generic mechanism (the
+    ``GatesConfig.layout_geometry`` field, its ``_parse_simple_gate_enabled``/
+    ``_parse_gate_override_enabled`` parsing, and ``resolve_gate_config``'s
+    generic ``GATE_FIELD_DEFAULTS``-driven merge) was already shipped for
+    ALL eight gates -- including ``layout_geometry`` -- by E2-F1-S1-T1
+    (commit 195be6a) and E2-F1-S1-T2 (commit 7a669c5), which predate this
+    task. These cases exist because no prior test named ``layout_geometry``
+    explicitly by name (every existing precedence/error-path test uses
+    ``ancestry``/``shared_file_impact``/``reachability`` as its exemplar
+    gate) -- they PIN the already-correct generic behavior specifically for
+    THIS gate name, closing the AC-TEST-001/002/003/004 and AC-CYCLE-001
+    coverage gap without re-implementing the generic mechanism a second
+    time (DRY)."""
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_no_gates_key_resolves_disabled_with_builtin_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-001: absent gates: key resolves layout_geometry.enabled False, builtin provenance."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.layout_geometry.enabled is False
+        from devbench.config_loader import resolve_gate_config
+
+        result = resolve_gate_config("layout_geometry", "org/repo", rt)
+        assert result.values == {"enabled": False}
+        assert result.provenance == {"enabled": "builtin"}
+
+    def test_project_level_enabled_true_resolves_project_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-002 (project layer): project-level enabled: true resolves True, project provenance."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config_loader import resolve_gate_config
+
+        result = resolve_gate_config("layout_geometry", "org/repo", rt)
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_per_repo_override_flips_enabled_with_repo_provenance(self, tmp_path: Path) -> None:
+        """AC-TEST-002 (repo layer), AC-CYCLE-001: a per-repo override under
+        gates.repos.caylent-solutions/devbench flips enabled while every other
+        repo stays on the project-level value. Project is set to True (differs
+        from the builtin False default) so the un-overridden repo's resolved
+        provenance is genuinely 'project', not 'builtin'."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+              org/other: {}
+            gates:
+              layout_geometry:
+                enabled: true
+              repos:
+                caylent-solutions/devbench:
+                  layout_geometry:
+                    enabled: false
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config_loader import resolve_gate_config
+
+        overridden = resolve_gate_config("layout_geometry", "caylent-solutions/devbench", rt)
+        assert overridden.values == {"enabled": False}
+        assert overridden.provenance == {"enabled": "repo"}
+        elsewhere = resolve_gate_config("layout_geometry", "org/other", rt)
+        assert elsewhere.values == {"enabled": True}
+        assert elsewhere.provenance == {"enabled": "project"}
+
+    def test_env_override_beats_project_and_repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-TEST-002 (env layer): DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED beats both lower layers.
+
+        Hermetic by construction: the unset leg explicitly ``delenv``s the
+        variable (rather than trusting the ambient shell), and the env-wins
+        leg ``setenv``s it and threads the result through the real
+        ``resolve_gate_env_override`` derivation, so the documented operator
+        env override is genuinely exercised in both directions instead of a
+        hand-injected boolean standing in for it.
+        """
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              caylent-solutions/devbench: {}
+            gates:
+              layout_geometry:
+                enabled: false
+              repos:
+                caylent-solutions/devbench:
+                  layout_geometry:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        from devbench.config import resolve_gate_env_override
+        from devbench.config_loader import resolve_gate_config
+
+        env_var = "DEVBENCH_GATE_LAYOUT_GEOMETRY_ENABLED"
+
+        monkeypatch.delenv(env_var, raising=False)
+        with_env_unset = resolve_gate_config(
+            "layout_geometry",
+            "caylent-solutions/devbench",
+            rt,
+            env_enabled_override=resolve_gate_env_override("layout_geometry"),
+        )
+        assert with_env_unset.values == {"enabled": True}
+        assert with_env_unset.provenance == {"enabled": "repo"}
+
+        monkeypatch.setenv(env_var, "false")
+        with_env_set = resolve_gate_config(
+            "layout_geometry",
+            "caylent-solutions/devbench",
+            rt,
+            env_enabled_override=resolve_gate_env_override("layout_geometry"),
+        )
+        assert with_env_set.values == {"enabled": False}
+        assert with_env_set.provenance == {"enabled": "env"}
+
+    def test_unknown_key_under_layout_geometry_raises_naming_key(self, tmp_path: Path) -> None:
+        """AC-TEST-003: an unrecognised key under gates.layout_geometry fails load naming it."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.layout_geometry.*bogus_key"):
+            load_runtime_config(cfg, {})
+
+    def test_non_boolean_enabled_raises_naming_key_and_expected_type(self, tmp_path: Path) -> None:
+        """AC-TEST-003: a non-boolean gates.layout_geometry.enabled fails load naming key and type."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              layout_geometry:
+                enabled: "yes"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.layout_geometry\.enabled.*boolean"):
+            load_runtime_config(cfg, {})
+
+    def test_schema_and_sample_config_both_carry_the_gate(self) -> None:
+        """AC-TEST-004: config-schema.json and sample-config.yaml both declare
+        gates.layout_geometry with additionalProperties: false preserved at
+        both the top-level gate block and the per-repo override block."""
+        repo_root = Path(__file__).resolve().parent.parent
+        schema = json.loads((repo_root / "src" / "devbench" / "config-schema.json").read_text(encoding="utf-8"))
+        gates_props = schema["properties"]["gates"]["properties"]
+        assert "layout_geometry" in gates_props
+        assert gates_props["layout_geometry"]["additionalProperties"] is False
+        assert "enabled" in gates_props["layout_geometry"]["properties"]
+        repo_override_props = gates_props["repos"]["patternProperties"]["^[^/]+/[^/]+$"]["properties"]
+        assert "layout_geometry" in repo_override_props
+        assert repo_override_props["layout_geometry"]["additionalProperties"] is False
+
+        sample_config = (repo_root / "sample-config.yaml").read_text(encoding="utf-8")
+        gates_section_start = sample_config.index("# gates:")
+        gates_section_end = sample_config.index("# ---", gates_section_start + len("# gates:"))
+        gates_section = sample_config[gates_section_start:gates_section_end]
+        assert "layout_geometry:" in gates_section, (
+            "sample-config.yaml 'gates:' section is missing its commented layout_geometry block (AC-TEST-004)"
+        )
+        # Scope past the shared "layout_geometry:" substring match (it also appears inside the
+        # gate's own comment prose) down to the start of the next sibling gate key, so this
+        # assertion can only pass against the actual gates.layout_geometry commented block --
+        # not any incidental mention of the gate name elsewhere in the section.
+        after_key = gates_section[gates_section.index("layout_geometry:") + 1 :]
+        next_sibling_key = re.search(r"\n#   [a-z]", after_key)
+        layout_geometry_block = after_key[: next_sibling_key.start()] if next_sibling_key else after_key
+        assert "enabled: false" in layout_geometry_block, (
+            "sample-config.yaml 'gates.layout_geometry' commented block is missing its "
+            "'enabled: false' line (AC-TEST-004)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# gates.reachability.entry_points (spec 4.1, 4.4 bullet 2; issue #10 AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestGatesReachabilityEntryPoints:
+    """``gates.reachability.entry_points`` config parsing and resolution
+    (spec 4.1, 4.4 bullet 2; issue #10 AC2; AC-5, AC-FUNC-005, AC-FUNC-006,
+    AC-FUNC-007). Malformed-shape cases are exercised via a direct call to
+    the private parser (matching ``TestGatesConfigDefenseInDepthDirectCalls``'s
+    established pattern in this module): the JSON schema
+    (``config-schema.json``'s ``type: array`` / ``items.type: string`` /
+    ``items.minLength: 1``) already rejects every one of these shapes
+    before ``load_runtime_config`` ever reaches ``_parse_reachability_gate``,
+    so a direct call bypassing that layer is the only way to exercise --
+    and pin the messages of -- this module's own defense-in-depth
+    validation.
+    """
+
+    _REPO = "org/repo"
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    # -- valid list: parses, and resolves with 'project' provenance -------
+
+    def test_valid_list_parses_and_resolves_with_project_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+                entry_points:
+                  - src/index.ts
+                  - cmd/server/main.go
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.gates.reachability.entry_points == ("src/index.ts", "cmd/server/main.go")
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == ("src/index.ts", "cmd/server/main.go")
+        assert result.provenance["entry_points"] == "project"
+
+    # -- AC-5/AC-FUNC-005: malformed entry_points fails naming the key ----
+    # Parametrised over exactly the Approach's four shapes (valid list,
+    # scalar value, a list containing an integer, a list containing an
+    # empty string) against the same direct-call parser, matching
+    # ``TestGatesConfigDefenseInDepthDirectCalls``'s established pattern in
+    # this module for exercising this module's own defense-in-depth
+    # validation (the JSON schema layer already rejects every one of these
+    # shapes before ``load_runtime_config`` ever reaches this parser -- see
+    # ``test_malformed_entry_points_fails_full_load_pipeline`` below for
+    # that layer).
+
+    @pytest.mark.parametrize(
+        ("raw", "expected", "match"),
+        [
+            pytest.param(
+                ["src/index.ts", "cmd/server/main.go"],
+                ("src/index.ts", "cmd/server/main.go"),
+                None,
+                id="valid_list",
+            ),
+            pytest.param(
+                "not-a-list", None, r"gates\.reachability\.entry_points must be a list.*not-a-list", id="scalar_value"
+            ),
+            pytest.param(
+                ["src/main.py", 1],
+                None,
+                r"gates\.reachability\.entry_points must contain only strings.*1",
+                id="list_containing_an_integer",
+            ),
+            pytest.param(
+                ["src/main.py", ""],
+                None,
+                r"gates\.reachability\.entry_points must not contain an empty string",
+                id="list_containing_an_empty_string",
+            ),
+            pytest.param(
+                ["src/main.py", "/etc/hostname"],
+                None,
+                r"gates\.reachability\.entry_points must contain only repo-relative paths.*etc/hostname",
+                id="absolute_path",
+            ),
+            pytest.param(
+                ["src/main.py", "../escape.py"],
+                None,
+                r"gates\.reachability\.entry_points must not contain parent traversal.*escape\.py",
+                id="parent_traversal_dotdot",
+            ),
+        ],
+    )
+    def test_entry_points_validation_matrix_direct(
+        self, tmp_path: Path, raw: object, expected: tuple[str, ...] | None, match: str | None
+    ) -> None:
+        """code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path
+        or a ``..`` parent-traversal segment must be rejected here, at
+        ``_parse_reachability_entry_points``'s own defense-in-depth layer
+        (matching every other malformed shape in this matrix), because a
+        bare ``(repo_path / entry_point).is_file()`` existence check alone
+        is not a safe repo-relativity guard (pathlib's ``/`` operator
+        discards the left operand for an absolute right operand)."""
+        from devbench.config_loader import _parse_reachability_entry_points
+
+        fake_path = tmp_path / "cfg.yaml"
+        if match is None:
+            assert _parse_reachability_entry_points(fake_path, raw) == expected
+        else:
+            with pytest.raises(ValueError, match=match):
+                _parse_reachability_entry_points(fake_path, raw)
+
+    def test_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_reachability_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.reachability must be a mapping"):
+            _parse_reachability_gate(fake_path, ["not", "a", "mapping"])
+
+    def test_gate_raw_none_returns_defaults_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GateReachabilityConfig, _parse_reachability_gate
+
+        fake_path = tmp_path / "cfg.yaml"
+        assert _parse_reachability_gate(fake_path, None) == GateReachabilityConfig()
+
+    @pytest.mark.parametrize(
+        ("entry_points_yaml", "match"),
+        [
+            pytest.param("not-a-list", r"gates\.reachability\.entry_points.*array", id="scalar_via_schema"),
+            pytest.param("[1]", r"gates\.reachability\.entry_points\.0.*string", id="non_string_element_via_schema"),
+            pytest.param('[""]', r"gates\.reachability\.entry_points\.0", id="empty_string_element_via_schema"),
+            pytest.param('["/etc/hostname"]', r"gates\.reachability\.entry_points\.0", id="absolute_path_via_schema"),
+            pytest.param('["../escape.py"]', r"gates\.reachability\.entry_points\.0", id="parent_traversal_via_schema"),
+        ],
+    )
+    def test_malformed_entry_points_fails_full_load_pipeline(
+        self, tmp_path: Path, entry_points_yaml: str, match: str
+    ) -> None:
+        """The full ``load_runtime_config`` pipeline also fails fast on every
+        malformed shape -- caught by the JSON schema layer before this
+        module's own parser ever runs, still naming
+        ``gates.reachability.entry_points`` in the raised ``ValueError``.
+        The absolute-path and parent-traversal shapes (code_review round-2
+        MISSING_AC_EVIDENCE finding) are rejected here by
+        ``config-schema.json``'s ``entry_points`` item ``pattern``, the
+        same layer that already rejects the other three shapes."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            f"""\
+            repos:
+              org/repo: {{}}
+            gates:
+              reachability:
+                enabled: true
+                entry_points: {entry_points_yaml}
+            """,
+        )
+        with pytest.raises(ValueError, match=match):
+            load_runtime_config(cfg, {})
+
+    def test_schema_rejects_unknown_reachability_key(self, tmp_path: Path) -> None:
+        """AC-FUNC-008's second clause (test_review round-2 COVERAGE finding):
+        JSON Schema ``additionalProperties: false`` rejects an unknown
+        ``gates.reachability:`` key, mirroring
+        ``test_schema_rejects_unknown_fixture_consistency_key`` for the
+        sibling gate."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                unknown_field: foo
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*unknown_field"):
+            load_runtime_config(cfg, {})
+
+    # -- AC-FUNC-006: absent/empty entry_points resolves to the built-in --
+    # -- source_classification-derived default, provenance 'builtin' ------
+
+    def test_absent_entry_points_resolves_to_source_classification_default(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+        from devbench.source_classification import ENTRY_POINT_STEMS
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.reachability.entry_points == ()
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == tuple(sorted(ENTRY_POINT_STEMS))
+        assert result.provenance["entry_points"] == "builtin"
+
+    def test_explicit_empty_list_also_resolves_to_builtin_default(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+        from devbench.source_classification import ENTRY_POINT_STEMS
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              reachability:
+                enabled: true
+                entry_points: []
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        result = resolve_gate_config("reachability", self._REPO, rt)
+        assert result.values["entry_points"] == tuple(sorted(ENTRY_POINT_STEMS))
+        assert result.provenance["entry_points"] == "builtin"
+
+    # -- AC-FUNC-007: resolved values/provenance carry BOTH fields --------
+
+    def test_resolved_reachability_carries_both_enabled_and_entry_points(self) -> None:
+        """Proves the reachability-specific merge step runs ALONGSIDE the
+        generic 'enabled' layer rather than replacing its output."""
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, resolve_gate_config
+
+        gates = GatesConfig(reachability=GateReachabilityConfig(enabled=True, entry_points=("src/main.py",)))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("reachability", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "entry_points": ("src/main.py",)}
+        assert result.provenance == {"enabled": "project", "entry_points": "project"}
+
+
+# ---------------------------------------------------------------------------
+# gates.newly_reachable_paths.paths (spec 4.1, 4.9a; decision C-03)
+# ---------------------------------------------------------------------------
+
+
+class TestGatesNewlyReachablePaths:
+    """``gates.newly_reachable_paths.paths`` config parsing and resolution
+    (spec 4.1, 4.9a; decision C-03; AC-5, AC-27): the migrated, config-backed
+    home of the retired free-text primitives registry under
+    ``backlog/config/`` that PR #320 read from disk. Mirrors
+    ``TestGatesReachabilityEntryPoints``'s structure -- same shared
+    ``_parse_repo_relative_path_list`` validator underneath -- but this
+    field also carries a real per-repo override layer, which
+    ``entry_points`` does not.
+    """
+
+    _REPO = "org/repo"
+
+    def _write(self, path: Path, content: str) -> Path:
+        path.write_text(textwrap.dedent(content), encoding="utf-8")
+        return path
+
+    def test_valid_list_parses_and_resolves_with_project_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths:
+                  - src/ui/zindex.ts
+                  - src/forms/useDirtyField.ts
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+
+        assert rt.gates.newly_reachable_paths.paths == ("src/ui/zindex.ts", "src/forms/useDirtyField.ts")
+
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, rt)
+        assert result.values["paths"] == ("src/ui/zindex.ts", "src/forms/useDirtyField.ts")
+        assert result.provenance["paths"] == "project"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected", "match"),
+        [
+            pytest.param(
+                ["src/ui/zindex.ts"],
+                ("src/ui/zindex.ts",),
+                None,
+                id="valid_list",
+            ),
+            pytest.param(
+                "not-a-list",
+                None,
+                r"gates\.newly_reachable_paths\.paths must be a list.*not-a-list",
+                id="scalar_value",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", 1],
+                None,
+                r"gates\.newly_reachable_paths\.paths must contain only strings.*1",
+                id="list_containing_an_integer",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", ""],
+                None,
+                r"gates\.newly_reachable_paths\.paths must not contain an empty string",
+                id="list_containing_an_empty_string",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", "/etc/hostname"],
+                None,
+                r"gates\.newly_reachable_paths\.paths must contain only repo-relative paths.*etc/hostname",
+                id="absolute_path",
+            ),
+            pytest.param(
+                ["src/ui/zindex.ts", "../escape.py"],
+                None,
+                r"gates\.newly_reachable_paths\.paths must not contain parent traversal.*escape\.py",
+                id="parent_traversal_dotdot",
+            ),
+        ],
+    )
+    def test_paths_validation_matrix_direct(
+        self, tmp_path: Path, raw: object, expected: tuple[str, ...] | None, match: str | None
+    ) -> None:
+        from devbench.config_loader import _parse_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        if match is None:
+            assert _parse_newly_reachable_paths(fake_path, raw) == expected
+        else:
+            with pytest.raises(ValueError, match=match):
+                _parse_newly_reachable_paths(fake_path, raw)
+
+    def test_gate_not_a_mapping_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        with pytest.raises(ValueError, match=r"gates\.newly_reachable_paths must be a mapping"):
+            _parse_gate_newly_reachable_paths(fake_path, ["not", "a", "mapping"])
+
+    def test_gate_raw_none_returns_defaults_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GateNewlyReachablePathsConfig, _parse_gate_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        assert _parse_gate_newly_reachable_paths(fake_path, None) == GateNewlyReachablePathsConfig()
+
+    def test_non_list_paths_fails_full_load_pipeline_naming_key(self, tmp_path: Path) -> None:
+        """AC-5: a non-list ``gates.newly_reachable_paths.paths`` value fails
+        the full ``load_runtime_config`` pipeline, caught by the JSON schema
+        layer (``type: array``), naming the offending key."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths: "not-a-list"
+            """,
+        )
+        with pytest.raises(ValueError, match=r"gates\.newly_reachable_paths\.paths.*array"):
+            load_runtime_config(cfg, {})
+
+    def test_unknown_key_inside_newly_reachable_paths_block_raises_naming_key(self, tmp_path: Path) -> None:
+        """AC-5: an unrecognised key nested inside gates.newly_reachable_paths
+        fails load naming it, caught by the JSON schema's
+        additionalProperties: false at that level."""
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                bogus_key: true
+            """,
+        )
+        with pytest.raises(ValueError, match=r"Additional properties are not allowed.*bogus_key"):
+            load_runtime_config(cfg, {})
+
+    def test_absent_paths_resolves_to_empty_tuple_builtin_provenance(self, tmp_path: Path) -> None:
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        assert rt.gates.newly_reachable_paths.paths == ()
+
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, rt)
+        assert result.values["paths"] == ()
+        assert result.provenance["paths"] == "builtin"
+
+    def test_resolved_newly_reachable_paths_carries_both_enabled_and_paths(self) -> None:
+        """Proves the newly_reachable_paths-specific merge step runs
+        ALONGSIDE the generic 'enabled' layer rather than replacing its
+        output (mirrors TestGatesReachabilityEntryPoints's equivalent
+        pin)."""
+        from devbench.config_loader import GateNewlyReachablePathsConfig, GatesConfig, resolve_gate_config
+
+        gates = GatesConfig(
+            newly_reachable_paths=GateNewlyReachablePathsConfig(enabled=True, paths=("src/ui/zindex.ts",))
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("newly_reachable_paths", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "paths": ("src/ui/zindex.ts",)}
+        assert result.provenance == {"enabled": "project", "paths": "project"}
+
+    # -- per-repo override merging field-wise over the project level (spec 4.1 precedence) --
+
+    def test_repo_override_paths_replaces_project_level_list_wholesale(self, tmp_path: Path) -> None:
+        """Unlike entry_points/fan_in_threshold, newly_reachable_paths.paths
+        carries a real per-repo override: a non-empty repo-level list
+        replaces the project-level list wholesale for that repo (D-15
+        field-wise merge), while 'enabled' is independently inherited from
+        the project level (proving the merge is field-wise, not
+        block-wise)."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                enabled: true
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  newly_reachable_paths:
+                    paths:
+                      - src/forms/useDirtyField.ts
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/forms/useDirtyField.ts",)
+        assert result.provenance["paths"] == "repo"
+        assert result.values["enabled"] is True
+        assert result.provenance["enabled"] == "project"
+
+    def test_repo_override_omitting_paths_inherits_project_level_list(self, tmp_path: Path) -> None:
+        """A per-repo override that only flips 'enabled' inherits the
+        project-level 'paths' list rather than resetting it to empty
+        (mirrors the existing AC-E2-F1-S1-T2-2 inheritance guarantee for
+        other gate tunables)."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  newly_reachable_paths:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/ui/zindex.ts",)
+        assert result.provenance["paths"] == "project"
+        assert result.values["enabled"] is True
+        assert result.provenance["enabled"] == "repo"
+
+    def test_repo_override_present_for_a_different_gate_leaves_paths_at_project_level(self, tmp_path: Path) -> None:
+        """A repo carrying an override block, but not FOR newly_reachable_paths
+        specifically (the override object for this gate is None), leaves
+        'paths' resolved purely from the project/built-in layers -- the
+        `gate_override is None` early-return branch in
+        `_merge_newly_reachable_paths`."""
+        from devbench.config_loader import resolve_gate_config
+
+        cfg = self._write(
+            tmp_path / "cfg.yaml",
+            """\
+            repos:
+              org/repo: {}
+            gates:
+              newly_reachable_paths:
+                paths:
+                  - src/ui/zindex.ts
+              repos:
+                org/repo:
+                  ancestry:
+                    enabled: true
+            """,
+        )
+        rt = load_runtime_config(cfg, {})
+        result = resolve_gate_config("newly_reachable_paths", "org/repo", rt)
+
+        assert result.values["paths"] == ("src/ui/zindex.ts",)
+        assert result.provenance["paths"] == "project"
+
+    def test_gate_override_paths_absent_defaults_to_empty_tuple_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        result = _parse_gate_override_newly_reachable_paths(fake_path, "gates.repos.org/repo.newly_reachable_paths", {})
+        assert result.enabled is None
+        assert result.paths == ()
+
+    def test_gate_override_enabled_wrong_type_raises_direct(self, tmp_path: Path) -> None:
+        from devbench.config_loader import _parse_gate_override_newly_reachable_paths
+
+        fake_path = tmp_path / "cfg.yaml"
+        key = "gates.repos.org/repo.newly_reachable_paths"
+        match = r"gates\.repos\.org/repo\.newly_reachable_paths\.enabled must be a boolean"
+        with pytest.raises(ValueError, match=match):
+            _parse_gate_override_newly_reachable_paths(fake_path, key, {"enabled": "yes"})
+
+
+# ---------------------------------------------------------------------------
+# resolve_gate_config -- four-layer field-wise precedence (spec 4.1, D-15; AC-27)
 # ---------------------------------------------------------------------------
 # orchestrate: reasoning effort and per-turn thinking budget
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
+class TestResolveGateConfigPrecedence:
+    """Four-layer field-wise precedence for ``resolve_gate_config`` (spec 4.1,
+    D-15; AC-27): built-in -> project -> per-repo override -> env, resolved
+    per field with per-field provenance. Covers the AC-27 scenario matrix:
+    built-in only, project sets a tunable, a per-repo override flips
+    ``enabled`` while inheriting the project-level tunable, and an env
+    override wins regardless of the lower layers.
+    """
+
+    _REPO = "org/repo"
+
+    def test_built_in_only_yields_every_field_from_builtin_layer(self) -> None:
+        """No project config, no repo override, no env override: every
+        field's value and provenance come from the built-in layer."""
+        from devbench.config_loader import GatesConfig, RepoConfig, RuntimeConfig, resolve_gate_config
+
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=GatesConfig())
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.gate == "shared_file_impact"
+        assert result.values == {"enabled": False, "auto_derive_registry": False, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "builtin",
+            "auto_derive_registry": "builtin",
+            "fan_in_threshold": "builtin",
+        }
+
+    def test_project_level_tunable_is_project_provenance_enabled_stays_builtin(self) -> None:
+        """Project sets a tunable away from its built-in default: that
+        field's provenance is 'project'; 'enabled' (untouched) stays
+        'builtin'."""
+        from devbench.config_loader import (
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": False, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "builtin",
+            "auto_derive_registry": "project",
+            "fan_in_threshold": "builtin",
+        }
+
+    def test_repo_override_flips_enabled_and_inherits_project_tunable(self) -> None:
+        """A per-repo override that flips 'enabled' inherits the
+        project-level tunable rather than resetting it to the built-in
+        default (AC-E2-F1-S1-T2-2)."""
+        from devbench.config_loader import (
+            GateRepoOverrides,
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            GateSharedFileImpactOverride,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True),
+            repos={self._REPO: GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {
+            "enabled": "repo",
+            "auto_derive_registry": "project",
+            "fan_in_threshold": "builtin",
+        }
+
+    def test_env_override_wins_regardless_of_lower_layers(self) -> None:
+        """The env layer overrides 'enabled' regardless of project/repo
+        layers; other tunables are left untouched. Setting env to the
+        opposite of the repo-override value proves precedence, not merely
+        that env can set a previously-unset field."""
+        from devbench.config_loader import (
+            GateRepoOverrides,
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            GateSharedFileImpactOverride,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(auto_derive_registry=True),
+            repos={self._REPO: GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config, env_enabled_override=False)
+
+        assert result.values == {"enabled": False, "auto_derive_registry": True, "fan_in_threshold": 3}
+        assert result.provenance == {"enabled": "env", "auto_derive_registry": "project", "fan_in_threshold": "builtin"}
+
+    def test_fan_in_threshold_project_level_override_is_project_provenance(self) -> None:
+        """A project-level fan_in_threshold different from the built-in default (3) resolves
+        with 'project' provenance -- exercises `_merge_shared_file_impact_fan_in_threshold`
+        (spec 4.6) alongside the generic bool merge, the same pattern
+        `test_resolved_reachability_carries_both_enabled_and_entry_points` pins for
+        reachability's `entry_points`."""
+        from devbench.config_loader import (
+            GatesConfig,
+            GateSharedFileImpactConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(shared_file_impact=GateSharedFileImpactConfig(enabled=True, fan_in_threshold=7))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("shared_file_impact", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True, "auto_derive_registry": False, "fan_in_threshold": 7}
+        assert result.provenance == {
+            "enabled": "project",
+            "auto_derive_registry": "builtin",
+            "fan_in_threshold": "project",
+        }
+
+    def test_fixture_consistency_tunable_uses_extract_source_literals_field(self) -> None:
+        """A different gate's differently-named tunable (extract_source_literals)
+        goes through the same generic field-wise merge."""
+        from devbench.config_loader import (
+            FixtureConsistencyConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(fixture_consistency=FixtureConsistencyConfig(extract_source_literals=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("fixture_consistency", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": False, "extract_source_literals": True}
+        assert result.provenance == {"enabled": "builtin", "extract_source_literals": "project"}
+
+    def test_simple_gate_with_only_enabled_field_resolves(self) -> None:
+        """A gate with no tunable beyond 'enabled' (e.g. ancestry) resolves
+        with a single-field values/provenance mapping. (Not reachability:
+        since it gained the `entry_points` tunable, its own resolved shape
+        is covered separately by `TestGatesReachabilityEntryPoints`.)"""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(ancestry=GateEnabledConfig(enabled=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_repo_present_but_no_override_for_this_gate_uses_project_layer(self) -> None:
+        """The target repo has overrides configured for a different gate;
+        the gate under test falls through to the project layer untouched."""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GateEnabledOverride,
+            GateRepoOverrides,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(
+            ancestry=GateEnabledConfig(enabled=True),
+            repos={self._REPO: GateRepoOverrides(write_path_audit=GateEnabledOverride(enabled=True))},
+        )
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_repo_absent_from_gates_repos_map_uses_only_builtin_and_project_layers(self) -> None:
+        """A repo with zero configured gate overrides at all (absent from
+        gates.repos) is not an error -- it simply has no repo layer."""
+        from devbench.config_loader import (
+            GateEnabledConfig,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+            resolve_gate_config,
+        )
+
+        gates = GatesConfig(ancestry=GateEnabledConfig(enabled=True))
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=gates)
+        assert runtime_config.gates.repos == {}
+        result = resolve_gate_config("ancestry", self._REPO, runtime_config)
+
+        assert result.values == {"enabled": True}
+        assert result.provenance == {"enabled": "project"}
+
+    def test_unknown_gate_name_raises_value_error_naming_gate(self) -> None:
+        """resolve_gate_config raises ValueError naming the gate when asked
+        to resolve a gate outside the declared set."""
+        from devbench.config_loader import GatesConfig, RepoConfig, RuntimeConfig, resolve_gate_config
+
+        runtime_config = RuntimeConfig(repos={self._REPO: RepoConfig()}, gates=GatesConfig())
+        with pytest.raises(ValueError, match=r"nosuchgate"):
+            resolve_gate_config("nosuchgate", self._REPO, runtime_config)
+
+
+@pytest.mark.unit
+class TestResolveGateConfigSingleReadPathPin:
+    """AC-E2-F1-S1-T2-5 (AC-27): ``resolve_gate_config`` is the ONLY sanctioned
+    read path for a gate's resolver-managed fields (``enabled``,
+    ``auto_derive_registry``, ``fan_in_threshold``, ``extract_source_literals``,
+    ``entry_points``). Fails when a module other than ``config_loader.py``
+    reads one of these fields directly off the raw ``GatesConfig`` tree
+    instead of calling the resolver, so a later gate epic cannot quietly
+    re-introduce a second, potentially divergent interpretation of the
+    precedence chain.
+
+    Scoped to the five resolver-managed field names rather than every
+    ``.gates.`` access, because two pre-existing, sanctioned direct reads
+    of *structural* (non-resolver) gate fields already exist in
+    ``cli.py`` (``gates.repos.<repo>.shared_file_impact.patterns`` and
+    ``gates.fixture_consistency.canonical_sources``/``scan``) -- fields
+    ``resolve_gate_config`` does not manage at all (no four-layer
+    precedence applies to them).
+    """
+
+    _SRC_ROOT = Path(__file__).parent.parent / "src" / "devbench"
+    _EXEMPT_MODULE = _SRC_ROOT / "config_loader.py"
+    _RAW_GATE_FIELD_ACCESS_RE = re.compile(
+        r"\.gates\.[\w.\[\]\"' ()]*?"
+        r"\.(enabled|auto_derive_registry|fan_in_threshold|extract_source_literals|entry_points)\b"
+    )
+
+    def _scanned_files(self) -> list[Path]:
+        return sorted(p for p in self._SRC_ROOT.rglob("*.py") if p != self._EXEMPT_MODULE)
+
+    def test_discovers_at_least_one_scanned_file(self) -> None:
+        """Guards against the check below silently collecting zero files."""
+        assert len(self._scanned_files()) >= 1
+
+    def test_no_module_reads_raw_gate_field_directly(self) -> None:
+        offenders: list[str] = []
+        for path in self._scanned_files():
+            text = path.read_text(encoding="utf-8")
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if self._RAW_GATE_FIELD_ACCESS_RE.search(line):
+                    offenders.append(f"{path.relative_to(self._SRC_ROOT.parent.parent)}:{line_no}: {line.strip()}")
+        assert not offenders, (
+            "resolve_gate_config is the only sanctioned read path for gate-resolved fields "
+            "(enabled, auto_derive_registry, extract_source_literals); found direct access(es) "
+            "outside config_loader.py:\n" + "\n".join(offenders)
+        )
+
+
 class TestOrchestrateEffortAndThinkingBudget:
     """The ``orchestrate.effort`` / ``max_thinking_tokens`` knobs load from YAML.
 

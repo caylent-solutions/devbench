@@ -1,12 +1,31 @@
 # bootstrap-environment skill quickstart
 
-The `bootstrap-environment` skill prepares every target repository listed in
-`backlog/config/devbench.yaml` so that `make validate` passes without manual
-intervention beyond yes/no confirmations. It clones repos, installs asdf toolchains,
-and runs the `make validate` baseline with a self-verify retry loop.
+The `bootstrap-environment` skill first interviews you about every environment
+decision it owns -- the LLM credential source (Anthropic API vs AWS Bedrock) and
+Bedrock region, the Anthropic OAuth credentials file path, the model the orchestrate
+skill's own coordination calls run on, and the GitHub token source and org
+restriction (D-16, spec `integration-reality-gates-hardening.md` section 4.15) --
+then prepares every target repository listed in `backlog/config/devbench.yaml` so
+that `make validate` passes without manual intervention beyond yes/no confirmations.
+It clones repos, installs asdf toolchains, and runs the `make validate` baseline
+with a self-verify retry loop.
+
+## Every-invocation contract
+
+Step 0's environment-decision interview runs in full on every invocation of the
+skill. It never silently reuses a prior answer: the current session's already-
+exported value for each variable is shown as the current value in every menu, but
+every question is still asked again on every run. There is no "skip because
+unchanged" path -- an environment assembled from remembered answers is an
+environment nobody has reviewed.
 
 ## What bootstrap-environment produces
 
+- A verified LLM credential source for this session: either the Claude Code OAuth
+  credentials file (Anthropic API) or a working `aws sts get-caller-identity` call
+  (AWS Bedrock).
+- Confirmation that `DEVBENCH_CLAUDE_MODEL` is set (required by every later devbench
+  command) and that a GitHub token is resolvable (file or `GH_TOKEN`).
 - Each target repo cloned to its `checkout_directory` (if not already present).
 - Toolchain installed from `.tool-versions` via asdf (if the file exists).
 - `make validate` passing for each repo (green baseline).
@@ -19,10 +38,14 @@ Before invoking bootstrap-environment:
 1. `backlog/config/devbench.yaml` must exist with a `repos:` section listing at least
    one target repository. If the file is absent, the skill asks for repo information
    interactively.
-2. Network access to `github.com` for cloning (or the repos must already be cloned).
-3. asdf installed if any target repo has a `.tool-versions` file.
-4. `make` available in the environment.
-5. Claude Code CLI installed and authenticated.
+2. Decide which LLM credential source you will use (Anthropic API via Claude Code
+   OAuth, or AWS Bedrock) -- see [`docs/llm-authentication.md`](../llm-authentication.md)
+   for the full comparison; Step 0 below interviews you about this choice and verifies
+   it works.
+3. Network access to `github.com` for cloning (or the repos must already be cloned).
+4. asdf installed if any target repo has a `.tool-versions` file.
+5. `make` available in the environment.
+6. Claude Code CLI installed and authenticated.
 
 ## How to invoke
 
@@ -46,6 +69,17 @@ run devbench:bootstrap-environment
 ```
 
 ## What the skill does (step by step)
+
+0. **Interviews environment decisions** -- one menu per variable it owns
+   (`DEVBENCH_USE_BEDROCK`, `DEVBENCH_BEDROCK_REGION`,
+   `DEVBENCH_CLAUDE_CREDENTIALS_FILE`, `DEVBENCH_CLAUDE_MODEL`, the `GH_TOKEN` /
+   `DEVBENCH_GH_TOKEN_FILE` token source, and `DEVBENCH_GH_ORG`), each with a
+   recommended value marked as such, every alternative, a free-form entry path, and
+   a full explanation of the consequence of each choice. Self-verify: checks the
+   chosen credential sources actually work (`aws sts get-caller-identity` for
+   Bedrock, the credentials file for Anthropic API, the GitHub token source, and
+   that `DEVBENCH_CLAUDE_MODEL` is non-empty). Retries the failing check once on
+   first failure; escalates with a diagnostic and suggested fix on the second.
 
 1. **Reads `backlog/config/devbench.yaml`** -- extracts the `repos:` section. Each
    entry must provide `repo` (org/name), `checkout_directory`, and `default_branch`.
@@ -92,18 +126,23 @@ run devbench:bootstrap-environment
 
 ## Self-verify retry loop
 
-Each step (clone, asdf install, make validate) runs a verification check immediately
-after the operation. On the first verification failure the skill logs a `[RETRY_*]`
-entry and re-runs the step once. On a second consecutive failure it pauses, presents
-a `[ESCALATE]` message with a specific diagnostic and suggested fix, and asks the
-operator whether to skip this repo and continue with the rest.
+Each step (Step 0's environment verification, clone, asdf install, make validate)
+runs a verification check immediately after the operation. On the first
+verification failure the skill logs a `[RETRY_*]` entry and re-runs the check or
+step once. On a second consecutive failure it pauses, presents an `[ESCALATE]`
+message with a specific diagnostic and suggested fix, and asks the operator whether
+to continue (Step 0) or skip this repo and continue with the rest (Step 2).
 
-This loop ensures the skill does not silently leave repos in a broken state.
+This loop ensures the skill does not silently leave the environment or a repo in a
+broken state.
 
 ## Output contract
 
 | Artefact | Condition |
 |----------|-----------|
+| Verified LLM credential source | `aws sts get-caller-identity` succeeds (Bedrock) or the Anthropic OAuth credentials file exists (Anthropic API) |
+| Verified GitHub token source | A token file exists at `DEVBENCH_GH_TOKEN_FILE` (or its default) or `GH_TOKEN` is exported |
+| `DEVBENCH_CLAUDE_MODEL` | Confirmed non-empty in the current session |
 | Cloned repos | Each `checkout_directory` has a valid `.git` |
 | Toolchains | `asdf current` lists every `.tool-versions` entry |
 | Baseline | `make validate` exits 0 for each non-escalated repo |
@@ -115,6 +154,8 @@ Read the `[ESCALATE]` message for the specific diagnostic. Common patterns:
 
 | Symptom | Suggested fix |
 |---------|---------------|
+| Credential source unverifiable (Step 0) | Export the missing variable in your shell profile; see [`docs/llm-authentication.md`](../llm-authentication.md) for the full credential-chain reference |
+| `DEVBENCH_CLAUDE_MODEL` unset (Step 0) | Export `DEVBENCH_CLAUDE_MODEL` to a valid model identifier before continuing -- every later devbench command requires it |
 | Clone fails | Verify network access to `github.com` and that `checkout_directory` path is writable |
 | asdf plugin missing | Run `asdf plugin add <plugin>` for each missing plugin, then re-run the skill |
 | `make validate` fails | Resolve the failing sub-target (lint, typecheck, test) manually, then re-run the skill |

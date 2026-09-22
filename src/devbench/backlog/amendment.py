@@ -600,14 +600,30 @@ def _categorise_rejection_reason(rejection_reason: str) -> str:
     Heuristic substring matching: the manifest-amender prompt instructs
     the LLM judge to surface canonical category tokens (``SCOPE`` /
     ``APPROACH_AUTH`` / ``JUSTIFICATION_COHERENCE`` / ``PRE_FILTER``)
-    inline in the rejection reason. Unmatched reasons fall back to
-    ``OTHER`` so consumers always see a known token.
+    inline in the rejection reason. A rejection reason's narrative often
+    names a category it did NOT fail against (for example a PRE_FILTER
+    rejection whose closing sentence reports "APPROACH_AUTH, SCOPE and
+    JUSTIFICATION_COHERENCE all PASSED"), so classification resolves by
+    the EARLIEST occurrence of any canonical token in the upper-cased
+    reason, not by a fixed iteration order over the candidate tokens.
+    Unmatched reasons fall back to ``OTHER`` so consumers always see a
+    known token. The candidate tokens are derived from
+    ``AMENDER_REJECTION_CATEGORIES`` (excluding ``OTHER``, which is a
+    fallback, not a token the judge names) so the taxonomy is
+    single-sourced.
     """
     haystack = rejection_reason.upper()
-    for category in ("SCOPE", "APPROACH_AUTH", "JUSTIFICATION_COHERENCE", "PRE_FILTER"):
-        if category in haystack:
-            return category
-    return "OTHER"
+    candidates = sorted(AMENDER_REJECTION_CATEGORIES - {"OTHER"})
+    earliest_index: int | None = None
+    earliest_category = "OTHER"
+    for category in candidates:
+        index = haystack.find(category)
+        if index == -1:
+            continue
+        if earliest_index is None or index < earliest_index:
+            earliest_index = index
+            earliest_category = category
+    return earliest_category
 
 
 # ---------------------------------------------------------------------------

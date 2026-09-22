@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import fcntl
 import json
 import logging
 import os
@@ -18,15 +20,26 @@ from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from test_source_classification import _CLI_REACHABILITY_HISTORICAL_EXTENSIONS
 from test_tdd_gate import commit_scratch_repo as _tdd_gate_commit_all
 from test_tdd_gate import init_scratch_repo as _init_scratch_repo_for_cli
+from test_tdd_gate import run_scratch_git as _run_scratch_git
 from test_tdd_gate import write_scratch_file as _tdd_gate_write
 
 from devbench import cli
+from devbench import fixture_consistency as fixture_consistency_module
 from devbench.backlog.proposal import Proposal
 from devbench.backlog.work_unit import WorkUnit, WorkUnitStatus, WorkUnitType
+from devbench.config_loader import (
+    FixtureCanonicalSource,
+    FixtureConsistencyConfig,
+    FixtureScanTarget,
+    ResolvedGateConfig,
+)
 from devbench.constants import (
     BACKLOG_SUBDIR,
+    GATE_NAMES,
+    GATE_TIERS,
     SESSION_DEFAULT_NAME,
     SESSION_SESSIONS_BASE_DIR,
     TDD_ENTRY_TEMPLATE,
@@ -34,6 +47,7 @@ from devbench.constants import (
     TDD_PHASE_RED_OBSERVED,
 )
 from devbench.github.git_ops import CIResult
+from devbench.source_classification import CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS
 
 
 @pytest.fixture
@@ -3287,6 +3301,158 @@ class TestCmdMarkDoneGatedBlock:
 
 
 @pytest.mark.unit
+class TestCmdMarkDoneGateRefusal:
+    """cmd_mark_done: an enabled machine-blocking gate without a fresh
+    [GATE_PASS] record refuses (rc=1), writes no status, and the message
+    reaches stderr (spec 4.2, G4; AC-E2-F2-S1-T2-1)."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _setup(self, tmp_path: Path, unit_id: str) -> tuple[Path, Path, MagicMock]:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "# Backlog\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|---|---|---|---|---|---|---|\n"
+            f"| {unit_id} | Gate refusal test | Task | in-review | None | {self._REPO} | `backlog/{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        backlog_subdir = tmp_path / "backlog"
+        backlog_subdir.mkdir()
+        wu_file = backlog_subdir / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}\n\n## Status: in-review\n\n## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `src/foo.py` | update |\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        unit = WorkUnit(
+            id=unit_id,
+            title="Gate refusal test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return backlog_index, wu_file, mock_parser
+
+    def _reachability_enabled_runtime_config(self) -> object:
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig()},
+            gates=GatesConfig(reachability=GateReachabilityConfig(enabled=True)),
+        )
+
+    def test_enabled_gate_without_record_refuses_and_writes_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E233-F1-S1-T1"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR: done-gate: gate 'reachability' is enabled for repo" in err
+        assert f"'{self._REPO}'" in err
+        assert f"has no [GATE_PASS reachability] record for {unit_id}" in err
+        assert f"Run: uv run devbench check-reachability {unit_id}" in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a refused mark-done must write nothing"
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E233-F1-S1-T2"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "[DONE]" in wu_file.read_text(encoding="utf-8")
+
+    def test_operator_waiver_satisfies_with_no_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-FUNC-005 (spec 4.2, 4.9, AC-16): an operator [GATE_WAIVER reachability]
+        marker satisfies the done gate even with no [GATE_PASS] record at all."""
+        unit_id = "E233-F1-S1-T3"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        wu_file.write_text(
+            wu_file.read_text(encoding="utf-8").replace(
+                "## Comments\n\n",
+                "## Comments\n\n"
+                "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+                "2026-01-01T00:00:00+00:00 src/foo.py operator pre-existing dead artifact, tracked separately\n",
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_executor_waiver_alone_is_insufficient(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-FUNC-005 (spec 3.6): reachability is machine-blocking, so an
+        executor-attributed waiver alone must never satisfy the done gate."""
+        unit_id = "E233-F1-S1-T4"
+        backlog_index, wu_file, mock_parser = self._setup(tmp_path, unit_id)
+        before_waiver = wu_file.read_text(encoding="utf-8")
+        wu_file.write_text(
+            before_waiver.replace(
+                "## Comments\n\n",
+                "## Comments\n\n"
+                "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+                "2026-01-01T00:00:00+00:00 src/foo.py executor pre-existing dead artifact, tracked separately\n",
+            ),
+            encoding="utf-8",
+        )
+        before = wu_file.read_text(encoding="utf-8")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", self._reachability_enabled_runtime_config()),
+        ):
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "executor-attributed" in err
+        assert "operator-attributed waiver" in err
+        assert wu_file.read_text(encoding="utf-8") == before, "a refused mark-done must write nothing"
+
+
+@pytest.mark.unit
 class TestCmdDeclineCitation:
     """cmd_decline: an already-satisfied decline requires a valid citation (AC-E4-F4-S1-T2-2/3)."""
 
@@ -3787,6 +3953,123 @@ class TestPreParseConfig:
         assert argv == original
 
 
+def _seed_scope_backlog(
+    tmp_path: Path,
+    unit_id: str = "E0-F1-S1-T1",
+    files: tuple[str, ...] = ("src/foo.py",),
+    *,
+    manifest_body: str | None = None,
+) -> tuple[Path, Path]:
+    """Write a scratch ``BACKLOG.md`` + one work-unit ``.md`` file under ``tmp_path``.
+
+    ``get-diff`` and ``check-manifest-scope`` resolve scope through
+    ``devbench.work_unit_scope.resolve_changed_files``, which does its own
+    ``BacklogParser`` lookup against ``devbench.work_unit_scope.BACKLOG_ROOT``
+    / ``BACKLOG_INDEX`` -- independent of, and not satisfied by, a mocked
+    ``devbench.cli.BacklogParser`` (which only serves ``cli.py``'s own,
+    earlier unit/repo lookup in ``_resolve_unit_repo_and_path``). Returns
+    ``(backlog_root, backlog_index)`` for patching those two module-level
+    constants so ``resolve_changed_files`` resolves ``unit_id`` against real
+    fixture data.
+
+    ``manifest_body`` overrides the auto-generated ``## Changes Manifest``
+    table body entirely (including header/separator rows), for tests that
+    need a deliberately malformed table; ``files`` is ignored when supplied.
+    """
+    backlog_root = tmp_path / "backlog"
+    backlog_root.mkdir(exist_ok=True)
+    wu_file = backlog_root / f"{unit_id}.md"
+    if manifest_body is None:
+        rows = "".join(f"| `{f}` | modify |\n" for f in files)
+        manifest_body = f"| File | Change |\n|------|--------|\n{rows}"
+    wu_file.write_text(
+        f"# {unit_id}: Scope test task\n\n## Status: in-progress\n\n"
+        f"## Changes Manifest\n\n{manifest_body}\n\n## Comments\n",
+        encoding="utf-8",
+    )
+    backlog_index = tmp_path / "BACKLOG.md"
+    backlog_index.write_text(
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        f"| {unit_id} | Scope test task | Task | in-progress | None | git-repo | `backlog/{unit_id}.md` |\n",
+        encoding="utf-8",
+    )
+    return backlog_root, backlog_index
+
+
+def _seed_gate_done_path_backlog(
+    tmp_path: Path, unit_id: str, repo_name: str, manifest_files: tuple[str, ...], title: str
+) -> tuple[Path, Path, Path]:
+    """Write a scratch ``BACKLOG.md`` + work-unit ``.md`` carrying everything a
+    gate's done-path end-to-end cycle needs at once: a ``## Target
+    Repository`` section and ``## Changes Manifest`` (`work_unit_scope`
+    resolution and `_check_gate_pass_done_invariant`'s repo extraction), an
+    exempt ``## Task Type`` (so `mark_done`'s RED_OBSERVED invariant never
+    blocks these tests -- that invariant is exercised elsewhere), and an
+    all-five-judges-pass ``## Comments`` block (`mark_done`'s judge-round
+    invariant).
+
+    Shared by every gate's done-path journey suite (reachability,
+    shared-file-impact, and any that follow): ``manifest_files`` is a TUPLE
+    because some journeys (e.g. shared-file-impact's
+    pre-existing-vs-introduced and attribution cases) need more than one
+    Changes Manifest row at once (e.g. both ``tests/test_suite.py`` and
+    ``tests/test_feature.py``), while a single-file caller passes a
+    one-element tuple; ``title`` is the work unit's display title so callers
+    across gates do not collide on a shared literal.
+
+    Returns ``(backlog_root, backlog_index, wu_file)``.
+    """
+    from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+    backlog_root = tmp_path / "backlog"
+    backlog_root.mkdir(exist_ok=True)
+    wu_file = backlog_root / f"{unit_id}.md"
+    all_pass = "".join(
+        f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+    )
+    manifest_rows = "".join(f"| `{f}` | modify |\n" for f in manifest_files)
+    wu_file.write_text(
+        f"# {unit_id}: {title}\n\n"
+        "## Status: in-review\n\n"
+        "## Task Type: test-only\n\n"
+        f"## Target Repository\n\n- **Repo:** `{repo_name}`\n\n"
+        "## Changes Manifest\n\n"
+        "| File | Change |\n|------|--------|\n"
+        f"{manifest_rows}\n"
+        f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+        encoding="utf-8",
+    )
+    backlog_index = tmp_path / "BACKLOG.md"
+    backlog_index.write_text(
+        "## Full Work Unit Index\n\n"
+        "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+        "|-----|-------|------|--------|-------------|------|----------|\n"
+        f"| {unit_id} | {title} | Task | in-review | None | "
+        f"{repo_name} | `backlog/{unit_id}.md` |\n",
+        encoding="utf-8",
+    )
+    return backlog_root, backlog_index, wu_file
+
+
+def _seed_reachability_done_path_backlog(
+    tmp_path: Path, unit_id: str, repo_name: str, manifest_file: str
+) -> tuple[Path, Path, Path]:
+    """Thin, single-file-Manifest wrapper over :func:`_seed_gate_done_path_backlog`.
+
+    Kept as its own name (rather than inlining the call at every reachability
+    call site) purely so `tests/test_integration/test_gate_reachability_e2e.py`
+    -- a sibling journey module outside this work unit's own Changes Manifest --
+    keeps importing a stable name; the actual seeding logic lives in exactly one
+    place, :func:`_seed_gate_done_path_backlog`, so there is nothing left to
+    drift between the reachability and shared-file-impact done-path fixtures.
+    """
+    return _seed_gate_done_path_backlog(
+        tmp_path, unit_id, repo_name, (manifest_file,), "End to end reachability cycle test"
+    )
+
+
 def _seed_wu_file(tmp_path: Path, unit_id: str = "E0-F1-S1-T1", files: tuple[str, ...] = ("src/foo.py",)) -> Path:
     """Write a minimal work-unit file carrying a real Changes Manifest.
 
@@ -4265,7 +4548,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
 
         diff_calls: list[list[str]] = []
 
@@ -4276,10 +4561,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -4301,7 +4587,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("foo.py",))
         expected_diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -4311,10 +4599,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -4334,7 +4623,9 @@ class TestCmdGetDiff:
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "devbench"
-        wu_file = _seed_wu_file(tmp_path, unit_id="E225-F1-S1-T1", files=("new_feature.py",))
+        repo_path.mkdir()
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id="E225-F1-S1-T1", files=("new_feature.py",))
 
         # Simulate: bare main3 would include upstream-merged file, origin/main3 would not
         branch_only_diff = (
@@ -4351,10 +4642,11 @@ class TestCmdGetDiff:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/devbench": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main3"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E225-F1-S1-T1")
 
@@ -4364,6 +4656,1825 @@ class TestCmdGetDiff:
             "Upstream-merged file appeared in output -- bare branch ref was used instead of origin/"
         )
         assert "new_feature.py" in output, "Branch-specific diff should appear in output"
+
+
+@pytest.mark.unit
+class _AncestryCmdFixtures:
+    """Shared fixture helpers for ``cmd_check_ancestry`` test classes (E4-F1-S1-T1).
+
+    Mirrors ``_ReachabilityCmdFixtures``'s config-fixture approach (a real
+    ``devbench.yaml`` resolved through ``DEVBENCH_CONFIG_PATH``, exercising
+    the actual ``resolve_gate_config`` read path) but without the heavier
+    real-git-checkout requirement: every ``cmd_check_ancestry`` test drives
+    git/`gh` exclusively through the ``run_command`` seam, so a real git
+    repo on disk is unnecessary here.
+
+    ``_patch_common`` also seeds a minimal, real work-unit markdown file
+    (E4-F2-S1-T1): a passing enabled run now persists a ``[GATE_PASS
+    ancestry]`` record (spec 4.2, 3.6) into the unit's own file, so every
+    test exercising a pass path needs one to write into, exactly like
+    ``_ReachabilityCmdFixtures``'s git checkout backs
+    ``cmd_check_reachability``'s own record write. ``manifest_files``
+    defaults to empty -- ancestry's own scope always also includes the
+    target ref, and a generated ancestry-gate task's Manifest may name a
+    report-file row that does not exist in the checkout yet -- so most
+    tests never need a real git blob hash and only the ``git rev-parse
+    <target-ref>`` call (added by :func:`_write_ancestry_gate_pass_record`)
+    must be handled by a pass-path test's ``fake_run_command``.
+
+    ``_make_origin_and_checkout``/``_seed_wu``/``_check_ancestry_patches``/
+    ``_mark_done_patches`` are the shared real-git-checkout fixture used by
+    every test class that needs ``cmd_check_ancestry`` and ``cmd_mark_done``
+    to run against an actual git repo on disk rather than a stubbed
+    ``run_command`` (``TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest``,
+    ``TestCheckAncestryAbsentManifestFileRealGit``) -- promoted here so the
+    two classes share one fixture implementation instead of maintaining
+    independent copies.
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Dependency ancestry gate",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    @classmethod
+    def _write_gate_config(cls, tmp_path: Path, gates_block: str) -> Path:
+        """Write a scratch ``devbench.yaml`` resolving ``resolve_gate_config``'s project layer."""
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {cls._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def _enable_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+        """Point ``DEVBENCH_CONFIG_PATH`` at a scratch config resolving ``gates.ancestry.enabled``.
+
+        Also clears the workspace-wide env override so an ambient
+        ``DEVBENCH_GATE_ANCESTRY_ENABLED`` left set by the host shell can
+        never leak into a test that relies on the project-layer value set
+        here (env is the highest-precedence layer, spec 4.1/D-15).
+        """
+        gates_block = f"gates:\n  ancestry:\n    enabled: {'true' if enabled else 'false'}\n"
+        cfg_path = self._write_gate_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+    @contextlib.contextmanager
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        fake_run_command: Callable[..., tuple[int, str, str]],
+        *,
+        manifest_files: tuple[str, ...] = (),
+    ) -> Iterator[None]:
+        """Apply the standard patches shared by every test method.
+
+        Seeds a minimal, real work-unit markdown file at ``BACKLOG_ROOT /
+        unit.file_path`` (mirroring ``_seed_scope_backlog``'s shape) so
+        :func:`devbench.cli._write_ancestry_gate_pass_record` -- invoked on
+        every PASS path -- has a real file to read/write, whether or not a
+        given test's scenario actually reaches that write step.
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_root = repo_path.parent / "backlog"
+        backlog_root.mkdir(parents=True, exist_ok=True)
+        rows = "".join(f"| `{f}` | modify |\n" for f in manifest_files)
+        wu_file = backlog_root / f"{unit.id}.md"
+        wu_file.write_text(
+            f"# {unit.id}: {unit.title}\n\n## Status: in-progress\n\n"
+            f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n{rows}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("devbench.cli.BacklogParser", return_value=mock_parser))
+            stack.enter_context(patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}))
+            stack.enter_context(patch("devbench.cli.get_configured_default_branch", return_value="main"))
+            stack.enter_context(patch("devbench.cli.run_command", side_effect=fake_run_command))
+            stack.enter_context(patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent))
+            stack.enter_context(patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent))
+            yield
+
+    def _make_origin_and_checkout(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Build a real origin repo plus a real clone of it, both on disk.
+
+        Shared by every test class that needs ``cmd_check_ancestry`` and
+        ``cmd_mark_done`` to run against an actual git checkout rather than
+        a stubbed ``run_command``.
+        """
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "README.md", "baseline\n")
+        _tdd_gate_commit_all(origin, "baseline")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        return origin, checkout
+
+    def _seed_wu(self, tmp_path: Path, unit_id: str, *, manifest_file: str = "README.md") -> tuple[Path, Path, Path]:
+        """Seed a real work-unit markdown file plus a real ``BACKLOG.md`` index.
+
+        ``manifest_file`` is the sole ``## Changes Manifest`` row's declared
+        path -- callers exercising the absent-Manifest-file scope-hash path
+        pass a path that does not exist in the checkout (mirroring the
+        generated ancestry-gate task's own report-file row) instead of the
+        default ``README.md``, which every real checkout built by
+        :meth:`_make_origin_and_checkout` already contains.
+        """
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        wu_file = backlog_root / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}: Ancestry real-git non-empty-manifest test\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            f"## Changes Manifest\n\n| File | Change |\n|------|--------|\n| `{manifest_file}` | modify |\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            f"| {unit_id} | Real-git test | Task | in-review | None | {self._REPO} | `{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return backlog_root, backlog_index, wu_file
+
+    def _check_ancestry_patches(self, tmp_path: Path, checkout: Path, backlog_root: Path, backlog_index: Path) -> Any:
+        unit = self._make_unit("E1-F1-S1-T1")
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: checkout}),
+            patch("devbench.cli.get_configured_default_branch", return_value="main"),
+        )
+
+    def _mark_done_patches(self, checkout: Path, backlog_root: Path, backlog_index: Path) -> Any:
+        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = WorkUnit(
+            id="E1-F1-S1-T1",
+            title="Real-git test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("E1-F1-S1-T1.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(default_branch="main", resolved_checkout_path=checkout)},
+            gates=GatesConfig(ancestry=GateEnabledConfig(enabled=True)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+        )
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestry(_AncestryCmdFixtures):
+    """Tests for cmd_check_ancestry, the canonical git-ancestry dependency gate (spec 4.5)."""
+
+    def test_returns_zero_and_pass_status_when_dependency_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: origin/dep-branch IS an ancestor of origin/main (strict probe rc=0)
+        When: cmd_check_ancestry is called with an explicit target-ref
+        Then: rc is 0, the status line reports mode "strict", and it is the FIRST stdout line
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        out_lines = capsys.readouterr().out.strip().splitlines()
+        payload = json.loads(out_lines[0])
+        assert payload["scope_hash"], "scope_hash must be a non-empty digest"
+        scope_hash = payload.pop("scope_hash")
+        assert payload == {
+            "gate": "ancestry",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+            "mode": "strict",
+            "dependency_ref": "origin/dep-branch",
+            "target_ref": "origin/main",
+        }
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
+
+        from devbench.gate_records import latest_gate_pass_record
+
+        wu_content = (repo_path.parent / "backlog" / "E1-F1-S1-T1.md").read_text(encoding="utf-8")
+        record = latest_gate_pass_record(wu_content, "ancestry")
+        assert record is not None
+        assert record.scope_hash == scope_hash
+
+    def test_ancestry_probe_rc_two_or_more_is_an_evaluation_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: merge-base cannot resolve a ref (rc=128, the git convention for a bad revision)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, an ERROR (not BLOCKED) is printed naming the rc, no status line is printed,
+              and the squash-PR probe is never invoked -- this is an evaluation failure, not a
+              confirmed "not merged" answer.
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        gh_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (128, "", "fatal: Not a valid commit name origin/bogus-ref")
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(cmd)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/bogus-ref", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: ancestry probe could not be evaluated (rc=128)" in captured.err
+        assert "BLOCKED" not in captured.err
+        assert gh_calls == []
+
+    def test_uses_remote_default_branch_ref_when_target_ref_omitted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: no target-ref argument is supplied, and the configured remote is "origin"
+        When: cmd_check_ancestry is called with only unit_id + dependency_ref
+        Then: it resolves and uses "<remote>/<default-branch>" as the target
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "origin/dep-branch", "origin/main"]]
+
+    def test_returns_one_when_unit_not_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Given: the unit_id does not exist in the backlog index
+        When: cmd_check_ancestry is called
+        Then: it fails fast with rc 1 before attempting any git call
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+
+    def test_returns_two_on_empty_dependency_ref(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        Given: an empty/whitespace dependency-ref argument
+        When: cmd_check_ancestry is called
+        Then: it fails fast with rc 2 (a usage error per spec Section 7), before any repo resolution
+        """
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "   ", "origin/main")
+
+        assert result == 2
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestrySquashProbe(_AncestryCmdFixtures):
+    """Tests for the squash-aware PR probe (spec 4.5, 317-D02): a second, independent
+    answer to "has this dependency merged" for a squash-merged/rebased/fix-pack-landed
+    branch that a strict ``git merge-base --is-ancestor`` cannot see."""
+
+    def _fake_run_command(
+        self,
+        *,
+        merge_base_rc: int = 1,
+        gh_rc: int = 0,
+        gh_stdout: str = "[]",
+        gh_stderr: str = "",
+        rev_parse_rc: int = 0,
+        rev_parse_stdout: str = "abc123deadbeef\n",
+        rev_parse_stderr: str = "",
+        remote: str = "origin",
+    ) -> tuple[Callable[..., tuple[int, str, str]], list[list[str]]]:
+        gh_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, f"{remote}\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (merge_base_rc, "", "")
+            if cmd[:2] == ["git", "rev-parse"]:
+                return (rev_parse_rc, rev_parse_stdout, rev_parse_stderr)
+            if cmd[:2] == ["gh", "pr"]:
+                gh_calls.append(cmd)
+                return (gh_rc, gh_stdout, gh_stderr)
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        return fake_run_command, gh_calls
+
+    def test_squash_merged_dependency_passes_via_pr_probe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 (not a graph ancestor) but the dependency's
+               commit was found on a merged PR via `gh pr list`
+        When: cmd_check_ancestry is called
+        Then: rc is 0, the status line carries mode "squash-pr", and BOTH probe outcomes
+              (strict AND squash-PR) are printed to stdout (spec 4.5, AC-ANC-001, AC-ANC-002)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, gh_calls = self._fake_run_command(
+            merge_base_rc=1,
+            gh_rc=0,
+            gh_stdout='[{"number": 317, "mergedAt": "2026-01-01T00:00:00Z", "title": "Squashed dependency"}]',
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        out_lines = captured.out.strip().splitlines()
+        payload = json.loads(out_lines[0])
+        assert payload["mode"] == "squash-pr"
+        assert payload["status"] == "pass"
+        assert payload["findings"] == 0
+        assert "Strict probe" in captured.out
+        assert "Squash-PR probe" in captured.out
+        assert gh_calls == [
+            [
+                "gh",
+                "pr",
+                "list",
+                "--search",
+                "abc123deadbeef",
+                "--state",
+                "merged",
+                "--base",
+                "main",
+                "--json",
+                "number,mergedAt,title",
+            ]
+        ]
+
+    def test_blocked_when_neither_probe_confirms_merge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 AND the squash-PR probe finds no merged PR
+        When: cmd_check_ancestry is called
+        Then: rc is 1, the status line reports status "fail", BOTH probe outcomes are
+              printed, and a BLOCKED message is printed to stderr (spec 4.5, AC-ANC-002)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(merge_base_rc=1, gh_rc=0, gh_stdout="[]")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        out_lines = captured.out.strip().splitlines()
+        payload = json.loads(out_lines[0])
+        assert payload["status"] == "fail"
+        assert payload["mode"] == "none"
+        assert payload["findings"] == 1
+        assert "Strict probe" in captured.out
+        assert "Squash-PR probe" in captured.out
+        assert "BLOCKED" in captured.err
+
+    def test_rev_parse_failure_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `git rev-parse <dependency-ref>` itself fails
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the dependency ref, and no status line is printed
+              (spec 3.5: never silently report "not found" for a probe that could not run)
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, rev_parse_rc=128, rev_parse_stdout="", rev_parse_stderr="fatal: bad revision"
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+
+    def test_gh_pr_list_failure_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list` itself fails (rc!=0)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the dependency ref and gh's stderr, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=1, gh_stdout="", gh_stderr="gh: authentication required"
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "authentication required" in captured.err
+
+    def test_gh_pr_list_malformed_json_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list` returns output that is not valid JSON
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the JSON parse failure, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(merge_base_rc=1, gh_rc=0, gh_stdout="not json")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "JSON" in captured.err
+
+    def test_gh_pr_list_unexpected_shape_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list --json ...` returns a JSON
+               object instead of the expected array (a malformed/unexpected shape)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the unexpected shape, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=0, gh_stdout='{"error": "not a list"}'
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+
+    def test_gh_pr_list_entry_missing_number_field_fails_the_probe_loudly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the strict probe returns rc=1 and `gh pr list --json ...` returns a
+               well-formed JSON array whose first entry has no numeric "number" field
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the missing field, no status line printed
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fake_run_command, _gh_calls = self._fake_run_command(
+            merge_base_rc=1, gh_rc=0, gh_stdout='[{"title": "no number field here"}]'
+        )
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: squash-merge probe failed for 'origin/dep-branch'" in captured.err
+        assert "'number' field" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryFetchIsFatal(_AncestryCmdFixtures):
+    """A `git fetch` failure must FATALLY abort the check (spec 3.5, AC-ANC-003) --
+    the shipped ("best-effort fetch") behaviour silently answered from stale refs."""
+
+    def test_fetch_failure_exits_one_and_merge_base_never_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: 'git fetch <remote>' fails (e.g. offline, renamed remote)
+        When: cmd_check_ancestry is called
+        Then: rc is 1, ERROR names the remote and the failure, no status line is printed,
+              and `git merge-base --is-ancestor` is never invoked against stale local refs
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd == ["git", "fetch", "origin"]:
+                return (1, "", "fatal: unable to access 'origin': Could not resolve host")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: git fetch 'origin' failed" in captured.err
+        assert "Could not resolve host" in captured.err
+        assert merge_base_calls == []
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryRemoteResolution(_AncestryCmdFixtures):
+    """The tracking remote name is resolved from the repo's own git configuration
+    (spec 4.5, AC-ANC-004), never assumed to be the literal "origin"."""
+
+    def test_fetches_and_defaults_target_ref_against_the_configured_remote(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Given: `git config --get branch.main.remote` reports a non-"origin" remote name
+        When: cmd_check_ancestry is called with no explicit target-ref
+        Then: `git fetch` and the merge-base default target-ref both use that remote name
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        fetch_calls: list[list[str]] = []
+        merge_base_calls: list[list[str]] = []
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "config", "--get", "branch.main.remote"]:
+                return (0, "upstream\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                fetch_calls.append(cmd)
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                merge_base_calls.append(cmd)
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "upstream/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "upstream/dep-branch")
+
+        assert result == 0
+        assert fetch_calls == [["git", "fetch", "upstream"]]
+        assert merge_base_calls == [["git", "merge-base", "--is-ancestor", "upstream/dep-branch", "upstream/main"]]
+
+    def test_unresolvable_remote_exits_one_naming_the_config_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch has no configured tracking remote (`git config --get` fails)
+        When: cmd_check_ancestry is called
+        Then: rc is 1 and stderr names the exact `git config branch.<default-branch>.remote`
+              setting the operator needs to fix -- no fetch or merge-base call is attempted
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "config", "--get", "branch.main.remote"]:
+                return (1, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "branch.main.remote" in captured.err
+
+    def test_unresolvable_default_branch_exits_one_before_remote_lookup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch itself cannot be determined (no configured
+               default branch, and the `origin/HEAD` fallback also fails)
+        When: cmd_check_ancestry is called
+        Then: rc is 1 and no git config / fetch / merge-base call is ever attempted
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (128, "", "fatal: ambiguous argument 'origin/HEAD'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+    def test_unresolvable_default_branch_remediation_is_reachable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: the default branch itself cannot be determined
+        When: cmd_check_ancestry is called
+        Then: the printed remediation does not tell the operator to "pass an
+              explicit target-ref" -- _prepare_ancestry_probe_context calls
+              _resolve_ancestry_remote unconditionally (the remote is also
+              needed for `git fetch` and the squash probe's `--base`), so an
+              explicit target-ref would hit the identical error again
+        """
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
+                return (128, "", "fatal: ambiguous argument 'origin/HEAD'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.cli.get_configured_default_branch", return_value=None),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.err.strip() == (
+            f"ERROR: Cannot determine default branch for '{self._REPO}' to resolve its tracking "
+            "remote. Set 'default_branch' for this repo in devbench.yaml, or run "
+            "'git remote set-head <remote-name> --auto' for the repo's configured tracking remote."
+        )
+        assert "target-ref" not in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryDisabled(_AncestryCmdFixtures):
+    """When the ancestry gate is disabled (or unconfigured) for the unit's repo,
+    the command must print exactly the spec 4.1 disabled line and exit 0 before
+    any git call (spec 4.1, AC-ANC-006)."""
+
+    @pytest.mark.parametrize("enabled", [False], ids=["explicitly_disabled"])
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, enabled: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=enabled)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "ancestry", "status": "disabled"}'
+
+    def test_gate_absent_from_config_defaults_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: `devbench.yaml` has no `gates:` key at all (D-17 built-in default: disabled)
+        When: cmd_check_ancestry is called
+        Then: the disabled line prints and rc is 0, without any per-gate config present
+        """
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {self._REPO}:\n    default_branch: main\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "ancestry", "status": "disabled"}'
+
+    def test_config_load_failure_exits_one_before_any_git_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        Given: `DEVBENCH_CONFIG_PATH` points at a config file that does not exist
+        When: cmd_check_ancestry is called
+        Then: rc is 1, the loader's own ERROR is printed, and no git call is attempted
+        """
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "does-not-exist" / "devbench.yaml"))
+        monkeypatch.delenv("DEVBENCH_GATE_ANCESTRY_ENABLED", raising=False)
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryGatePassRecord(_AncestryCmdFixtures):
+    """AC-REC-001/002: a passing enabled check-ancestry run persists exactly
+    one `[GATE_PASS ancestry] <iso-utc> <scope-hash>` marker (spec 4.2, 3.6)
+    into the audit section that survives `read-unit --strip-comments`
+    (spec 4.3) -- never under `## Comments` itself; a failing, error, or
+    disabled run writes none."""
+
+    def _wu_content(self, repo_path: Path, unit_id: str) -> str:
+        return (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+
+    def test_pass_writes_single_gate_pass_marker_in_the_audit_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS ancestry]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+
+        # The marker survives `read-unit --strip-comments`'s truncation at
+        # the literal "\n## Comments" boundary (spec 4.3) -- it must sit in
+        # the audit section BEFORE that heading, never under it.
+        stripped = content.split("\n## Comments")[0]
+        assert "[GATE_PASS ancestry]" in stripped
+
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        status_line = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        assert record.scope_hash == status_line["scope_hash"]
+
+    def test_blocked_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (1, "", "")
+            if cmd == ["git", "rev-parse", "origin/dep-branch"]:
+                return (0, "abc123deadbeef\n", "")
+            if cmd[:2] == ["gh", "pr"]:
+                return (0, "[]", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_disabled_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_wu_file_missing_at_write_time_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the record cannot be written because
+        the work-unit file no longer exists by the time the passing run
+        reaches the write step -- fails loud, never a silent skip."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            (repo_path.parent / "backlog" / "E1-F1-S1-T1.md").unlink()
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "work unit file not found" in captured.err
+
+    def test_manifest_parse_error_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the work-unit file has no `## Changes
+        Manifest` section at write time -- fails loud, never a silent skip
+        or an empty-scope record."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            wu_file = repo_path.parent / "backlog" / "E1-F1-S1-T1.md"
+            wu_file.write_text("# E1-F1-S1-T1: no manifest section\n\n## Status: in-progress\n\n## Comments\n")
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+
+    def test_git_hash_object_failure_for_a_present_file_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: a Manifest file that DOES exist on
+        disk in the checkout still fails `git hash-object` for some other
+        reason (e.g. a corrupted git object store) -- fails loud, never a
+        partial record. A file simply ABSENT from the checkout is NOT this
+        path any more (doc_review FAIL, round 2, BLOCKING) -- see
+        `TestCheckAncestryAbsentManifestFileRealGit`."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        present_file = repo_path / "src" / "present.py"
+        present_file.parent.mkdir(parents=True, exist_ok=True)
+        present_file.write_text("print('hi')\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "hash-object", "--"]:
+                return (128, "", "fatal: unable to read sha1 file for 'src/present.py'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command, manifest_files=("src/present.py",)):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git hash-object failed" in captured.err
+
+    def test_git_rev_parse_target_ref_failure_prints_error_and_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: resolving the target ref's sha fails at
+        write time -- fails loud, never a partial record."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (128, "", "fatal: ambiguous argument 'origin/main'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git rev-parse failed for target ref" in captured.err
+
+    def test_squash_pr_pass_with_record_write_failure_exits_1_and_prints_no_status_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path (test_review FAIL, round 1): the
+        squash-PR pass branch's own `isinstance(written, int): return
+        written` early return was uncovered by any test -- a passing
+        squash-PR probe whose subsequent record write fails must still
+        exit 1 with no status line printed, exactly like the strict-pass
+        branch's equivalent failure."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (1, "", "")
+            if cmd == ["git", "rev-parse", "origin/dep-branch"]:
+                return (0, "abc123deadbeef\n", "")
+            if cmd[:2] == ["gh", "pr"]:
+                return (
+                    0,
+                    '[{"number": 317, "mergedAt": "2026-01-01T00:00:00Z", "title": "Squashed dependency"}]',
+                    "",
+                )
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (128, "", "fatal: ambiguous argument 'origin/main'")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "", "a record-write failure must never print a status line"
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "git rev-parse failed for target ref" in captured.err
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        assert "[GATE_PASS ancestry]" not in content
+
+    def test_unknown_unit_id_at_write_time_prints_error_and_exits_1(self, tmp_path: Path) -> None:
+        """Task-specific error path (test_review FAIL, round 1, AC-TEST-001):
+        `_write_ancestry_gate_pass_record`'s OWN "unit not found" branch --
+        distinct from `cmd_check_ancestry`'s earlier unit-resolution check
+        -- was uncovered by any test. Exercised directly since it is only
+        reachable if the unit disappears from the backlog index between
+        `cmd_check_ancestry`'s own earlier resolution and the write step."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli._write_ancestry_gate_pass_record("E1-F1-S1-T1", tmp_path, "origin/main")
+
+        assert result == 1
+
+    def test_unknown_unit_id_at_write_time_error_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            cli._write_ancestry_gate_pass_record("E1-F1-S1-T1", tmp_path, "origin/main")
+
+        captured = capsys.readouterr()
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1: unit not found" in captured.err
+
+    def test_wu_file_genuinely_unreadable_triggers_the_oserror_branch_not_the_not_found_branch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Fix for test_review FAIL (round 1): the prior version of this
+        test put a DIRECTORY where the work-unit file was expected, but
+        `Path.is_file()` returns False for a directory, so control took the
+        EARLIER "work unit file not found" branch and the `except OSError`
+        handler (the read failure this test claims to exercise) was never
+        entered -- proven by that branch being absent from the coverage
+        report. This version forces `Path.read_text` itself to raise
+        `OSError`, genuinely entering the read-failure branch, and asserts
+        wording distinguishable from the not-found branch so the test
+        fails if the OSError handler is removed."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        real_read_text = Path.read_text
+
+        def failing_read_text(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if self.name == "E1-F1-S1-T1.md":
+                raise OSError("Permission denied (simulated)")
+            return real_read_text(self, encoding, errors)
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            with patch.object(Path, "read_text", failing_read_text):
+                result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1" in captured.err
+        assert "Permission denied (simulated)" in captured.err
+
+    def test_audit_marker_write_failure_exits_1_names_the_unit_file_and_leaves_no_partial_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Declared Error Handling Contract path (test_review FAIL, code_review
+        FAIL, round 1): 'the audit-section write of the [GATE_PASS ancestry]
+        marker fails (unit file unreadable or not writable) -> loud ERROR:
+        naming the unit file path and exit 1, leaving no partial record.'
+        Forces `atomic_write_text` (the write half of
+        `_append_audit_markers_before_comments`) to raise `OSError`, proving
+        BOTH that the write is guarded (no uncaught traceback) AND that the
+        [GATE_PASS ancestry] record is never left orphaned without its
+        [GATE_ANCESTRY_TARGET_REF] companion, since both are written in one
+        call that either fully succeeds or fully fails."""
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        wu_file_path = repo_path.parent / "backlog" / "E1-F1-S1-T1.md"
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            with patch(
+                "devbench.backlog.manager.atomic_write_text",
+                side_effect=OSError("Disk full (simulated)"),
+            ):
+                result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+            assert result == 1
+            captured = capsys.readouterr()
+            assert captured.out.strip() == ""
+            assert f"ERROR: Cannot write [GATE_PASS ancestry] record for E1-F1-S1-T1: {wu_file_path}" in captured.err
+            assert "Disk full (simulated)" in captured.err
+
+            content = self._wu_content(repo_path, "E1-F1-S1-T1")
+            assert "[GATE_PASS ancestry]" not in content, "a failed write must never leave a partial record"
+            assert "[GATE_ANCESTRY_TARGET_REF]" not in content
+
+
+@pytest.mark.unit
+class TestCmdCheckAncestryGatePassRecordRealManifest(_AncestryCmdFixtures):
+    """AC-REC-001/007, AC-TEST-001 (test_review FAIL, code_review FAIL,
+    round 1): every prior ancestry cli-level test used an EMPTY Changes
+    Manifest, so the `git hash-object` half of the scope-hash assembly was
+    never exercised through `cmd_check_ancestry`. This test still stubs
+    `devbench.cli.run_command` wholesale (via `_patch_common`, mirroring
+    every other test in this module) rather than driving a real git
+    process -- its `fake_run_command` fabricates the `git hash-object`
+    output for the NON-EMPTY Manifest file -- but it is the first test to
+    exercise that assembly step through `cmd_check_ancestry` at all and to
+    assert the resulting record's `scope_hash` against
+    `gate_records.compute_scope_hash` computed independently over the same
+    fabricated blob hash. See `TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest`
+    for the real-git, end-to-end (`cmd_check_ancestry` then `cmd_mark_done`)
+    proof over an actual checkout."""
+
+    def _wu_content(self, repo_path: Path, unit_id: str) -> str:
+        return (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+
+    def test_pass_with_non_empty_manifest_folds_in_the_manifest_file_blob_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from devbench.gate_records import compute_scope_hash
+
+        self._enable_gate(tmp_path, monkeypatch)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        manifest_file = repo_path / "src" / "foo.py"
+        manifest_file.parent.mkdir(parents=True, exist_ok=True)
+        manifest_file.write_text("print('foo')\n", encoding="utf-8")
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, "deadbeefcafe\n", "")
+            if cmd[:3] == ["git", "hash-object", "--"]:
+                return (0, "blob-hash-for-src-foo-py\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command, manifest_files=("src/foo.py",)):
+            result = cli.cmd_check_ancestry("E1-F1-S1-T1", "origin/dep-branch", "origin/main")
+
+        assert result == 0
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[0])
+        expected_hash = compute_scope_hash({"src/foo.py": "blob-hash-for-src-foo-py"}, target_ref_sha="deadbeefcafe")
+        assert payload["scope_hash"] == expected_hash
+
+        content = self._wu_content(repo_path, "E1-F1-S1-T1")
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        assert record.scope_hash == expected_hash
+
+
+@pytest.mark.unit
+class TestAncestryScopeHashIncludesTargetRef(_AncestryCmdFixtures):
+    """AC-REC-003 (spec 4.5, internal issue #12 AC3): the persisted/reported
+    ancestry scope hash folds in the resolved target ref's sha, so two
+    passing runs with an identical changed-file set but different target
+    ref shas produce different hashes, and two runs with identical inputs
+    produce identical hashes."""
+
+    def _run_and_get_scope_hash(self, tmp_path: Path, target_sha: str, *, unit_id: str = "E1-F1-S1-T1") -> str:
+        unit = self._make_unit(unit_id)
+        repo_path = tmp_path / f"devbench-{target_sha}"
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "config", "--get"]:
+                return (0, "origin\n", "")
+            if cmd[:2] == ["git", "fetch"]:
+                return (0, "", "")
+            if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+                return (0, "", "")
+            if cmd == ["git", "rev-parse", "origin/main"]:
+                return (0, f"{target_sha}\n", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with self._patch_common(unit, repo_path, fake_run_command):
+            result = cli.cmd_check_ancestry(unit_id, "origin/dep-branch", "origin/main")
+        assert result == 0
+        content = (repo_path.parent / "backlog" / f"{unit_id}.md").read_text(encoding="utf-8")
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "ancestry")
+        assert record is not None
+        return record.scope_hash
+
+    def test_different_target_ref_shas_produce_different_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+
+        first = self._run_and_get_scope_hash(tmp_path, "sha-one", unit_id="E1-F1-S1-T1")
+        second = self._run_and_get_scope_hash(tmp_path, "sha-two", unit_id="E1-F1-S1-T2")
+
+        assert first != second
+
+    def test_identical_target_ref_shas_produce_identical_hashes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch)
+
+        first = self._run_and_get_scope_hash(tmp_path, "sha-same", unit_id="E1-F1-S1-T1")
+        second = self._run_and_get_scope_hash(tmp_path, "sha-same", unit_id="E1-F1-S1-T2")
+
+        assert first == second
+
+
+@pytest.mark.unit
+class TestMarkDoneAncestryGate:
+    """AC-REC-004/005/006 (spec 4.2, 4.5; internal issue #12 AC3): mark-done's
+    ancestry-specific record freshness check. Real git fixture repo (a real
+    ``origin`` plus a ``git clone`` checkout tracking it), no mocked git --
+    the Definition of Ready requires the record and its staleness to be
+    exercised through the real CLI."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_origin_and_checkout(self, tmp_path: Path) -> tuple[Path, Path]:
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "README.md", "baseline\n")
+        _tdd_gate_commit_all(origin, "baseline")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        return origin, checkout
+
+    def _seed_wu(self, tmp_path: Path, unit_id: str, *, extra_comments: str = "") -> tuple[Path, Path, Path]:
+        from devbench.constants import ALL_REQUIRED_JUDGE_NAMES
+
+        backlog_root = tmp_path / "backlog"
+        backlog_root.mkdir(exist_ok=True)
+        wu_file = backlog_root / f"{unit_id}.md"
+        all_pass = "".join(
+            f"[2026-01-01 00:00 UTC] [judge/{j}] [REVIEW_PASS] ok\n" for j in sorted(ALL_REQUIRED_JUDGE_NAMES)
+        )
+        wu_file.write_text(
+            f"# {unit_id}: Ancestry done-path test\n\n"
+            "## Status: in-review\n\n"
+            "## Task Type: chore\n\n"
+            f"## Target Repository\n\n- **Repo:** `{self._REPO}`\n\n"
+            "## Changes Manifest\n\n| File | Change |\n|------|--------|\n\n"
+            f"## TDD Cycle Log\n\n## Comments\n\n{all_pass}{extra_comments}",
+            encoding="utf-8",
+        )
+        backlog_index = tmp_path / "BACKLOG.md"
+        backlog_index.write_text(
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n"
+            f"| {unit_id} | Ancestry done-path test | Task | in-review | None | {self._REPO} | "
+            f"`{unit_id}.md` |\n",
+            encoding="utf-8",
+        )
+        return backlog_root, backlog_index, wu_file
+
+    def _patches(
+        self,
+        unit_id: str,
+        checkout: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+        *,
+        gate_enabled: bool = True,
+    ) -> tuple[Any, ...]:
+        from devbench.config_loader import GateEnabledConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = WorkUnit(
+            id=unit_id,
+            title="Ancestry done-path test",
+            status=WorkUnitStatus.IN_REVIEW,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(default_branch="main", resolved_checkout_path=checkout)},
+            gates=GatesConfig(ancestry=GateEnabledConfig(enabled=gate_enabled)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", rt_cfg),
+        )
+
+    def test_no_record_blocks_with_dependency_ref_remediation(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_no_record_remediation_names_dependency_ref_placeholder(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, _wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            cli.cmd_mark_done(unit_id)
+
+        err = capsys.readouterr().err
+        assert f"uv run devbench check-ancestry {unit_id} <dependency-ref>" in err
+
+    def test_fresh_record_allows_done(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_stale_record_after_target_ref_moves_blocks_with_spec_wording(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+
+        # Advance origin's main branch AFTER the record was captured (AC-7),
+        # then fetch it into the checkout's local origin/main tracking ref
+        # -- the recomputed target ref sha must now differ.
+        _tdd_gate_write(origin, "CHANGED.md", "moved\n")
+        _tdd_gate_commit_all(origin, "advance main")
+        _run_scratch_git(["fetch", "origin"], checkout)
+
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "ERROR: gate 'ancestry' record is stale (scope changed since it ran)" in capsys.readouterr().err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_fresh_record_with_explicit_target_ref_survives_recompute(self, tmp_path: Path) -> None:
+        """Real-defect regression (found during E4-F2-S1-T1 review): ``check-ancestry``
+        accepts an OPTIONAL explicit ``<target-ref>`` override (spec 4.5), so the
+        ref a passing run actually probed against is not always the repo's
+        default branch. A record captured against an explicit ref that PINS an
+        older commit than the CURRENT default branch tip must recompute as
+        fresh -- if the recompute wrongly re-derived ``origin/main`` instead of
+        reading back the persisted ``[GATE_ANCESTRY_TARGET_REF]`` marker, the
+        mismatch between the pinned tag's sha and main's (now-advanced) sha
+        would make this record read as permanently stale."""
+        unit_id = "E1-F1-S1-T1"
+        origin, checkout = self._make_origin_and_checkout(tmp_path)
+
+        # Pin an explicit tag at the baseline commit, then advance origin's
+        # main branch past it -- "origin/main" and the "pinned" tag now
+        # resolve to two different shas.
+        _run_scratch_git(["tag", "pinned"], origin)
+        _tdd_gate_write(origin, "CHANGED.md", "advanced past the pin\n")
+        _tdd_gate_commit_all(origin, "advance main past the pin")
+        _run_scratch_git(["fetch", "--tags", "origin"], checkout)
+        pinned_sha = _run_scratch_git(["rev-parse", "pinned"], checkout).stdout.strip()
+        main_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+        assert pinned_sha != main_sha
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=pinned_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("pinned")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_missing_target_ref_marker_fails_loud_not_silently_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: a ``[GATE_PASS ancestry]`` record with no
+        companion ``[GATE_ANCESTRY_TARGET_REF]`` marker (e.g. hand-authored, or
+        written before this marker existed) must fail loud at recompute time
+        (spec 3.5 fallback ban), never silently guess which ref was used."""
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        from devbench.gate_records import compose_gate_pass_record, compute_scope_hash
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path, unit_id, extra_comments=f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "ERROR:" in err
+        assert "no [GATE_ANCESTRY_TARGET_REF] marker recorded" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_unresolvable_target_ref_fails_loud_not_silently_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Task-specific error path: the persisted ``[GATE_ANCESTRY_TARGET_REF]``
+        marker names a ref that can no longer be resolved in the checkout
+        (e.g. its remote-tracking branch was removed) -- the recompute must
+        fail loud (spec 3.5 fallback ban), never silently treat an
+        unresolvable target ref as "unchanged"."""
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        target_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+        _run_scratch_git(["update-ref", "-d", "refs/remotes/origin/main"], checkout)
+
+        from devbench.gate_records import (
+            compose_ancestry_target_ref_marker,
+            compose_gate_pass_record,
+            compute_scope_hash,
+        )
+
+        scope_hash = compute_scope_hash({}, target_ref_sha=target_sha)
+        record_line = compose_gate_pass_record("ancestry", scope_hash)
+        target_ref_line = compose_ancestry_target_ref_marker("origin/main")
+        backlog_root, backlog_index, wu_file = self._seed_wu(
+            tmp_path,
+            unit_id,
+            extra_comments=(
+                f"[2026-01-01 00:00 UTC] [agent/executor] {record_line}\n"
+                f"[2026-01-01 00:00 UTC] [agent/executor] {target_ref_line}\n"
+            ),
+        )
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 1
+        assert "ERROR:" in capsys.readouterr().err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path) -> None:
+        unit_id = "E1-F1-S1-T1"
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+        patches = self._patches(unit_id, checkout, backlog_root, backlog_index, gate_enabled=False)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = cli.cmd_mark_done(unit_id)
+
+        assert result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest(_AncestryCmdFixtures):
+    """AC-REC-004/005/006, AC-TEST-001 (code_review FAIL, test_review FAIL,
+    round 1): a real end-to-end binding proof over a real git checkout with
+    a NON-EMPTY Changes Manifest -- `cmd_check_ancestry` writes the record
+    (exercising `_compute_ancestry_scope_hash`'s git hash-object loop for
+    real), and `cmd_mark_done` then accepts it (exercising
+    `BacklogManager._recompute_gate_scope_hash`'s delegation to the SAME
+    function). No test previously drove both commands together over a real,
+    non-empty Manifest, so the writer and the recompute were never proven
+    to agree in practice.
+
+    Fixture helpers (``_make_origin_and_checkout``, ``_seed_wu``,
+    ``_check_ancestry_patches``, ``_mark_done_patches``) live on
+    ``_AncestryCmdFixtures`` -- shared with
+    ``TestCheckAncestryAbsentManifestFileRealGit`` below."""
+
+    def test_check_ancestry_record_is_accepted_by_mark_done_over_a_real_non_empty_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+
+        assert check_result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS ancestry]" in content
+        assert "[GATE_ANCESTRY_TARGET_REF]" in content
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_editing_the_manifest_file_after_the_record_was_written_makes_mark_done_refuse_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+        assert check_result == 0
+
+        # Edit the Manifest's declared file's live working-tree content
+        # AFTER the record was written -- the Manifest's declared file list
+        # is unchanged, but the file's blob hash is not.
+        (checkout / "README.md").write_text("edited after the gate ran\n", encoding="utf-8")
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 1
+        err = capsys.readouterr().err
+        assert "gate 'ancestry' record is stale (scope changed since it ran)" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckAncestryAbsentManifestFileRealGit(_AncestryCmdFixtures):
+    """doc_review FAIL, round 2 (BLOCKING): the canonical generated
+    ancestry-gate task's Changes Manifest names exactly one `add` row for
+    its own report file (`docs/gate-reports/<id>-ancestry.md`), which the
+    Approach's final step writes on first execution -- so it provably does
+    NOT exist in the checkout at check-ancestry time. Before this fix,
+    `_compute_ancestry_scope_hash` ran `git hash-object` unconditionally
+    against every declared Manifest file; on a real checkout `git
+    hash-object` exits 128 for a path that does not exist, so the
+    RuntimeError branch fired and `check-ancestry` exited 1 with NO status
+    line even when the dependency HAD merged -- the exact task this whole
+    epic exists to make work was broken on its own first run. Every prior
+    test of this path (`TestCmdCheckAncestryGatePassRecordRealManifest`,
+    `TestCheckAncestryThenMarkDoneRealGitNonEmptyManifest`) either used an
+    empty Manifest or stubbed `git hash-object` to always return 0, so
+    nothing caught this. This class drives a REAL git checkout (no
+    `run_command` stub) end to end: `cmd_check_ancestry` must succeed with
+    a status line over an absent declared file, and the digest folded in
+    for that absence must be a DEFINED, deterministic input -- proven by
+    creating the file afterward and observing `cmd_mark_done` then refuse
+    the now-stale record."""
+
+    _ABSENT_REPORT_FILE = "docs/gate-reports/E1-F1-S1-T1-ancestry.md"
+
+    def test_check_ancestry_succeeds_with_a_status_line_over_a_manifest_file_absent_from_the_checkout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id, manifest_file=self._ABSENT_REPORT_FILE)
+
+        assert not (checkout / self._ABSENT_REPORT_FILE).exists(), "fixture precondition: the file must not exist yet"
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+
+        assert check_result == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out.strip().splitlines()[0])
+        assert payload["status"] == "pass"
+        assert payload["scope_hash"], "a passing run must persist a real, non-empty scope hash"
+
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS ancestry]" in content
+        assert "[GATE_ANCESTRY_TARGET_REF]" in content
+
+    def test_creating_the_absent_manifest_file_after_the_record_was_written_makes_mark_done_refuse_as_stale(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E1-F1-S1-T1"
+        self._enable_gate(tmp_path, monkeypatch)
+        _origin, checkout = self._make_origin_and_checkout(tmp_path)
+        backlog_root, backlog_index, wu_file = self._seed_wu(tmp_path, unit_id, manifest_file=self._ABSENT_REPORT_FILE)
+
+        check_patches = self._check_ancestry_patches(tmp_path, checkout, backlog_root, backlog_index)
+        with check_patches[0], check_patches[1], check_patches[2], check_patches[3], check_patches[4], check_patches[5]:
+            check_result = cli.cmd_check_ancestry(unit_id, "origin/main", "origin/main")
+        assert check_result == 0
+
+        # The Approach's final step writes the gate task's own report file
+        # -- exactly the moment the absent-file digest marker must stop
+        # applying and the record must read as stale.
+        report_path = checkout / self._ABSENT_REPORT_FILE
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("ancestry gate report, written on first execution\n", encoding="utf-8")
+
+        mark_done_patches = self._mark_done_patches(checkout, backlog_root, backlog_index)
+        with (
+            mark_done_patches[0],
+            mark_done_patches[1],
+            mark_done_patches[2],
+            mark_done_patches[3],
+            mark_done_patches[4],
+        ):
+            mark_done_result = cli.cmd_mark_done(unit_id)
+
+        assert mark_done_result == 1
+        err = capsys.readouterr().err
+        assert "gate 'ancestry' record is stale (scope changed since it ran)" in err
+        assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckAncestryRegistration:
+    """The check-ancestry command must be registered in the CLI dispatch table."""
+
+    def test_check_ancestry_in_commands(self) -> None:
+        assert "check-ancestry" in cli._COMMANDS
+        handler, argc, _help = cli._COMMANDS["check-ancestry"]
+        assert handler is cli.cmd_check_ancestry
+        assert argc == 2
 
 
 @pytest.mark.unit
@@ -5958,7 +8069,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -5967,10 +8079,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -5983,7 +8096,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("some/file.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("some/file.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"]:
@@ -5992,10 +8106,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value=None),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6009,7 +8124,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("new_file.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("new_file.py",))
         # Create an untracked file for the synthetic diff
         untracked_file = repo_path / "new_file.py"
         untracked_file.write_text("print('hello')\n", encoding="utf-8")
@@ -6021,10 +8137,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6040,7 +8157,8 @@ class TestCmdGetDiffEdgeCases:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("foo.py",))
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("foo.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "diff", "--cached", "--", "foo.py"]:
@@ -6051,10 +8169,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6072,7 +8191,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("nonexistent_file.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("nonexistent_file.py",))
         # Do NOT create the file so reading it raises OSError
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6082,10 +8202,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6098,7 +8219,8 @@ class TestCmdGetDiffEdgeCases:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("valid.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("valid.py",))
         # Create a valid file so one line succeeds, and one blank line gets skipped
         valid_file = repo_path / "valid.py"
         valid_file.write_text("x = 1\n", encoding="utf-8")
@@ -6111,10 +8233,11 @@ class TestCmdGetDiffEdgeCases:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6147,16 +8270,17 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("A.py",))
 
         (tmp_repo_dir / "A.py").write_text("print('mine')\n", encoding="utf-8")
         (tmp_repo_dir / "sibling.py").write_text("print('not mine')\n", encoding="utf-8")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6175,7 +8299,7 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("A.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("A.py",))
 
         # Both files are committed first so a later edit is "unstaged", not
         # "untracked" -- this test targets the `git diff` pathspec, not
@@ -6191,9 +8315,10 @@ class TestCmdGetDiffManifestScoping:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6212,7 +8337,7 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=())
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=())
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
@@ -6221,9 +8346,11 @@ class TestCmdGetDiffManifestScoping:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6235,19 +8362,18 @@ class TestCmdGetDiffManifestScoping:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = tmp_path / "E0-F1-S1-T1.md"
-        wu_file.write_text(
-            "# E0-F1-S1-T1: Test Task\n\n## Status: in-progress\n\n"
-            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
-            encoding="utf-8",
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
         )
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6285,7 +8411,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6300,10 +8427,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6325,7 +8454,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6340,10 +8470,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6368,7 +8500,8 @@ class TestCmdGetDiffTaskCommitAttribution:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
@@ -6381,10 +8514,12 @@ class TestCmdGetDiffTaskCommitAttribution:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6419,7 +8554,7 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
         (tmp_repo_dir / "unowned.py").write_text("not mine\n", encoding="utf-8")
@@ -6427,8 +8562,9 @@ class TestCmdCheckManifestScope:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6443,15 +8579,16 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         (tmp_repo_dir / "owned.py").write_text("mine\n", encoding="utf-8")
         subprocess.run(["git", "add", "owned.py"], cwd=tmp_repo_dir, check=True, capture_output=True)
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6465,19 +8602,18 @@ class TestCmdCheckManifestScope:
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = tmp_path / "E0-F1-S1-T1.md"
-        wu_file.write_text(
-            "# E0-F1-S1-T1: Test\n\n## Status: in-progress\n\n"
-            "## Changes Manifest\n\n| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |\n",
-            encoding="utf-8",
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
         )
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_check_manifest_scope("E0-F1-S1-T1")
 
@@ -6543,7 +8679,7 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
         )
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         # Sibling residue: untracked, never staged by this unit.
         (tmp_repo_dir / "sibling.py").write_text("not mine\n", encoding="utf-8")
@@ -6554,9 +8690,10 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_repo_dir}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             diff_rc = cli.cmd_get_diff("E0-F1-S1-T1")
             diff_output = capsys.readouterr().out
@@ -6570,6 +8707,1699 @@ class TestChangesManifestJudgeAutoFailsOnManifestMismatch:
         )
         assert scope_rc == 1, "check-manifest-scope must trip on the unmanifested staged file"
         assert "unmanifested.py" in scope_err
+
+
+@pytest.mark.unit
+class TestScopeSingleImplementationPin:
+    """AC-E2-F3-S1-T1-5 (spec 4.3, AC-9): no module other than
+    ``devbench.work_unit_scope`` may resolve a work unit's own commit(s) by
+    commit-message subject via raw git plumbing -- that is the ADR-12
+    attribution logic ``get-diff`` and ``check-manifest-scope`` were
+    migrated to consume from the single shared implementation (db-247), and
+    the near-copy this task's Approach names (the reachability evidence
+    command, the shared-file and fixture working-tree scans) must never
+    reintroduce it independently.
+
+    ``--format=%H`` is the exact, narrow fingerprint of that resolution --
+    ``git log --grep '^<unit_id>:' --format=%H`` -- chosen because it is
+    unlikely to collide with any other legitimate git invocation, unlike a
+    broader pattern (e.g. ``git diff``) that ``cli.py`` still legitimately
+    issues directly for hunk *rendering* once scope is already resolved.
+    """
+
+    _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "devbench"
+    _SCOPE_HELPER = _SRC_ROOT / "work_unit_scope.py"
+    _COMMIT_SHA_RESOLUTION_MARKER = "--format=%H"
+
+    def _other_python_files(self) -> list[Path]:
+        return [
+            path
+            for path in self._SRC_ROOT.rglob("*.py")
+            if path.resolve() != self._SCOPE_HELPER.resolve() and "__pycache__" not in path.parts
+        ]
+
+    def test_scope_helper_itself_carries_the_marker(self) -> None:
+        """Sanity check: the marker exists exactly where it is supposed to."""
+        assert self._SCOPE_HELPER.is_file()
+        content = self._SCOPE_HELPER.read_text(encoding="utf-8")
+        assert self._COMMIT_SHA_RESOLUTION_MARKER in content
+
+    def test_no_other_module_resolves_commit_sha_scope_via_raw_git_plumbing(self) -> None:
+        offenders = sorted(
+            str(path.relative_to(self._SRC_ROOT))
+            for path in self._other_python_files()
+            if self._COMMIT_SHA_RESOLUTION_MARKER in path.read_text(encoding="utf-8")
+        )
+        assert offenders == [], (
+            "AC-9: only devbench.work_unit_scope may resolve a work unit's own commit(s) via raw "
+            f"git plumbing; found a second implementation in: {offenders}"
+        )
+
+    def test_pin_detector_flags_a_synthetic_second_implementation(self, tmp_path: Path) -> None:
+        """Proves the detector logic above is load-bearing (fails when a
+        second path is introduced), without actually reintroducing the
+        regression into the real codebase."""
+        decoy = tmp_path / "decoy_scope_module.py"
+        decoy.write_text('run_command(["git", "log", "--grep", f"^{unit_id}:", "--format=%H"])\n', encoding="utf-8")
+
+        offenders = [decoy] if self._COMMIT_SHA_RESOLUTION_MARKER in decoy.read_text(encoding="utf-8") else []
+
+        assert offenders == [decoy], "the detector must flag a module that reintroduces the marker"
+
+
+class TestReachabilityHelperFunctions:
+    """Unit tests for the pure helper functions behind cmd_check_reachability
+    (caylent-solutions/devbench-internal-backlog#10)."""
+
+    def test_is_reachability_candidate_accepts_known_source_extension(self) -> None:
+        assert cli._is_reachability_candidate("src/components/Button.tsx") is True
+
+    def test_is_reachability_candidate_rejects_unknown_extension(self) -> None:
+        assert cli._is_reachability_candidate("src/data.json") is False
+
+    def test_is_reachability_candidate_rejects_test_and_story_paths(self) -> None:
+        assert cli._is_reachability_candidate("src/__tests__/Button.tsx") is False
+        assert cli._is_reachability_candidate("src/Button.test.tsx") is False
+        assert cli._is_reachability_candidate("src/Button.stories.tsx") is False
+        assert cli._is_reachability_candidate("src/tests/test_button.py") is False
+
+    def test_is_reachability_candidate_rejects_entry_point_stems(self) -> None:
+        assert cli._is_reachability_candidate("src/index.ts") is False
+        assert cli._is_reachability_candidate("src/App.tsx") is False
+        assert cli._is_reachability_candidate("pkg/__init__.py") is False
+
+    def test_is_reachability_candidate_matches_extension_case_insensitively(self) -> None:
+        """AC-E2-F6-S1-T1-4 (spec 4.3): the shared classification is case-insensitive
+        on the suffix; this asserts `cli.py`'s own consumer inherits that property."""
+        assert cli._is_reachability_candidate("src/components/Button.TSX") is True
+        assert cli._is_reachability_candidate("src/components/Button.Tsx") is True
+
+    @pytest.mark.parametrize("extension", sorted(_CLI_REACHABILITY_HISTORICAL_EXTENSIONS))
+    def test_is_reachability_candidate_accepts_every_shared_source_extension(self, extension: str) -> None:
+        """Migration pin (AC-2, AC-3; test_review round-1 COVERAGE_REGRESSION):
+        fails if `cli.py` ever re-declares a private, narrower extension
+        tuple instead of importing
+        `devbench.source_classification.SOURCE_EXTENSIONS` -- a private
+        copy would omit at least one of these 15 extensions and this
+        parametrization would catch it.
+
+        Parametrized over `_CLI_REACHABILITY_HISTORICAL_EXTENSIONS`,
+        imported from `tests/test_source_classification.py` rather than a
+        collection-time import of the live `SOURCE_EXTENSIONS` constant
+        (test_review round-3 TDD_CYCLE_MISSING remediation):
+        `source_classification.py` is a Changes-Manifest "add" row that
+        `BacklogManager._is_production_source` classifies as production,
+        so `green-green-check`'s scoped stash deletes it to reconstruct
+        the "before" state, and `default_pytest_runner` runs pytest at
+        FILE scope -- a module-scope import of the live constant, or any
+        other test in this file that legitimately fails before the
+        module exists, would fail this whole file's process exit code
+        and reject every witness selected from it, not merely the one
+        test that touches the constant. Importing the inlined literal
+        from `test_source_classification` (itself never importing the
+        production module at module scope, so it stays collectible even
+        when `source_classification.py` is stashed away) is safe here for
+        the same reason `test_tdd_gate`'s helpers are already imported
+        this way above. Parametrizing over this literal instead of
+        `sorted(SOURCE_EXTENSIONS)` is also the stronger pin on its own
+        merits: a live import would let a future narrowing of the shared
+        set silently shrink what gets parametrized instead of failing it.
+        The literal's own drift guard --
+        `tests/test_source_classification.py
+        ::TestSourceExtensions::test_historical_reachability_extensions_equal_source_extensions_exactly`
+        -- ties it to the live `SOURCE_EXTENSIONS` constant by equality,
+        so a narrowing or widening of the shared set still fails loudly;
+        it lives there (not here) so the deferred, before-state-failing
+        import stays out of this witness-bearing file."""
+        assert cli._is_reachability_candidate(f"src/Widget{extension}") is True
+
+    def test_derive_basename_symbol_uses_parent_dir_for_index_barrel(self) -> None:
+        assert cli._derive_reachability_basename_symbol("src/Button/index.tsx") == "Button"
+
+    def test_derive_basename_symbol_uses_filename_otherwise(self) -> None:
+        assert cli._derive_reachability_basename_symbol("src/Button.tsx") == "Button"
+
+    def test_extract_symbols_finds_named_js_export(self) -> None:
+        content = "export function useWidget() { return 1; }\n"
+        symbols = cli._extract_reachability_symbols(content, "src/hooks/useWidget.ts")
+        assert "useWidget" in symbols
+
+    def test_extract_symbols_finds_python_class_and_basename(self) -> None:
+        content = "class Validator:\n    pass\n"
+        symbols = cli._extract_reachability_symbols(content, "src/validators/rule.py")
+        assert "Validator" in symbols
+        assert "rule" in symbols
+
+    def test_extract_symbols_finds_export_brace_list(self) -> None:
+        content = "const helperA = 1;\nconst helperB = 2;\nexport { helperA, helperB as aliasedB };\n"
+        symbols = cli._extract_reachability_symbols(content, "src/helpers.ts")
+        assert "helperA" in symbols
+        assert "helperB" in symbols
+
+    def test_search_pathspecs_cover_every_shared_source_extension(self) -> None:
+        """AC-FUNC-003/315-D02: the importer search's pathspecs are derived from
+        the shared source-classification set, one ``*.<ext>`` glob apiece --
+        never a private, narrower copy."""
+        pathspecs = cli._reachability_search_pathspecs()
+        assert pathspecs == sorted(f"*.{ext.lstrip('.')}" for ext in _CLI_REACHABILITY_HISTORICAL_EXTENSIONS)
+
+    # -- _matches_reachability_entry_point (issue #10 AC2) ----------------
+
+    def test_matches_entry_point_literal_path_match(self) -> None:
+        assert cli._matches_reachability_entry_point("src/main.py", ("src/main.py",)) is True
+
+    def test_matches_entry_point_stem_match_is_case_insensitive(self) -> None:
+        """The built-in stem-based default (bare lower-case stems) matches a
+        candidate like ``App.tsx`` regardless of the file's own casing."""
+        assert cli._matches_reachability_entry_point("src/App.tsx", ("app",)) is True
+
+    def test_matches_entry_point_no_match_returns_false(self) -> None:
+        assert cli._matches_reachability_entry_point("src/Consumer.tsx", ("main", "app")) is False
+
+    # -- _is_reachable_from_entry_points (issue #10 AC2) -------------------
+
+    def test_is_reachable_true_when_path_itself_is_an_entry_point(self, tmp_path: Path) -> None:
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/main.py", ("main",)) is True
+
+    def test_is_reachable_false_when_already_visited(self, tmp_path: Path) -> None:
+        """AC-FUNC-004: the visited-set cycle guard short-circuits a path
+        already in the current walk. The file is created on disk with real,
+        importable content -- and is itself an entry point by stem -- so
+        that only the ``if rel_path in visited: return False`` guard can
+        produce ``False`` here; without it, the function would instead
+        reach ``_matches_reachability_entry_point`` and return ``True``,
+        which is what makes this test able to fail if the guard is
+        deleted (test_review round-2 non-discriminating-assertion finding:
+        the old version pointed at a nonexistent path, so the surviving
+        ``if not abs_path.is_file(): return False`` branch produced the
+        identical result and the mutated (guard-deleted) code stayed
+        green)."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/Already.tsx").write_text("export function Already() { return null; }\n", encoding="utf-8")
+        visited = {"src/Already.tsx"}
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/Already.tsx", ("already",), visited) is False
+
+    def test_is_reachable_false_when_path_does_not_exist_on_disk(self, tmp_path: Path) -> None:
+        assert cli._is_reachable_from_entry_points(tmp_path, "src/does-not-exist.tsx", ()) is False
+
+    def test_is_reachable_raises_when_file_unreadable(self, tmp_path: Path) -> None:
+        """code_review round-2 FAIL_FAST finding: a referrer that cannot be
+        read must not silently degrade to a ``False`` ('unreachable')
+        verdict -- the old behaviour this test used to pin. The read
+        failure must propagate as ``_ReachabilityReferrerReadError``,
+        carrying the referrer's own path and the original cause, so the
+        caller (``_reachability_scan_candidates``) is the one that decides
+        how to report it (a counted ``[LOAD_ERROR]`` finding naming the
+        REFERRER, matching the identical top-level-candidate contract --
+        see ``TestCmdCheckReachabilityOrphanChain
+        ::test_unreadable_referrer_produces_load_error_finding_naming_referrer``
+        for the end-to-end assertion)."""
+        (tmp_path / "src").mkdir()
+        target = tmp_path / "src/Broken.tsx"
+        target.write_text("export function Broken() { return null; }\n", encoding="utf-8")
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with (
+            patch.object(Path, "read_text", fake_read_text),
+            pytest.raises(cli._ReachabilityReferrerReadError) as exc_info,
+        ):
+            cli._is_reachable_from_entry_points(tmp_path, "src/Broken.tsx", ())
+
+        assert exc_info.value.rel_path == "src/Broken.tsx"
+        assert isinstance(exc_info.value.cause, OSError)
+        assert "permission denied" in str(exc_info.value.cause)
+
+    # -- _reachability_missing_entry_point (code_review round-2 -----------
+    # -- MISSING_AC_EVIDENCE finding: containment defense-in-depth) -------
+
+    def test_missing_entry_point_none_for_builtin_provenance_without_touching_disk(self, tmp_path: Path) -> None:
+        assert cli._reachability_missing_entry_point(tmp_path, ("main", "app"), "builtin") is None
+
+    def test_missing_entry_point_none_when_project_path_exists(self, tmp_path: Path) -> None:
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/main.py").write_text("print('hi')\n", encoding="utf-8")
+        assert cli._reachability_missing_entry_point(tmp_path, ("src/main.py",), "project") is None
+
+    def test_missing_entry_point_names_path_absent_from_repo(self, tmp_path: Path) -> None:
+        assert cli._reachability_missing_entry_point(tmp_path, ("src/does-not-exist.py",), "project") == (
+            "src/does-not-exist.py"
+        )
+
+    def test_missing_entry_point_names_absolute_path_outside_repo_even_though_it_exists_on_disk(
+        self, tmp_path: Path
+    ) -> None:
+        """Reproduces the reviewer's direct pathlib finding
+        (``Path('/tmp/somerepo') / '/etc/hostname' == Path('/etc/hostname')``):
+        an absolute *entry_point* that genuinely exists on disk, but OUTSIDE
+        *repo_path*, must still be reported as 'missing' -- the containment
+        check runs before ``.is_file()`` is trusted, so a real file outside
+        the checkout can never silently satisfy this guard."""
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        outside_file = tmp_path / "outside.py"
+        outside_file.write_text("print('not in the checkout')\n", encoding="utf-8")
+        assert str(outside_file).startswith("/")
+
+        assert cli._reachability_missing_entry_point(repo_path, (str(outside_file),), "project") == str(outside_file)
+
+    def test_missing_entry_point_names_dotdot_path_escaping_repo_even_though_it_exists_on_disk(
+        self, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        outside_file = tmp_path / "outside.py"
+        outside_file.write_text("print('not in the checkout')\n", encoding="utf-8")
+
+        assert cli._reachability_missing_entry_point(repo_path, ("../outside.py",), "project") == "../outside.py"
+
+
+def _gates_table_cells(line: str) -> list[str]:
+    """Split one rendered ``devbench gates`` line back into its cells.
+
+    Columns are separated by at least two spaces (``_format_gates_table``
+    left-justifies each cell to its column width, then joins with two more
+    spaces); no cell value used by these tests ever contains two
+    consecutive spaces, so this split is unambiguous.
+    """
+    return re.split(r"\s{2,}", line.strip())
+
+
+def _make_resolved_gate_config(gate: str = "reachability", *, enabled: bool, provenance: str) -> ResolvedGateConfig:
+    return ResolvedGateConfig(gate=gate, values={"enabled": enabled}, provenance={"enabled": provenance})
+
+
+class TestFormatGatesTable:
+    """cli._format_gates_table: pure row-rendering, column widths computed
+    from the data (AC-E2-F1-S2-T1-2, AC-E2-F1-S2-T1-3; DoD: no hard-coded
+    widths). The ``tier`` column (AC-E2-F2-S1-T2-6) is looked up from
+    ``constants.GATE_TIERS`` by gate name, completing the G2 worked-example
+    shape."""
+
+    def test_header_only_when_no_records(self) -> None:
+        lines = cli._format_gates_table([])
+        assert lines == ["gate  tier  status  repos  provenance"]
+
+    def test_disabled_row_uses_no_override_placeholder(self) -> None:
+        resolved = _make_resolved_gate_config(enabled=False, provenance="builtin")
+        lines = cli._format_gates_table([("reachability", resolved, [])])
+        assert len(lines) == 2
+        assert _gates_table_cells(lines[0]) == ["gate", "tier", "status", "repos", "provenance"]
+        assert _gates_table_cells(lines[1]) == ["reachability", "machine-blocking", "disabled", "-", "builtin"]
+
+    def test_enabled_repo_override_row_lists_the_repo(self) -> None:
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        lines = cli._format_gates_table([("shared_file_impact", resolved, ["caylent-solutions/devbench"])])
+        assert _gates_table_cells(lines[1]) == [
+            "shared_file_impact",
+            "machine-blocking",
+            "enabled",
+            "caylent-solutions/devbench",
+            "repo",
+        ]
+
+    def test_judge_evidence_gate_renders_its_tier(self) -> None:
+        resolved = _make_resolved_gate_config("write_path_audit", enabled=False, provenance="builtin")
+        lines = cli._format_gates_table([("write_path_audit", resolved, [])])
+        assert _gates_table_cells(lines[1]) == ["write_path_audit", "judge-evidence", "disabled", "-", "builtin"]
+
+    def test_multiple_override_repos_are_comma_joined(self) -> None:
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        repos = ["org-a/repo-a", "org-b/repo-b"]
+        lines = cli._format_gates_table([("shared_file_impact", resolved, repos)])
+        assert _gates_table_cells(lines[1])[3] == "org-a/repo-a, org-b/repo-b"
+
+    def test_column_width_grows_to_fit_longest_cell_without_truncation(self) -> None:
+        long_repo = "an-organisation-with-a-very-long-name/an-equally-long-repository-name"
+        resolved = _make_resolved_gate_config("shared_file_impact", enabled=True, provenance="repo")
+        lines = cli._format_gates_table([("shared_file_impact", resolved, [long_repo])])
+        header, row = lines
+        # The full, untruncated repo name is preserved as its own cell...
+        assert _gates_table_cells(row)[3] == long_repo
+        # ...and since it is by far the widest cell in the "repos" column,
+        # the column carries no extra padding: the next column
+        # ("provenance") starts immediately after it plus the 2-space
+        # separator, at the SAME offset in both the header and the data
+        # row -- proving the width is derived from the data (a fixed,
+        # hard-coded width would either truncate this cell or misalign the
+        # header).
+        expected_provenance_start = row.index(long_repo) + len(long_repo) + 2
+        assert row.index("repo", expected_provenance_start) == expected_provenance_start
+        assert header.index("provenance") == expected_provenance_start
+
+    def test_multiple_rows_stay_column_aligned(self) -> None:
+        short = _make_resolved_gate_config("ancestry", enabled=False, provenance="builtin")
+        long_gate = _make_resolved_gate_config("newly_reachable_paths", enabled=True, provenance="env")
+        lines = cli._format_gates_table(
+            [
+                ("ancestry", short, []),
+                ("newly_reachable_paths", long_gate, []),
+            ]
+        )
+        header, row_a, row_b = lines
+        status_offset = header.index("status")
+        assert row_a.index("disabled") == status_offset
+        assert row_b.index("enabled") == status_offset
+
+
+class TestCmdGates:
+    """devbench gates: read-only overview of every declared gate's tier,
+    status, repo overrides and provenance, resolved exclusively through
+    resolve_gate_config (spec G2, section 4.1; AC-E2-F1-S2-T1-1..4,
+    AC-E2-F2-S1-T2-6, AC-4, AC-27)."""
+
+    _REPO = "caylent-solutions/devbench"
+
+    @staticmethod
+    def _write_config(tmp_path: Path, gates_block: str = "") -> Path:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {TestCmdGates._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def test_no_gates_key_renders_all_eight_disabled(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = self._write_config(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        assert len(lines) == 1 + len(GATE_NAMES)
+        rendered_gates = {_gates_table_cells(ln)[0] for ln in lines[1:]}
+        assert rendered_gates == set(GATE_NAMES)
+        for row in lines[1:]:
+            cells = _gates_table_cells(row)
+            assert cells[1] == GATE_TIERS[cells[0]]
+            assert cells[2] == "disabled"
+            assert cells[3] == "-"
+            assert cells[4] == "builtin"
+
+    def test_repo_override_enables_shared_file_impact(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gates_block = f"gates:\n  repos:\n    {self._REPO}:\n      shared_file_impact:\n        enabled: true\n"
+        cfg_path = self._write_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("shared_file_impact"))
+        assert _gates_table_cells(row) == [
+            "shared_file_impact",
+            "machine-blocking",
+            "enabled",
+            self._REPO,
+            "repo",
+        ]
+
+    def test_project_level_config_sets_provenance_project(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-E2-F1-S2-T1-3: provenance is asserted for the project layer too (not just repo/env)."""
+        gates_block = "gates:\n  ancestry:\n    enabled: true\n"
+        cfg_path = self._write_config(tmp_path, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("ancestry"))
+        # No per-repo override exists, so the "repos" column still shows the
+        # no-override placeholder even though the gate is enabled at the
+        # project level.
+        assert _gates_table_cells(row) == ["ancestry", "machine-blocking", "enabled", "-", "project"]
+
+    def test_env_override_sets_provenance_env(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_path = self._write_config(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.setenv("DEVBENCH_GATE_REACHABILITY_ENABLED", "true")
+
+        result = cli.cmd_gates()
+
+        assert result == 0
+        out = capsys.readouterr().out
+        row = next(ln for ln in out.splitlines() if ln.startswith("reachability"))
+        assert _gates_table_cells(row) == ["reachability", "machine-blocking", "enabled", "-", "env"]
+
+    def test_config_load_failure_exits_1_with_loader_message_and_no_table(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg_dir = tmp_path / "backlog" / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text("repos: [unterminated\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+        result = cli.cmd_gates()
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "Invalid YAML" in captured.err
+
+    def test_missing_config_file_exits_1_with_loader_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+
+        result = cli.cmd_gates()
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "not found" in captured.err
+
+
+class _ReachabilityCmdFixtures:
+    """Shared git-fixture / config-fixture helpers for
+    ``cmd_check_reachability`` test classes (caylent-solutions/devbench-internal-backlog#10).
+
+    Deliberately NOT ``Test``-prefixed so pytest never collects it directly
+    (code_review/test_review round-2 DRY finding): the two concrete classes
+    below used to be related by subclassing one collected ``Test*`` class
+    from the other, which made pytest re-collect and re-execute every
+    parent test method under the subclass as well (30 collected node ids,
+    only 8 genuinely new). Both ``TestCmdCheckReachability`` and
+    ``TestCmdCheckReachabilityOrphanChain`` inherit from this mixin
+    instead, so each test method executes exactly once.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+    _ENABLED_GATES_BLOCK = "gates:\n  reachability:\n    enabled: true\n"
+
+    def _make_unit(self, unit_id: str = "E0-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    @pytest.fixture(autouse=True)
+    def _isolate_git_locator_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Clear git's repository-locator variables before every test method
+        body runs, including before ``_git_repo`` runs.
+
+        Git's repository-locator variables (``GIT_DIR``, ``GIT_WORK_TREE``,
+        ``GIT_INDEX_FILE``, ``GIT_CEILING_DIRECTORIES``,
+        ``GIT_OBJECT_DIRECTORY``) override ``cwd``-based discovery when set,
+        and git exports ``GIT_DIR``/``GIT_INDEX_FILE`` to every hook process
+        it spawns, so a leaked value from an outer wrapper/hook process is a
+        reachable condition, not an exotic one.
+
+        This MUST be an autouse fixture rather than a ``delenv`` inside
+        ``_run``: ``_run`` executes strictly after ``_git_repo`` has already
+        run ``git init``/``git config``/``git add -A``/``git commit`` under
+        the ambient environment, so clearing these variables only inside
+        ``_run`` cannot protect ``_git_repo``'s own subprocess calls.
+        Verified: with the variables cleared only inside ``_run`` (the prior
+        placement), an ambient ``GIT_DIR`` pointed at a foreign repository
+        left only 4 of this class's 22 collected cases passing -- the rest
+        failed inside ``_git_repo`` with ``CalledProcessError`` from ``git
+        commit``, because ``git init``/``git commit`` ran against the foreign
+        ``GIT_DIR`` before the ``_run`` delenv ever executed. With the same
+        five variables cleared here instead (an autouse fixture runs before
+        the test function body, i.e. before any call to ``_git_repo``), all
+        22 cases pass under the same ambient ``GIT_DIR``.
+        """
+        for git_locator_var in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_OBJECT_DIRECTORY",
+        ):
+            monkeypatch.delenv(git_locator_var, raising=False)
+
+    def _git_repo(self, tmp_path: Path) -> Path:
+        """Create a real git repo with one committed baseline file."""
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (
+            ["git", "init"],
+            ["git", "config", "user.email", "t@ex.com"],
+            ["git", "config", "user.name", "Test"],
+        ):
+            subprocess.run(args, cwd=repo, check=True, capture_output=True)
+        (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @classmethod
+    def _write_gate_config(cls, tmp_path: Path, gates_block: str) -> Path:
+        """Write a scratch ``devbench.yaml`` resolving ``resolve_gate_config``'s
+        project layer, separate from the ``_seed_scope_backlog`` Manifest tree
+        and from the git fixture repo."""
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {cls._REPO}:\n    default_branch: main\n{gates_block}")
+        return cfg_path
+
+    def _run(
+        self,
+        unit_id: str,
+        repo: Path,
+        backlog_root: Path,
+        backlog_index: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        gates_block: str = _ENABLED_GATES_BLOCK,
+    ) -> int:
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        cfg_path = self._write_gate_config(repo.parent, gates_block)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        # The env layer is highest-precedence (spec 4.1, D-15): an ambient
+        # DEVBENCH_GATE_REACHABILITY_ENABLED left set by the host shell must
+        # never leak into a test that relies on the project-layer config above.
+        monkeypatch.delenv("DEVBENCH_GATE_REACHABILITY_ENABLED", raising=False)
+        # `_search_reachability_importers` passes `cwd=repo_path` to `git grep`
+        # but otherwise inherits the ambient environment unchanged
+        # (`run_command`'s `env=None` default). The class-level autouse
+        # `_isolate_git_locator_env` fixture clears git's repository-locator
+        # variables before this method (and before `_git_repo`) ever runs, so
+        # no additional clearing is needed here.
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            # `unit.file_path` is `backlog/<unit_id>.md`, relative -- pointed
+            # at the real `_seed_scope_backlog` fixture file (`_resolve_work_unit_file`
+            # tries `BACKLOG_ROOT / unit.file_path` first) so the waiver read
+            # and the `[GATE_PASS reachability]` record write both resolve to
+            # the same on-disk work-unit file `work_unit_scope` resolves scope
+            # against, rather than a nonexistent path in the real checkout.
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            return cli.cmd_check_reachability(unit_id)
+
+
+class TestCmdCheckReachability(_ReachabilityCmdFixtures):
+    """Tests for cmd_check_reachability (caylent-solutions/devbench-internal-backlog#10:
+    reachability gate; spec `integration-reality-gates-hardening.md` 4.4).
+
+    Scope is resolved through ``devbench.work_unit_scope.resolve_changed_files``
+    (spec 4.3, AC-9) against a real, on-disk Changes Manifest written by
+    ``_seed_scope_backlog`` -- never a mocked ``devbench.cli.BacklogParser``
+    return value alone, since that helper only serves ``cli.py``'s own
+    unit/repo lookup in ``_resolve_unit_repo_and_path`` and not
+    ``work_unit_scope``'s independent ``BacklogParser`` lookup (see that
+    helper's own docstring). Uses a real git repo (not a mocked
+    ``run_command``) so the ``git grep`` based importer search exercises
+    real git semantics end-to-end. Fixture helpers live on
+    ``_ReachabilityCmdFixtures`` (shared with
+    ``TestCmdCheckReachabilityOrphanChain``).
+    """
+
+    # -- unit/repo/config resolution failures ---------------------------
+
+    def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_reachability("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    def test_no_local_path(self, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_check_reachability(unit.id)
+
+        assert result == 1
+        assert "no local path" in capsys.readouterr().err.lower()
+
+    def test_config_load_failure_exits_1_with_loader_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        repo = self._git_repo(tmp_path)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+        ):
+            result = cli.cmd_check_reachability(unit.id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+
+    def test_malformed_manifest_exits_1_without_status_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Error-handling contract: a ``ValueError``/``ManifestParseError`` from scope
+        resolution prints the raised ``ERROR:`` and exits 1 with NO status line."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path,
+            unit_id=unit_id,
+            manifest_body="| File | Change | Extra |\n|---|---|---|\n| `A.py` | modify | oops |",
+        )
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+
+    # -- spec 4.1 disabled short-circuit / spec 5.2 status line ---------
+
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-007: with no `gates:` key in config, the gate is disabled."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/whatever.py",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block="")
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out.strip()) == {"gate": "reachability", "status": "disabled"}
+
+    def test_status_line_is_first_stdout_line_with_all_fields(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-008: an enabled run's spec 5.2 status line is stdout line 1."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+
+        assert result == 0
+        status_line = json.loads(out_lines[0])
+        assert status_line == {
+            "gate": "reachability",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+            "scope_hash": status_line["scope_hash"],
+        }
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_empty_manifest_reports_no_classified_source_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FIX-007: the deleted `[SKIPPED]`/"No newly-added source files" wording
+        is replaced by the shipped empty-scope message about the Changes Manifest."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=())
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+
+        assert result == 0
+        assert json.loads(out_lines[0])["findings"] == 0
+        assert "No classified source files found in this work unit's Changes Manifest." in "\n".join(out_lines)
+        assert "No newly-added source files" not in "\n".join(out_lines)
+
+    # -- AC-FUNC-001/002/315-D01: word-boundary matching -----------------
+
+    def test_word_boundary_symbol_not_cleared_by_substring_match(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Card.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/Other.tsx").write_text("// Cardinal points\nconst discardCards = 1;\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Card.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Card.tsx" in out
+
+    def test_standalone_identifier_clears_reachability(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Card.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Card } from './Card';\nexport function App() { return Card; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Card.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Card.tsx" in out
+        assert "src/App.tsx" in out
+
+    def test_orphaned_component_flagged_unreachable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        # The exported symbol name ("Impl") differs from the file basename
+        # ("Orphan") so a `git grep` for the basename finds zero hits at all
+        # (not even a self-match), exercising the "no match anywhere" path
+        # distinct from the "only self-referenced" path covered elsewhere.
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+        assert "Summary: 1 candidate(s) examined, 1 potentially unreachable, 0 load error(s), 0 waived." in out
+
+    def test_referenced_only_by_own_test_still_flagged_unreachable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Lonely.tsx").write_text("export function Lonely() { return null; }\n", encoding="utf-8")
+        (repo / "src/Lonely.test.tsx").write_text(
+            "import { Lonely } from './Lonely';\ntest('x', () => Lonely());\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Lonely.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Lonely.tsx" in out
+
+    def test_importer_list_truncated_after_ten(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-002: one of the 11 importers (`App.tsx`) is itself reachable
+        from the built-in entry-point-stem default, so `[OK]` still clears the
+        candidate under the orphan-chain layer -- the other 10 (`Consumer*.tsx`,
+        none of them entry points) exist purely to exercise the display-limit
+        truncation this test pins."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Widget } from './Widget'; // entry-point importer\n", encoding="utf-8"
+        )
+        for i in range(10):
+            (repo / f"src/Consumer{i}.tsx").write_text(
+                f"import {{ Widget }} from './Widget'; // consumer {i}\n", encoding="utf-8"
+            )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+        assert "Non-test importers found: 11" in out
+        assert "... and 1 more" in out
+
+    # -- AC-FUNC-003/315-D02: source-classified scope, prose never clears -
+
+    @pytest.mark.parametrize("prose_rel_path", ["CHANGELOG.md", "docs/architecture.md", "backlog/E9-F1-S1-T1.md"])
+    def test_prose_mention_does_not_clear_orphan(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        prose_rel_path: str,
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        prose_file = repo / prose_rel_path
+        prose_file.parent.mkdir(parents=True, exist_ok=True)
+        prose_file.write_text("See Orphan for background on this change.\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+
+    # -- AC-FUNC-004/Section 7: git grep rc semantics ---------------------
+
+    def test_git_grep_failure_exits_loud_with_stderr(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            assert cmd[:2] == ["git", "grep"], f"unexpected subprocess routed through the mock: {cmd}"
+            return (2, "", "fatal: forced pathspec failure for the rc>=2 test")
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert "ERROR: git grep failed:" in captured.err
+        assert "forced pathspec failure" in captured.err
+        assert captured.out == ""
+
+    # -- AC-FUNC-005: load_error replaces the silent [SKIPPED] branch -----
+
+    def test_unreadable_file_produces_load_error_finding_no_skipped_token(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Broken.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Broken.tsx",))
+
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[LOAD_ERROR] src/Broken.tsx" in out
+        assert "Could not read file" in out
+        assert "[SKIPPED]" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
+
+    def test_non_utf8_candidate_produces_load_error_finding_no_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-005: ``Path.read_text(encoding="utf-8")`` raises ``UnicodeDecodeError``
+        (a ``ValueError`` subclass, not an ``OSError``) for a classified candidate whose
+        bytes are not valid UTF-8. The gate must catch that the same way it catches a
+        permission failure -- a counted ``[LOAD_ERROR]`` finding driving exit 1 -- and
+        must never let the exception escape as an unhandled traceback."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/NonUtf8.tsx").write_bytes(b"export default function Impl() { return \xff\xfe; }\n")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/NonUtf8.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[LOAD_ERROR] src/NonUtf8.tsx" in out
+        assert "Could not read file" in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
+
+    def test_deleted_manifest_path_is_not_a_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-FUNC-005/AC-FUNC-009: ``work_unit_scope._compute_files_scope_hash``
+        documents that ``scope.files`` legitimately carries a Manifest path with no
+        on-disk file, e.g. one a prior stage of this same unit deleted (mandatory
+        under the complete-replacement standard). A path absent from the work tree
+        is not a reachability candidate at all -- a deleted artifact cannot be an
+        orphan -- so it must never surface as a ``[LOAD_ERROR]`` finding."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        # `src/Broken.tsx` is declared in the Manifest but deliberately never
+        # written into the checkout, simulating a file this unit's own change
+        # deleted.
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Broken.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 0
+        assert "Broken.tsx" not in out
+        assert "[LOAD_ERROR]" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 0
+        assert status_line["status"] == "pass"
+
+    # -- AC-FUNC-006: the devbench-defer-reachability escape hatch is gone -
+
+    def test_defer_marker_no_longer_clears_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Deferred.tsx").write_text(
+            "// devbench-defer-reachability: legacy escape hatch, no longer honoured\n"
+            "export default function Impl() { return null; }\n",
+            encoding="utf-8",
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Deferred.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/Deferred.tsx" in out
+        assert "[DEFERRED]" not in out
+
+    def test_defer_marker_string_absent_from_shipped_source_tree(self) -> None:
+        """AC-FIX-012/AC-FUNC-006: a repo-wide grep for the deleted escape-hatch
+        marker returns zero hits across every tracked file under ``src/``,
+        ``docs/`` and ``plugin/`` -- not merely inside ``src/devbench/cli.py``."""
+        repo_root = Path(__file__).resolve().parent.parent
+        listing = subprocess.run(
+            ["git", "ls-files", "--", "src", "docs", "plugin"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tracked_files = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+        marker = "devbench-defer-reachability"
+        offenders = sorted(
+            rel_path
+            for rel_path in tracked_files
+            if marker in (repo_root / rel_path).read_text(encoding="utf-8", errors="ignore")
+        )
+        assert offenders == [], f"deleted escape-hatch marker still referenced in: {offenders}"
+
+    # -- AC-FUNC-009: Manifest is the sole attribution boundary -----------
+
+    def test_file_outside_manifest_scope_never_named_in_finding(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/InScope.tsx").write_text("export function InScope() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { InScope } from './InScope';\nexport function App() { return InScope; }\n", encoding="utf-8"
+        )
+        # Orphaned, but deliberately NOT part of this unit's Changes Manifest
+        # -- a *candidate* may only come from `scope.files` (AC-FUNC-009);
+        # this file has no importer at all, so it is never named as a
+        # referrer either (referrer naming, unlike candidate selection, is
+        # not Manifest-scoped -- see the [OK]/orphan-chain/[LOAD_ERROR]
+        # importer lists).
+        (repo / "src/OutOfScopeOrphan.tsx").write_text(
+            "export default function Impl() { return null; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/InScope.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "OutOfScopeOrphan" not in out
+
+
+class TestCmdCheckReachabilityOrphanChain(_ReachabilityCmdFixtures):
+    """Transitive reachability / `gates.reachability.entry_points` tests
+    (caylent-solutions/devbench-internal-backlog#10 AC2; spec
+    `integration-reality-gates-hardening.md` 4.4 bullet 2; AC-FUNC-001
+    through AC-FUNC-007).
+
+    Inherits from ``_ReachabilityCmdFixtures`` (shared with
+    ``TestCmdCheckReachability``, not a ``Test*``-collected class) to get
+    its git-fixture helpers (``_git_repo``, ``_write_gate_config``, ``_run``,
+    ``_make_unit``) and, critically, its autouse ``_isolate_git_locator_env``
+    fixture -- every test method here shells out to ``git init``/``git
+    commit`` via the inherited ``_git_repo``, so it needs the exact same
+    repository-locator isolation as ``TestCmdCheckReachability``. Neither
+    class re-collects the other's test methods (test_review round-2 DRY
+    finding).
+    """
+
+    # -- AC-FUNC-001: every referrer itself unreachable -> orphan-chain ---
+
+    def test_referrer_unreachable_from_any_entry_point_reports_orphan_chain(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/legacy").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/legacy/unused_panel.py").write_text(
+            "# refers to Widget, but nothing imports this module\nWidget = None\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+        assert "src/legacy/unused_panel.py" in out
+        assert "[OK] src/Widget.tsx" not in out
+
+    # -- code_review round-2 FAIL_FAST fix: unreadable referrer ------------
+
+    def test_unreadable_referrer_produces_load_error_finding_naming_referrer(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A referrer that cannot be read during the entry-point walk must
+        become a counted ``[LOAD_ERROR]`` finding naming the REFERRER, not a
+        silent ``False`` 'unreachable' verdict that would wrongly flip the
+        candidate to ``[POTENTIALLY UNREACHABLE via orphan-chain]``
+        (code_review round-2 FAIL_FAST finding, cli.py:4888-4891 --
+        pinned at the helper level by
+        ``TestReachabilityHelperFunctions::test_is_reachable_raises_when_file_unreadable``;
+        this is the end-to-end assertion that the caller renders the loud
+        finding rather than swallowing the exception)."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/Broken.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function Broken() { return Widget; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        real_read_text: Callable[..., str] = Path.read_text
+
+        def fake_read_text(path_self: Path, *args: object, **kwargs: object) -> str:
+            if path_self.name == "Broken.tsx":
+                raise OSError("permission denied")
+            return real_read_text(path_self, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fake_read_text):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[LOAD_ERROR] src/Broken.tsx" in out
+        assert "Could not read file" in out
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" not in out
+        assert "[OK] src/Widget.tsx" not in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 1
+        assert status_line["status"] == "fail"
+
+    # -- AC-FUNC-002: referrer reachable through one intermediate module ---
+
+    def test_referrer_reachable_through_intermediate_module_clears_candidate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/Mid.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function Mid() { return Widget; }\n", encoding="utf-8"
+        )
+        (repo / "src/App.tsx").write_text(
+            "import { Mid } from './Mid';\nexport function App() { return Mid; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+        assert "orphan-chain" not in out
+
+    # -- AC-FUNC-004: mutual-import cycle terminates, orphan-chain finding -
+
+    def test_mutual_import_cycle_terminates_and_reports_orphan_chain(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/CycleA.tsx").write_text(
+            "import { Widget } from './Widget';\n"
+            "import { CycleB } from './CycleB';\n"
+            "export function CycleA() { return Widget && CycleB; }\n",
+            encoding="utf-8",
+        )
+        (repo / "src/CycleB.tsx").write_text(
+            "import { CycleA } from './CycleA';\nexport function CycleB() { return CycleA; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+
+    # -- AC-FUNC-003: both orphan shapes counted in the same findings total
+
+    def test_both_orphan_shapes_counted_in_findings_total(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/NoReferrer.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        (repo / "src/ChainedOrphan.tsx").write_text(
+            "export function ChainedOrphan() { return null; }\n", encoding="utf-8"
+        )
+        (repo / "src/DeadReferrer.tsx").write_text(
+            "import { ChainedOrphan } from './ChainedOrphan';\nChainedOrphan();\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, unit_id=unit_id, files=("src/NoReferrer.tsx", "src/ChainedOrphan.tsx")
+        )
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out_lines = capsys.readouterr().out.splitlines()
+        out = "\n".join(out_lines)
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE] src/NoReferrer.tsx" in out
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/ChainedOrphan.tsx" in out
+        status_line = json.loads(out_lines[0])
+        assert status_line["findings"] == 2
+
+    # -- orphan-chain importer list truncation (display-limit coverage) ---
+
+    def test_orphan_chain_importer_list_truncated_after_ten(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        for i in range(11):
+            (repo / f"src/DeadConsumer{i}.tsx").write_text(
+                f"import {{ Widget }} from './Widget'; // dead consumer {i}\n", encoding="utf-8"
+            )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+        assert "Non-test importers found: 11 (none reachable from a configured entry point)" in out
+        assert "... and 1 more" in out
+
+    # -- gates.reachability.entry_points: explicit config, positive path --
+
+    def test_explicit_entry_points_config_clears_via_literal_path_match(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A referrer named outside the built-in entry-point-stem convention
+        (``CustomRoot`` is not one of ``main``/``app``/``index``/...) still
+        clears the candidate once it is explicitly configured via
+        ``gates.reachability.entry_points`` -- proving the literal-path
+        match branch, distinct from every other test in this module (which
+        exercises the built-in stem-based default via ``App.tsx``)."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/CustomRoot.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function CustomRoot() { return Widget; }\n",
+            encoding="utf-8",
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/CustomRoot.tsx\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        out = capsys.readouterr().out
+
+        assert result == 0
+        assert "[OK] src/Widget.tsx" in out
+
+    def test_explicit_entry_points_config_replaces_default_not_merges(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Once ``entry_points`` is explicitly configured, the built-in
+        stem-based default no longer applies: ``App.tsx`` (a default entry
+        point) does NOT clear the candidate when the resolved config
+        carries only the explicit, unrelated path."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Widget } from './Widget';\nexport function App() { return Widget; }\n", encoding="utf-8"
+        )
+        (repo / "src/CustomRoot.tsx").write_text("export function CustomRoot() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/CustomRoot.tsx\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        out = capsys.readouterr().out
+
+        assert result == 1
+        assert "[POTENTIALLY UNREACHABLE via orphan-chain] src/Widget.tsx" in out
+
+    # -- gates.reachability.entry_points: existence check (fail-fast) -----
+
+    def test_configured_entry_point_missing_from_repo_fails_loud_before_scan(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = "gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - src/does-not-exist.py\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert (
+            "ERROR: gates.reachability.entry_points names a path that is not present in the repo: "
+            "src/does-not-exist.py" in captured.err
+        )
+
+    # -- gates.reachability.entry_points: repo-relativity is enforced -----
+
+    @pytest.mark.parametrize(
+        "entry_point",
+        [
+            pytest.param("/etc/hostname", id="absolute_path"),
+            pytest.param("../escape.py", id="parent_traversal"),
+        ],
+    )
+    def test_configured_entry_point_outside_repo_fails_loud_at_config_load(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        entry_point: str,
+    ) -> None:
+        """code_review round-2 MISSING_AC_EVIDENCE finding: an absolute path
+        or a ``..`` escape must never reach
+        ``_reachability_missing_entry_point``'s ``.is_file()`` existence
+        check at all -- ``repo_path / entry_point`` silently discards
+        *repo_path* for an absolute right operand, so a bare existence
+        check alone is not a safe guard. Both shapes are now rejected
+        fail-fast during config load (schema ``pattern`` on
+        ``entry_points`` items, config-schema.json), before
+        ``cmd_check_reachability`` ever resolves the gate or scans a
+        candidate.
+
+        test_review round-2 non-discriminating-assertion finding
+        (``parent_traversal`` only -- ``absolute_path`` already
+        discriminates): ``../escape.py`` never existed on disk here, so a
+        mutant that deleted all three repo-relativity guards (the schema
+        ``pattern``, ``_parse_reachability_entry_points``'s own ``..``
+        rejection, and ``_reachability_missing_entry_point``'s
+        ``resolve()``/``is_relative_to()`` containment check) still hit
+        the harmless ``candidate.is_file()`` branch, since a nonexistent
+        path is not a file either way, and produced the identical
+        ``ERROR: ... names a path that is not present in the repo``
+        output -- indistinguishable from the guards-intact result this
+        test pins. A real file now sits at the escaped location
+        (``tmp_path / "escape.py"``, sibling of the ``checkout`` repo
+        directory ``../escape.py`` resolves to) so that if all three
+        guards were absent, ``.is_file()`` would find it and the run
+        would proceed past the existence check entirely -- printing
+        non-empty stdout and no ``ERROR:`` line, which fails the
+        assertions below and makes this test able to catch that
+        regression."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Widget.tsx").write_text("export function Widget() { return null; }\n", encoding="utf-8")
+        (tmp_path / "escape.py").write_text("# genuinely exists outside the checkout\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Widget.tsx",))
+        gates_block = f"gates:\n  reachability:\n    enabled: true\n    entry_points:\n      - {entry_point}\n"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch, gates_block=gates_block)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "gates.reachability.entry_points" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckReachabilityWritesGatePass(_ReachabilityCmdFixtures):
+    """check-reachability persists the spec-4.2 machine record: a passing
+    enabled run writes exactly one `[GATE_PASS reachability]` line whose
+    scope hash matches the status line (AC-FUNC-001); a failing run writes
+    none (AC-FUNC-002)."""
+
+    def test_passing_run_writes_exactly_one_gate_pass_record_matching_scope_hash(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 0
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS reachability]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "reachability")
+        assert record is not None
+        assert record.scope_hash == status_line["scope_hash"]
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_failing_run_writes_no_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 1
+        assert "[GATE_PASS reachability]" not in content
+
+    def test_wu_file_unreadable_prints_error_and_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task-specific error path: the waiver read cannot open the work-unit
+        file (here, a directory sits where the file is expected) -- the
+        command fails loud with no status line, never a silent 'no waivers'."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/foo.py",))
+        wu_file = backlog_root / f"{unit_id}.md"
+        wu_file.unlink()
+        wu_file.mkdir()
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert f"ERROR: Cannot read work unit file for {unit_id}" in captured.err
+
+    def test_wu_file_missing_at_write_time_prints_error_and_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Task-specific error path: the record cannot be written because the
+        work-unit file no longer exists by the time the passing run reaches
+        the write step -- fails loud, never a silent skip."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Wired.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        # A subclass whose `.is_file()` always lies, wrapping the exact same
+        # on-disk path: `read_text()` still succeeds (real bytes on disk),
+        # only the LATER `.is_file()` check the write step guards on sees
+        # "missing". Patched only into `devbench.cli._resolve_work_unit_file`
+        # (the sole caller `_reachability_prepare_run` uses to build `wu_file`),
+        # so `work_unit_scope`'s own independent `BacklogParser` lookup -- a
+        # distinct `Path` object over the same string -- is unaffected.
+        class _NeverIsFilePath(Path):
+            def is_file(self, *args: object, **kwargs: object) -> bool:
+                return False
+
+        with patch("devbench.cli._resolve_work_unit_file", return_value=_NeverIsFilePath(wu_file)):
+            result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS reachability] record for {unit_id}" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckReachabilityWaivedTarget(_ReachabilityCmdFixtures):
+    """Waiver adoption (spec 4.9, Section 2 G7): a waived candidate is
+    reported `[WAIVED] <target> -- <reason>`, excluded from the blocking
+    `findings` count (AC-FUNC-006), and a malformed `[GATE_WAIVER
+    reachability]` marker is a loud error, never a silent pass (AC-FUNC-007)."""
+
+    def _seed_with_waiver(self, tmp_path: Path, unit_id: str, waiver_line: str) -> tuple[Path, Path]:
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, unit_id=unit_id, files=("src/Orphan.tsx",))
+        wu_file = backlog_root / f"{unit_id}.md"
+        content = wu_file.read_text(encoding="utf-8")
+        content = content.replace("## Comments\n", f"## Comments\n\n{waiver_line}\n")
+        wu_file.write_text(content, encoding="utf-8")
+        return backlog_root, backlog_index
+
+    def test_waived_candidate_reported_and_excluded_from_findings_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/Orphan.tsx operator mounted via route-split registry\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, waiver)
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+        status_line = json.loads(out.splitlines()[0])
+
+        assert result == 0
+        assert status_line["findings"] == 0
+        assert "[WAIVED] src/Orphan.tsx -- mounted via route-split registry" in out
+        assert "[POTENTIALLY UNREACHABLE]" not in out
+
+    def test_malformed_waiver_marker_exits_1_naming_offending_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        malformed_waiver = (
+            "[2026-01-01 00:00 UTC] [agent/operator] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 operator missing the target token\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, malformed_waiver)
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        captured = capsys.readouterr()
+
+        assert result == 1
+        assert captured.out == ""
+        assert "ERROR: malformed [GATE_WAIVER reachability] marker in" in captured.err
+        assert unit_id in captured.err
+
+    def test_executor_only_waiver_neither_clears_the_finding_nor_writes_a_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec Section 3.6/D-6: reachability is machine-blocking, so an
+        executor cannot self-certify a waiver. An executor-attributed
+        `[GATE_WAIVER reachability]` marker for the only finding must NOT be
+        rendered `[WAIVED]`, must NOT zero the blocking `findings` count, and
+        the run must NOT persist a `[GATE_PASS reachability]` record --
+        otherwise the executor waiver `mark-done`'s generic gate-record
+        invariant refuses would be laundered into a record it accepts
+        unconditionally."""
+        unit_id = "E0-F1-S1-T1"
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Orphan.tsx").write_text("export default function Impl() { return null; }\n", encoding="utf-8")
+        executor_waiver = (
+            "[2026-01-01 00:00 UTC] [agent/executor] [GATE_WAIVER reachability] "
+            "2026-01-01T00:00:00+00:00 src/Orphan.tsx executor self-certified this orphan\n"
+        )
+        backlog_root, backlog_index = self._seed_with_waiver(tmp_path, unit_id, executor_waiver)
+        wu_file = backlog_root / f"{unit_id}.md"
+
+        result = self._run(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+        out = capsys.readouterr().out
+        status_line = json.loads(out.splitlines()[0])
+        content = wu_file.read_text(encoding="utf-8")
+
+        assert result == 1
+        assert status_line["findings"] == 1
+        assert "[WAIVED]" not in out
+        assert "[POTENTIALLY UNREACHABLE] src/Orphan.tsx" in out
+        assert "[GATE_PASS reachability]" not in content
+
+
+@pytest.mark.unit
+class TestReachabilityDonePathEndToEnd(_ReachabilityCmdFixtures):
+    """AC-CYCLE-001 (spec 4.2/4.4): the reachability done-path cycle observed
+    end to end against a real git fixture repo -- `mark-done` is blocked with
+    no record, `check-reachability` writes the `[GATE_PASS reachability]`
+    record, `mark-done` then consumes it and proceeds, and separately an
+    in-scope edit stales an existing record while an operator
+    `[GATE_WAIVER reachability]` still unblocks despite the staleness
+    (AC-FUNC-003/004/005, spec Section 2 G4)."""
+
+    def _seed(self, tmp_path: Path, unit_id: str) -> tuple[Path, Path, Path, Path]:
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        (repo / "src/Wired.tsx").write_text("export function Wired() { return null; }\n", encoding="utf-8")
+        (repo / "src/App.tsx").write_text(
+            "import { Wired } from './Wired';\nexport function App() { return Wired; }\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "wire Wired.tsx"], cwd=repo, check=True, capture_output=True)
+        backlog_root, backlog_index, wu_file = _seed_gate_done_path_backlog(
+            tmp_path, unit_id, self._REPO, ("src/Wired.tsx",), "End to end reachability cycle test"
+        )
+        return repo, backlog_root, backlog_index, wu_file
+
+    def _patches(
+        self, unit_id: str, repo: Path, backlog_root: Path, backlog_index: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[Any, ...]:
+        from devbench.config_loader import GateReachabilityConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        cfg_path = self._write_gate_config(repo.parent, self._ENABLED_GATES_BLOCK)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_REACHABILITY_ENABLED", raising=False)
+        mark_done_rt_cfg = RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(reachability=GateReachabilityConfig(enabled=True)),
+        )
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", mark_done_rt_cfg),
+        )
+
+    def test_blocked_then_record_written_then_done(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id)
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            before = wu_file.read_text(encoding="utf-8")
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1, "mark-done must refuse before any [GATE_PASS reachability] record exists"
+            assert wu_file.read_text(encoding="utf-8") == before
+
+            checked = cli.cmd_check_reachability(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS reachability]" in wu_file.read_text(encoding="utf-8")
+
+            done = cli.cmd_mark_done(unit_id)
+            assert done == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_stale_record_blocks_and_operator_waiver_unblocks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id)
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, monkeypatch)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+            checked = cli.cmd_check_reachability(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS reachability]" in wu_file.read_text(encoding="utf-8")
+
+            # Edit the in-scope file AFTER the record was captured (AC-7):
+            # the persisted scope hash no longer matches the recomputed one.
+            (repo / "src/Wired.tsx").write_text("export function Wired() { return 'changed'; }\n", encoding="utf-8")
+
+            capsys.readouterr()  # discard the check-reachability output above
+            stale = cli.cmd_mark_done(unit_id)
+            assert stale == 1
+            # AC-FUNC-004's exact wording, so this test can only pass for the
+            # right reason -- not for an unrelated refusal (a judge-round or
+            # RED_OBSERVED invariant, or a scope-resolution failure).
+            assert "ERROR: gate 'reachability' record is stale (scope changed since it ran)" in capsys.readouterr().err
+            content_before_waiver = wu_file.read_text(encoding="utf-8")
+            assert "## Status: done" not in content_before_waiver
+
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "reachability",
+                "--target",
+                "src/Wired.tsx",
+                "--reason",
+                "reviewed manually, safe despite the stale record",
+                "--operator",
+            )
+            assert waiver_result == 0
+
+            unblocked = cli.cmd_mark_done(unit_id)
+            assert unblocked == 0, "an operator waiver must satisfy the gate even with a stale record"
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
 
 
 class TestCmdGetDiffModeAware:
@@ -6607,7 +10437,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py", "untracked.py"))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py", "untracked.py"))
         (repo_path / "untracked.py").write_text("x = 1\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6623,11 +10454,12 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", False),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6648,7 +10480,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             if cmd == ["git", "diff", "--cached", "--", "owned.py"]:
@@ -6659,11 +10492,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6675,15 +10510,19 @@ class TestCmdGetDiffModeAware:
     def test_defer_pr_mode_pre_commit_returns_staged_and_unstaged(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Pre-commit: staged and unstaged are both present; both appear;
-        the post-commit task-commit resolution never runs because parts is
-        already non-empty."""
+        """Pre-commit: staged and unstaged are both present; both appear.
+        Scope resolution may resolve this unit's commit sha(s) as ordinary
+        attribution metadata regardless of staged/unstaged state (spec 4.3),
+        but ``cmd_get_diff`` never substitutes commit-sha hunks while its own
+        staged/unstaged parts are non-empty, and there is never a HEAD
+        fallback."""
         unit = self._make_unit()
         mock_parser = MagicMock()
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6696,11 +10535,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6708,11 +10549,13 @@ class TestCmdGetDiffModeAware:
         output = capsys.readouterr().out
         assert "STAGED-HUNK" in output
         assert "UNSTAGED-HUNK" in output
-        assert not any(c[:2] == ["git", "log"] for c in calls), (
-            "task-commit resolution should only run when staged/unstaged are empty"
-        )
-        assert ["git", "show", "--format=", "HEAD"] not in calls, (
-            "the superseded unconditional git show HEAD substitution must never run"
+        # Scope resolution records the unit's commit sha(s) as ordinary
+        # attribution metadata on every invocation (spec 4.3), so the `git
+        # log` behind it legitimately runs here. What must never happen
+        # pre-commit is the substitution itself: no commit-sha hunk, and in
+        # particular no unconditional `git show --format= HEAD` (db-247).
+        assert not any(c[:2] == ["git", "show"] for c in calls), (
+            "commit-sha hunks must never be substituted while staged/unstaged parts are non-empty"
         )
 
     def test_defer_pr_mode_post_commit_returns_git_show_head(
@@ -6727,9 +10570,10 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
+        (repo_path / ".git").mkdir()
         # Regression fixture update (db-247): the file(s) `git show` would
         # emit now MUST be in the Manifest, since the show is pathspec-scoped.
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
         calls: list[list[str]] = []
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6744,11 +10588,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6771,7 +10617,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("current.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("current.py",))
         current_staged = "diff --git a/current.py b/current.py\n+new line\n"
         accumulated_branch = "".join(f"diff --git a/prior-{i}.py b/prior-{i}.py\n+prior line {i}\n" for i in range(10))
 
@@ -6784,11 +10631,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6809,7 +10658,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("brand_new.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("brand_new.py",))
         (repo_path / "brand_new.py").write_text("print('hi')\n", encoding="utf-8")
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
@@ -6821,15 +10671,22 @@ class TestCmdGetDiffModeAware:
             # fail-fast diagnostic.
             if cmd == ["git", "log", "--grep", "^E0-F1-S1-T1:", "--format=%H"]:
                 return (0, "task-sha\n", "")
+            if cmd[:2] == ["git", "hash-object"]:
+                # brand_new.py exists on disk; resolve_changed_files hashes it
+                # for the scope hash (spec 4.2) -- irrelevant to this test's
+                # own assertions, so any well-formed hash satisfies it.
+                return (0, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n", "")
             return (0, "", "")
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6848,7 +10705,8 @@ class TestCmdGetDiffModeAware:
         mock_parser.parse_index.return_value = [unit]
         repo_path = tmp_path / "repo"
         repo_path.mkdir()
-        wu_file = _seed_wu_file(tmp_path, unit_id="E0-F1-S1-T1", files=("owned.py",))
+        (repo_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("owned.py",))
 
         def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
             # This unit's own commit exists (so the fail-fast no-commit
@@ -6860,11 +10718,13 @@ class TestCmdGetDiffModeAware:
 
         with (
             patch("devbench.cli.BacklogParser", return_value=mock_parser),
-            patch("devbench.cli._resolve_unit_file", return_value=wu_file),
             patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": repo_path}),
             patch("devbench.cli.get_configured_default_branch", return_value="main"),
             patch("devbench.cli.run_command", side_effect=fake_run_command),
             patch("devbench.config.DEFER_PR", True),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.run_command", side_effect=fake_run_command),
         ):
             result = cli.cmd_get_diff("E0-F1-S1-T1")
 
@@ -6959,6 +10819,719 @@ class TestCmdLogTddUnitNotFound:
         assert "not found" in capsys.readouterr().err.lower()
 
 
+@pytest.mark.unit
+class TestCmdLogWaiver:
+    """Tests for cmd_log_waiver (spec 4.9, 5.3; AC-E2-F4-S1-T1-1..4)."""
+
+    _UNIT_ID = "E9-F1-S1-T1"
+
+    def _make_wu_file(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Return (backlog_dir, wu_file) with a real-shape ## TDD Cycle Log / ## Comments ordering.
+
+        Mirrors the ordering every generated backlog task file uses (TDD
+        Cycle Log immediately before Comments), which is the ordering
+        ``read-unit --strip-comments`` relies on to keep a marker written
+        into TDD Cycle Log visible (AC-E2-F4-S1-T1-1).
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / f"{self._UNIT_ID}.md"
+        wu_file.write_text(
+            f"# {self._UNIT_ID}: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [WU_CLAIMED] Set to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        return backlog_dir, wu_file
+
+    def _make_unit(self, backlog_dir: Path) -> WorkUnit:
+        return WorkUnit(
+            id=self._UNIT_ID,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / f"{self._UNIT_ID}.md",
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, *args: str) -> tuple[int, Path]:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_waiver(*args)
+        return result, wu_file
+
+    # -- (a) valid executor waiver for a judge-evidence gate: exit 0 --
+
+    def test_valid_executor_waiver_writes_marker_and_exits_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/ui/LegacyPanel.tsx",
+            "--reason",
+            "mounted via route-split registry resolved at runtime",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        marker_idx = content.find("[GATE_WAIVER layout_geometry]")
+        assert tdd_start != -1
+        assert marker_idx != -1
+        assert tdd_start < marker_idx < comments_start
+        assert (
+            "[GATE_WAIVER layout_geometry] " in content[marker_idx : marker_idx + len("[GATE_WAIVER layout_geometry] ")]
+        )
+        assert "src/ui/LegacyPanel.tsx executor mounted via route-split registry resolved at runtime" in content
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "unit_id": self._UNIT_ID,
+            "judge": "code_review",
+            "gate": "layout_geometry",
+            "target": "src/ui/LegacyPanel.tsx",
+            "attribution": "executor",
+        }
+
+    def test_marker_survives_strip_comments_evidence_fetch(self, tmp_path: Path) -> None:
+        """AC-E2-F4-S1-T1-1: the marker lands where the judges' Evidence fetch retains it."""
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_log_waiver(
+                "code_review",
+                self._UNIT_ID,
+                "--gate",
+                "layout_geometry",
+                "--target",
+                "src/x.py",
+                "--reason",
+                "reason text",
+            )
+            assert rc == 0
+
+            content = wu_file.read_text(encoding="utf-8")
+            marker = f"\n{cli.COMMENTS_SECTION_HEADER}"
+            idx = content.find(marker)
+            stripped_content = content[:idx] if idx != -1 else content
+            assert "[GATE_WAIVER layout_geometry]" in stripped_content
+
+    # -- (a-operator) machine-blocking gate WITH --operator succeeds --
+
+    def test_machine_blocking_gate_with_operator_succeeds_and_attributes_operator(self, tmp_path: Path) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "reachability",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reviewed by hand",
+            "--operator",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert "[GATE_WAIVER reachability]" in content
+        assert " operator reviewed by hand" in content
+
+    # -- (b) machine-blocking gate without --operator: exit 2 naming --operator --
+
+    @pytest.mark.parametrize("gate", ["reachability", "ancestry", "shared_file_impact", "fixture_consistency"])
+    def test_machine_blocking_gate_without_operator_exits_2_naming_operator(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], gate: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            gate,
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--operator" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (c) empty or whitespace-only --reason: exit 2 naming --reason --
+
+    @pytest.mark.parametrize("reason", ["", "   "])
+    def test_empty_or_whitespace_reason_exits_2_naming_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], reason: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            reason,
+        )
+
+        assert result == 2
+        assert "--reason" in capsys.readouterr().err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (d) unknown judge / unknown gate: exit 2 naming the offending argument --
+
+    def test_unknown_judge_exits_2_naming_judge(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "not_a_real_judge",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "judge" in err.lower()
+        assert "not_a_real_judge" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    def test_unknown_gate_exits_2_naming_gate(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "not_a_real_gate",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--gate" in err
+        assert "not_a_real_gate" in err
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (e) unit id that does not exist: exit 1 --
+
+    def test_unknown_unit_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_waiver(
+                "code_review",
+                "NONEXISTENT",
+                "--gate",
+                "layout_geometry",
+                "--target",
+                "src/x.py",
+                "--reason",
+                "reason text",
+            )
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    # -- (f) reason containing an em-dash: rejected by the existing free-text validation --
+
+    _EM_DASH_REASON = "bad \u2014 emdash reason"
+
+    def test_em_dash_in_reason_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            self._EM_DASH_REASON,
+        )
+
+        assert result == 1
+        assert "em-dash" in capsys.readouterr().err.lower()
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    def test_control_character_in_reason_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "bad\tcontrol char",
+        )
+
+        assert result == 1
+        assert "control character" in capsys.readouterr().err.lower()
+        assert "[GATE_WAIVER" not in wu_file.read_text(encoding="utf-8")
+
+    # -- usage-error paths not enumerated above but required for fail-fast coverage --
+
+    def test_missing_positional_args_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, "code_review")
+        assert result == 2
+        assert "log-waiver requires" in capsys.readouterr().err
+
+    def test_missing_gate_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, "code_review", self._UNIT_ID, "--target", "src/x.py", "--reason", "reason text")
+        assert result == 2
+        assert "--gate" in capsys.readouterr().err
+
+    def test_missing_target_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--reason",
+            "reason text",
+        )
+        assert result == 2
+        assert "--target" in capsys.readouterr().err
+
+    def test_missing_target_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--reason",
+            "reason text",
+            "--target",
+        )
+        assert result == 2
+        assert "--target" in capsys.readouterr().err
+
+    def test_missing_gate_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+        )
+        assert result == 2
+        assert "--gate" in capsys.readouterr().err
+
+    def test_missing_reason_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(
+            tmp_path,
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+        )
+        assert result == 2
+        assert "--reason" in capsys.readouterr().err
+
+    def test_registered_in_commands_with_two_min_args(self) -> None:
+        func, min_args, _ = cli._COMMANDS["log-waiver"]
+        assert func is cli.cmd_log_waiver
+        assert min_args == 2
+
+    def test_registered_as_variadic(self) -> None:
+        assert "log-waiver" in cli._VARIADIC_COMMANDS
+
+    def test_empty_string_token_is_skipped_during_flag_scan(self, tmp_path: Path) -> None:
+        """An empty-string argv token (e.g. from shell interpolation) is skipped, not treated as positional."""
+        result, wu_file = self._run(
+            tmp_path,
+            "",
+            "code_review",
+            self._UNIT_ID,
+            "--gate",
+            "layout_geometry",
+            "--target",
+            "src/x.py",
+            "--reason",
+            "reason text",
+        )
+
+        assert result == 0
+        assert "[GATE_WAIVER layout_geometry]" in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCmdLogNewlyReachable:
+    """Tests for cmd_log_newly_reachable (spec 4.9(a), 5.3; AC-E2-F4-S1-T2-1..4)."""
+
+    _UNIT_ID = "E9-F1-S1-T1"
+    _REPO = "caylent-solutions/devbench"
+
+    # Expected accepted values (spec 4.9(a), PR #320's proposed schema). Deliberately
+    # literal (not `cli.NEWLY_REACHABLE_METHODS`/`cli.NEWLY_REACHABLE_RESULTS`) so this
+    # test module still COLLECTS when `src/devbench/cli.py`'s production changes are
+    # stashed (the `tdd-gate` RED re-verification cycle stashes only production-source
+    # Changes Manifest rows and re-runs a named node id -- a collection-time
+    # `AttributeError` from a `@pytest.mark.parametrize(..., cli.X)` decorator would be a
+    # collection error, not a genuine test failure). `test_declared_vocabularies_match_expected`
+    # below cross-checks these literals against the real production constants at test-body
+    # (not collection) time.
+    _EXPECTED_METHODS = ("functional_test", "integration_test", "manual", "unit_test")
+    _EXPECTED_RESULTS = ("broken", "verified")
+
+    def _make_wu_file(self, tmp_path: Path) -> tuple[Path, Path]:
+        """Return (backlog_dir, wu_file) with a real-shape ## TDD Cycle Log / ## Comments ordering.
+
+        Mirrors the ordering every generated backlog task file uses (TDD
+        Cycle Log immediately before Comments), which is the ordering
+        ``read-unit --strip-comments`` relies on to keep a marker written
+        into TDD Cycle Log visible (AC-E2-F4-S1-T2-4).
+        """
+        backlog_dir = tmp_path / "backlog"
+        backlog_dir.mkdir()
+        wu_file = backlog_dir / f"{self._UNIT_ID}.md"
+        wu_file.write_text(
+            f"# {self._UNIT_ID}: Test\n\n"
+            "## Status: in-progress\n\n"
+            "## TDD Cycle Log\n\n"
+            "## Comments\n\n"
+            "[2026-01-01 00:00 UTC] [agent/orchestrator] [WU_CLAIMED] Set to 'in-progress'\n",
+            encoding="utf-8",
+        )
+        return backlog_dir, wu_file
+
+    def _make_unit(self, backlog_dir: Path) -> WorkUnit:
+        return WorkUnit(
+            id=self._UNIT_ID,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=backlog_dir / f"{self._UNIT_ID}.md",
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _run(self, tmp_path: Path, *args: str) -> tuple[int, Path]:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            result = cli.cmd_log_newly_reachable(*args)
+        return result, wu_file
+
+    # -- (a) valid invocation writes exactly one marker with the spec field order, exits 0 --
+
+    def test_valid_invocation_writes_marker_and_exits_0(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/ui/LegacyPanel.tsx",
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        tdd_start = content.find("## TDD Cycle Log")
+        comments_start = content.find("## Comments")
+        marker_idx = content.find("[NEWLY_REACHABLE]")
+        assert tdd_start != -1
+        assert marker_idx != -1
+        assert tdd_start < marker_idx < comments_start
+        assert content.count("[NEWLY_REACHABLE]") == 1
+        assert "[NEWLY_REACHABLE] src/ui/LegacyPanel.tsx manual verified" in content
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {
+            "unit_id": self._UNIT_ID,
+            "path": "src/ui/LegacyPanel.tsx",
+            "method": "manual",
+            "result": "verified",
+        }
+
+    @pytest.mark.parametrize("method", _EXPECTED_METHODS)
+    @pytest.mark.parametrize("result_value", _EXPECTED_RESULTS)
+    def test_every_declared_method_and_result_combination_succeeds(
+        self, tmp_path: Path, method: str, result_value: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            method,
+            "--result",
+            result_value,
+        )
+
+        assert result == 0
+        assert f"[NEWLY_REACHABLE] src/x.py {method} {result_value}" in wu_file.read_text(encoding="utf-8")
+
+    def test_declared_vocabularies_match_expected(self) -> None:
+        """AC-E2-F4-S1-T2-5: cross-checks the real constants against `_EXPECTED_METHODS`/`_EXPECTED_RESULTS`."""
+        assert frozenset(self._EXPECTED_METHODS) == cli.NEWLY_REACHABLE_METHODS
+        assert frozenset(self._EXPECTED_RESULTS) == cli.NEWLY_REACHABLE_RESULTS
+
+    # -- (f) the marker survives the judge Evidence fetch (AC-21/AC-E2-F4-S1-T2-4) --
+
+    def test_marker_survives_strip_comments_evidence_fetch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        backlog_dir, wu_file = self._make_wu_file(tmp_path)
+        unit = self._make_unit(backlog_dir)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_dir),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+        ):
+            rc = cli.cmd_log_newly_reachable(
+                self._UNIT_ID,
+                "--path",
+                "src/x.py",
+                "--method",
+                "unit_test",
+                "--result",
+                "verified",
+            )
+            assert rc == 0
+            capsys.readouterr()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: tmp_path}),
+        ):
+            rc = cli.cmd_read_unit("--strip-comments", self._UNIT_ID)
+        assert rc == 0
+
+        payload = json.loads(capsys.readouterr().out)
+        assert "## Comments" not in payload["content"]
+        assert "[NEWLY_REACHABLE] src/x.py unit_test verified" in payload["content"]
+
+    # -- (b) unknown --method: exit 2 naming --method and listing the accepted values --
+
+    def test_unknown_method_exits_2_naming_method(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "telepathy",
+            "--result",
+            "verified",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--method" in err
+        assert "telepathy" in err
+        for accepted in cli.NEWLY_REACHABLE_METHODS:
+            assert accepted in err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (c) unknown --result: exit 2 naming --result and listing the accepted values --
+
+    def test_unknown_result_exits_2_naming_result(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "manual",
+            "--result",
+            "maybe",
+        )
+
+        assert result == 2
+        err = capsys.readouterr().err
+        assert "--result" in err
+        assert "maybe" in err
+        for accepted in cli.NEWLY_REACHABLE_RESULTS:
+            assert accepted in err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (d) empty or whitespace-only --path: exit 2 naming --path --
+
+    @pytest.mark.parametrize("path", ["", "   "])
+    def test_empty_or_whitespace_path_exits_2_naming_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], path: str
+    ) -> None:
+        result, wu_file = self._run(
+            tmp_path,
+            self._UNIT_ID,
+            "--path",
+            path,
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+        assert "[NEWLY_REACHABLE" not in wu_file.read_text(encoding="utf-8")
+
+    # -- (e) unit id that does not exist: exit 1, writes nothing --
+
+    def test_unknown_unit_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_log_newly_reachable(
+                "NONEXISTENT",
+                "--path",
+                "src/x.py",
+                "--method",
+                "manual",
+                "--result",
+                "verified",
+            )
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err.lower()
+
+    # -- usage-error paths not enumerated above but required for fail-fast coverage --
+
+    def test_missing_positional_arg_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path)
+        assert result == 2
+        assert "log-newly-reachable requires" in capsys.readouterr().err
+
+    def test_missing_path_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--method", "manual", "--result", "verified")
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+
+    def test_missing_method_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--result", "verified")
+        assert result == 2
+        assert "--method" in capsys.readouterr().err
+
+    def test_missing_result_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--method", "manual")
+        assert result == 2
+        assert "--result" in capsys.readouterr().err
+
+    def test_missing_path_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--method", "manual", "--result", "verified", "--path")
+        assert result == 2
+        assert "--path" in capsys.readouterr().err
+
+    def test_missing_method_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--result", "verified", "--method")
+        assert result == 2
+        assert "--method" in capsys.readouterr().err
+
+    def test_missing_result_value_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        result, _ = self._run(tmp_path, self._UNIT_ID, "--path", "src/x.py", "--method", "manual", "--result")
+        assert result == 2
+        assert "--result" in capsys.readouterr().err
+
+    def test_registered_in_commands_with_one_min_arg(self) -> None:
+        func, min_args, _ = cli._COMMANDS["log-newly-reachable"]
+        assert func is cli.cmd_log_newly_reachable
+        assert min_args == 1
+
+    def test_registered_as_variadic(self) -> None:
+        assert "log-newly-reachable" in cli._VARIADIC_COMMANDS
+
+    def test_empty_string_token_is_skipped_during_flag_scan(self, tmp_path: Path) -> None:
+        """An empty-string argv token (e.g. from shell interpolation) is skipped, not treated as positional."""
+        result, wu_file = self._run(
+            tmp_path,
+            "",
+            self._UNIT_ID,
+            "--path",
+            "src/x.py",
+            "--method",
+            "manual",
+            "--result",
+            "verified",
+        )
+
+        assert result == 0
+        assert "[NEWLY_REACHABLE] src/x.py manual verified" in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestComposeNewlyReachableRecord:
+    """Direct tests for compose_newly_reachable_record's defense-in-depth validation.
+
+    ``cmd_log_newly_reachable`` never reaches these raise paths (the CLI boundary
+    already rejects an empty/whitespace-bearing path and an undeclared
+    method/result before this function is called), so they are exercised directly
+    here.
+    """
+
+    def test_composes_the_exact_spec_5_3_field_order(self) -> None:
+        assert (
+            cli.compose_newly_reachable_record("src/x.py", "manual", "verified")
+            == "[NEWLY_REACHABLE] src/x.py manual verified"
+        )
+
+    def test_empty_path_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="non-empty token"):
+            cli.compose_newly_reachable_record("", "manual", "verified")
+
+    def test_whitespace_bearing_path_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="non-empty token"):
+            cli.compose_newly_reachable_record("src/x y.py", "manual", "verified")
+
+    def test_unknown_method_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="Unknown method"):
+            cli.compose_newly_reachable_record("src/x.py", "telepathy", "verified")
+
+    def test_unknown_result_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="Unknown result"):
+            cli.compose_newly_reachable_record("src/x.py", "manual", "maybe")
+
+
 class TestCmdRunTests:
     """Test cmd_run_tests command."""
 
@@ -7047,6 +11620,5685 @@ class TestCmdRunTests:
         assert result == 0
         pytest_calls = [c for c in calls if c[0] == "pytest"]
         assert len(pytest_calls) == 1
+
+
+_SHARED_FILE_IMPACT_REPO = "caylent-solutions/git-repo"
+# The real `assert-shared-file-impact.sh` hook (ref) -- used by the handful of
+# tests in this module that drive the real Python write path AND the real
+# shell consumer end to end, rather than the shell-side fixtures already
+# exercised more thoroughly in `tests/unit/test_assert_shared_file_impact.py`.
+_HOOK_SCRIPT_PATH = (
+    Path(__file__).parent.parent / "plugin" / "devbench-orchestrate" / "scripts" / ("assert-shared-file-impact.sh")
+)
+
+
+def _shared_file_impact_unit(unit_id: str = "E0-F1-S1-T1") -> WorkUnit:
+    return WorkUnit(
+        id=unit_id,
+        title="Test Task",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path(f"backlog/{unit_id}.md"),
+        repo=_SHARED_FILE_IMPACT_REPO,
+        dependencies=[],
+    )
+
+
+def _shared_file_impact_parser(unit: WorkUnit) -> MagicMock:
+    mock_parser = MagicMock()
+    mock_parser.parse_index.return_value = [unit]
+    return mock_parser
+
+
+def _write_shared_file_impact_gate_config(
+    workspace_root: Path,
+    *,
+    repo: str = _SHARED_FILE_IMPACT_REPO,
+    enabled: bool = True,
+    auto_derive_registry: bool = False,
+    fan_in_threshold: int = 3,
+) -> Path:
+    """Write a scratch ``devbench.yaml`` at *workspace_root*'s DEFAULT resolved
+    config path (``backlog/config/devbench.yaml``, ``resolve_config_path``'s
+    fallback when ``DEVBENCH_CONFIG_PATH`` is unset) so ``_load_gate_config_or_report``
+    -- the SAME helper ``check-ancestry``/``check-reachability`` use -- resolves the
+    ``shared_file_impact`` gate's ``enabled``/``auto_derive_registry``/
+    ``fan_in_threshold`` fields from a real file, exactly as production does (spec
+    4.1, D-15; round-1 code_review C1 finding: ``cmd_check_shared_file_impact`` no
+    longer reads these off a mocked module-level ``RUNTIME_CONFIG`` snapshot).
+
+    A ``repos:`` block naming *repo* (with no further keys) is always included --
+    the config schema's own ``required: [repos]``/``minProperties: 1`` rejects a
+    ``repos:``-less file outright, and this gate command never reads per-repo
+    ``default_branch``/etc. off this particular file (those come from whatever
+    the test's own ``RUNTIME_CONFIG`` mock or git fixture provides), so an empty
+    per-repo mapping is deliberate, not an oversight.
+    """
+    cfg_path = workspace_root / "backlog" / "config" / "devbench.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "repos:\n"
+        f"  {repo}: {{}}\n"
+        "gates:\n"
+        "  shared_file_impact:\n"
+        f"    enabled: {'true' if enabled else 'false'}\n"
+        f"    auto_derive_registry: {'true' if auto_derive_registry else 'false'}\n"
+        f"    fan_in_threshold: {fan_in_threshold}\n"
+    )
+    return cfg_path
+
+
+def _shared_file_impact_runtime_cfg(
+    patterns: tuple[str, ...] = (),
+    default_branch: str | None = None,
+    *,
+    auto_derive_registry: bool = False,
+    fan_in_threshold: int = 3,
+) -> Any:
+    from devbench.config_loader import (
+        GateRepoOverrides,
+        GatesConfig,
+        GateSharedFileImpactConfig,
+        GateSharedFileImpactOverride,
+        RepoConfig,
+        RuntimeConfig,
+    )
+
+    overrides = GateRepoOverrides(shared_file_impact=GateSharedFileImpactOverride(patterns=patterns))
+    return RuntimeConfig(
+        repos={_SHARED_FILE_IMPACT_REPO: RepoConfig(default_branch=default_branch)},
+        gates=GatesConfig(
+            shared_file_impact=GateSharedFileImpactConfig(
+                auto_derive_registry=auto_derive_registry, fan_in_threshold=fan_in_threshold
+            ),
+            repos={_SHARED_FILE_IMPACT_REPO: overrides},
+        ),
+    )
+
+
+def _shared_file_impact_git_fixture(
+    tmp_path: Path,
+    *,
+    base_test_content: str,
+    feature_test_content: str | None,
+    feature_extra_path: str | None = None,
+    feature_extra_content: str = "",
+    makefile_content: str | None = None,
+) -> tuple[Path, str]:
+    """Build a real two-branch git fixture: ``main`` at a base commit, ``feature`` diverged from it.
+
+    Returns ``(checkout_path, base_sha)`` where *checkout_path* has
+    ``feature`` checked out (the work unit's current tree) and
+    ``origin/main`` resolvable to *base_sha* (the merge-base / branch
+    point). When *feature_test_content* is given, ``tests/test_suite.py``
+    is rewritten to it on ``feature``; when *feature_extra_path* is given,
+    an additional file is added on ``feature`` without touching
+    ``tests/test_suite.py`` -- used to model an unrelated change that
+    doesn't touch a pre-existing failure. When *makefile_content* is given,
+    a ``Makefile`` carrying it is committed on the base commit (so it is
+    present at the branch point too, which a branch-point capture worktree
+    needs) -- used to exercise `_select_test_command`'s ``["make", "test"]``
+    branch instead of the bare ``pytest`` fallback.
+    """
+    origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+    if makefile_content is not None:
+        _tdd_gate_write(origin, "Makefile", makefile_content)
+    _tdd_gate_write(origin, "tests/test_suite.py", base_test_content)
+    _tdd_gate_commit_all(origin, "base")
+    _run_scratch_git(["branch", "-M", "main"], origin)
+
+    checkout = tmp_path / "checkout"
+    _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+    _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+    _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+    base_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+    _run_scratch_git(["checkout", "-b", "feature"], checkout)
+    if feature_test_content is not None:
+        _tdd_gate_write(checkout, "tests/test_suite.py", feature_test_content)
+        _tdd_gate_commit_all(checkout, "feature change")
+    if feature_extra_path is not None:
+        _tdd_gate_write(checkout, feature_extra_path, feature_extra_content)
+        _tdd_gate_commit_all(checkout, "unrelated feature addition")
+
+    return checkout, base_sha
+
+
+def _shared_file_impact_status_and_payload(out: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split ``cmd_check_shared_file_impact``'s captured stdout into ``(status_line, payload)``.
+
+    An enabled run's stdout is always the spec 5.2 gate status line (a single-line JSON
+    object) followed by the multi-line, ``indent=2`` findings payload (E5-F3-S1-T1, AC-2).
+    Splitting on the first newline rather than assuming both are single-line lets this
+    helper parse either shape of payload (the no-match ``shared_file_impact: False`` object
+    or the matched ``verdict``/``new_failures`` object) without re-deriving the split logic
+    at every call site.
+    """
+    first_line, _, rest = out.partition("\n")
+    return json.loads(first_line), json.loads(rest)
+
+
+# Real-shaped sample output per registered runner (AC-2), keyed off the registry itself so
+# this map cannot silently drift out of sync with `_SHARED_FILE_RUNNER_PARSERS` in either
+# direction: REMOVING a registered runner surfaces as a `KeyError` in the parametrized tests
+# below (they iterate this map's keys and look each one up in the production registry).
+# ADDING one does NOT raise a `KeyError` here -- the parametrize source is this map, not the
+# registry, so an added registry entry with no matching sample here is simply never exercised
+# by the parametrized cases. `test_registry_matches_the_documented_sample_coverage` below is
+# the drift detector for that direction: it asserts the two key sets are exactly equal.
+_RUNNER_PARSER_SAMPLES: dict[str, tuple[str, set[str]]] = {
+    "pytest": (
+        "============================= FAILURES ==============================\n"
+        "________________________________ test_foo ____________________________\n"
+        "assert 1 == 2\n"
+        "=========================== short test summary info ===========================\n"
+        "FAILED tests/test_foo.py::test_foo - AssertionError: assert 1 == 2\n"
+        "FAILED tests/test_bar.py::TestBar::test_bar - assert False\n"
+        "===================== 2 failed, 3 passed in 0.12s ======================\n",
+        {"tests/test_foo.py::test_foo", "tests/test_bar.py::TestBar::test_bar"},
+    ),
+    "go test": (
+        "=== RUN   TestFoo\n"
+        "--- FAIL: TestFoo (0.00s)\n"
+        "    foo_test.go:10: expected 1 got 2\n"
+        "=== RUN   TestBar\n"
+        "--- PASS: TestBar (0.00s)\n"
+        "=== RUN   TestBaz\n"
+        "--- FAIL: TestBaz (0.01s)\n"
+        "    baz_test.go:22: expected true got false\n"
+        "FAIL\n"
+        "FAIL\texample.com/pkg\t0.014s\n",
+        {"TestFoo", "TestBaz"},
+    ),
+    "npm/jest": (
+        "FAIL src/foo.test.js\n"
+        "  App\n"
+        "    ✕ renders without crashing (15 ms)\n"
+        "    ✓ handles click (5 ms)\n"
+        "    ✗ submits the form (8 ms)\n",
+        {"renders without crashing (15 ms)", "submits the form (8 ms)"},
+    ),
+}
+
+
+class TestSharedFileRunnerParsers:
+    """Explicit runner-parser registry (spec 4.6, finding 318-D4; issue #13 AC1-AC5).
+
+    Replaces the guess-every-format-and-degrade parser with a registry keyed by the
+    repo's configured test command: each registered runner has its own parser, and a
+    command matching none of them is a loud, pre-suite error rather than a synthetic
+    "suite failed" marker.
+    """
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    # -- AC-2: each registered runner parses the exact failing node-id set --
+    #
+    # Parametrized off `_RUNNER_PARSER_SAMPLES` (this module's own fixture map) rather
+    # than `cli._SHARED_FILE_RUNNER_PARSERS` directly: a `pytest.mark.parametrize` argument
+    # is evaluated at collection time, so referencing a production symbol there would turn
+    # any absence of that symbol into a collection error for the whole module instead of a
+    # reportable test failure. `test_registry_matches_the_documented_sample_coverage` below
+    # closes the loop by asserting the two key sets never drift apart.
+
+    @pytest.mark.parametrize("runner_key", sorted(_RUNNER_PARSER_SAMPLES))
+    def test_registered_runner_parses_exact_failing_node_ids(self, runner_key: str) -> None:
+        sample_output, expected = _RUNNER_PARSER_SAMPLES[runner_key]
+        parser = cli._SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+        assert parser(sample_output) == expected
+
+    @pytest.mark.parametrize("runner_key", sorted(_RUNNER_PARSER_SAMPLES))
+    def test_registered_runner_parses_zero_failures_on_a_clean_run(self, runner_key: str) -> None:
+        """A passing suite's output (no failure-shaped lines) parses to the empty set --
+        the zero-failure case an all-formats-must-match design could get wrong."""
+        parser = cli._SHARED_FILE_RUNNER_PARSERS[runner_key].parse
+        assert parser("3 passed in 0.05s\n") == set()
+
+    def test_registry_matches_the_documented_sample_coverage(self) -> None:
+        """Keeps `_RUNNER_PARSER_SAMPLES` (this file's parametrize source, see above) from
+        silently drifting out of sync with the production registry it exercises."""
+        assert set(cli._SHARED_FILE_RUNNER_PARSERS) == set(_RUNNER_PARSER_SAMPLES)
+
+    # -- AC-1/AC-5: an unregistered command is a single loud error, pre-suite -------
+
+    def test_unregistered_runner_exits_one_before_running_suite(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._select_test_command_with_recipe", return_value=(["bazel", "test", "//..."], "")),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'bazel test //\.\.\.'", captured.err)
+        assert captured.err.count("\n") == 1, f"expected a single stderr sentence, not: {captured.err!r}"
+        assert ["bazel", "test", "//..."] not in calls, "the suite subprocess double must never be invoked"
+
+    def test_resolve_runner_parser_raises_valueerror_naming_the_full_command(self) -> None:
+        with pytest.raises(ValueError, match=r"cannot parse test output for runner 'bazel test //\.\.\.'"):
+            cli._resolve_runner_parser(["bazel", "test", "//..."])
+
+    # -- BLOCKING (test_review, round 2): the raised type must be the dedicated subclass,
+    # -- not merely satisfy the builtin `ValueError` a mutation to the builtin also satisfies.
+
+    def test_resolve_runner_key_raises_the_dedicated_unknown_runner_type(self) -> None:
+        """Reverting `_resolve_runner_key`'s raise to the builtin `ValueError` still passes
+        `test_resolve_runner_parser_raises_valueerror_naming_the_full_command` above (a
+        `ValueError` subclass instance still satisfies `pytest.raises(ValueError, ...)`), so
+        that test alone does not pin the narrowing `cmd_check_shared_file_impact` depends on
+        to avoid misreporting an unrelated `ValueError` as an unrecognised-runner error. This
+        asserts the concrete type."""
+        with pytest.raises(cli.UnknownTestRunnerError):
+            cli._resolve_runner_key(["bazel", "test", "//..."])
+
+    def test_cmd_check_shared_file_impact_does_not_misreport_an_unrelated_valueerror(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`cmd_check_shared_file_impact` catches `UnknownTestRunnerError` specifically, not
+        the builtin `ValueError` -- an unrelated `ValueError` raised deeper in the gate (e.g.
+        from `_evaluate_shared_file_gate`) must propagate as an uncaught exception rather than
+        being printed as if it were a formed `ERROR: cannot parse test output ...` sentence.
+        Reverting the `except` clause back to the builtin `ValueError` makes this test fail
+        (the exception is swallowed and misreported as exit 1 instead of raised)."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        workspace = tmp_path / "workspace"
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.cli._evaluate_shared_file_gate",
+                side_effect=ValueError("unrelated value error, not an unrecognised-runner error"),
+            ),
+        ):
+            with pytest.raises(ValueError, match="unrelated value error"):
+                cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+        assert capsys.readouterr().err == "", "an unrelated ValueError must never be printed as a formed ERROR line"
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending", (
+            "an uncaught exception must leave the verdict record at 'pending' (fail-closed for the hook)"
+        )
+
+    def test_resolve_runner_key_recognises_npm_yarn_npx_jest_invocations(self) -> None:
+        assert cli._resolve_runner_key(["npm", "test"]) == "npm/jest"
+        assert cli._resolve_runner_key(["yarn", "test"]) == "npm/jest"
+        assert cli._resolve_runner_key(["npx", "jest"]) == "npm/jest"
+        assert cli._resolve_runner_key(["go", "test", "./..."]) == "go test"
+
+    # -- BLOCKING (code_review/changes_manifest/doc_review, round 2): `make test` is not a
+    # -- fourth runner family -- it must be resolved from what its dry-run recipe actually
+    # -- invokes, never assumed to be pytest -------------------------------------------
+
+    def test_resolve_runner_key_resolves_make_wrapped_pytest_recipe_to_the_pytest_parser(self) -> None:
+        """`_select_test_command`'s first branch -- returned whenever the repo's Makefile
+        has a `test` target, the dominant shape for any Makefile-driven repo including this
+        one -- must resolve when its recipe invokes pytest, via the recipe, not via the
+        literal `["make", "test"]` command."""
+        assert cli._resolve_runner_key(["make", "test"], "uv run pytest tests/ -v --tb=short -q\n") == "pytest"
+        assert (
+            cli._resolve_runner_parser(["make", "test"], "uv run pytest tests/ -v --tb=short -q\n")
+            is cli._parse_pytest_failures
+        )
+
+    def test_resolve_runner_key_resolves_make_wrapped_go_test_recipe_to_the_go_test_parser(self) -> None:
+        assert cli._resolve_runner_key(["make", "test"], "go test ./...\n") == "go test"
+        assert cli._resolve_runner_parser(["make", "test"], "go test ./...\n") is cli._parse_go_test_failures
+
+    def test_resolve_runner_key_raises_for_a_make_wrapped_unregistered_recipe(self) -> None:
+        """A Makefile `test` target need not wrap pytest -- mapping `make test` unconditionally
+        to the pytest parser was a guess, not a mapping, and would silently misparse a
+        non-pytest recipe's output. A recipe naming no registered runner must reach the same
+        `UnknownTestRunnerError`, naming both the `make test` command and the inspected
+        recipe text, so an operator can see what was actually checked rather than a bare
+        command with no diagnostic pointer."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "bazel test //...\n")
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        assert "bazel test //..." in message, f"expected the inspected recipe text in the message, got: {message!r}"
+
+    # -- BLOCKING 1 (code_review, round 4): `shlex.split(make_recipe)` with shlex's default
+    # -- `comments=False` is comment-unaware -- a trailing shell comment naming a different
+    # -- runner would be tokenised right along with the real recipe, and an apostrophe inside
+    # -- an untokenised comment raises the builtin `ValueError` uncaught anywhere in the call
+    # -- chain, crashing the gate with a traceback instead of a formed AC-5 error line ------
+
+    def test_resolve_runner_key_ignores_a_trailing_shell_comment_when_resolving_a_make_wrapped_recipe(self) -> None:
+        """A recipe line's trailing `#`-comment is not part of what the recipe invokes --
+        shlex must be told `comments=True` so it is stripped before token matching, both
+        so a comment naming a different runner cannot hijack resolution and so an
+        apostrophe inside the comment (ordinary English punctuation, not shell syntax)
+        never reaches shlex's quote-balancing at all."""
+        assert (
+            cli._resolve_runner_key(["make", "test"], "go test ./...  # do not run this in CI, it's slow\n")
+            == "go test"
+        )
+        with pytest.raises(cli.UnknownTestRunnerError, match=r"cannot parse test output for runner 'make test'"):
+            cli._resolve_runner_key(["make", "test"], "bazel test //...  # run pytest here\n")
+
+    def test_resolve_runner_key_raises_the_dedicated_error_not_a_bare_valueerror_for_an_unparsable_recipe(
+        self,
+    ) -> None:
+        """A recipe that is not shell-tokenizable even with `comments=True` (an unmatched
+        quote/apostrophe outside of a comment, e.g. a bare `don't` in an `@echo` line) must
+        still surface as the dedicated `UnknownTestRunnerError` naming the offending command
+        and shlex's reason the recipe could not be tokenized -- never the builtin
+        `shlex.split`-raised `ValueError` propagating uncaught, which
+        `cmd_check_shared_file_impact`'s `except (RuntimeError, UnknownTestRunnerError,
+        TimeoutError)` clause does not catch."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "@echo don't forget && pytest\n")
+        assert type(exc_info.value) is cli.UnknownTestRunnerError
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        assert "\n" not in message, f"expected a single-line ERROR message, got: {message!r}"
+
+    # -- BLOCKING 3 (code_review, round 4): more than one registry entry's `wraps`
+    # -- predicate can accept the SAME recipe (`_recipe_invokes_go_test`'s any-position
+    # -- rule and the pytest entry's `"pytest" in tokens` rule are not mutually exclusive
+    # -- the way each `matches` predicate is for a direct invocation), so a recipe naming
+    # -- two runner families is ambiguous rather than resolvable by "first match wins" --
+    # -- spec 3.5 bans guessing, so this must be a loud error naming the recipe and the
+    # -- candidates, not a silent pick of whichever registry entry happens to iterate first.
+
+    def test_resolve_runner_key_raises_when_a_make_recipe_matches_more_than_one_registered_runner(self) -> None:
+        """A recipe invoking both `go test` and `pytest` (e.g. a monorepo `test` target
+        that runs a Go suite then a Python suite) matches two registry entries' `wraps`
+        predicates -- neither is more correct than the other, so resolving it silently to
+        whichever entry iterates first would drop attribution for the other runner's
+        failures without ever telling the operator. Must raise `UnknownTestRunnerError`
+        naming both candidates, not pick one."""
+        with pytest.raises(cli.UnknownTestRunnerError) as exc_info:
+            cli._resolve_runner_key(["make", "test"], "go test ./... && pytest -q\n")
+        message = str(exc_info.value)
+        assert message.startswith("ERROR: cannot parse test output for runner 'make test'")
+        # -- The recipe text echoed into the message ALSO contains the literal substrings
+        # -- "go test" and "pytest" (it is the recipe `go test ./... && pytest -q`), so a
+        # -- bare `"go test" in message` / `"pytest" in message` pair does not pin the
+        # -- candidate-list segment specifically -- deleting the joined-candidates clause
+        # -- from the raised message still leaves both substrings present via the echoed
+        # -- recipe alone. Assert on the candidate-list segment by name instead.
+        assert "matches multiple registered runners (go test, pytest), which is ambiguous" in message, (
+            f"candidate-list segment missing or reordered, got: {message!r}"
+        )
+        assert "\n" not in message, f"expected a single-line ERROR message, got: {message!r}"
+
+    def test_resolve_runner_key_make_wrapped_resolution_requires_no_prefix_anchor(self) -> None:
+        """A recipe commonly prefixes the runner with a version manager, an env var, or a
+        working-directory change -- the wrapped runner is not always the recipe's first
+        token, unlike a direct invocation's `matches` predicate."""
+        assert cli._resolve_runner_key(["make", "test"], "cd pkg && go test ./...\n") == "go test"
+        assert cli._resolve_runner_key(["make", "test"], "NODE_ENV=test npx jest --ci\n") == "npm/jest"
+
+    # -- BLOCKING (code_review, round 1, LSP/contract): a tuple must resolve identically --
+
+    def test_resolve_runner_key_normalises_tuple_input_identically_to_list(self) -> None:
+        """`test_command` is annotated `Sequence[str]`, so a tuple must resolve exactly like
+        the equivalent list -- not fall through to `UnknownTestRunnerError` because a slice
+        of a tuple compares unequal to a list literal."""
+        assert cli._resolve_runner_key(("pytest", "-q")) == cli._resolve_runner_key(["pytest", "-q"]) == "pytest"
+        recipe = "uv run pytest tests/ -v --tb=short -q\n"
+        assert (
+            cli._resolve_runner_key(("make", "test"), recipe)
+            == cli._resolve_runner_key(["make", "test"], recipe)
+            == "pytest"
+        )
+        assert (
+            cli._resolve_runner_key(("go", "test", "./..."))
+            == cli._resolve_runner_key(["go", "test", "./..."])
+            == "go test"
+        )
+
+    # -- BLOCKING (code_review, round 1, SOLID/OCP): the registry must be the real ------
+    # -- extension point -- a new entry must be reachable WITHOUT editing the resolver --
+
+    def test_registry_is_open_for_extension_without_editing_resolve_runner_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Registers a brand-new runner family purely by adding a `_SHARED_FILE_RUNNER_PARSERS`
+        entry -- no monkeypatching or editing of `_resolve_runner_key` itself -- and proves
+        it is reachable. Before the round-1 fix, `_resolve_runner_key`'s hand-written
+        if-chain restated the runner list independently, so a fourth registry entry was
+        dead config: this test would have failed with `UnknownTestRunnerError` even though
+        the entry existed in the mapping."""
+
+        def _tsr_parser(_output: str) -> set[str]:
+            return {"tsr::node"}
+
+        extended = dict(cli._SHARED_FILE_RUNNER_PARSERS)
+        extended["tsr"] = cli._RunnerSpec(
+            matches=lambda cmd: cmd[:1] == ("tsr",), wraps=lambda tokens: "tsr" in tokens, parse=_tsr_parser
+        )
+        monkeypatch.setattr(cli, "_SHARED_FILE_RUNNER_PARSERS", extended)
+
+        assert cli._resolve_runner_key(["tsr", "run"]) == "tsr"
+        assert cli._resolve_runner_parser(["tsr", "run"]) is _tsr_parser
+        # every pre-existing entry must still resolve too -- extension, not replacement.
+        assert cli._resolve_runner_key(["pytest"]) == "pytest"
+
+    def test_registry_extension_is_reachable_through_make_wrapped_resolution_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registry is the extension point for BOTH resolution paths (BLOCKING-1,
+        round 2): a newly registered runner must be reachable when a Makefile `test`
+        target wraps it, exactly like a direct invocation, without editing
+        `_resolve_runner_key`."""
+
+        def _tsr_parser(_output: str) -> set[str]:
+            return {"tsr::node"}
+
+        extended = dict(cli._SHARED_FILE_RUNNER_PARSERS)
+        extended["tsr"] = cli._RunnerSpec(
+            matches=lambda cmd: cmd[:1] == ("tsr",), wraps=lambda tokens: "tsr" in tokens, parse=_tsr_parser
+        )
+        monkeypatch.setattr(cli, "_SHARED_FILE_RUNNER_PARSERS", extended)
+
+        assert cli._resolve_runner_key(["make", "test"], "tsr run\n") == "tsr"
+        assert cli._resolve_runner_parser(["make", "test"], "tsr run\n") is _tsr_parser
+
+
+class TestSharedFileAutoDerive:
+    """Auto-derived shared-file registry from import fan-in (spec 4.6, issue #13 AC4;
+    E5-F2-S1-T2). ``_derive_shared_file_registry`` scans a real ``tmp_path`` fixture
+    repo -- these tests drive the real function, never a reimplementation of its
+    counting rule."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    # -- AC-1: derivation at, below, and above the threshold ----------------------
+
+    def _write_fan_in_fixture(self, tmp_path: Path, *, importer_count: int) -> None:
+        (tmp_path / "shared_module.py").write_text("def shared():\n    pass\n")
+        (tmp_path / "lonely_module.py").write_text("def lonely():\n    pass\n")
+        for i in range(importer_count):
+            (tmp_path / f"consumer_{i}.py").write_text("import shared_module\n")
+        (tmp_path / "single_consumer.py").write_text("import lonely_module\n")
+
+    def test_file_imported_by_more_than_threshold_modules_is_derived(self, tmp_path: Path) -> None:
+        """Four importing modules straddle the default threshold (3): shared_module.py's
+        fan-in (4) is strictly greater than 3, so it is derived; lonely_module.py's
+        fan-in (1) is not."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"shared_module.py"}
+
+    def test_threshold_uses_strictly_greater_than_not_at_least(self, tmp_path: Path) -> None:
+        """AC-1: 'more than fan_in_threshold', not 'at least' -- a fan-in of exactly 4
+        against threshold=4 must NOT be derived."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        assert result == set()
+
+    def test_raising_threshold_above_fan_in_yields_empty_set(self, tmp_path: Path) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 10)
+
+        assert result == set()
+
+    def test_module_imported_once_is_never_derived_at_the_minimum_threshold(self, tmp_path: Path) -> None:
+        """Even at the minimum valid threshold (1), a fan-in of exactly 1 (not
+        strictly greater than 1) is never derived, while shared_module.py's
+        fan-in of 4 still is."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+
+        result = cli._derive_shared_file_registry(tmp_path, 1)
+
+        assert "lonely_module.py" not in result
+        assert "shared_module.py" in result
+
+    def test_git_directory_is_never_scanned(self, tmp_path: Path) -> None:
+        """At the fan-in boundary (threshold=4, exactly 4 real importers -> NOT derived,
+        since 4 is not strictly greater than 4): a fifth importer living under `.git`
+        must never push the count over the boundary -- if it did, shared_module.py
+        would wrongly be derived here."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "hooks.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        assert result == set()
+
+    # -- AC-7: an unreadable source file is a loud scan error, never a partial result --
+
+    def test_unreadable_file_raises_loud_error_naming_the_path(self, tmp_path: Path) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        unreadable = tmp_path / "consumer_0.py"
+        original_mode = unreadable.stat().st_mode
+        unreadable.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for consumer_0\.py"):
+                cli._derive_shared_file_registry(tmp_path, 3)
+        finally:
+            unreadable.chmod(original_mode)
+
+    def test_unreadable_directory_raises_loud_error_instead_of_a_silent_partial_registry(self, tmp_path: Path) -> None:
+        """E6-F2-S1-T1 round-2 code_review/test_review/changes_manifest finding: the
+        round-1 Blocking 6 DRY delegation to
+        :func:`devbench.source_classification.iter_classified_source_files` also
+        imports that walk's ``onerror=_reraise_walk_error`` policy into the
+        shared-file-impact gate. An unreadable subdirectory must surface as this
+        gate's own documented ``ERROR: import scan failed`` ``RuntimeError`` shape
+        (the same shape :func:`_derive_shared_file_registry`'s ``Raises:`` block
+        already promises and :func:`_prepare_shared_file_impact_run` already
+        catches) -- never an uncaught ``PermissionError`` escaping past that
+        ``except RuntimeError`` guard, and never a silent partial registry that
+        looks identical to a clean pass having genuinely inspected the whole
+        scope."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        locked_dir = tmp_path / "locked"
+        locked_dir.mkdir()
+        (locked_dir / "consumer_locked.py").write_text("import shared_module\n")
+        original_mode = locked_dir.stat().st_mode
+        locked_dir.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+                cli._derive_shared_file_registry(tmp_path, 3)
+            assert "locked" in str(exc_info.value), (
+                f"expected the RuntimeError to name the unreadable 'locked' directory, got: {exc_info.value}"
+            )
+            # W-a (E6-F2-S1-T1 round-3 code_review): the reported directory is repo-RELATIVE,
+            # matching this same gate's sibling file-level message
+            # (``ERROR: import scan failed for {rel}: {exc}``) and
+            # ``fixture_consistency._MSG_SOURCE_SCAN_DIRECTORY_FAILED``'s own ``directory`` slot,
+            # never an absolute tmp_path-prefixed form.
+            assert "directory locked:" in str(exc_info.value), (
+                f"expected the directory slot to be repo-relative 'locked', got: {exc_info.value}"
+            )
+            assert f"directory {tmp_path}" not in str(exc_info.value), (
+                f"expected the directory slot to be repo-relative, not absolute-path-prefixed, got: {exc_info.value}"
+            )
+        finally:
+            locked_dir.chmod(original_mode)
+
+    def test_repo_root_itself_unreadable_names_the_root_not_a_bare_dot(self, tmp_path: Path) -> None:
+        """W3 (round-4 doc_review + code_review): CHANGELOG.md claims this gate's
+        directory-not-found message 'names the unreadable directory repo-relatively (matching
+        the file-level message next to it)'. When the unreadable directory IS the repo root
+        itself, ``raw_directory.relative_to(repo_path)`` collapses to ``Path('.')``, whose
+        ``.as_posix()`` is the bare, unhelpful string ``'.'`` -- exactly the shape
+        ``fixture_consistency._check_source_literals`` already special-cases (W-b, round-3
+        code_review). ``_iter_shared_file_scan_candidates`` must apply the SAME special case so
+        the two siblings genuinely match, rather than one emitting a useless bare dot."""
+        original_mode = tmp_path.stat().st_mode
+        tmp_path.chmod(0o000)
+        try:
+            with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+                cli._derive_shared_file_registry(tmp_path, 3)
+            assert "directory .:" not in str(exc_info.value), (
+                f"expected the repo root's own directory slot to name the root path, not a bare "
+                f"'.', got: {exc_info.value}"
+            )
+            assert f"directory {tmp_path}:" in str(exc_info.value), (
+                f"expected the directory slot to name the repo root path '{tmp_path}', got: {exc_info.value}"
+            )
+        finally:
+            tmp_path.chmod(original_mode)
+
+    def test_unreadable_directory_outside_repo_path_falls_back_to_the_raw_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """W-a's repo-relative conversion (``raw_directory.relative_to(repo_path)``) cannot
+        succeed for every possible ``OSError.filename`` -- mirrors
+        ``fixture_consistency``'s own identical guard
+        (``TestSourceLiteralExtractionUnreadableDirectory
+        ::test_unreadable_directory_outside_repo_path_falls_back_to_the_raw_path``).
+        Monkeypatches ``iter_classified_source_files`` to raise an ``OSError`` naming a path that
+        is not a descendant of *repo_path* at all -- the code must not assume a real
+        ``os.walk`` under *repo_path* could never itself produce this shape."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        outside_dir = tmp_path.parent / "definitely-outside-the-repo"
+
+        def _raise_outside_oserror(root: Path) -> list[Path]:
+            raise OSError(13, "Permission denied", str(outside_dir))
+
+        monkeypatch.setattr(cli, "iter_classified_source_files", _raise_outside_oserror)
+
+        with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for directory") as exc_info:
+            cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert str(outside_dir) in str(exc_info.value), (
+            f"expected the raw absolute path fallback since '{outside_dir}' is not under "
+            f"'{tmp_path}', got: {exc_info.value}"
+        )
+
+    def test_dangling_symlink_raises_loud_error_naming_the_path(self, tmp_path: Path) -> None:
+        """D4 (round 1 doc_review): a broken symlink is never silently skipped --
+        the scan candidate list is never filtered on ``Path.is_file()`` (which
+        swallows a broken symlink's OSError), so reading one reaches the same
+        loud ``ERROR: import scan failed`` path as any other unreadable file."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        broken = tmp_path / "dangling.py"
+        broken.symlink_to(tmp_path / "does_not_exist.py")
+
+        with pytest.raises(RuntimeError, match=r"ERROR: import scan failed for dangling\.py"):
+            cli._derive_shared_file_registry(tmp_path, 3)
+
+    def test_symlink_resolving_outside_repo_path_is_silently_excluded_never_read(self, tmp_path: Path) -> None:
+        """SECURITY (security_review round-3 MEDIUM finding, E6-F2-S1-T1): a symlink whose
+        target resolves OUTSIDE *repo_path* is excluded at enumeration time by
+        ``source_classification.iter_classified_source_files``'s own boundary check -- it never
+        reaches this gate's ``read_text`` call at all, so it neither raises (unlike the dangling
+        in-repo case above) nor contributes any content to the derived registry.
+
+        test_review round-4 WARN: this test previously seeded ``shared_module.py`` with a
+        fan-in of 4 against the default threshold of 3, so ``"shared_module.py" in result``
+        stayed true regardless of whether the out-of-root symlink exclusion ran at all, and
+        ``linked_outside.py`` can never be counted in the first place because the registry is
+        keyed by IMPORTED module name, never by an importer's own filename -- so neither
+        assertion could ever fail. Seeding EXACTLY the threshold (3) instead means
+        ``shared_module.py`` is only excluded from the result if the out-of-root symlink is
+        never read as a fourth, silently-crediting importer; removing the exclusion in
+        ``_resolves_outside_root`` makes ``linked_outside.py`` a real (if unreachable-by-name)
+        fourth importer and flips this assertion from pass to fail."""
+        self._write_fan_in_fixture(tmp_path, importer_count=3)
+        outside = tmp_path.parent / "outside-the-repo"
+        outside.mkdir(exist_ok=True)
+        (outside / "secret.py").write_text("import shared_module\n" * 10, encoding="utf-8")
+        (tmp_path / "linked_outside.py").symlink_to(outside / "secret.py")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert "shared_module.py" not in result, (
+            "the out-of-root symlink must never be read as a fan-in vote: at exactly the "
+            "threshold (3 real importers), a fourth (silent) vote from the excluded symlink "
+            "would wrongly push shared_module.py's fan-in strictly above threshold"
+        )
+
+    def test_scan_candidates_delegates_to_the_shared_classified_source_enumeration(self) -> None:
+        """W6 (round-2 test_review advisory): a structural regression guard, mirroring
+        this repo's own ``inspect.getsource`` precedent (e.g.
+        ``TestCheckSourceLiteralsUsesSharedClassifiedSourceEnumeration`` in
+        ``tests/test_fixture_consistency.py``, and
+        ``TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync`` in this file). Without
+        this pin, reverting round-1 Blocking 6's DRY fix -- restoring a hand-copied
+        ``os.walk`` body inside ``_iter_shared_file_scan_candidates`` instead of delegating to
+        ``source_classification.iter_classified_source_files`` -- kills zero tests: a hand-rolled
+        walk that prunes the same directory names and filters on the same extensions produces
+        byte-identical results for every OTHER test in this class."""
+        import inspect
+
+        source = inspect.getsource(cli._iter_shared_file_scan_candidates)
+        assert "iter_classified_source_files" in source, (
+            "_iter_shared_file_scan_candidates must enumerate candidate files via "
+            "source_classification.iter_classified_source_files (spec 4.3 PM-3 / E6-F2-S1-T1 "
+            "round-1 Blocking 6), not a hand-copied os.walk body"
+        )
+        # Stronger than a bare substring check: requires the actual CALL expression (not
+        # merely a docstring/comment mention of the name, which could survive a real
+        # call-site substitution unchanged), and rejects a hand-copied walk reappearing in
+        # the same function body.
+        assert "iter_classified_source_files(repo_path)" in source
+        assert "os.walk(" not in source
+
+    # -- A1 (round 1 code_review): resolution against the importer's own package/
+    # relative location and the repo-root module path, never a global basename index
+
+    def test_stdlib_name_collision_is_never_derived(self, tmp_path: Path) -> None:
+        """A bare Python import whose name collides with an unrelated file's
+        basename must never credit that file's fan-in -- absolute imports resolve
+        against the repo/source root, never a global basename index."""
+        (tmp_path / "mylib").mkdir()
+        (tmp_path / "mylib" / "types.py").write_text("VALUE = 1\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import types\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    def test_same_basename_files_in_different_packages_are_not_conflated(self, tmp_path: Path) -> None:
+        """``pkg_a/shared.py`` imported by 5 modules must never also derive the
+        unrelated, unimported ``pkg_b/shared.py`` that merely shares a basename."""
+        (tmp_path / "pkg_a").mkdir()
+        (tmp_path / "pkg_a" / "__init__.py").write_text("")
+        (tmp_path / "pkg_a" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "pkg_b").mkdir()
+        (tmp_path / "pkg_b" / "__init__.py").write_text("")
+        (tmp_path / "pkg_b" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import pkg_a.shared\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg_a/shared.py"}
+
+    def test_ambiguous_resolution_refuses_to_credit_any_candidate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A target resolvable against more than one source root is credited to
+        NEITHER candidate, and the refusal is printed to stderr rather than
+        silently dropped."""
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "pkg" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "pkg").mkdir()
+        (tmp_path / "src" / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "src" / "pkg" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.py").write_text("import pkg.shared\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+        stderr = capsys.readouterr().err
+        assert "pkg.shared" in stderr
+        assert "pkg/shared.py" in stderr
+        assert "src/pkg/shared.py" in stderr
+
+    def test_bare_js_specifier_is_never_resolved_locally(self, tmp_path: Path) -> None:
+        """A bare (non-relative) JS import target is an external package specifier
+        -- it must never be credited to a same-named local file."""
+        (tmp_path / "utils.js").write_text("module.exports = {};\n")
+        for i in range(5):
+            (tmp_path / f"consumer_{i}.js").write_text("import utils from 'utils';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    # -- A2 (round 1 code_review): vendored/dependency trees are pruned DURING
+    # the walk, never enumerated and then filtered out
+
+    def test_vendored_directory_is_never_scanned(self, tmp_path: Path) -> None:
+        """A file living under a vendored dependency directory (`.venv`) must
+        never be scanned as a candidate, and must never vote for a real file's
+        fan-in either."""
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        vendored = tmp_path / ".venv" / "lib" / "site-packages"
+        vendored.mkdir(parents=True)
+        (vendored / "extra_consumer.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        # A 5th (vendored) importer would push fan-in from 4 to 5, crossing the
+        # threshold=4 boundary -- if the vendored file were scanned, this would
+        # wrongly derive shared_module.py.
+        assert result == set()
+
+    # -- A3 (round 1 code_review/test_review): directory-form composition roots
+    # resolve to their entry file, and idiomatic import spellings agree
+
+    def test_python_package_init_directory_form_is_derived(self, tmp_path: Path) -> None:
+        """``from mypkg import SHARED`` naming the package itself must resolve to
+        ``mypkg/__init__.py``."""
+        (tmp_path / "mypkg").mkdir()
+        (tmp_path / "mypkg" / "__init__.py").write_text("SHARED = 1\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.py").write_text("from mypkg import SHARED\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"mypkg/__init__.py"}
+
+    def test_js_directory_barrel_form_is_derived(self, tmp_path: Path) -> None:
+        """``import {A} from './lib'`` naming a barrel directory must resolve to
+        ``lib/index.js``."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "index.js").write_text("export const A = 1;\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.js").write_text("import {A} from './lib';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/index.js"}
+
+    def test_js_import_with_explicit_extension_is_derived(self, tmp_path: Path) -> None:
+        """``import Foo from './utils.js'`` spells out its own extension -- the
+        resolved prefix already carries it, so it must match the literal
+        candidate rather than being appended a second (nonexistent) `.js.js`."""
+        (tmp_path / "utils.js").write_text("export const Foo = 1;\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.js").write_text("import Foo from './utils.js';\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"utils.js"}
+
+    def test_dots_only_and_explicit_relative_import_spellings_agree(self, tmp_path: Path) -> None:
+        """``from . import target`` and ``from .target import x`` are two
+        idiomatic spellings of the same import and must derive the same file."""
+        (tmp_path / "target.py").write_text("VALUE = 1\n")
+        (tmp_path / "other_target.py").write_text("VALUE = 2\n")
+        for i in range(4):
+            (tmp_path / f"consumer_dots_{i}.py").write_text("from . import target\n")
+        for i in range(4):
+            (tmp_path / f"consumer_explicit_{i}.py").write_text("from .other_target import x\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"target.py", "other_target.py"}
+
+    def test_relative_import_resolves_against_importers_own_package(self, tmp_path: Path) -> None:
+        """A relative import resolves against the IMPORTING file's own directory,
+        never a same-named file living in an unrelated directory."""
+        (tmp_path / "pkg_a").mkdir()
+        (tmp_path / "pkg_a" / "shared.py").write_text("VALUE = 1\n")
+        (tmp_path / "pkg_b").mkdir()
+        (tmp_path / "pkg_b" / "shared.py").write_text("VALUE = 2\n")
+        for i in range(4):
+            (tmp_path / "pkg_a" / f"consumer_{i}.py").write_text("from .shared import VALUE\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg_a/shared.py"}
+
+    # -- Non-Python language resolution (spec 4.6, round-1 A1 finding) -------------
+
+    def test_go_absolute_import_path_is_derived(self, tmp_path: Path) -> None:
+        """Go import paths are always project-absolute -- resolved against the repo
+        root, never a bare basename index."""
+        (tmp_path / "myproj").mkdir()
+        (tmp_path / "myproj" / "shared.go").write_text("package myproj\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.go").write_text('import "myproj/shared"\n')
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"myproj/shared.go"}
+
+    def test_php_relative_require_is_derived(self, tmp_path: Path) -> None:
+        """A PHP `require`/`include` with a leading `./` resolves relative to the
+        importing file's own directory."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nrequire('./lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+
+    def test_php_bare_require_resolves_against_source_root(self, tmp_path: Path) -> None:
+        """A PHP `require`/`include` with no leading `./` resolves against the repo
+        root, exactly like Go's always-absolute import paths."""
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nrequire('lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+
+    def test_php_use_namespace_is_derived(self, tmp_path: Path) -> None:
+        """A PHP `use` namespace (backslash-separated) is normalised to a path and
+        resolved against the repo root."""
+        (tmp_path / "App").mkdir()
+        (tmp_path / "App" / "Shared.php").write_text("<?php\n")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.php").write_text("<?php\nuse App\\Shared;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"App/Shared.php"}
+
+    def test_jvm_dotted_import_is_derived(self, tmp_path: Path) -> None:
+        """A Java `import` of a fully-qualified dotted namespace resolves against
+        the repo root, joined on `.`."""
+        (tmp_path / "com" / "example").mkdir(parents=True)
+        (tmp_path / "com" / "example" / "SharedModule.java").write_text("package com.example;\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.java").write_text("import com.example.SharedModule;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"com/example/SharedModule.java"}
+
+    def test_csharp_using_namespace_is_derived(self, tmp_path: Path) -> None:
+        """A C# `using` of a dotted namespace resolves against the repo root."""
+        (tmp_path / "MyProject").mkdir()
+        (tmp_path / "MyProject" / "Shared.cs").write_text("namespace MyProject;\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.cs").write_text("using MyProject.Shared;\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"MyProject/Shared.cs"}
+
+    def test_swift_import_is_derived(self, tmp_path: Path) -> None:
+        """A Swift `import` of a module name resolves against the repo root when a
+        matching top-level file exists."""
+        (tmp_path / "SharedModule.swift").write_text("public let value = 1\n")
+        for i in range(4):
+            (tmp_path / f"Consumer{i}.swift").write_text("import SharedModule\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"SharedModule.swift"}
+
+    def test_ruby_bare_require_is_never_resolved_locally(self, tmp_path: Path) -> None:
+        """A bare `require 'shared_module'` (no leading `./`) is an external gem
+        specifier -- it must never be credited to a same-named local file."""
+        (tmp_path / "shared_module.rb").write_text("")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.rb").write_text("require 'shared_module'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+
+    def test_ruby_relative_require_is_derived(self, tmp_path: Path) -> None:
+        (tmp_path / "lib").mkdir()
+        (tmp_path / "lib" / "shared.rb").write_text("")
+        for i in range(4):
+            (tmp_path / f"consumer_{i}.rb").write_text("require_relative './lib/shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.rb"}
+
+    # -- Round-2 test_review finding: every JS/TS/Ruby/relative-PHP fixture above
+    # writes its importers to `tmp_path`'s own ROOT, so `importer_dir` is always
+    # empty and `_resolve_relative_path_shared_file_target`'s
+    # `f"{importer_dir}/{normalized}"` join is never exercised -- only the
+    # dedicated Python subdirectory test above
+    # (`test_relative_import_resolves_against_importers_own_package`) exercises
+    # that shape, and it drives the SEPARATE `_resolve_python_shared_file_target`.
+    # These tests place the importer in a subdirectory with a same-named decoy
+    # at the repo root, so a join that dropped `importer_dir` (crediting the
+    # decoy instead of the real file) would be caught here.
+
+    @pytest.mark.parametrize(
+        ("suffix", "consumer_text"),
+        [
+            (".js", "import {x} from './shared';\n"),
+            (".jsx", "import {x} from './shared';\n"),
+            (".ts", "import {x} from './shared';\n"),
+            (".tsx", "import {x} from './shared';\n"),
+            (".mjs", "import {x} from './shared';\n"),
+            (".cjs", "const {x} = require('./shared');\n"),
+        ],
+    )
+    def test_js_family_relative_import_credits_importer_directory_not_repo_root_decoy(
+        self, tmp_path: Path, suffix: str, consumer_text: str
+    ) -> None:
+        """A relative `./shared` import from an importer living in `pkg/` must
+        resolve to `pkg/shared<suffix>` -- never a same-named decoy file sitting
+        at the repo root -- for every extension in the JS/TS resolve family."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / f"shared{suffix}").write_text("export const x = 1;\n")
+        (tmp_path / f"shared{suffix}").write_text("export const x = 999;\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}{suffix}").write_text(consumer_text)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {f"pkg/shared{suffix}"}
+
+    def test_ruby_relative_require_credits_importer_directory_not_repo_root_decoy(self, tmp_path: Path) -> None:
+        """A relative `require_relative './shared'` from an importer living in
+        `pkg/` must resolve to `pkg/shared.rb` -- never a same-named decoy file
+        sitting at the repo root."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "shared.rb").write_text("")
+        (tmp_path / "shared.rb").write_text("")
+        for i in range(4):
+            (pkg / f"consumer_{i}.rb").write_text("require_relative './shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg/shared.rb"}
+
+    def test_php_relative_require_credits_importer_directory_not_repo_root_decoy(self, tmp_path: Path) -> None:
+        """A relative PHP `require('./shared.php')` from an importer living in
+        `pkg/` must resolve to `pkg/shared.php` -- never a same-named decoy file
+        sitting at the repo root."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "shared.php").write_text("<?php\n")
+        (tmp_path / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}.php").write_text("<?php\nrequire('./shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"pkg/shared.php"}
+
+    # -- Round-5 test_review finding (BLOCKING 5): the leading-`/` branch of
+    # `_resolve_relative_path_shared_file_target`
+    # (`prefix = posixpath.normpath(normalized.lstrip("/"))`) was NOT-EXECUTED
+    # under the full suite despite being documented, in this round's own
+    # docstrings and in docs/devbench-yaml-reference.md, as repo-root-anchored
+    # and NEVER falling back to `src/`. Each importer below lives in a
+    # subdirectory (`pkg/`) and names a leading-`/` target, with a same-named
+    # decoy at the importer-relative path AND a same-named decoy under a
+    # top-level `src/` directory, so a regression toward either the
+    # importer-relative join or a `src/` fallback is caught.
+
+    @pytest.mark.parametrize(
+        ("suffix", "consumer_text"),
+        [
+            (".js", "import {x} from '/lib/shared';\n"),
+            (".jsx", "import {x} from '/lib/shared';\n"),
+            (".ts", "import {x} from '/lib/shared';\n"),
+            (".tsx", "import {x} from '/lib/shared';\n"),
+            (".mjs", "import {x} from '/lib/shared';\n"),
+            (".cjs", "const {x} = require('/lib/shared');\n"),
+        ],
+    )
+    def test_js_family_leading_slash_import_anchors_to_repo_root_only(
+        self, tmp_path: Path, suffix: str, consumer_text: str
+    ) -> None:
+        """A leading-`/` JS/TS import from an importer living in `pkg/` must
+        resolve to the repo-root `lib/shared<suffix>` ONLY -- never the
+        importer-relative decoy at `pkg/lib/shared<suffix>` and never a
+        `src/`-anchored decoy at `src/lib/shared<suffix>` -- for every
+        extension in the JS/TS resolve family."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / f"shared{suffix}").write_text("export const x = 1;\n")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / f"shared{suffix}").write_text("export const x = 2;\n")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / f"shared{suffix}").write_text("export const x = 3;\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}{suffix}").write_text(consumer_text)
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {f"lib/shared{suffix}"}
+        assert f"pkg/lib/shared{suffix}" not in result
+        assert f"src/lib/shared{suffix}" not in result
+
+    def test_ruby_leading_slash_require_anchors_to_repo_root_only(self, tmp_path: Path) -> None:
+        """A leading-`/` Ruby `require '/lib/shared'` from an importer living in
+        `pkg/` must resolve to the repo-root `lib/shared.rb` ONLY -- never the
+        importer-relative decoy at `pkg/lib/shared.rb` and never a
+        `src/`-anchored decoy at `src/lib/shared.rb`."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / "shared.rb").write_text("")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / "shared.rb").write_text("")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / "shared.rb").write_text("")
+        for i in range(4):
+            (pkg / f"consumer_{i}.rb").write_text("require '/lib/shared'\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.rb"}
+        assert "pkg/lib/shared.rb" not in result
+        assert "src/lib/shared.rb" not in result
+
+    def test_php_leading_slash_require_anchors_to_repo_root_only(self, tmp_path: Path) -> None:
+        """A leading-`/` PHP `require('/lib/shared.php')` from an importer
+        living in `pkg/` must resolve to the repo-root `lib/shared.php` ONLY --
+        never the importer-relative decoy at `pkg/lib/shared.php` and never a
+        `src/`-anchored decoy at `src/lib/shared.php`."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        (lib / "shared.php").write_text("<?php\n")
+        pkg = tmp_path / "pkg"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "lib" / "shared.php").write_text("<?php\n")
+        src_lib = tmp_path / "src" / "lib"
+        src_lib.mkdir(parents=True)
+        (src_lib / "shared.php").write_text("<?php\n")
+        for i in range(4):
+            (pkg / f"consumer_{i}.php").write_text("<?php\nrequire('/lib/shared.php');\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == {"lib/shared.php"}
+        assert "pkg/lib/shared.php" not in result
+        assert "src/lib/shared.php" not in result
+
+    # -- Round-6 test_review finding: `_resolve_python_shared_file_target`'s
+    # over-pop guard (`if pops > len(base_parts): return set()`) was
+    # NOT-EXECUTED under the full suite and survived mutation. Without the
+    # guard, a relative import popping more directories than the importer
+    # actually has silently anchors at the repo root via a negative slice that
+    # wraps to `[]`, casting a spurious fan-in vote for an unrelated
+    # same-stem file elsewhere in the tree -- the round-1 A1 defect class.
+
+    def test_over_popping_relative_import_never_anchors_to_repo_root(self, tmp_path: Path) -> None:
+        """Four importers at `src/consumer_0..3.py` each write
+        `from ...shared import VALUE` -- a relative import with level 3
+        (three leading dots), so `pops = level - 1 = 2`. The importer's own
+        directory is `src` (`base_parts = ["src"]`, length 1), so `pops (2) >
+        len(base_parts) (1)`: the level pops past the repo root itself, which
+        is not a real location any file can be resolved against. This must
+        derive `set()`, never the unrelated repo-root decoy `shared.py`,
+        even though the decoy exists and four importers exceed the
+        threshold."""
+        (tmp_path / "shared.py").write_text("VALUE = 1\n")
+        src = tmp_path / "src"
+        src.mkdir()
+        for i in range(4):
+            (src / f"consumer_{i}.py").write_text("from ...shared import VALUE\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 3)
+
+        assert result == set()
+        assert "shared.py" not in result
+
+    # -- Round-2 test_review finding: 11 of 14 (now 16) excluded-directory
+    # entries could previously be removed individually with zero test failures
+    # (only `.git` was pinned; `.venv`/`site-packages` were pinned only as a
+    # conjunction via the `.venv/lib/site-packages` fixture path). This
+    # parametrized test pins every entry individually: a file living under it
+    # must never cast a fan-in vote, even a vote that would otherwise push a
+    # target over threshold.
+
+    # Hard-coded (never read from `source_classification.CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS`
+    # itself): parametrizing over the production constant would make a removed
+    # entry silently vanish from this test's own case list rather than fail it.
+    # The companion equality-pin test below independently pins the constant's
+    # exact membership, so an addition or removal on either side is caught.
+    #
+    # Round-2 code_review finding W3: this used to pin `cli._SHARED_FILE_SCAN_
+    # EXCLUDED_DIRS`, a module-level alias of the same constant that Blocking 6's
+    # walk delegation left with zero production consumers. Pinning the shared
+    # `source_classification` constant directly is the same regression coverage
+    # with no dead re-export required to carry it.
+    _EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS = frozenset(
+        {
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "__pycache__",
+            ".tox",
+            ".nox",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".eggs",
+            "site-packages",
+            "dist",
+            "build",
+            "htmlcov",
+            "vendor",
+            "third_party",
+        }
+    )
+
+    def test_excluded_dirs_constant_membership_is_pinned(self) -> None:
+        assert CLASSIFIED_SOURCE_WALK_EXCLUDED_DIRS == self._EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS
+
+    @pytest.mark.parametrize("excluded_dir", sorted(_EXPECTED_SHARED_FILE_SCAN_EXCLUDED_DIRS))
+    def test_each_excluded_directory_entry_prunes_a_would_be_extra_voter(
+        self, tmp_path: Path, excluded_dir: str
+    ) -> None:
+        self._write_fan_in_fixture(tmp_path, importer_count=4)
+        pruned = tmp_path / excluded_dir / "nested"
+        pruned.mkdir(parents=True)
+        (pruned / "extra_consumer.py").write_text("import shared_module\n")
+
+        result = cli._derive_shared_file_registry(tmp_path, 4)
+
+        # A 5th (excluded-dir) importer would push fan-in from 4 to 5, crossing
+        # the threshold=4 boundary -- if this directory were not pruned, this
+        # would wrongly derive shared_module.py.
+        assert result == set()
+
+    # -- Derived-registry cache alongside the baseline record (AC-6) ---------------
+
+    def test_derived_registry_cache_path_is_a_sibling_of_the_baseline(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            baseline_path = cli._shared_file_baseline_path(self.REPO, "deadbeef")
+            cache_path = cli._shared_file_derived_registry_cache_path(self.REPO, "deadbeef")
+        assert cache_path.parent == baseline_path.parent
+        assert cache_path.name == "deadbeef.derived-registry.json"
+
+    def test_write_derived_registry_cache_persists_expected_shape(self, tmp_path: Path) -> None:
+        path = tmp_path / "deadbeef.derived-registry.json"
+        cli._write_shared_file_derived_registry_cache(
+            path, branch_point="deadbeef", fan_in_threshold=3, derived_registry={"src/shared.py", "src/other.py"}
+        )
+        record = json.loads(path.read_text())
+        assert record["branch_point"] == "deadbeef"
+        assert record["fan_in_threshold"] == 3
+        assert record["derived_registry"] == ["src/other.py", "src/shared.py"]
+        datetime.fromisoformat(record["captured_at"])
+
+    def test_derived_registry_cache_and_payload_key_written_on_a_reached_verdict(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-6 (round 1 test_review): the derived-registry cache file and the
+        payload's own ``derived_registry`` key are both real side effects of
+        reaching a verdict through ``_evaluate_shared_file_gate`` over a real
+        full-suite run -- not merely properties of the writer helper tested in
+        isolation, or of the no-match payload branch. Kills two independent
+        mutations: deleting the ``_write_shared_file_derived_registry_cache`` call
+        site, and deleting ``base_payload["derived_registry"] = sorted(...)``."""
+        unit = _shared_file_impact_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        cfg_path = _write_shared_file_impact_gate_config(workspace, auto_derive_registry=True, fan_in_threshold=3)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("tests/test_suite.py",),
+                    default_branch="main",
+                    auto_derive_registry=True,
+                    fan_in_threshold=3,
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"tests/test_suite.py"}),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["derived_registry"] == ["tests/test_suite.py"]
+
+        cache_path = (
+            workspace
+            / ".devbench"
+            / "test-baselines"
+            / self.REPO.replace("/", "__")
+            / f"{base_sha}.derived-registry.json"
+        )
+        assert cache_path.exists(), "the derived-registry cache must be written when a verdict is actually reached"
+        cache_record = json.loads(cache_path.read_text())
+        assert cache_record["derived_registry"] == ["tests/test_suite.py"]
+        assert cache_record["fan_in_threshold"] == 3
+
+    # -- cmd_check_shared_file_impact wiring: additive union + resolver reads ------
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    def test_hand_pattern_not_derived_still_matches(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-2: a hand-listed pattern the scanner did not derive still matches, even
+        with auto_derive_registry enabled."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/hand_listed.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("src/hand_listed.py",), auto_derive_registry=True, fan_in_threshold=3
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value=set()) as mock_derive,
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_derive.assert_called_once_with(tmp_path, 3)
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/hand_listed.py"]
+        assert mock_evaluate.call_args.kwargs["auto_derive_registry"] is True
+        assert mock_evaluate.call_args.kwargs["fan_in_threshold"] == 3
+        assert mock_evaluate.call_args.kwargs["derived_registry"] == set()
+
+    def test_derived_file_matches_with_empty_hand_list(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-2: a derived file matches even when the hand list is empty."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/derived_only.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/derived_only.py"]
+
+    def test_hand_pattern_and_derived_file_both_survive_the_union(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-2 (round 1 test_review): with BOTH a hand-listed match and a derived
+        match present simultaneously, the union must be ADDITIVE -- neither side
+        may be dropped in favour of the other. Kills the mutation that replaces
+        the union with `set(scope.files) & derived_registry` (discarding every
+        hand-listed match): under that mutation `matched_files` would be
+        `["src/derived_only.py"]` alone, missing `src/hand_listed.py`."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/hand_listed.py", "src/derived_only.py"))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        canned_payload: dict[str, Any] = {"unit_id": "E0-F1-S1-T1", "verdict": "pass"}
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(
+                    patterns=("src/hand_listed.py",), auto_derive_registry=True, fan_in_threshold=3
+                ),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/derived_only.py"}),
+            patch("devbench.cli._evaluate_shared_file_gate", return_value=(canned_payload, 0)) as mock_evaluate,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert mock_evaluate.call_args.kwargs["matched_files"] == ["src/derived_only.py", "src/hand_listed.py"]
+
+    def test_derived_file_outside_scope_never_matches(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A derived file NOT in this unit's own scope must never be unioned in --
+        the union is `scope.files & derived_registry`, not `derived_registry` alone."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_run.assert_not_called()
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+
+    def test_derived_registry_printed_on_no_match_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-6: the derived set is printed on the run even on a no-match invocation."""
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=3
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry", return_value={"src/some_other_derived_file.py"}),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_run.assert_not_called()
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        assert payload["derived_registry"] == ["src/some_other_derived_file.py"]
+
+    def test_import_scan_failure_exits_one_and_leaves_verdict_pending(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC-7 surfaced through cmd_check_shared_file_impact: a loud scan error exits 1
+        and never reaches a clean verdict (fail-closed for the hook)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(workspace, auto_derive_registry=True, fan_in_threshold=3)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=3),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.cli._derive_shared_file_registry",
+                side_effect=RuntimeError("ERROR: import scan failed for src/broken.py: [Errno 13] Permission denied"),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "ERROR: import scan failed for src/broken.py" in captured.err
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending"
+
+    def test_auto_derive_registry_and_fan_in_threshold_read_through_resolver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both new keys are read exclusively through resolve_gate_config (spec 4.1 AC-27),
+        proven by a recording wrapper around the real resolver."""
+        from devbench.config_loader import resolve_gate_config as real_resolve_gate_config
+
+        unit = self._make_unit()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        (tmp_path / ".git").mkdir()
+        cfg_path = _write_shared_file_impact_gate_config(
+            tmp_path / "workspace", auto_derive_registry=True, fan_in_threshold=9
+        )
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        calls: list[str] = []
+
+        def recording_resolve(gate: str, *args: Any, **kwargs: Any) -> Any:
+            calls.append(gate)
+            return real_resolve_gate_config(gate, *args, **kwargs)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=(), auto_derive_registry=True, fan_in_threshold=9),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config_loader.resolve_gate_config", side_effect=recording_resolve),
+            patch("devbench.cli._derive_shared_file_registry", return_value=set()) as mock_derive,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert calls == ["shared_file_impact"]
+        mock_derive.assert_called_once_with(tmp_path, 9)
+
+
+class TestCmdCheckSharedFileImpact:
+    """Test cmd_check_shared_file_impact -- caylent-solutions/devbench-internal-backlog#13
+
+    Shared-file full-suite regression gate.
+    """
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    def test_unit_not_found(self, tmp_path: Path) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        workspace = tmp_path / "workspace"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            result = cli.cmd_check_shared_file_impact("NONEXISTENT")
+        assert result == 1
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists(), (
+            "the unconditional 'pending' write at the very start of cmd_check_shared_file_impact "
+            "must land even when the unit id is unrecognised -- an unknown-unit-id early return "
+            "must never leave the hook with no record to fail closed on"
+        )
+        assert record.read_text().splitlines()[0] == "pending"
+
+    def test_no_local_path(self, tmp_path: Path) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+        assert result == 1
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists(), (
+            "the unconditional 'pending' write at the very start of cmd_check_shared_file_impact "
+            "must land even when no local repo path is configured -- this early return must never "
+            "leave the hook with no record to fail closed on"
+        )
+        assert record.read_text().splitlines()[0] == "pending"
+
+    def test_no_patterns_configured_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No shared_file_impact patterns for the repo -- always a no-op, full suite never runs."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        mock_run.assert_not_called()
+        verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", "a no-patterns-configured no-op must record 'pass'"
+
+    def test_auto_derive_registry_disabled_never_calls_derivation(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-3 (round 1 test_review): with `auto_derive_registry` resolving to its
+        default of False, `_derive_shared_file_registry` must never be called and
+        `derived_registry` must never appear in the payload -- kills the mutation
+        that hardcodes `auto_derive_registry = True` at the consumption site."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=())),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._derive_shared_file_registry") as mock_derive,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_derive.assert_not_called()
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert "derived_registry" not in payload
+
+    def test_gate_disabled_prints_status_line_and_writes_pass_verdict(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """C1/D3 (round 1 code_review): `enabled` is now read through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability`
+        use, closing the previous gap where this command never checked `enabled`
+        at all. A `false` config disables the gate before any scope/derivation/
+        full-suite work runs, and the PostToolUse hook's verdict record is still
+        overwritten with `pass` (never left at `pending`) so the hook does not
+        stay blocked on a disabled gate forever."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        cfg_path = _write_shared_file_impact_gate_config(workspace, enabled=False)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "shared_file_impact", "status": "disabled"}'
+        mock_run.assert_not_called()
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            "a disabled gate must still write 'pass' so the PostToolUse hook is never left blocked"
+        )
+
+    def test_config_load_error_reports_and_leaves_verdict_pending(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuine config-load error (malformed YAML) via `_load_gate_config_or_report`
+        must exit 1 with the loader's own `ERROR:` message and leave the verdict record
+        at `pending` -- never the disabled path's `pass` write, since no gate config was
+        actually resolved."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/app/Shell.tsx",))
+        cfg_path = workspace / "backlog" / "config" / "devbench.yaml"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text("gates: [this is not a mapping\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        mock_run.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("ERROR:")
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pending", (
+            "a genuine config-load error must leave the verdict at 'pending', not write 'pass'"
+        )
+
+    def test_changed_files_do_not_match_is_noop(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Patterns configured, but this task's diff doesn't touch any of them -- no-op."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated/foo.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command") as mock_run,
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        mock_run.assert_not_called()
+        verdict_record = (tmp_path / "workspace" / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", "a no-match no-op must record 'pass'"
+
+    @pytest.mark.parametrize(
+        ("exc", "match"),
+        [
+            (
+                ValueError("Unknown work unit id: 'E0-F1-S1-T1'. No matching entry in the backlog index."),
+                "Unknown work unit id",
+            ),
+            (
+                RuntimeError("'git hash-object -- src/app/Shell.tsx' failed in '/repo' (exit 128): fatal: bad object"),
+                "git hash-object",
+            ),
+            (
+                FileNotFoundError(2, "No such file or directory", "/backlog/E0-F1-S1-T1.md"),
+                "No such file or directory",
+            ),
+        ],
+        ids=["value_error", "runtime_error", "file_not_found_error"],
+    )
+    def test_scope_resolution_error_reports_and_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], exc: Exception, match: str
+    ) -> None:
+        """AC-3 (spec 4.3): every error type `work_unit_scope.resolve_changed_files` can
+        raise or propagate -- `ValueError` (unknown unit id, bad repo path),
+        `RuntimeError` (git plumbing exiting >= 2), and `FileNotFoundError` (the unit's
+        work-unit file deleted in a same-process race between the backlog parse and the
+        manifest read, propagated from `work_unit_scope._load_manifest_paths`) -- surface
+        as exit 1 with the helper's own message on stderr, and no partial gate verdict (no
+        JSON payload) is ever printed."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.resolve_changed_files", side_effect=exc),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "no JSON payload must be printed when scope resolution fails"
+        assert "ERROR: cannot resolve scope for unit E0-F1-S1-T1" in captured.err
+        assert match in captured.err
+        record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert record.splitlines()[0] == "pending", (
+            "a scope-resolution error must leave the verdict record at 'pending' (fail-closed for the hook), "
+            f"got: {record!r}"
+        )
+
+
+class TestWriteGatePassRecordSharedHelper:
+    """code_review round-1 (E6-F2-S1-T2 Blocking 2): ``_write_shared_file_impact_gate_pass_record``
+    and ``_write_fixture_consistency_gate_pass_record`` were a 22-line verbatim copy of
+    each other, differing only by the gate-name constant substituted in three places
+    (an AST-level body diff with docstrings stripped showed zero other differences).
+    Extracted into one ``_write_gate_pass_record(gate_name, unit, unit_id, scope)`` that
+    both gates now call, so this generic behaviour -- successful write, missing-file
+    error, and append ``OSError`` -- is pinned exactly once here, parameterized over an
+    arbitrary gate name, rather than duplicated per gate."""
+
+    def _make_unit(self, unit_id: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo="caylent-solutions/git-repo",
+            dependencies=[],
+        )
+
+    def _scope(self):
+        from devbench.work_unit_scope import ScopeResult
+
+        return ScopeResult(
+            files=["src/foo.py"],
+            mode="per_task_branch",
+            commit_shas=[],
+            scope_hash="a" * 64,
+        )
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency", "write_path_audit"])
+    def test_successful_write_appends_a_marker_naming_the_given_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        backlog_root = tmp_path / "backlog-root"
+        wu_file = backlog_root / "backlog" / f"{unit_id}.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+
+        result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result is None
+        content = wu_file.read_text(encoding="utf-8")
+        assert f"[GATE_PASS {gate_name}]" in content
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency"])
+    def test_missing_work_unit_file_reports_the_given_gate_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", tmp_path / "backlog-does-not-exist")
+        monkeypatch.setattr(cli, "WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist")
+
+        result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: work unit file not found" in (
+            captured.err
+        )
+
+    @pytest.mark.parametrize("gate_name", ["shared_file_impact", "fixture_consistency"])
+    def test_append_os_error_reports_the_given_gate_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], gate_name: str
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        unit = self._make_unit(unit_id)
+        backlog_root = tmp_path / "backlog-root"
+        wu_file = backlog_root / "backlog" / f"{unit_id}.md"
+        wu_file.parent.mkdir(parents=True)
+        wu_file.write_text(f"# {unit_id}: Test\n\n## Status: in-progress\n\n## Comments\n", encoding="utf-8")
+        monkeypatch.setattr(cli, "BACKLOG_ROOT", backlog_root)
+
+        with patch(
+            "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+            side_effect=OSError(28, "No space left on device"),
+        ):
+            result = cli._write_gate_pass_record(gate_name, unit, unit_id, self._scope())
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"ERROR: Cannot write [GATE_PASS {gate_name}] record for {unit_id}: {wu_file}" in captured.err
+        assert "Traceback" not in captured.err
+
+
+class TestCmdCheckSharedFileImpactWritesGatePass:
+    """check-shared-file-impact persists the spec-4.2 machine record (E5-F3-S1-T1,
+    AC-3): a passing enabled run -- either of its two shapes, a no-match no-op or a
+    matched run with zero attributable new failures -- writes exactly one
+    `[GATE_PASS shared_file_impact]` line whose scope hash matches the status line's
+    (AC-FUNC-shared-file-1); a work-unit file that cannot be located at write time is
+    a loud `ERROR: ...` and exit 1 with no stdout, never a silent skip
+    (AC-FUNC-shared-file-2)."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    def test_no_match_pass_writes_exactly_one_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS shared_file_impact]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        from devbench.gate_records import latest_gate_pass_record
+
+        record = latest_gate_pass_record(content, "shared_file_impact")
+        assert record is not None
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert record.scope_hash == status_line["scope_hash"]
+        assert status_line["scope_hash"], "scope_hash must be a non-empty digest"
+
+    def test_no_match_pass_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            # Neither candidate _resolve_work_unit_file tries resolves to the real,
+            # `_seed_scope_backlog`-written file: this makes the write step itself
+            # (never the scope resolution, which reads through the independently
+            # patched `work_unit_scope.BACKLOG_ROOT`/`BACKLOG_INDEX` below) fail.
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+
+    def test_no_match_pass_write_failure_on_append_os_error_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The work-unit file resolves, but the audit-marker append itself raises
+        `OSError` (e.g. a permission error or a full disk) -- this must surface as
+        the standard `ERROR: ...` shape and exit 1, never a raw traceback, mirroring
+        `_write_ancestry_gate_pass_record`'s own `OSError` handling."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+                side_effect=OSError(28, "No space left on device"),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+        assert "Traceback" not in captured.err, "an OSError during the append must never surface as a raw traceback"
+
+    def test_matched_pass_writes_gate_pass_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        cfg_path = _write_shared_file_impact_gate_config(workspace)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=("tests/test_suite.py",), default_branch="main"),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        gate_pass_lines = [line for line in content.splitlines() if "[GATE_PASS shared_file_impact]" in line]
+        assert len(gate_pass_lines) == 1, gate_pass_lines
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert status_line["status"] == "pass"
+        assert status_line["findings"] == 0, "a matched but non-blocking run must report zero findings"
+
+    def test_matched_pass_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = self._make_unit()
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace-does-not-exist")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch(
+                "devbench.cli.RUNTIME_CONFIG",
+                _shared_file_impact_runtime_cfg(patterns=("tests/test_suite.py",), default_branch="main"),
+            ),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert "ERROR: Cannot write [GATE_PASS shared_file_impact] record for E0-F1-S1-T1" in captured.err
+
+    def test_empty_manifest_pass_never_attempts_a_write(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verification-only unit (empty Changes Manifest, `scope.files == []`) reaching
+        a passing status must never attempt a `[GATE_PASS shared_file_impact]` write --
+        there is no scope to hash (mirrors `compute_scope_hash`'s own refusal on an empty
+        change set). Isolates the `scope.files` operand of `_emit_shared_file_impact_status`'s
+        `status == GATE_STATUS_PASS and scope.files` guard from the `status` operand
+        the blocking-run tests already exercise."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, manifest_body="| File | Change |\n|------|--------|\n| (none) | none |\n"
+        )
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+        wu_file_mtime_before = wu_file.stat().st_mtime_ns
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            # Deliberately NOT patched: devbench.cli.BACKLOG_ROOT. If the empty-scope
+            # guard were ever bypassed, the write attempt would try to resolve the
+            # work-unit file through the unpatched default and fail loudly (exit 1) --
+            # this test would then fail on `result == 0` below, proving the guard is
+            # what keeps this test passing, not an accidentally-successful write.
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        status_line = json.loads(capsys.readouterr().out.splitlines()[0])
+        assert status_line["scope_hash"] == ""
+        assert wu_file.stat().st_mtime_ns == wu_file_mtime_before, "an empty-scope pass must never touch the wu file"
+        assert "[GATE_PASS shared_file_impact]" not in wu_file.read_text(encoding="utf-8")
+
+
+class TestPrepareSharedFileImpactRun:
+    """`_prepare_shared_file_impact_run` returns a frozen dataclass, not an
+    8-element positional tuple (E5-F3-S1-T1 round-1 code_review idiomatic-code
+    finding): a positional tuple this wide invites a silent reordering bug that
+    only `mypy`'s partial protection (adjacent `bool`/`int`/`str` slots) would
+    catch, where a named-attribute dataclass cannot be misordered at all."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    def test_returns_named_dataclass_not_positional_tuple(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        unit = _shared_file_impact_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/unrelated.py",))
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=("src/app/Shell.tsx",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            prepared = cli._prepare_shared_file_impact_run("E0-F1-S1-T1", "test-invocation")
+
+        assert not isinstance(prepared, int)
+        assert prepared.__class__.__name__ == "_SharedFileImpactRun"
+        assert prepared.unit is unit
+        assert prepared.canonical_repo == self.REPO
+        assert prepared.repo_path == tmp_path
+        assert prepared.patterns == ("src/app/Shell.tsx",)
+        assert prepared.auto_derive_registry is False
+        assert prepared.fan_in_threshold >= 1
+        assert prepared.scope.files == ["src/unrelated.py"]
+        assert prepared.derived_registry == set()
+        mutable_field_name = "canonical_repo"
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(prepared, mutable_field_name, "mutated")
+
+
+class TestCheckSharedFileImpactScope:
+    """AC-1/AC-2 (spec 4.3, 4.6, AC-9): the gate's changed-file list and attribution
+    boundary come from `work_unit_scope.resolve_changed_files`'s `ScopeResult`, never a
+    raw working-tree scan (finding 318-D7)."""
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = ()) -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    @pytest.mark.parametrize(
+        ("node_id", "scope_files", "expected"),
+        [
+            ("tests/test_suite.py::test_new_fail", frozenset({"tests/test_suite.py"}), True),
+            ("tests/test_suite.py::test_new_fail", frozenset({"src/other.py"}), False),
+            ("tests/test_suite.py::test_new_fail", frozenset(), False),
+            # `go test` / jest node ids carry no file segment at all (no "::"): always
+            # attributable regardless of scope, since there is no file to compare.
+            ("TestFoo", frozenset(), True),
+            ("renders without crashing (15 ms)", frozenset({"tests/test_suite.py"}), True),
+        ],
+        ids=["in_scope", "out_of_scope", "empty_scope", "go_test_bare_name", "jest_bare_name"],
+    )
+    def test_shared_file_gate_attributable(self, node_id: str, scope_files: frozenset[str], expected: bool) -> None:
+        assert cli._shared_file_gate_attributable(node_id, scope_files) is expected
+
+    def test_uses_work_unit_scope_not_working_tree(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-1: the gate's changed-file list comes ONLY from
+        `work_unit_scope.resolve_changed_files`, proven two ways at once: (a) a recording
+        double wrapping the real implementation shows it is called exactly once with this
+        unit's own `(unit_id, repo_path, mode)`; (b) an untracked file dirty in the
+        working tree, matching the configured pattern but absent from the unit's own
+        Changes Manifest, never appears in the gate's `changed_files` -- the exact
+        318-D7 defect this task fixes (a file another, unrelated task left dirty could
+        previously both trigger the gate and be blamed for a failure it never caused)."""
+        unit = self._make_unit()
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        (checkout / "src").mkdir()
+        (checkout / "src" / "other_leftover.py").write_text("# left dirty by a different, unrelated task\n")
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+
+        real_resolve = cli.resolve_changed_files
+        calls: list[tuple[str, Path, str]] = []
+
+        def recording_resolve(unit_id: str, repo_path: Path, mode: str) -> Any:
+            calls.append((unit_id, repo_path, mode))
+            return real_resolve(unit_id, repo_path, mode)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/other_leftover.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.resolve_changed_files", side_effect=recording_resolve),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["shared_file_impact"] is False
+        assert payload["changed_files"] == ["tests/test_suite.py"]
+        assert "src/other_leftover.py" not in payload["changed_files"]
+        assert len(calls) == 1, f"resolve_changed_files must be the sole scope source, called once, got: {calls}"
+        assert calls[0] == ("E0-F1-S1-T1", checkout, cli.MODE_PER_TASK_BRANCH)
+
+    def test_new_failure_outside_scope_is_reported_but_not_attributed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-2 (spec 4.3 attribution rule): a NEW full-suite failure whose file is
+        outside the unit's own `ScopeResult.files` is still visible in the repo-wide
+        RESULT (`full_suite_exit_code`, `unattributed_new_failures`) but is never named
+        in `new_failures` and never blocks -- the gate exits 0 (G6 worked example: "a
+        file untouched by the unit never appears under 'introduced by this unit'")."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+        # The unit's own Changes Manifest is a DIFFERENT file from the one the new
+        # failure actually lives in: it still matches the configured
+        # shared_file_impact pattern (so the gate triggers), but "tests/test_suite.py"
+        # (where `test_new_fail` lives) is outside this unit's own scope.
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("src/shared_module.py",))
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("src/shared_module.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["verdict"] == "pass"
+        assert payload["matched_files"] == ["src/shared_module.py"]
+        assert payload["full_suite_exit_code"] != 0, "the repo-wide RESULT must still show the real suite exit"
+        assert payload["unattributed_new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload.get("new_failures") is None, "an out-of-scope new failure must never be named in new_failures"
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["failing"] == [], "the pre-change baseline itself is unaffected by this attribution rule"
+
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            "an out-of-scope new failure must never turn the verdict record itself into 'block'"
+        )
+
+
+class TestSharedFileImpactVerdictRecord:
+    """Direct unit coverage for the verdict-record primitives themselves (spec 4.6, finding
+    318-D13 remediation, round 5 redesign) -- `_write_shared_file_impact_verdict` and
+    `_shared_file_impact_verdict_path` -- independent of the full `cmd_check_shared_file_impact`
+    call graph exercised elsewhere in this file."""
+
+    def test_write_rejects_an_undeclared_status(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="not a declared shared-file-impact verdict status"):
+            cli._write_shared_file_impact_verdict(
+                "maybe", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="test-invocation"
+            )
+
+    def test_write_creates_the_devbench_directory_when_absent(self, tmp_path: Path) -> None:
+        assert not (tmp_path / ".devbench").exists()
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="test-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.exists()
+        lines = record.read_text().splitlines()
+        assert lines[0] == "pending"
+        assert lines[1] == "E0-F1-S1-T1"
+        # Third line is an ISO-8601 UTC timestamp -- round-trips through fromisoformat.
+        assert datetime.fromisoformat(lines[2]).tzinfo is not None
+
+    def test_write_overwrites_a_prior_record_rather_than_appending(self, tmp_path: Path) -> None:
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "block", "the second write must replace, not append to, the first"
+
+    def test_own_pending_to_terminal_transition_still_works(self, tmp_path: Path) -> None:
+        """The non-clobbering guard (round-5 finding A1) must not interfere with a SINGLE
+        invocation's ordinary `"pending"` -> `"pass"` transition: that overwrite only ever
+        clobbers a status THIS SAME call itself just wrote, never a foreign `"block"`."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="own-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pass"
+
+    @pytest.mark.parametrize("later_status", ["pending", "pass", "block"], ids=["pending", "pass", "block"])
+    def test_pass_and_pending_writes_never_clobber_an_unconsumed_block(self, tmp_path: Path, later_status: str) -> None:
+        """AC-5 (spec 3.5, 4.6): round-5 finding A1, a regression against round 4. An
+        unconsumed `"block"` verdict from one invocation must survive EVERY write a
+        later, different invocation can make (its own `"pending"` start-of-call write,
+        a `"pass"` clean-exit write, or even a redundant `"block"` write) -- only the
+        hook consuming (reading then deleting) the record may clear it."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "block"
+
+        cli._write_shared_file_impact_verdict(
+            later_status, workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "block", (
+            f"a later invocation's own {later_status!r} write must never clobber an unconsumed "
+            "'block' from a different, earlier invocation"
+        )
+        assert "E9-F1-S1-T1" in record.read_text(), "the surviving block record must still name the unit that earned it"
+
+    def test_consuming_a_block_record_unblocks_the_next_write(self, tmp_path: Path) -> None:
+        """Once the record is actually consumed (deleted, as `assert-shared-file-impact.sh`
+        does on every read), the non-clobbering guard no longer applies -- it protects an
+        UNCONSUMED block, not the status forever."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.unlink()
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "pass"
+
+    def test_empty_record_file_is_never_treated_as_a_sticky_block(self, tmp_path: Path) -> None:
+        """`_shared_file_impact_verdict_write_is_blocked` must not treat a zero-byte
+        record (no content to read a status from) as an unconsumed block -- there is
+        nothing to protect, so a write must proceed normally."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_text("", encoding="utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F3-S1-T3", invocation_id="test-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass"
+
+    def test_pending_record_with_missing_or_empty_fourth_line_is_freely_overwritten(self, tmp_path: Path) -> None:
+        """Test-review round-5/6 warn W1: a `"pending"` record with fewer than 4 lines
+        (no correlator recorded at all -- a record format that has never actually
+        shipped, but is reachable if a future/older writer omits the field) is a
+        DEGRADED record the foreign-pending guard cannot compare an invocation id
+        against. The shipped choice (see `_shared_file_impact_verdict_write_is_blocked`'s
+        own docstring, "fewer than 4 lines... never treated as blocking") is fail-OPEN
+        for this specific degraded shape: since there is nothing comparable to protect,
+        a foreign write is allowed through rather than guessing "same invocation" or
+        refusing unconditionally. This is deliberately narrower than the `"pending"`
+        guard's normal behaviour and is safe only because `atomic_write_text` means a
+        real 4-line record is never partially observable and no production call site
+        ever omits `invocation_id` (it is a required parameter): a 3-line record can
+        only originate from a hand-written test double or a pre-round-5 record format,
+        never from this module's own writer."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_text("pending\nE9-F4-S1-T1\n2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F5-S1-T1", invocation_id="foreign-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass", (
+            "a pending record with no recorded correlator (fewer than 4 lines) has nothing "
+            "comparable to protect and must be freely overwritten, by design"
+        )
+
+    def test_undecodable_record_is_freely_overwritten(self, tmp_path: Path) -> None:
+        """Test-review round-5/6 warn W1: a record this process cannot decode as UTF-8
+        text (`UnicodeDecodeError`) is caught by the SAME broad `except (OSError,
+        UnicodeDecodeError)` clause as a genuinely absent/unreadable record, and is
+        therefore also fail-OPEN by the shipped design -- there is no status this
+        function can extract from bytes it cannot decode, so (as with the missing-file
+        case) it treats the write as unblocked rather than guessing. This is a narrow,
+        deliberate choice: `atomic_write_text` (this function's own writer) always
+        writes valid UTF-8, so an undecodable record can only originate outside this
+        module's own write path (disk corruption, a different process writing raw
+        bytes), a case this function has no principled status to fail closed ON."""
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        record.parent.mkdir(parents=True)
+        record.write_bytes(b"\xff\xfe\x00\xff not valid utf-8")
+
+        cli._write_shared_file_impact_verdict(
+            "pass", workspace_root=tmp_path, unit_id="E9-F6-S1-T1", invocation_id="foreign-invocation"
+        )
+        assert record.read_text().splitlines()[0] == "pass", (
+            "a record this process cannot decode has no status to protect and must be freely overwritten, by design"
+        )
+
+    def test_invocation_id_is_unique_per_call_in_the_same_process(self) -> None:
+        """`_shared_file_impact_invocation_id` combines this process's PID with a
+        monotonically increasing in-process counter (round-5 finding A1 family): two
+        calls in the SAME process must never collide, since the whole point of the
+        correlator is to tell two invocations apart even when they share a PID (this
+        test process itself)."""
+        first = cli._shared_file_impact_invocation_id()
+        second = cli._shared_file_impact_invocation_id()
+        assert first != second
+        assert str(os.getpid()) in first
+        assert str(os.getpid()) in second
+
+    def test_two_cmd_check_shared_file_impact_invocations_use_different_invocation_ids(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Each real `cmd_check_shared_file_impact` call generates its own fresh
+        invocation id (spec 3.5/4.6, round-5 finding A1 family) rather than reusing a
+        shared default -- two separate no-patterns-configured no-op runs must record
+        two different correlators on line 4."""
+        unit = _shared_file_impact_unit()
+        workspace = tmp_path / "workspace"
+        (tmp_path / "repo").mkdir()
+        (tmp_path / "repo" / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path / "repo", files=("src/unrelated/foo.py",))
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        with (
+            patch("devbench.cli.BacklogParser", return_value=_shared_file_impact_parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {_SHARED_FILE_IMPACT_REPO: tmp_path / "repo"}),
+            patch("devbench.cli.RUNTIME_CONFIG", _shared_file_impact_runtime_cfg(patterns=())),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+            first_invocation_id = record.read_text().splitlines()[3]
+            cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+            second_invocation_id = record.read_text().splitlines()[3]
+        capsys.readouterr()
+        assert first_invocation_id != second_invocation_id, (
+            "two separate invocations must never share the same correlator"
+        )
+
+    @pytest.mark.parametrize("later_status", ["pending", "pass"], ids=["pending", "pass"])
+    def test_writes_never_clobber_an_unconsumed_foreign_pending(self, tmp_path: Path, later_status: str) -> None:
+        """AC-5 (spec 3.5, 4.6): round-5 finding A1 family, residual gap. An unconsumed
+        `"pending"` verdict opened by one invocation (e.g. it crashed before reaching a
+        clean pass/block verdict, exactly the "started but the verdict cannot be
+        determined" case spec 3.5 requires to fail closed) must survive a DIFFERENT,
+        later invocation's own NON-ESCALATING writes (its own `"pending"` start-of-call
+        write, or a `"pass"` clean-exit write) -- only the hook consuming (reading then
+        deleting) the record, that SAME invocation's own follow-up write, or a foreign
+        invocation's own genuine `"block"` (see
+        `test_a_foreign_block_write_escalates_an_unconsumed_foreign_pending` immediately
+        below -- round-6 code_review finding: a foreign `"block"` must NEVER be refused
+        here, unlike `"pending"`/`"pass"`) may clear or replace it."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pending"
+
+        cli._write_shared_file_impact_verdict(
+            later_status, workspace_root=tmp_path, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "pending", (
+            f"a later, DIFFERENT invocation's own {later_status!r} write must never clobber an "
+            "unconsumed 'pending' opened by a different invocation"
+        )
+        assert "E9-F1-S1-T1" in record.read_text(), (
+            "the surviving pending record must still name the unit that opened it"
+        )
+        assert "invocation-a" in record.read_text(), "the surviving pending record must still carry its own correlator"
+
+    def test_a_foreign_block_write_escalates_an_unconsumed_foreign_pending(self, tmp_path: Path) -> None:
+        """Round-6 code_review REQUIRED FIX: reproduces, end to end and with NO
+        concurrency, the exact chained shape the module comment above the verdict-record
+        constants names as the threat model (`check-shared-file-impact <unit-a> ;
+        check-shared-file-impact <unit-b>`): unit A's invocation writes its opening
+        `"pending"` and is killed before reaching a clean verdict; unit B's invocation
+        then genuinely FAILS its own gate and writes `"block"`. Before this fix,
+        `_shared_file_impact_verdict_write_is_blocked` refused EVERY foreign write over
+        an unconsumed `"pending"`, including this one, so unit B's real regression was
+        silently discarded and the record stayed pointed at the crashed unit A -- an
+        agent following the hook's own prescribed remediation (re-run unit A, which then
+        passes) would end at `"pass"` and the next Bash call would be ALLOWED, even
+        though unit B's genuine failure was never fixed. A foreign `"block"` must always
+        be allowed to escalate an unconsumed `"pending"`, since `"block"` is itself the
+        strongest, sticky status and nothing is lost by letting the escalation land.
+        Drives the REAL `cli._write_shared_file_impact_verdict` function for both writes
+        and then the REAL `assert-shared-file-impact.sh` hook, asserting it reports the
+        BLOCKING unit (B), not the crashed one (A)."""
+        workspace = tmp_path / "workspace"
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=workspace, unit_id="E9-F1-S1-T1", invocation_id="invocation-a"
+        )
+        record = workspace / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == "pending", "unit A's opening write must land normally"
+
+        cli._write_shared_file_impact_verdict(
+            "block", workspace_root=workspace, unit_id="E9-F2-S1-T2", invocation_id="invocation-b"
+        )
+        assert record.read_text().splitlines()[0] == "block", (
+            "unit B's genuine 'block' verdict must escalate over unit A's unconsumed "
+            "'pending', never be silently discarded"
+        )
+        assert "E9-F2-S1-T2" in record.read_text(), (
+            "the escalated record must name unit B, the unit that actually earned the block"
+        )
+
+        hook_env = {
+            k: v for k, v in os.environ.items() if k not in ("DEVBENCH_WORKSPACE_ROOT", "DEVBENCH_SESSION_NAME")
+        }
+        hook_env["DEVBENCH_WORKSPACE_ROOT"] = str(workspace)
+        result = subprocess.run(
+            [str(_HOOK_SCRIPT_PATH)],
+            input="{}",
+            capture_output=True,
+            text=True,
+            env=hook_env,
+        )
+        assert result.returncode == 2, "the real hook must block on the escalated 'block' record"
+        assert "E9-F2-S1-T2" in result.stderr, (
+            "the real hook must name the BLOCKING unit (B), never the crashed unit (A) whose "
+            "'pending' was correctly superseded"
+        )
+        assert "E9-F1-S1-T1" not in result.stderr, (
+            "the crashed unit's own id must not be what the hook tells the agent to re-run -- "
+            "that remediation would silently drop unit B's real failure"
+        )
+
+    @pytest.mark.parametrize("terminal_status", ["pass", "block"], ids=["pass", "block"])
+    def test_own_invocation_id_can_transition_its_own_pending_to_a_terminal_status(
+        self, tmp_path: Path, terminal_status: str
+    ) -> None:
+        """The foreign-pending guard must not interfere with a SINGLE invocation's own
+        `"pending"` -> `"pass"`/`"block"` transition when both writes carry the SAME
+        explicit `invocation_id` -- exactly what a real `check-shared-file-impact` run
+        does (one id generated once, threaded through every write it makes)."""
+        cli._write_shared_file_impact_verdict(
+            "pending", workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="same-invocation"
+        )
+        cli._write_shared_file_impact_verdict(
+            terminal_status, workspace_root=tmp_path, unit_id="E0-F1-S1-T1", invocation_id="same-invocation"
+        )
+        record = tmp_path / ".devbench" / "shared-file-impact-verdict"
+        assert record.read_text().splitlines()[0] == terminal_status
+
+    def test_verdict_path_default_has_no_session_subdirectory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DEVBENCH_SESSION_NAME", raising=False)
+        assert cli._shared_file_impact_verdict_path(tmp_path) == tmp_path / ".devbench" / "shared-file-impact-verdict"
+
+    def test_verdict_path_honours_devbench_session_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC (spec 4.4.4): two concurrent named sessions targeting the same workspace must
+        never share one verdict record -- each session's own
+        `assert-shared-file-impact.sh` invocation only ever observes verdicts written by
+        `check-shared-file-impact` calls made under that SAME session name."""
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "alpha")
+        assert (
+            cli._shared_file_impact_verdict_path(tmp_path)
+            == tmp_path / ".devbench" / "sessions" / "alpha" / "shared-file-impact-verdict"
+        )
+
+    def test_verdict_path_rejects_a_path_traversal_session_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("DEVBENCH_SESSION_NAME", "../escape")
+        with pytest.raises(ValueError, match="invalid path segment"):
+            cli._shared_file_impact_verdict_path(tmp_path)
+
+
+class TestCheckSharedFileImpactBaseline:
+    """Test the pre-change shared-file baseline (spec 4.6, 5.4; issue #13 AC2; 318-D2/D3).
+
+    Covers the baseline location/shape, the introduced-vs-pre-existing
+    failure distinction, corrupt/mismatched baselines, the write-side
+    ``fcntl.flock`` and a failed ``git merge-base``.
+    """
+
+    REPO = _SHARED_FILE_IMPACT_REPO
+
+    @pytest.fixture(autouse=True)
+    def _enable_shared_file_impact_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve `gates.shared_file_impact.enabled` to `true` by default for every
+        test in this class (round-1 code_review C1 finding: `cmd_check_shared_file_impact`
+        now reads `enabled`/`auto_derive_registry`/`fan_in_threshold` through the SAME
+        `_load_gate_config_or_report` helper `check-ancestry`/`check-reachability` use,
+        which loads a REAL config file rather than a mocked `RUNTIME_CONFIG` snapshot).
+        Points `DEVBENCH_CONFIG_PATH` at this scratch file -- `tests/conftest.py` sets
+        that env var unconditionally to a fixture config with no `gates:` block at all,
+        so the built-in disabled-by-default (D-17) would otherwise always win. A test
+        that needs `auto_derive_registry`/`fan_in_threshold`/`enabled=False` values other
+        than these defaults overwrites this same file before invoking the command."""
+        cfg_path = _write_shared_file_impact_gate_config(tmp_path / "workspace")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+
+    def _make_unit(self) -> WorkUnit:
+        return _shared_file_impact_unit()
+
+    def _runtime_cfg(self, patterns: tuple[str, ...] = (), default_branch: str | None = "main") -> Any:
+        return _shared_file_impact_runtime_cfg(patterns=patterns, default_branch=default_branch)
+
+    def _parser(self, unit: WorkUnit) -> MagicMock:
+        return _shared_file_impact_parser(unit)
+
+    # -- baseline path / record shape ------------------------------------
+
+    def test_baseline_path_is_keyed_by_repo_and_branch_point(self, tmp_path: Path) -> None:
+        with patch("devbench.cli.WORKSPACE_ROOT", tmp_path):
+            path = cli._shared_file_baseline_path(self.REPO, "deadbeef")
+        assert path == tmp_path / ".devbench" / "test-baselines" / "caylent-solutions__git-repo" / "deadbeef.json"
+
+    def test_baseline_record_has_exactly_the_spec_5_4_fields(self) -> None:
+        record = cli._build_shared_file_baseline_record(
+            branch_point="deadbeef", runner="pytest", failing={"tests/test_a.py::test_x"}
+        )
+        assert set(record) == {"schema_version", "captured_at", "branch_point", "runner", "failing"}
+        assert record["branch_point"] == "deadbeef"
+        assert record["runner"] == "pytest"
+        assert record["failing"] == ["tests/test_a.py::test_x"]
+        assert isinstance(record["schema_version"], int)
+        # captured_at must parse back as a real timestamp, not a placeholder string.
+        datetime.fromisoformat(record["captured_at"])
+
+    # -- write-side flock ----------------------------------------------------
+
+    def test_write_baseline_holds_the_lock_until_the_write_is_visible_on_disk(self, tmp_path: Path) -> None:
+        """AC-4 / 318 lost-update finding: the payload must not be visible on disk when the
+        lock is acquired, and must already be visible when the lock is released -- i.e. the
+        lock is held for the full duration of the write, not just called before/after it in
+        some order. Records the target file's on-disk visibility alongside each real
+        ``fcntl.flock`` call (not just the op codes) so a release-before-write mutation is
+        caught even though it would still call LOCK_EX then LOCK_UN in the right order."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
+        calls: list[tuple[int, bool]] = []
+        real_flock = fcntl.flock
+
+        def recording_flock(fd: int, op: int) -> None:
+            real_flock(fd, op)
+            calls.append((op, path.exists()))
+
+        with patch("devbench.session.fcntl.flock", side_effect=recording_flock):
+            cli._write_shared_file_baseline(path, record)
+
+        assert len(calls) == 2, f"expected exactly one acquire and one release call, got {calls}"
+        (acquire_op, visible_at_acquire), (release_op, visible_at_release) = calls
+        assert acquire_op & fcntl.LOCK_EX and acquire_op & fcntl.LOCK_NB
+        assert visible_at_acquire is False, "payload must not exist on disk when the lock is acquired"
+        assert release_op == fcntl.LOCK_UN
+        assert visible_at_release is True, "payload must already exist on disk before the lock is released"
+        written = json.loads(path.read_text())
+        assert written["branch_point"] == "deadbeef"
+
+    def test_write_baseline_lock_path_is_a_sibling_of_the_baseline_never_the_baseline_itself(
+        self, tmp_path: Path
+    ) -> None:
+        """The lock is taken on ``<path>.lock``, a separate inode from *path* -- never on
+        *path* itself -- so it composes with atomic_write_text's temp-then-rename swap."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
+        cli._write_shared_file_baseline(path, record)
+        assert (tmp_path / "baseline.json.lock").exists()
+
+    # -- git merge-base failure -----------------------------------------------
+
+    def test_merge_base_failure_raises_with_git_stderr(self, tmp_path: Path) -> None:
+        not_a_repo = tmp_path / "not-a-repo"
+        not_a_repo.mkdir()
+        with patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg()):
+            with pytest.raises(RuntimeError, match=r"ERROR: git merge-base failed for unit UNIT-X") as excinfo:
+                cli._resolve_branch_point_sha(not_a_repo, self.REPO, "UNIT-X")
+        assert "not a git repository" in str(excinfo.value)
+
+    def test_merge_base_failure_at_cmd_level_exits_1_with_git_stderr_on_stderr_stream(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-6 exercised through `cmd_check_shared_file_impact` itself, not just the
+        `_resolve_branch_point_sha` helper: the process exit code and stderr stream must
+        both carry the real git failure, not merely the unit-level exception object."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        not_a_repo = tmp_path / "not-a-repo"
+        (not_a_repo / "tests").mkdir(parents=True)
+        (not_a_repo / "tests" / "test_suite.py").write_text("def test_ok():\n    assert True\n")
+        # An empty `.git` directory (not a real, `git init`-ed repository) satisfies
+        # `work_unit_scope._require_git_work_tree`'s cheap existence check (so scope
+        # resolution reaches `_evaluate_shared_file_gate`'s own `git merge-base` call
+        # below) while still genuinely failing that later `git merge-base` call with
+        # "not a git repository" -- `git hash-object` (scope resolution's own git call,
+        # over the on-disk `tests/test_suite.py` above) does not require repo validity
+        # and succeeds regardless.
+        (not_a_repo / ".git").mkdir()
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: not_a_repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: git merge-base failed for unit E0-F1-S1-T1" in captured.err
+        assert "not a git repository" in captured.err
+
+    def test_evaluate_gate_timeout_error_exits_1_with_a_single_error_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review advisory: `flock_path` (via `_load_shared_file_baseline` /
+        `_write_shared_file_baseline`) raises `TimeoutError`, an `OSError` subclass, when a
+        stuck lock holder is not released within `SESSION_DEFAULT_FLOCK_TIMEOUT_SECONDS`.
+        Before this fix `cmd_check_shared_file_impact` caught only `RuntimeError`, so a
+        lock timeout escaped as an uncaught traceback instead of the spec Section 7
+        one-line `ERROR: ...` sentence on stderr with a non-zero exit."""
+        unit = self._make_unit()
+        (tmp_path / ".git").mkdir()
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace"),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch(
+                "devbench.cli._evaluate_shared_file_gate",
+                side_effect=TimeoutError("Could not acquire lock at /tmp/x.lock within 30s."),
+            ),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.err.count("\n") == 1, f"expected a single stderr line, not a traceback: {captured.err!r}"
+        assert captured.err.startswith("ERROR:")
+        assert "E0-F1-S1-T1" in captured.err
+        assert "Could not acquire lock at /tmp/x.lock within 30s." in captured.err
+
+    # -- fail-fast ordering: cheap prerequisites before the full suite -------
+
+    def test_corrupt_baseline_error_precedes_full_suite_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review BLOCKING D: branch-point resolution and baseline validation must
+        happen before the (expensive) current-tree suite run, so a terminal baseline
+        error never costs a full-suite execution first. Patches
+        `_select_test_command_with_recipe` to raise if it is ever called -- if the
+        implementation regresses to running the suite first, this test fails with that
+        AssertionError instead of the expected corrupt-baseline RuntimeError."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        baseline_file.write_bytes(b"{not valid json")
+
+        def _select_test_command_must_not_run(_repo_path: Path) -> tuple[list[str], str]:
+            raise AssertionError("full suite command must not be selected before baseline validation")
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli._select_test_command_with_recipe", side_effect=_select_test_command_must_not_run),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: shared-file baseline .* is corrupt", captured.err)
+
+    # -- corrupt / mismatched baseline: loud failure, never rewritten -------
+
+    def test_corrupt_baseline_is_loud_and_leaves_file_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """finding 318-D2: a baseline that fails to parse is a loud ERROR, never a silent re-bootstrap."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        corrupt_bytes = b"{not valid json"
+        baseline_file.write_bytes(corrupt_bytes)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: shared-file baseline .* is corrupt", captured.err)
+        assert baseline_file.read_bytes() == corrupt_bytes
+
+    def test_branch_point_mismatch_is_loud_and_leaves_file_untouched(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        stale_record = cli._build_shared_file_baseline_record(branch_point="0" * 40, runner="pytest", failing=set())
+        stale_bytes = (json.dumps(stale_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(stale_bytes)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: stored baseline branch_point" in captured.err
+        assert base_sha in captured.err
+        assert baseline_file.read_bytes() == stale_bytes
+
+    # -- pre-change semantics: real two-branch git fixtures ------------------
+
+    def test_pre_existing_failure_at_branch_point_does_not_block(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A failure already present at the merge-base branch point exits 0 (issue #13 AC2, AC-18)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n\n\ndef test_pre_existing_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content=base_content,
+            feature_test_content=None,
+            feature_extra_path="tests/test_feature.py",
+            feature_extra_content="def test_feature_addition():\n    assert True\n",
+        )
+
+        backlog_root, backlog_index = _seed_scope_backlog(
+            tmp_path, files=("tests/test_suite.py", "tests/test_feature.py")
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 0
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert payload["verdict"] == "pass"
+        assert payload["branch_point"] == base_sha
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert set(baseline) == {"schema_version", "captured_at", "branch_point", "runner", "failing"}
+        assert baseline["branch_point"] == base_sha
+        assert baseline["failing"] == ["tests/test_suite.py::test_pre_existing_fail"]
+
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        assert verdict_record.splitlines()[0] == "pass", (
+            f"a passing gate run must overwrite the record with 'pass', got: {verdict_record!r}"
+        )
+
+    def test_introduced_failure_blocks_and_names_the_node_id(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A failure the unit's own diff introduces exits 1 and names the failing node id."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        status_line, payload = _shared_file_impact_status_and_payload(captured.out)
+        assert status_line["status"] == "fail"
+        assert status_line["findings"] == 1, "findings must count the one attributed new failure"
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload["branch_point"] == base_sha
+        assert "tests/test_suite.py::test_new_fail" in captured.err
+        assert "E0-F1-S1-T1" in captured.err
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        assert payload["baseline_path"] == str(baseline_path)
+        assert payload["matched_files"] == ["tests/test_suite.py"]
+        assert payload["full_suite_command"] == ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+        assert payload["full_suite_exit_code"] != 0
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["failing"] == []
+
+        verdict_record = (workspace / ".devbench" / "shared-file-impact-verdict").read_text()
+        record_lines = verdict_record.splitlines()
+        assert record_lines[0] == "block", (
+            f"a blocking gate run must overwrite the record with 'block', got: {verdict_record!r}"
+        )
+        assert record_lines[1] == "E0-F1-S1-T1", (
+            "the record must name the unit id for the hook's own diagnostic message"
+        )
+
+    # -- BLOCKING (code_review/changes_manifest/doc_review, round 1): the gate must run to
+    # -- completion, end to end, on a Makefile-driven repo -----------------------------
+
+    def test_end_to_end_gate_resolves_a_make_wrapped_pytest_recipe_to_the_pytest_parser(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`_select_test_command`'s FIRST branch (`["make", "test"]`, chosen whenever the
+        repo's Makefile has a `test` target -- the dominant shape for any Makefile-driven
+        repo, including this one) must resolve its recipe to the `pytest` registry entry and
+        run the gate to completion, not raise `UnknownTestRunnerError` before any suite runs.
+        The other Makefile-driven end-to-end tests in this class cover only the make-wrapped
+        ERROR paths, which is precisely why this make-wrapped SUCCESS path stayed uncovered."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content=base_content,
+            feature_test_content=feature_content,
+            makefile_content="test:\n\tpytest --no-header -q -p no:cacheprovider tests/\n",
+        )
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        captured = capsys.readouterr()
+        assert result == 1, f"gate must run to completion and block, not error: {captured.err}"
+        _status_line, payload = _shared_file_impact_status_and_payload(captured.out)
+        assert payload["verdict"] == "block"
+        assert payload["new_failures"] == ["tests/test_suite.py::test_new_fail"]
+        assert payload["full_suite_command"] == ["make", "test"]
+
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        baseline = json.loads(baseline_path.read_text())
+        assert baseline["runner"] == "pytest"
+        assert baseline["failing"] == []
+
+    def test_end_to_end_gate_reports_the_ac1_error_when_a_makefile_wraps_an_unregistered_runner(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """BLOCKING-1 (round 2): mapping `make test` unconditionally to the pytest parser
+        was a guess, not a mapping -- it would silently misparse the output of ANY
+        non-pytest runner a Makefile `test` target happens to wrap. This fixture's Makefile
+        wraps `bazel test //...`, a runner with no registered parser, so the gate must
+        reach the exact same AC-1 unrecognised-runner error a bare `bazel test //...`
+        command reaches (see `TestSharedFileRunnerParsers`) -- not the pytest parser, and
+        not a guessed/degraded result -- and the wrapped runner must never be invoked."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content="def test_ok():\n    assert True\n",
+            feature_test_content=None,
+            makefile_content="test:\n\tbazel test //...\n",
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'make test'", captured.err)
+        # BLOCKING (test_review, round 4): `bazel` is only ever spawned as a CHILD process
+        # of `make test` -- it never appears as its own entry in `calls`, which only records
+        # this module's own `run_command` invocations, under ANY implementation, so an
+        # assertion phrased over `calls` containing a `["bazel", "test"]` entry can never
+        # fail regardless of whether the wrapped suite actually runs. The real invariant is
+        # that `["make", "test"]` itself -- the command that would spawn `bazel` as its
+        # child -- is never invoked; only the dry run `["make", "-n", "test"]` may
+        # legitimately appear in `calls`.
+        assert ["make", "test"] not in calls, (
+            f"the make-wrapped, unregistered suite must never be invoked, calls were: {calls}"
+        )
+
+    def test_end_to_end_gate_reports_a_formed_error_not_a_traceback_when_the_make_recipe_is_not_shell_tokenizable(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """BLOCKING-1 (code_review, round 4): a Makefile recipe with an apostrophe that
+        `shlex.split` cannot tokenize (even with `comments=True`) must still reach the
+        gate's formed AC-5 single-sentence `ERROR: ...` stderr line -- never an uncaught
+        `ValueError` traceback, which `cmd_check_shared_file_impact`'s narrowed `except
+        (RuntimeError, UnknownTestRunnerError, TimeoutError)` clause does not catch -- and
+        the wrapped `make test` suite must never be invoked."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path,
+            base_test_content="def test_ok():\n    assert True\n",
+            feature_test_content=None,
+            makefile_content="test:\n\t@echo don't forget && pytest\n",
+        )
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert re.search(r"ERROR: cannot parse test output for runner 'make test'", captured.err)
+        assert captured.err.count("\n") == 1, f"expected a single stderr sentence, not: {captured.err!r}"
+        assert ["make", "test"] not in calls, (
+            f"the make-wrapped suite with an unparsable recipe must never be invoked, calls were: {calls}"
+        )
+
+    # -- BLOCKING (code_review/test_review, round 1): the current-tree run must be held to
+    # -- the same "never silently pass over an unattributed failure" rule the branch-point
+    # -- capture path has always had, restoring the coverage a prior round removed --------
+
+    def test_current_tree_run_blocks_when_suite_exits_nonzero_with_zero_attributed_failures(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A pytest collection/import error exits non-zero and prints `ERROR tests/x.py`,
+        never a `FAILED <node-id>` short-summary line the registered parser matches, so
+        `current_failing` parses to the empty set even though the suite did not actually
+        pass. Against an already-captured, clean baseline this must raise loudly (exit 1)
+        rather than report `verdict: "pass"` over a suite that could not be read -- exactly
+        the spec 3.5 degraded-but-passing outcome this task exists to eliminate, now pinned
+        for the current-tree path specifically (the guard the round-1 diff had only on the
+        branch-point capture path, `_capture_shared_file_baseline`'s `test_rc != 0 and not
+        failing` check, with no current-tree equivalent)."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        clean_record = cli._build_shared_file_baseline_record(branch_point=base_sha, runner="pytest", failing=set())
+        clean_bytes = (json.dumps(clean_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(clean_bytes)
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:1] == ["pytest"]:
+                return (2, "", "ImportError while importing test module 'tests/test_suite.py'\n")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR: shared-file gate for unit E0-F1-S1-T1 could not attribute per-test failures" in captured.err
+        assert "ImportError while importing test module" in captured.err
+        assert captured.out == "", "no JSON payload must be printed on this fail-fast path"
+        assert baseline_file.read_bytes() == clean_bytes, "the clean, already-captured baseline must be untouched"
+
+    # -- runner registry: mismatch detection (AC-4) --------------------------
+
+    def test_stored_runner_mismatch_blocks_before_running_the_current_tree_suite(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-4 (spec 5.4): a baseline captured under one runner registry key must never
+        be diffed against a current run resolved to a different key -- the two failure
+        sets are not comparable. Pre-populates a clean baseline stored under the `go test`
+        key while the fixture's current tree resolves to `pytest` (no Makefile present),
+        so the mismatch must be caught, exit 1, and the baseline file must be left
+        untouched (no diff, no rewrite).
+
+        BLOCKING (test_review, round 2): exit code and stderr sentence alone do not
+        distinguish "checked before the suite runs" from "checked after" -- a
+        run-then-compare ordering produces the identical exit 1 and error text, just
+        after spending a full suite run that `_evaluate_shared_file_gate`'s own
+        docstring says never happens on this path. Pinned here with a recording
+        wrapper around the real `run_command`: the resolved current-tree suite
+        command must never appear in the recorded calls."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        checkout, base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content="def test_ok():\n    assert True\n", feature_test_content=None
+        )
+        baseline_dir = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__")
+        baseline_dir.mkdir(parents=True)
+        baseline_file = baseline_dir / f"{base_sha}.json"
+        mismatched_record = cli._build_shared_file_baseline_record(
+            branch_point=base_sha, runner="go test", failing=set()
+        )
+        mismatched_bytes = (json.dumps(mismatched_record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        baseline_file.write_bytes(mismatched_bytes)
+
+        real_run_command = cli.run_command
+        calls: list[list[str]] = []
+
+        def recording_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.cli.run_command", side_effect=recording_run_command),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert (
+            "ERROR: baseline was captured with runner 'go test' but the repo is configured "
+            "for 'pytest'; failure sets are not comparable across runners" in captured.err
+        )
+        assert baseline_file.read_bytes() == mismatched_bytes
+        resolved_suite_cmd = ["pytest", "--no-header", "-q", "-p", "no:cacheprovider"]
+        assert resolved_suite_cmd not in calls, (
+            f"the current-tree suite must never run on the mismatch path, calls were: {calls}"
+        )
+
+    def test_freshly_captured_baseline_mismatch_blocks_before_writing_the_baseline(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The runner-mismatch guard (AC-4) must also apply to a FRESHLY captured baseline,
+        not only a previously stored one -- the branch-point worktree a fresh capture runs
+        against may carry a different Makefile than the current tree (e.g. a unit that adds
+        or removes a Makefile `test` target between the branch point and HEAD), so two
+        incomparable failure sets could otherwise be diffed under a single freshly written
+        baseline. This fixture's base commit carries a Makefile whose recipe wraps `go test`
+        (via `true go test`, which exits 0 without requiring a real `go` toolchain); the
+        feature branch drops the Makefile entirely, so the current tree resolves to the bare
+        `pytest` fallback -- the two runners must never be compared, and no baseline file may
+        be written."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        origin = _init_scratch_repo_for_cli(tmp_path, dir_name="origin")
+        _tdd_gate_write(origin, "Makefile", "test:\n\ttrue go test\n")
+        _tdd_gate_write(origin, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(origin, "base")
+        _run_scratch_git(["branch", "-M", "main"], origin)
+
+        checkout = tmp_path / "checkout"
+        _run_scratch_git(["clone", "-q", str(origin), str(checkout)], tmp_path)
+        _run_scratch_git(["config", "user.email", "gate-test@example.com"], checkout)
+        _run_scratch_git(["config", "user.name", "Gate Test"], checkout)
+        base_sha = _run_scratch_git(["rev-parse", "origin/main"], checkout).stdout.strip()
+
+        _run_scratch_git(["checkout", "-b", "feature"], checkout)
+        _run_scratch_git(["rm", "Makefile"], checkout)
+        _tdd_gate_commit_all(checkout, "drop Makefile on feature")
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert (
+            "ERROR: baseline was captured with runner 'go test' but the repo is configured "
+            "for 'pytest'; failure sets are not comparable across runners" in captured.err
+        )
+        baseline_path = workspace / ".devbench" / "test-baselines" / self.REPO.replace("/", "__") / f"{base_sha}.json"
+        assert not baseline_path.exists(), "no baseline may be written when the fresh capture's runner mismatches"
+
+    def test_payload_no_longer_carries_a_degraded_field(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-3: the guess-and-degrade concept (and its `degraded` payload field) is
+        deleted in full, not merely renamed -- an introduced-failure run's payload must
+        not carry that key any more."""
+        unit = self._make_unit()
+        workspace = tmp_path / "workspace"
+        base_content = "def test_ok():\n    assert True\n"
+        feature_content = "def test_ok():\n    assert True\n\n\ndef test_new_fail():\n    assert False\n"
+        checkout, _base_sha = _shared_file_impact_git_fixture(
+            tmp_path, base_test_content=base_content, feature_test_content=feature_content
+        )
+
+        backlog_root, backlog_index = _seed_scope_backlog(tmp_path, files=("tests/test_suite.py",))
+        with (
+            patch("devbench.cli.BacklogParser", return_value=self._parser(unit)),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self.REPO: checkout}),
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(patterns=("tests/test_suite.py",))),
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_shared_file_impact("E0-F1-S1-T1")
+
+        assert result == 1
+        _status_line, payload = _shared_file_impact_status_and_payload(capsys.readouterr().out)
+        assert "degraded" not in payload
+
+    # -- _resolve_branch_point_sha error paths -------------------------------
+
+    def test_resolve_branch_point_sha_raises_when_default_branch_unresolvable(self, tmp_path: Path) -> None:
+        not_a_repo = tmp_path / "not-a-repo"
+        not_a_repo.mkdir()
+        with patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg(default_branch=None)):
+            with pytest.raises(RuntimeError, match="could not resolve a default branch"):
+                cli._resolve_branch_point_sha(not_a_repo, self.REPO, "UNIT-Y")
+
+    def test_resolve_branch_point_sha_raises_on_empty_merge_base_output(self, tmp_path: Path) -> None:
+        """Defensive branch (real `git merge-base` never exits 0 with empty stdout): a strict
+        allowlisted fake proves the guard fires rather than returning an empty/assumed SHA."""
+
+        def fake_run_command(cmd: list[str], **_kwargs: object) -> tuple[int, str, str]:
+            if cmd[:2] == ["git", "merge-base"]:
+                return (0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with (
+            patch("devbench.cli.RUNTIME_CONFIG", self._runtime_cfg()),
+            patch("devbench.cli.run_command", side_effect=fake_run_command),
+        ):
+            with pytest.raises(RuntimeError, match="empty merge-base output"):
+                cli._resolve_branch_point_sha(tmp_path, self.REPO, "UNIT-Z")
+
+    # -- _load_shared_file_baseline: non-object JSON, and the success path --
+
+    def test_load_baseline_raises_when_json_is_not_an_object(self, tmp_path: Path) -> None:
+        path = tmp_path / "baseline.json"
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(RuntimeError, match="is corrupt and will not be rewritten"):
+            cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+        assert path.read_text() == "[1, 2, 3]"
+
+    def test_load_baseline_returns_matching_record(self, tmp_path: Path) -> None:
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(
+            branch_point="deadbeef", runner="pytest", failing={"tests/test_a.py::test_x"}
+        )
+        path.write_text(json.dumps(record))
+        loaded = cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+        assert loaded == record
+
+    def test_load_baseline_takes_a_shared_lock_on_the_sibling_lock_file(self, tmp_path: Path) -> None:
+        """test_review WARN (round 2): the read-side shared lock was unasserted --
+        deleting the `with flock_path(..., shared=True)` wrapper around the read in
+        `_load_shared_file_baseline` left all 24 SharedFileImpact tests green. Records
+        the op and the locked inode at each real `fcntl.flock` call, and asserts the
+        locked inode is the sibling `<path>.lock` file's -- never *path* itself --
+        mirroring `test_write_baseline_holds_the_lock_until_the_write_is_visible_on_disk`
+        and `test_write_baseline_lock_path_is_a_sibling_of_the_baseline_never_the_baseline_itself`."""
+        path = tmp_path / "baseline.json"
+        record = cli._build_shared_file_baseline_record(branch_point="deadbeef", runner="pytest", failing=set())
+        path.write_text(json.dumps(record))
+        lock_path = tmp_path / "baseline.json.lock"
+        calls: list[tuple[int, int]] = []
+        real_flock = fcntl.flock
+
+        def recording_flock(fd: int, op: int) -> None:
+            real_flock(fd, op)
+            calls.append((op, os.fstat(fd).st_ino))
+
+        with patch("devbench.session.fcntl.flock", side_effect=recording_flock):
+            loaded = cli._load_shared_file_baseline(path, branch_point="deadbeef", unit_id="UNIT-Q")
+
+        assert loaded == record
+        assert len(calls) == 2, f"expected exactly one acquire and one release call, got {calls}"
+        (acquire_op, acquire_ino), (release_op, release_ino) = calls
+        assert acquire_op & fcntl.LOCK_SH and acquire_op & fcntl.LOCK_NB
+        assert not acquire_op & fcntl.LOCK_EX, "read path must never take an exclusive lock"
+        assert release_op == fcntl.LOCK_UN
+        assert acquire_ino == lock_path.stat().st_ino == release_ino, "must lock the sibling .lock inode"
+        assert acquire_ino != path.stat().st_ino, "must never lock the baseline file itself"
+
+    # -- _capture_shared_file_baseline error paths (real git worktree) ------
+
+    def test_capture_baseline_raises_when_worktree_checkout_fails(self, tmp_path: Path) -> None:
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "README.md", "x\n")
+        _tdd_gate_commit_all(repo, "init")
+        with pytest.raises(RuntimeError, match="could not check out branch point"):
+            cli._capture_shared_file_baseline(repo, "0" * 40, "UNIT-W")
+
+    def test_capture_baseline_raises_and_removes_worktree_when_capture_run_is_unattributed(
+        self, tmp_path: Path
+    ) -> None:
+        """code_review BLOCKING C: a branch-point capture that exits non-zero yet whose
+        registered parser found no failing node ids (including the runner not even
+        starting, rc 127 per `run_command`'s command-not-found/timeout convention) must
+        raise rather than let the caller persist an empty failing set as the permanent,
+        never-rewritten pre-change baseline. The worktree must still be cleaned up (the
+        raise happens inside the try/finally, not instead of it)."""
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(repo, "init")
+        base_sha = _run_scratch_git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:1] == ["pytest"]:
+                return (127, "", "pytest: command not found")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            with pytest.raises(RuntimeError, match="could not attribute per-test failures") as excinfo:
+                cli._capture_shared_file_baseline(repo, base_sha, "UNIT-D")
+
+        assert "pytest: command not found" in str(excinfo.value)
+        worktree_list = _run_scratch_git(["worktree", "list", "--porcelain"], repo).stdout
+        worktree_paths = [line.split(" ", 1)[1] for line in worktree_list.splitlines() if line.startswith("worktree ")]
+        assert worktree_paths == [str(repo)], "the capture worktree must still be removed on the unattributed path"
+
+    def test_capture_baseline_removal_failure_does_not_delete_worktree_and_names_prune(self, tmp_path: Path) -> None:
+        """code_review BLOCKING B: on a `git worktree remove` failure the registration in
+        `repo`'s `.git/worktrees` survives even though the caller's `finally` ran, so
+        deleting the worktree directory out from under that registration would orphan it
+        with nothing left to inspect or hand to `git worktree remove --force` again. The
+        error must name `git worktree prune` as the remediation, and the directory must
+        still exist on disk (and the worktree must still be registered) after the raise."""
+        repo = _init_scratch_repo_for_cli(tmp_path, dir_name="repo")
+        _tdd_gate_write(repo, "tests/test_suite.py", "def test_ok():\n    assert True\n")
+        _tdd_gate_commit_all(repo, "init")
+        base_sha = _run_scratch_git(["rev-parse", "HEAD"], repo).stdout.strip()
+
+        real_run_command = cli.run_command
+
+        def fake_run_command(
+            cmd: list[str], cwd: Path | None = None, timeout: int | None = None, env: dict[str, str] | None = None
+        ) -> tuple[int, str, str]:
+            if cmd[:3] == ["git", "worktree", "remove"]:
+                return (1, "", "fatal: could not remove worktree")
+            return real_run_command(cmd, cwd=cwd, timeout=timeout, env=env)
+
+        with patch("devbench.cli.run_command", side_effect=fake_run_command):
+            with pytest.raises(RuntimeError, match="could not remove baseline-capture worktree") as excinfo:
+                cli._capture_shared_file_baseline(repo, base_sha, "UNIT-V")
+
+        assert "git worktree prune" in str(excinfo.value)
+
+        worktree_list = _run_scratch_git(["worktree", "list", "--porcelain"], repo).stdout
+        worktree_paths = [line.split(" ", 1)[1] for line in worktree_list.splitlines() if line.startswith("worktree ")]
+        capture_worktrees = [p for p in worktree_paths if p != str(repo)]
+        assert len(capture_worktrees) == 1, worktree_list
+        assert Path(capture_worktrees[0]).exists(), "the worktree directory must be left in place, not deleted"
+
+
+def _make_fixture_consistency_test_unit() -> WorkUnit:
+    """Build the shared test WorkUnit for the fixture-consistency command test classes below.
+
+    Module-level factory (DRY): `TestCmdCheckFixtureConsistency` and
+    `TestCmdCheckFixtureConsistencyLoudModes` previously each declared their
+    own byte-identical `_make_unit` method.
+    """
+    return WorkUnit(
+        id="E0-F1-S1-T1",
+        title="Test Task",
+        status=WorkUnitStatus.IN_PROGRESS,
+        unit_type=WorkUnitType.TASK,
+        file_path=Path("backlog/E0-F1-S1-T1.md"),
+        repo="caylent-solutions/git-repo",
+        dependencies=[],
+    )
+
+
+def _init_fixture_consistency_git_repo(tmp_path: Path) -> None:
+    """Turn *tmp_path* into a real git work tree in place (no commit needed).
+
+    ``cmd_check_fixture_consistency``'s scope resolution
+    (``work_unit_scope.resolve_changed_files``, E6-F2-S1-T2) requires
+    *repo_path* to be a git work tree once the calling unit's Changes
+    Manifest is non-empty (``work_unit_scope._require_git_work_tree``), and
+    computes each Manifest file's scope hash via ``git hash-object`` -- a
+    plumbing command that needs no commit history, so ``git init`` alone
+    (no ``git add``/``git commit``) is sufficient. Every
+    ``TestCmdCheckFixtureConsistency``/``...LoudModes``/
+    ``...ReadsExtractSourceLiteralsThroughResolver`` test that reaches a
+    passing or blocking (not config-error/disabled) verdict writes its
+    canonical/scan fixture files directly under *tmp_path* and points
+    ``REPO_LOCAL_PATHS`` at *tmp_path* itself (not a ``checkout``
+    subdirectory), so this helper git-inits *tmp_path* in place rather than
+    creating a fresh subdirectory the way ``test_tdd_gate.init_scratch_repo``
+    does.
+    """
+    for args in (
+        ["init"],
+        ["config", "user.email", "fixture-consistency-test@example.com"],
+        ["config", "user.name", "Fixture Consistency Test"],
+    ):
+        _run_scratch_git(args, tmp_path)
+
+
+def _seed_fixture_consistency_scope(tmp_path: Path, files: tuple[str, ...]) -> tuple[Path, Path]:
+    """Git-init *tmp_path* and seed a scratch backlog whose Changes Manifest is *files*.
+
+    Returns ``(backlog_root, backlog_index)`` for patching
+    ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` -- the
+    independent ``BacklogParser`` lookup
+    ``work_unit_scope.resolve_changed_files`` performs, separate from
+    ``devbench.cli.BacklogParser`` (see ``_seed_scope_backlog``'s own
+    docstring) -- so ``cmd_check_fixture_consistency``'s scope resolution can
+    find a real, on-disk Changes Manifest for ``E0-F1-S1-T1``
+    (``_make_fixture_consistency_test_unit``'s id) naming *files*. Callers
+    must additionally patch ``devbench.cli.BACKLOG_ROOT`` to
+    ``backlog_root.parent`` so ``_resolve_work_unit_file`` resolves to the
+    SAME on-disk work-unit file a passing run's
+    ``[GATE_PASS fixture_consistency]`` record is appended to.
+    """
+    _init_fixture_consistency_git_repo(tmp_path)
+    return _seed_scope_backlog(tmp_path, unit_id="E0-F1-S1-T1", files=files)
+
+
+class TestCmdCheckFixtureConsistency:
+    """Test cmd_check_fixture_consistency command (caylent-solutions/devbench-internal-backlog#17)."""
+
+    def test_unit_not_found(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Unknown work unit id returns 1."""
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_fixture_consistency("NONEXISTENT")
+
+        assert result == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_no_local_path_configured(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """No local path configured for the resolved repo returns 1."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 1
+        assert "No local path configured" in capsys.readouterr().err
+
+    def test_skips_as_no_op_when_unconfigured(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """No gates.fixture_consistency.canonical_sources configured -> spec 5.2 disabled line, exits 0."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig()
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        assert json.loads(capsys.readouterr().out.strip()) == {"gate": "fixture_consistency", "status": "disabled"}
+
+    def test_passes_when_fixtures_are_consistent(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A configured check with no cross-reference issues returns 0, prints OK, and persists
+        a `[GATE_PASS fixture_consistency]` record (E6-F2-S1-T2, spec 4.2)."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
+        wu_file = backlog_root / "E0-F1-S1-T1.md"
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
+        assert result == 0
+        # Exactly four keys, deliberately with no `scope_hash` (unlike
+        # check-reachability/check-shared-file-impact's status lines): this
+        # gate's own SCAN stays workspace-wide, not the calling unit's own
+        # Changes Manifest, so there is no meaningful "scope this run
+        # covered" hash to render on the line a human reads -- the
+        # persisted `[GATE_PASS fixture_consistency]` record below carries
+        # its own scope hash instead (see cmd_check_fixture_consistency's
+        # docstring).
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 0,
+        }
+        assert "OK" in rest
+        assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
+
+    def test_fails_and_prints_findings_when_key_is_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A mock fixture referencing a key absent from the canonical source returns 1 and prints FAIL."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "GHOST-SKU"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
+        assert result == 1
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 1,
+        }
+        assert "FAIL" in rest
+        assert "GHOST-SKU" in rest
+
+    def test_in_fixture_allow_missing_marker_suppresses_the_missing_key_finding_and_passes_the_gate(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An edge-case fixture whose ONLY problem record carries a valid in-fixture
+        ``allow_missing`` marker is successfully waived: the gate's findings output for the
+        waived key names only ``waiver_applied``, never ``missing_key`` (AC-E6-F1-S1-T2-1), AND
+        the run itself PASSES (``status: "pass"``, exit 0) because ``waiver_applied`` is not a
+        BLOCKING finding kind (``fixture_consistency.BLOCKING_FINDING_KINDS`` is exactly
+        ``missing_key``/``coverage_shortfall``/``load_error``) -- a validly waived record is not
+        an unresolved cross-reference problem for the gate to fail on. The applied waiver stays
+        visible in the report on this pass path too (AC-E6-F1-S1-T2-2), so the suppression can
+        still be challenged in review even though it did not block the gate. A hand-built
+        ``FixtureScanTarget`` can no longer suppress anything on its own: the pre-T2
+        ``allow_missing`` field is fully removed, so passing it as a keyword argument raises
+        ``TypeError`` rather than being silently accepted and ignored (see the sibling test
+        below)."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_not_found.json").write_text(
+            json.dumps([{"sku": "SKU-DOES-NOT-EXIST", "allow_missing": {"reason": "models an empty lookup response"}}]),
+            encoding="utf-8",
+        )
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_not_found.json")
+        )
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_not_found.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
+        assert result == 0
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "pass",
+            "findings": 1,
+        }
+        assert "OK" in rest
+        assert "[waiver_applied]" in rest
+        assert "[missing_key]" not in rest
+        assert "SKU-DOES-NOT-EXIST" in rest
+
+    def test_fails_with_both_a_waived_and_an_unwaived_record_and_shows_both_findings(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """test_review round 1 Blocking 2: the ``status: "fail"`` / exit-1 / both-findings-listed
+        contract had zero coverage -- every other test in this class seeds a fixture whose ONLY
+        problem record is either waived (the pass path) or unwaived (a single-finding fail path),
+        so mutating the FAIL branch's ``_print_fixture_findings(findings)`` call to
+        ``_print_fixture_findings(blocking_findings)`` (which would hide every applied waiver
+        whenever the run ALSO has a blocking finding) survived the entire suite. This fixture
+        seeds one validly-waived record AND one unwaived record in the SAME scan target: the run
+        must still report ``status: "fail"`` (a blocking ``missing_key`` finding is present) with
+        BOTH ``[waiver_applied]`` and ``[missing_key]`` visible in the printed output, and
+        ``findings`` must count both (2), not only the blocking one."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(
+            json.dumps(
+                [
+                    {"sku": "SKU-WAIVED-GHOST", "allow_missing": {"reason": "models an empty lookup response"}},
+                    {"sku": "SKU-UNWAIVED-GHOST"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        out = capsys.readouterr().out
+        first_line, _, rest = out.partition("\n")
+        assert result == 1
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 2,
+        }
+        assert "FAIL" in rest
+        assert "[waiver_applied]" in rest
+        assert "[missing_key]" in rest
+        assert "SKU-WAIVED-GHOST" in rest
+        assert "SKU-UNWAIVED-GHOST" in rest
+
+
+@pytest.mark.unit
+class TestCmdCheckFixtureConsistencyLoudModes:
+    """spec 4.7 bullets 1-3 (322-D02/D03/D05): the three degenerate configurations that must exit 1
+    with a one-line stderr diagnostic instead of a passing/misleading result (AC-19)."""
+
+    def _run(
+        self, tmp_path: Path, fixture_config: FixtureConsistencyConfig, *, manifest_files: tuple[str, ...] | None = None
+    ) -> tuple[int, str, str]:
+        """Run ``cmd_check_fixture_consistency`` against *fixture_config*.
+
+        *manifest_files*, when supplied, seeds a real scratch backlog and git
+        work tree (:func:`_seed_fixture_consistency_scope`) and patches
+        ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` and
+        ``devbench.cli.BACKLOG_ROOT`` so ``cmd_check_fixture_consistency``'s
+        scope resolution (E6-F2-S1-T2) can resolve ``E0-F1-S1-T1``'s
+        Changes-Manifest scope -- required for any case that reaches a
+        blocking-findings determination (any status other than
+        ``"error"``/``"disabled"``). ``None`` (the default) preserves this
+        class's original config-error-path behaviour, where scope resolution
+        is never reached at all.
+        """
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = fixture_config
+
+        patches: list[AbstractContextManager[Any]] = [
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+        ]
+        if manifest_files is not None:
+            backlog_root, backlog_index = _seed_fixture_consistency_scope(tmp_path, files=manifest_files)
+            patches.extend(
+                (
+                    patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+                    patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+                    patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+                )
+            )
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        captured = self._capsys.readouterr()
+        return result, captured.out, captured.err
+
+    @pytest.fixture(autouse=True)
+    def _inject_capsys(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._capsys = capsys
+
+    def test_identifier_field_typo_exits_1_with_error_status_line(self, tmp_path: Path) -> None:
+        (tmp_path / "catalog.json").write_text(json.dumps([{"id": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"id": "A1"}]), encoding="utf-8")
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="idd"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="id"),),
+        )
+
+        result, out, err = self._run(tmp_path, config)
+
+        assert result == 1
+        assert json.loads(out.strip()) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "error",
+            "findings": 0,
+        }
+        expected_summary = fixture_consistency_module._MSG_IDENTIFIER_FIELD_ZERO_MATCH.format(
+            field="idd", path="catalog.json"
+        )
+        assert f"ERROR: {expected_summary}" in err
+
+    def test_empty_scan_list_exits_1_with_error_status_line(self, tmp_path: Path) -> None:
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(),
+        )
+
+        result, out, err = self._run(tmp_path, config)
+
+        assert result == 1
+        assert json.loads(out.strip()) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "error",
+            "findings": 0,
+        }
+        assert f"ERROR: {fixture_consistency_module._MSG_EMPTY_SCAN_LIST}" in err
+
+    def test_unknown_extension_scan_target_exits_1_with_load_error_finding_count(self, tmp_path: Path) -> None:
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.txt").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        config = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.txt", identifier_field="sku"),),
+        )
+
+        result, out, err = self._run(tmp_path, config, manifest_files=("catalog.json", "mock_lookup.txt"))
+
+        first_line, _, rest = out.partition("\n")
+        assert result == 1
+        assert json.loads(first_line) == {
+            "gate": "fixture_consistency",
+            "tier": "machine-blocking",
+            "status": "fail",
+            "findings": 1,
+        }
+        assert "load_error" in rest
+        assert "mock_lookup.txt" in rest
+        assert ".txt" not in fixture_consistency_module._EXTENSION_PARSERS
+        assert err == ""
+
+    def test_totally_omitted_unit_id_argument_is_rejected_by_the_shared_dispatcher(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An entirely OMITTED <unit-id> never reaches this handler at all.
+
+        `main()`'s shared argument-count check (every registered command,
+        not just this gate) returns 1 with a `Command '<name>' requires at
+        least <n> argument(s)` message before `cmd_check_fixture_consistency`
+        is ever called -- documented here as the measured behavior of the
+        shared dispatcher this command is registered against, distinct from
+        the handler-level usage-error guard exercised below.
+        """
+        with patch("sys.argv", ["devbench", "check-fixture-consistency"]):
+            result = cli.main()
+
+        assert result == 1
+        assert "requires at least 1 argument" in capsys.readouterr().err
+
+    def test_missing_unit_id_argument_is_a_usage_error_exit_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A PRESENT but empty <unit-id> is a usage error, exit 2 (spec Section 7, AC-6).
+
+        Mirrors the existing `cmd_check_ancestry` precedent (`cli.py`'s empty
+        `dependency_ref` guard): a handler-level arity/usage guard, not
+        `main()`'s shared argument-COUNT guard above (which only ever
+        returns 1, and cannot see a positional argument's VALUE). Called
+        directly, exactly as `main()` would invoke it once the shared
+        argument-count check has already been satisfied by a present (even if
+        empty) positional.
+        """
+        result = cli.cmd_check_fixture_consistency("")
+
+        assert result == 2
+        assert "requires a non-empty <unit-id>" in capsys.readouterr().err
+
+    def test_unrelated_value_error_propagates_uncaught(self, tmp_path: Path) -> None:
+        """The CLI catch is narrowed to ``FixtureConsistencyConfigError``, not the bare builtin
+        ``ValueError`` (round-1 remediation, code_review): an unrelated ``ValueError`` raised by
+        ``check_fixture_consistency`` itself must propagate uncaught, exactly as every other
+        unexpected failure in this command does, rather than being mis-reported as ``status:
+        "error"`` with a misleading exit 1 (test_review round 2, 5d -- pins the narrowing so a
+        future re-broadening back to a bare ``except ValueError`` turns this test red)."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch(
+                "devbench.fixture_consistency.check_fixture_consistency",
+                side_effect=ValueError("unrelated parse failure"),
+            ),
+            pytest.raises(ValueError, match="unrelated parse failure"),
+        ):
+            cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+
+class TestCmdCheckFixtureConsistencyReadsExtractSourceLiteralsThroughResolver:
+    """E6-F2-S1-T1 doc_review round-1 D4 (spec 4.1, AC-27): ``extract_source_literals`` is a
+    resolver-managed field (``constants.GATE_FIELD_DEFAULTS["fixture_consistency"]``) -- the
+    command must read it exclusively through ``config_loader.resolve_gate_config``, never off
+    ``RUNTIME_CONFIG.gates.fixture_consistency`` directly. Behavioral proof (not merely a static
+    grep pin, which cannot see a read routed through an intermediate local variable): mocks
+    ``resolve_gate_config`` itself and asserts both that it is called with the resolved unit's
+    canonical repo and the ``fixture_consistency`` gate name, and that its returned value -- not
+    ``RUNTIME_CONFIG.gates.fixture_consistency.extract_source_literals`` -- is what actually
+    controls whether the source-literal scan mode runs."""
+
+    def test_resolve_gate_config_is_called_with_the_units_canonical_repo(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        backlog_root, backlog_index = _seed_fixture_consistency_scope(
+            tmp_path, files=("catalog.json", "mock_lookup.json")
+        )
+
+        # The project-level config's own `extract_source_literals` is left at
+        # its dataclass default (False) -- if the command read it directly
+        # instead of through the (mocked) resolver below, the resolver
+        # mock's return value would never be consulted at all and this
+        # test could not distinguish the two read paths.
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+        )
+        mock_resolved = MagicMock()
+        mock_resolved.values = {"enabled": False, "extract_source_literals": False}
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.config_loader.resolve_gate_config", return_value=mock_resolved) as mock_resolve,
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 0
+        mock_resolve.assert_called_once_with("fixture_consistency", "caylent-solutions/git-repo", mock_runtime_cfg)
+
+    def test_resolver_true_enables_the_scan_mode_even_though_project_config_says_false(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The resolver's answer -- not the raw project-level dataclass field -- decides whether
+        the source-literal scan mode runs: with the raw field False but the (mocked) resolver
+        returning True, the zero-classified-source-files loud error (a real, only-reachable-when-
+        the-mode-is-actually-on behaviour) fires, proving the resolved value was actually used."""
+        unit = _make_fixture_consistency_test_unit()
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        (tmp_path / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (tmp_path / "mock_lookup.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        # Only unclassified-extension files exist under tmp_path besides the
+        # two fixtures above -- zero classified source files in scope.
+
+        mock_runtime_cfg = MagicMock()
+        mock_runtime_cfg.gates.repos = {}
+        mock_runtime_cfg.gates.fixture_consistency = FixtureConsistencyConfig(
+            canonical_sources=(FixtureCanonicalSource(path="catalog.json", identifier_field="sku"),),
+            scan=(FixtureScanTarget(path="mock_lookup.json", identifier_field="sku"),),
+            extract_source_literals=False,
+        )
+        mock_resolved = MagicMock()
+        mock_resolved.values = {"enabled": False, "extract_source_literals": True}
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.config_loader.resolve_gate_config", return_value=mock_resolved),
+        ):
+            result = cli.cmd_check_fixture_consistency("E0-F1-S1-T1")
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert "extract_source_literals" in err
+        assert "zero classified source files" in err
+
+
+class TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync:
+    """AC-E6-F2-S1-T1-4 / spec Section 8 (docs land in the same commit as the behaviour):
+    ``cmd_check_fixture_consistency``'s docstring and its ``FixtureConsistencyConfigError``
+    exception-handler comment each carry a hand-maintained enumeration of every
+    ``status: "error"`` loud-error cause. Adding the fifth cause (``extract_source_literals``
+    enabled with zero classified source files, E6-F2-S1-T1) without updating BOTH of those two
+    prose spots leaves them silently claiming an authoritative FOUR-path enumeration that is no
+    longer true.
+
+    Every assertion below is checked against a HAND-TYPED literal of the expected wording, never
+    against a production constant or against the other prose copy -- deriving both sides of an
+    assertion from the same source text can never fail, which is exactly the stub-test shape this
+    pin exists to rule out."""
+
+    def _source(self) -> str:
+        import inspect
+
+        return inspect.getsource(cli.cmd_check_fixture_consistency)
+
+    def test_docstring_enumerates_the_extract_source_literals_cause(self) -> None:
+        source = self._source()
+        assert "``extract_source_literals`` enabled with zero" in source
+        assert "classified source files in scope (spec 4.7 bullet 4, E6-F2-S1-T1" in source
+
+    def test_docstring_claims_five_paths_not_four(self) -> None:
+        source = self._source()
+        assert "the authoritative five-path enumeration" in source
+        assert "All five" in source
+        assert "the authoritative four-path enumeration" not in source
+        assert "All four\n      raise a ``fixture_consistency.FixtureConsistencyConfigError``" not in source
+
+    def test_exception_handler_comment_enumerates_the_extract_source_literals_cause(self) -> None:
+        source = self._source()
+        assert "zero-classified-source-files-with-" in source
+        assert "`extract_source_literals`-enabled (spec 4.7 bullet 4," in source
+
+    def test_exception_handler_comment_claims_five_paths_not_four(self) -> None:
+        """Distinct assertion from the docstring's own five-path claim above: the comment is a
+        SEPARATE piece of hand-maintained prose (a Python comment, not part of the docstring
+        object at runtime) that drifts independently, so it needs its own pin."""
+        source = self._source()
+        comment_block = source.split('"""', 2)[2]
+        assert "the authoritative five-path enumeration) config" in comment_block
+        assert "the authoritative four-path enumeration) config" not in comment_block
+
+
+class TestCmdCheckFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync:
+    """code_review/doc_review round-1 (E6-F2-S1-T2): the done-path wiring this task adds
+    creates two more zero-stdout terminals -- scope resolution for the calling unit
+    failing, and a due ``[GATE_PASS fixture_consistency]`` record failing to be written
+    -- on top of the three ``_resolve_fixture_consistency_repo_path`` already enumerated,
+    for a total of six. ``cmd_check_fixture_consistency``'s own docstring must both drop
+    the false 'for every run that reaches gate resolution' universal quantifier and name
+    all six, or a future change can silently falsify the enumeration again exactly as
+    happened here (mirrors ``TestCmdCheckFixtureConsistencyErrorPathEnumerationDocsSync``
+    above, added by E6-F2-S1-T1 for the same defect class against the config-error
+    enumeration).
+
+    Every assertion below is checked against a HAND-TYPED literal of the expected
+    wording, never against a production constant or against the other prose copy. The
+    docstring is whitespace-normalized (collapsed to single spaces) before matching so a
+    pin does not depend on exactly where the source wraps a line."""
+
+    def _source(self) -> str:
+        import inspect
+
+        return " ".join(inspect.getsource(cli.cmd_check_fixture_consistency).split())
+
+    def test_docstring_drops_the_false_universal_quantifier(self) -> None:
+        source = self._source()
+        assert "for every run that reaches a findings-based or config-error verdict" in source
+        assert "for every run that reaches gate resolution:" not in source
+
+    def test_docstring_claims_six_terminals_not_three(self) -> None:
+        source = self._source()
+        assert "SIX terminals never reach that verdict at all and" in source
+        assert "The three terminals that" not in source
+
+    def test_docstring_names_the_scope_resolution_failure_terminal(self) -> None:
+        source = self._source()
+        assert "scope resolution for the calling unit failing (exit 1," in source
+        assert "_resolve_scope_or_report`` call, E6-F2-S1-T2)" in source
+
+    def test_docstring_names_the_gate_pass_record_write_failure_terminal(self) -> None:
+        source = self._source()
+        assert "a due ``[GATE_PASS fixture_consistency]`` record failing to be written" in source
+        assert "_write_gate_pass_record`, E6-F2-S1-T2)" in source
+
+
+class _CliReferenceSectionPin:
+    """Shared base for ``docs/cli-reference.md`` section-pinning test classes
+    (code_review round 3, E7-F2-S1-T3): both
+    ``TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync``
+    and ``TestCliReferenceCheckWritePathScopeAttributionDocsSync`` need the
+    identical "slice the doc down to one command's section, bounded at the
+    next ``##``/``###`` heading" idiom; hoisting it here (parameterised by
+    the per-subclass ``_HEADING`` class attribute) means the two pin classes
+    can no longer drift into two independently-maintained copies of the same
+    slicing logic."""
+
+    _DOC_PATH = Path(__file__).resolve().parent.parent / "docs" / "cli-reference.md"
+    _HEADING_RE = re.compile(r"^#{2,3} ", re.MULTILINE)
+    _HEADING: str = ""
+
+    def _doc_text(self) -> str:
+        return self._DOC_PATH.read_text(encoding="utf-8")
+
+    def _section(self) -> str:
+        """Return only this class's ``_HEADING`` section, bounded at the NEXT
+        ``##``/``###`` heading. Unlike a whole-document ``text.split(...)[1]``
+        (which runs to end of file), this stops the slice at the section's own
+        end so an assertion cannot be satisfied by prose relocated into a later
+        command's section."""
+        text = self._doc_text()
+        start = text.index(self._HEADING)
+        after_heading = start + len(self._HEADING)
+        match = self._HEADING_RE.search(text, after_heading)
+        end = match.start() if match is not None else len(text)
+        return text[start:end]
+
+
+class TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync(_CliReferenceSectionPin):
+    """Same defect class as the class above, pinned against the ``docs/cli-reference.md``
+    prose this unit's diff rewrites (code_review/doc_review round-1, E6-F2-S1-T2): the
+    doc's own opening sentence must carry the corrected 'findings-based or config-error
+    verdict' phrasing and the six-terminal count, matching ``cmd_check_fixture_consistency``'s
+    docstring exactly, or the two prose copies can drift independently again."""
+
+    _HEADING = "### `check-fixture-consistency`"
+
+    def test_doc_drops_the_false_universal_quantifier(self) -> None:
+        section = self._section()
+        assert "for every run that reaches a findings-based or config-error verdict" in section
+        assert "for every run that reaches gate resolution (spec 4.1" not in section
+
+    def test_doc_claims_six_terminals_not_three(self) -> None:
+        section = self._section()
+        assert "Six terminals never reach that verdict at all and write ZERO bytes to stdout" in section
+
+    def test_doc_names_both_new_write_failure_causes(self) -> None:
+        section = self._section()
+        assert "the unit's own work-unit file cannot be located on disk" in section
+        assert "the audit-marker append itself raises `OSError`" in section
+
+
+class TestCliReferenceCheckWritePathScopeAttributionDocsSync(_CliReferenceSectionPin):
+    """doc_review round 1 (E7-F2-S1-T3): the ``check-write-path`` section of
+    ``docs/cli-reference.md`` must document the scope-limited BLAME vs
+    repo-wide RESULTS split this unit introduces, the new out-of-scope
+    fallback rendering line, and the new zero-stdout exit-1 scope-resolution
+    terminal -- pinned the same way
+    ``TestCliReferenceFixtureConsistencyZeroStdoutTerminalEnumerationDocsSync``
+    pins the sibling fixture-consistency gate's docs (both now share
+    ``_CliReferenceSectionPin``, code_review round 3, E7-F2-S1-T3), so the
+    doc and the shipped behavior cannot drift independently again."""
+
+    _HEADING = "### `check-write-path`"
+
+    def test_doc_documents_the_scope_attribution_dependency(self) -> None:
+        section = self._section()
+        assert "devbench.work_unit_scope.resolve_changed_files" in section
+        assert "scope-limited BLAME" in section
+        assert "repo-wide RESULTS" in section
+
+    def test_doc_documents_the_new_out_of_scope_fallback_line(self) -> None:
+        section = self._section()
+        assert ("(no assignment/setter sites found within this unit's scope; N found outside scope)") in section
+
+    def test_doc_documents_the_new_scope_resolution_exit_one_terminal(self) -> None:
+        section = self._section()
+        assert "resolve_changed_files` fails to resolve the calling unit's scope" in section
+        assert "writes ZERO bytes to stdout" in section
+
+
+class _WritePathCmdFixtures:
+    """Shared fixture helpers for ``cmd_check_write_path`` test classes
+    (E7-F1-S1-T1, E7-F2-S1-T3; spec `integration-reality-gates-hardening.md`
+    section 4.8).
+
+    ``audit_write_path`` itself never shells out to git (it scans the repo
+    checkout's files directly) -- only ``cmd_check_write_path``'s scope
+    resolution does, since E7-F2-S1-T3 wired it to
+    ``work_unit_scope.resolve_changed_files`` (spec 4.3, AC-9, AC-WP-025) so
+    it can limit BLAME attribution (the itemized findings ``WritePathAudit.render``
+    prints) to the calling unit's own Changes-Manifest scope while still
+    reporting a repo-wide verdict/status line. ``_patch_common`` below seeds
+    a real, on-disk Changes Manifest for every call (reusing
+    ``_seed_scope_backlog``, this module's shared scope-fixture helper --
+    DRY, not a second hand-rolled copy), defaulting to an EMPTY manifest (a
+    verification-only unit) unless a caller passes ``manifest_files`` -- an
+    empty manifest resolves without any git work tree at all
+    (``resolve_changed_files`` short-circuits before its own git plumbing
+    when ``files`` is empty), so most of this fixture's existing callers
+    (usage-error / unknown-unit / disabled / config-load-failure tests, none
+    of which ever reach scope resolution) need no git repo either. A caller
+    that DOES pass non-empty ``manifest_files`` must first turn ``repo_path``
+    into a real git work tree via ``_init_scratch_repo_for_cli`` (imported
+    from ``test_tdd_gate.init_scratch_repo`` at module scope, not re-derived
+    here) -- ``resolve_changed_files`` hashes every non-empty scope's files
+    through ``git hash-object``.
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Write-path audit gate task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _write_gate_config(self, tmp_path: Path, *, enabled: bool) -> Path:
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(
+            f"repos:\n  {self._REPO}:\n    default_branch: main\n"
+            f"gates:\n  write_path_audit:\n    enabled: {'true' if enabled else 'false'}\n"
+        )
+        return cfg_path
+
+    def _enable_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+        """Point ``DEVBENCH_CONFIG_PATH`` at a scratch config resolving
+        ``gates.write_path_audit.enabled``, clearing the workspace-wide env
+        override so an ambient ``DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED``
+        left set by the host shell can never leak in (env is the
+        highest-precedence layer, spec 4.1/D-15)."""
+        cfg_path = self._write_gate_config(tmp_path, enabled=enabled)
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+    @contextlib.contextmanager
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        *,
+        manifest_files: tuple[str, ...] = (),
+        manifest_body: str | None = None,
+    ) -> Iterator[None]:
+        """Patch surface every ``cmd_check_write_path`` test class shares.
+
+        ``manifest_files`` (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3) seeds
+        ``unit``'s real ``## Changes Manifest`` via ``_seed_scope_backlog``
+        (this module's shared scope-fixture helper, reused directly rather
+        than re-derived) and patches ``devbench.work_unit_scope.BACKLOG_ROOT``/
+        ``BACKLOG_INDEX`` alongside this fixture's pre-existing
+        ``devbench.cli.BacklogParser``/``REPO_LOCAL_PATHS`` patches --
+        ``work_unit_scope.resolve_changed_files`` does its OWN, independent
+        ``BacklogParser`` lookup against those two module-level constants,
+        never satisfied by a mocked ``devbench.cli.BacklogParser`` alone
+        (``_seed_scope_backlog``'s own docstring), so both must point at the
+        same real, on-disk fixture data for scope resolution to succeed.
+        ``manifest_body`` is forwarded to ``_seed_scope_backlog`` verbatim
+        (overriding ``manifest_files`` entirely) for a caller that needs a
+        deliberately malformed ``## Changes Manifest`` table, e.g. to prove
+        ``cmd_check_write_path`` propagates a scope-resolution failure.
+        """
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_root, backlog_index = _seed_scope_backlog(
+            repo_path.parent, unit_id=unit.id, files=manifest_files, manifest_body=manifest_body
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            yield
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCheckWritePathVariadicDispatch:
+    """`check-write-path` is registered in `_VARIADIC_COMMANDS` (spec 4.8):
+    a fixed-arity dispatch would slice ``sys.argv`` to ``[<id>]`` only,
+    dropping ``--flag <name>`` entirely before it ever reaches the handler.
+    This test drives the REAL ``main()`` dispatcher end to end (not a
+    direct call to ``cmd_check_write_path``, which bypasses the slice
+    entirely and so cannot catch this class of registration bug)."""
+
+    def test_flag_and_value_both_reach_the_handler_through_main(self) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch("sys.argv", ["devbench", "check-write-path", "E1-F1-S1-T1", "--flag", "isPremiumEligible"]),
+            patch.dict(
+                cli._COMMANDS,
+                {"check-write-path": (mock_fn, 0, "Write-path audit: check-write-path <id> --flag <name>")},
+            ),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathUsageErrors(_WritePathCmdFixtures):
+    """AC-WP-007: usage failures exit 2 with the offending argument named on stderr."""
+
+    def test_missing_flag_exits_two_naming_the_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1")
+
+        assert result == 2
+        assert "--flag" in capsys.readouterr().err
+
+    def test_flag_with_no_value_exits_two(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag")
+
+        assert result == 2
+        assert "--flag" in capsys.readouterr().err
+
+    def test_missing_unit_id_exits_two(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_check_write_path("--flag", "isPremiumEligible")
+
+        assert result == 2
+        assert "unit id" in capsys.readouterr().err
+
+    def test_unknown_flag_exits_two(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible", "--bogus")
+
+        assert result == 2
+        assert "--bogus" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathUnknownUnit(_WritePathCmdFixtures):
+    """AC-WP-007: an unknown unit id exits 1 with one actionable sentence, no stack trace."""
+
+    def test_unknown_unit_id_exits_one(self, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_check_write_path("E9-F9-S9-T9", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "E9-F9-S9-T9" in captured.err
+        assert "Traceback" not in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathDisabled(_WritePathCmdFixtures):
+    """AC-WP-006 (spec 4.1): a disabled/unconfigured gate prints exactly the
+    status line and exits 0 before ``--flag`` is ever audited."""
+
+    def test_disabled_gate_prints_exact_status_line_and_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+    def test_unconfigured_gate_defaults_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+        cfg_dir = tmp_path / "cfgdir"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / "devbench.yaml"
+        cfg_path.write_text(f"repos:\n  {self._REPO}:\n    default_branch: main\n")
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(cfg_path))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+    def test_empty_positional_argument_is_silently_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`_parse_unit_id_and_required_flag_argv`'s `if not arg: i += 1; continue`
+        (cli.py; shared by `check-write-path` and `scaffold-store-factory`,
+        E9-F1-S1-T2 round 2) treats an empty-string argv entry as a no-op: it is
+        neither counted toward the required single positional unit id nor
+        rejected as an unknown/invalid token. This is a DELIBERATE
+        decision for this round, matching the empty-value tolerance an
+        argv-splitting caller (e.g. a shell wrapper that leaves a stray
+        empty token from a doubled separator) would otherwise trip on --
+        it is not a usage error a human or CI caller is likely to type by
+        hand, unlike a genuinely missing/duplicated unit id or an unknown
+        flag, which DO still exit 2 (see the sibling tests above). Proven
+        here by placing the empty string BEFORE the real unit id: if it
+        were counted as a second positional, this would exit 2 with
+        "requires exactly one unit id"; instead the parse succeeds exactly
+        as it would with the empty token absent."""
+        self._enable_gate(tmp_path, monkeypatch, enabled=False)
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("", "E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        assert capsys.readouterr().out.strip() == '{"gate": "write_path_audit", "status": "disabled"}'
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathEnabled(_WritePathCmdFixtures):
+    """AC-WP-005, AC-WP-006: an enabled run prints the spec 5.2 status line
+    (judge-evidence tier, first line) then human-readable findings, and
+    never blocks on an `indeterminate` verdict."""
+
+    def test_live_verdict_prints_pass_status_and_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line == {
+            "gate": "write_path_audit",
+            "tier": "judge-evidence",
+            "status": "pass",
+            "findings": 0,
+            "flag": "isPremiumEligible",
+            "verdict": "live",
+        }
+        assert "[PERMISSION_FLAG_WRITE_PATH_AUDIT]" in captured.out
+        assert "src/reducers/permissionReducer.ts:1" in captured.out
+
+    def test_default_verdict_prints_fail_status_and_exits_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "slices" / "permissionSlice.ts",
+            "const initialState = {\n  isPremiumEligible: false,\n};\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/slices/permissionSlice.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line["status"] == "fail"
+        assert first_line["verdict"] == "default"
+        assert first_line["findings"] == 1
+
+    def test_indeterminate_verdict_never_blocks_and_shows_evidence(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "misc" / "assign.py",
+            "isPremiumEligible = someUnknownVar\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/misc/assign.py",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        first_line = json.loads(captured.out.splitlines()[0])
+        assert first_line["status"] == "pass"
+        assert first_line["verdict"] == "indeterminate"
+        assert "src/misc/assign.py:1" in captured.out
+
+    def test_config_load_failure_exits_one_before_any_audit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = tmp_path / "devbench"
+        repo_path.mkdir()
+        monkeypatch.setenv("DEVBENCH_CONFIG_PATH", str(tmp_path / "does-not-exist" / "devbench.yaml"))
+        monkeypatch.delenv("DEVBENCH_GATE_WRITE_PATH_AUDIT_ENABLED", raising=False)
+
+        with self._patch_common(unit, repo_path):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+
+@pytest.mark.unit
+class TestCmdCheckWritePathScopeAttribution(_WritePathCmdFixtures):
+    """AC-CODE-001, AC-TEST-001 (spec 4.3, AC-9, AC-WP-025, E7-F2-S1-T3):
+    ``cmd_check_write_path`` resolves the calling unit's own Changes-Manifest
+    scope via ``work_unit_scope.resolve_changed_files`` and threads it into
+    ``audit_write_path`` as the new keyword-only ``scope`` parameter, so a
+    live write in a file OUTSIDE that scope is never named in the rendered
+    findings, while the overall verdict/status line still reflects the
+    REPO-WIDE scan -- matching the pattern already used by the
+    machine-blocking gates (``_shared_file_gate_attributable``/#318,
+    ``_fixture_finding_is_attributable``/#322)."""
+
+    def test_out_of_scope_live_write_excluded_from_findings_verdict_stays_repo_wide(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        captured = capsys.readouterr()
+        assert result == 0, f"stdout={captured.out!r} stderr={captured.err!r}"
+        first_line = json.loads(captured.out.splitlines()[0])
+        # Repo-wide RESULT: the only live write found anywhere in the repo still
+        # drives a `live`/pass verdict, even though it is out of this unit's scope.
+        assert first_line["status"] == "pass"
+        assert first_line["verdict"] == "live"
+        # Scope-limited BLAME: the out-of-scope write is never named.
+        assert "src/legacy/unrelated_module.ts:1" not in captured.out
+
+    def test_in_scope_live_write_still_surfaces_in_findings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "legacy" / "unrelated_module.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/reducers/permissionReducer.ts",)):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "src/reducers/permissionReducer.ts:1" in captured.out
+        assert "src/legacy/unrelated_module.ts:1" not in captured.out
+
+    def test_malformed_manifest_fails_scope_resolution_and_exits_one_before_any_audit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A malformed ``## Changes Manifest`` table (spec 4.3's
+        ``ManifestParseError`` path, caught by ``_resolve_scope_or_report``)
+        fails scope resolution before ``audit_write_path`` is ever called --
+        no spec 5.2 status line is printed, and the ERROR reaches stderr."""
+        self._enable_gate(tmp_path, monkeypatch, enabled=True)
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "reducers" / "permissionReducer.ts",
+            "isPremiumEligible = action.payload.value;\n",
+        )
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_body="| File | Change | Extra |\n|------|--------|-------|\n"
+            "| `src/reducers/permissionReducer.ts` | modify | oops |\n",
+        ):
+            result = cli.cmd_check_write_path("E1-F1-S1-T1", "--flag", "isPremiumEligible")
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out.strip() == ""
+        assert "ERROR" in captured.err
+
+
+class TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate:
+    """doc_review round-2 (E6-F2-S1-T2 Blocking 3): ``_resolve_scope_mode`` and
+    ``_resolve_scope_or_report`` each carry an exhaustive parenthetical caller
+    enumeration. This task adds a fifth caller
+    (:func:`cli._finalize_fixture_consistency_result`) to both helpers, so both
+    enumerations must name it -- pinned here so a future new caller of either
+    helper cannot land without this list being swept too.
+
+    code_review round 4 (E7-F2-S1-T3, advisory): both enumerations were also
+    swept to name a sixth caller, :func:`cli.cmd_check_write_path`, in the
+    same diff that added the ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX``
+    pin below, but neither of the two tests here was extended to assert it --
+    added here so the write-path gate is pinned in both enumerations too.
+
+    code_review round 1 (E9-F1-S1-T2, Blocking): both enumerations were
+    swept again to name a seventh caller, :func:`cli.cmd_scaffold_store_factory`,
+    so a future new caller of either helper still cannot land without this
+    list being swept too."""
+
+    def test_resolve_scope_mode_names_the_fixture_consistency_gate(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "fixture-consistency gate" in source
+
+    def test_resolve_scope_mode_names_check_write_path(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "cmd_check_write_path" in source
+
+    def test_resolve_scope_mode_names_cmd_scaffold_store_factory(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_mode)
+        assert "cmd_scaffold_store_factory" in source
+
+    def test_resolve_scope_or_report_names_the_fixture_consistency_gate(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "fixture-consistency gate" in source
+
+    def test_resolve_scope_or_report_names_check_write_path(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "cmd_check_write_path" in source
+
+    def test_resolve_scope_or_report_names_cmd_scaffold_store_factory(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_scope_or_report)
+        assert "cmd_scaffold_store_factory" in source
+
+
+@pytest.mark.unit
+class TestSharedGateHelperCallerEnumerationsNameCheckWritePath:
+    """code_review + changes_manifest round 1 (E7-F1-S1-T1 Blocking 5): four
+    shared helpers this unit adds a new caller to each carry an exhaustive
+    caller/count enumeration that was accurate before this unit's change and
+    false after it (a stale "all five verbs" / "exactly one definition
+    across both verbs" / "the two verbs' usage errors" claim, and an
+    `**extra_fields` example list that never named `write_path_audit`'s own
+    fields). Pinned here, following the same pattern as
+    ``TestScopeResolutionHelperCallerEnumerationsNameTheFixtureGate`` above,
+    so a future new caller of any of these four helpers cannot land without
+    this list being swept too.
+
+    code_review round 1 (E9-F1-S1-T2, Blocking): ``cmd_scaffold_store_factory``
+    became a new caller of all five of these helpers (four here plus the
+    ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX`` comment pinned below), so
+    every count/enumeration in this class was swept from six/three/three to
+    seven/four/four, and a dedicated pin for the new caller was added
+    alongside each tightened count assertion.
+
+    code_review round 2 (E9-F1-S1-T2, Blocking, DRY): ``scaffold-store-factory``'s
+    own argv parser shipped as a line-for-line copy of ``check-write-path``'s;
+    both were replaced by one shared function, ``_parse_unit_id_and_required_flag_argv``,
+    so ``_consume_gate_verb_flag_value`` and ``_gate_verb_usage_error`` now
+    have THREE callers/functions of their own respectively (not four), and
+    the pins below were swept to name the shared function instead of the
+    two now-deleted per-verb parsers."""
+
+    def test_resolve_unit_repo_and_path_names_check_write_path_as_a_sixth_caller(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_unit_repo_and_path)
+        assert "cmd_check_write_path" in source
+        # W3 (test_review): bare "six" is a substring of "sixth" and would
+        # pass even if the docstring's claim drifted to name a different
+        # count; "seven callers" pins the exact claim the docstring makes
+        # after E9-F1-S1-T2 added a seventh caller.
+        assert "seven callers" in source
+
+    def test_resolve_unit_repo_and_path_names_cmd_scaffold_store_factory_as_a_seventh_caller(
+        self,
+    ) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._resolve_unit_repo_and_path)
+        assert "cmd_scaffold_store_factory" in source
+
+    def test_consume_gate_verb_flag_value_names_parse_unit_id_and_required_flag_argv(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._consume_gate_verb_flag_value)
+        assert "_parse_unit_id_and_required_flag_argv" in source
+        # W3 (test_review): tightened from bare "three"; this docstring's
+        # own wording is "three callers" again after E9-F1-S1-T2 round 2
+        # merged check-write-path's and scaffold-store-factory's separate,
+        # duplicated parsers into this one shared caller (DRY fix for the
+        # round-1/round-2 line-for-line-copy finding).
+        assert "three callers" in source
+
+    def test_consume_gate_verb_flag_value_names_both_verbs_the_shared_parser_serves(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._consume_gate_verb_flag_value)
+        assert "check-write-path" in source
+        assert "scaffold-store-factory" in source
+
+    def test_gate_verb_usage_error_names_check_write_path_and_its_scope_correctly(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_verb_usage_error)
+        assert "check-write-path" in source
+        assert "is a gate CHECK verb" in source
+        assert "gate-MARKER verbs" in source
+        assert "four verbs" in source
+
+    def test_gate_verb_usage_error_names_scaffold_store_factory_and_the_shared_parser(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_verb_usage_error)
+        assert "scaffold-store-factory" in source
+        assert "_parse_unit_id_and_required_flag_argv" in source
+
+    def test_gate_status_line_extra_fields_names_write_path_audit_fields(self) -> None:
+        import inspect
+
+        source = inspect.getsource(cli._gate_status_line)
+        assert "write_path_audit" in source
+        # W3 (test_review): bare "flag" and "verdict" are loose substrings;
+        # the backtick-wrapped, docstring-literal spellings pin the exact
+        # field names the docstring documents for write_path_audit.
+        assert "``flag``" in source
+        assert "``verdict``" in source
+
+    def test_generic_scope_resolution_message_prefix_names_check_write_path_as_a_third_caller(
+        self,
+    ) -> None:
+        """code_review round 1, this unit (E7-F2-S1-T3): the comment above
+        ``_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX`` enumerated only two
+        callers before ``cmd_check_write_path`` became the shared template's
+        third consumer; pinned so a fourth future caller cannot land without
+        this comment being swept too.
+
+        code_review round 3 (E7-F2-S1-T3): derives the contiguous ``# ``-prefixed
+        comment block immediately preceding the marker line instead of slicing a
+        magic, underived 700-character look-back window (which would silently
+        truncate if the comment grows, or bleed into the unrelated
+        ``_resolve_scope_or_report`` body above it if the comment shrinks), and
+        asserts the exact ordinal phrases the comment makes rather than the bare
+        substring "three" -- the loose-ordinal-assertion pattern this same file's
+        test_review rounds already rejected twice (see the sibling tests' "W3
+        (test_review): tightened from bare ..." comments above).
+
+        code_review round 1 (E9-F1-S1-T2, Blocking): ``cmd_scaffold_store_factory``
+        became the comment's fourth caller, so the pinned ordinals were swept
+        from "three" to "four" and a dedicated assertion for the new caller
+        was added below."""
+        import inspect
+
+        module_lines = inspect.getsource(cli).splitlines()
+        marker_line_index = next(
+            index
+            for index, line in enumerate(module_lines)
+            if line.startswith("_GENERIC_SCOPE_RESOLUTION_MESSAGE_PREFIX: str =")
+        )
+        comment_lines: list[str] = []
+        for line in reversed(module_lines[:marker_line_index]):
+            if not line.startswith("# "):
+                break
+            comment_lines.insert(0, line)
+        preceding_comment = "\n".join(comment_lines)
+        assert "cmd_check_write_path" in preceding_comment
+        assert "cmd_scaffold_store_factory" in preceding_comment
+        assert "the four :func:`_resolve_scope_or_report`" in preceding_comment
+        assert "the four call sites" in preceding_comment
+
+
+class _FixtureGateCmdFixtures:
+    """Shared git-fixture / config-fixture helpers for the fixture-consistency
+    done-path test classes below (E6-F2-S1-T2). Mirrors
+    ``_ReachabilityCmdFixtures``'s role for the reachability gate: a real,
+    on-disk git checkout plus a real, on-disk scratch backlog, rather than a
+    working-tree-free mock, since ``work_unit_scope.resolve_changed_files``
+    (spec 4.3, AC-9) needs both to resolve a real scope.
+    """
+
+    _REPO = "caylent-solutions/git-repo"
+
+    def _make_unit(self, unit_id: str) -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Test Task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    def _seed(
+        self, tmp_path: Path, unit_id: str, *, scan_value: str = "A1", extra_manifest_files: tuple[str, ...] = ()
+    ) -> tuple[Path, Path, Path, Path]:
+        """Seed a real git checkout (catalog/scan fixtures) and a done-path scratch backlog.
+
+        *scan_value* is the scan target's single record's ``sku`` value:
+        ``"A1"`` (the default) matches the canonical source, so the check
+        passes; any other value produces a ``missing_key`` finding naming
+        the scan target, which is IN the seeded Changes Manifest (both
+        fixture files are declared there), so it is attributable and
+        blocks (spec 4.3, E6-F2-S1-T2 AC-6).
+
+        *extra_manifest_files* adds further paths to the seeded Changes
+        Manifest beyond ``catalog.json``/``mock_lookup.json`` -- e.g. a
+        seeded source-literal file a caller wants to declare in scope so a
+        ``missing_key`` finding naming it is attributable (spec 4.3).
+        """
+        repo = tmp_path / "checkout"
+        repo.mkdir()
+        for args in (["init"], ["config", "user.email", "t@ex.com"], ["config", "user.name", "Test"]):
+            _run_scratch_git(args, repo)
+        (repo / "catalog.json").write_text(json.dumps([{"sku": "A1"}]), encoding="utf-8")
+        (repo / "mock_lookup.json").write_text(json.dumps([{"sku": scan_value}]), encoding="utf-8")
+        backlog_root, backlog_index, wu_file = _seed_gate_done_path_backlog(
+            tmp_path,
+            unit_id,
+            self._REPO,
+            ("catalog.json", "mock_lookup.json", *extra_manifest_files),
+            "Fixture consistency gate cycle test",
+        )
+        return repo, backlog_root, backlog_index, wu_file
+
+    def _runtime_config(
+        self,
+        repo: Path,
+        *,
+        enabled: bool = True,
+        canonical_identifier_field: str = "sku",
+        canonical_source_paths: tuple[str, ...] | None = None,
+        scan_target_paths: tuple[str, ...] = ("mock_lookup.json",),
+        extract_source_literals: bool = False,
+    ) -> Any:
+        """Build a `RuntimeConfig` with a single `fixture_consistency` gate configured.
+
+        Parameterized (test_review, E6-F2-S1-T2 round 5 W4) so every journey-suite
+        variant shares this one builder instead of hand-rolling its own inline
+        `RuntimeConfig(...)` plus a local `config_loader` import block:
+
+        - `canonical_source_paths=None` (the default) configures the single
+          `catalog.json` canonical source every journey but the disabled/empty ones
+          uses; `canonical_source_paths=()` configures NONE at all, matching
+          `FixtureConsistencyConfig()`'s own unconfigured default (the disabled-gate
+          journey).
+        - `canonical_identifier_field` overrides the canonical source's
+          `identifier_field` (the typo'd-field adversarial journey passes `"skuu"`).
+        - `scan_target_paths` accepts more than one path (the attribution journey
+          configures a second, out-of-Manifest scan target alongside the default
+          `mock_lookup.json`); every scan target shares `identifier_field="sku"`,
+          matching every journey's actual usage.
+        - `extract_source_literals` is forwarded verbatim (the two seeded-source-
+          literal journeys set it `True`).
+        """
+        from devbench.config_loader import (
+            FixtureCanonicalSource,
+            FixtureConsistencyConfig,
+            FixtureScanTarget,
+            GatesConfig,
+            RepoConfig,
+            RuntimeConfig,
+        )
+
+        resolved_canonical_paths = ("catalog.json",) if canonical_source_paths is None else canonical_source_paths
+        fixture_cfg = FixtureConsistencyConfig(
+            enabled=enabled,
+            canonical_sources=tuple(
+                FixtureCanonicalSource(path=path, identifier_field=canonical_identifier_field)
+                for path in resolved_canonical_paths
+            ),
+            scan=tuple(FixtureScanTarget(path=path, identifier_field="sku") for path in scan_target_paths),
+            extract_source_literals=extract_source_literals,
+        )
+        return RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(fixture_consistency=fixture_cfg),
+        )
+
+    def _patches(
+        self, unit_id: str, repo: Path, backlog_root: Path, backlog_index: Path, *, runtime_config: Any = None
+    ) -> tuple[Any, ...]:
+        """Every patch both ``cmd_check_fixture_consistency`` and ``cmd_mark_done`` need.
+
+        A single shared ``RuntimeConfig`` is patched at BOTH
+        ``devbench.cli.RUNTIME_CONFIG`` (``cmd_check_fixture_consistency``
+        reads ``RUNTIME_CONFIG.gates.fixture_consistency`` directly, never
+        re-loaded from a config file) and ``devbench.config.RUNTIME_CONFIG``
+        (``BacklogManager._check_gate_pass_done_invariant`` resolves
+        ``gates.fixture_consistency.enabled`` through
+        ``config_loader.resolve_gate_config`` against THAT import location)
+        -- the two gates' config surfaces genuinely differ (see
+        ``cmd_check_fixture_consistency``'s own docstring), but this test
+        module always wants them to agree, so one ``RuntimeConfig`` object
+        backs both patches.
+        """
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        resolved_runtime_config = runtime_config if runtime_config is not None else self._runtime_config(repo)
+        return (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", resolved_runtime_config),
+            patch("devbench.cli.BACKLOG_ROOT", backlog_root.parent),
+            patch("devbench.cli.WORKSPACE_ROOT", backlog_root.parent),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+            patch("devbench.config.RUNTIME_CONFIG", resolved_runtime_config),
+        )
+
+
+class TestFixtureGateWritesGatePassRecord(_FixtureGateCmdFixtures):
+    """AC-E6-F2-S1-T2-1 (spec 4.2; 4.7 done-path sentence): a passing
+    ``check-fixture-consistency`` run writes ``[GATE_PASS
+    fixture_consistency] <iso-utc> <scope-hash>`` to the unit's audit trail
+    from the command itself; a failing run writes no record."""
+
+    def test_passing_run_writes_gate_pass_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        capsys.readouterr()
+        assert result == 0
+        content = wu_file.read_text(encoding="utf-8")
+        assert content.count("[GATE_PASS fixture_consistency]") == 1
+        import devbench.gate_records as gate_records_module
+
+        record = gate_records_module.latest_gate_pass_record(content, "fixture_consistency")
+        assert record is not None
+        assert record.timestamp.tzinfo is not None
+
+    def test_failing_run_writes_no_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="GHOST-SKU")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        capsys.readouterr()
+        assert result == 1
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_scope_resolution_failure_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """`work_unit_scope.resolve_changed_files` performs its OWN independent
+        `BacklogParser` lookup against `work_unit_scope.BACKLOG_ROOT`/`BACKLOG_INDEX` --
+        separate from `devbench.cli.BacklogParser`, which only serves this command's
+        earlier unit/repo resolution (`_resolve_fixture_consistency_repo_path`). Pointing
+        the former at a backlog that does not declare the unit (while the latter still
+        resolves it fine) makes scope resolution itself fail, which must exit 1 with an
+        `ERROR: ...` message rather than propagate an uncaught exception."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        empty_backlog_root = tmp_path / "empty-backlog"
+        empty_backlog_root.mkdir()
+        empty_backlog_index = tmp_path / "EmptyBACKLOG.md"
+        empty_backlog_index.write_text(
+            "## Full Work Unit Index\n\n| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|-----|-------|------|--------|-------------|------|----------|\n",
+            encoding="utf-8",
+        )
+        patches = [
+            *self._patches(unit_id, repo, backlog_root, backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", empty_backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", empty_backlog_index),
+        ]
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        assert result == 1
+        assert f"cannot resolve scope for unit {unit_id}" in capsys.readouterr().err
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_write_failure_when_wu_file_unresolvable_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The work-unit file cannot be located on disk at write time (`BACKLOG_ROOT`/
+        `WORKSPACE_ROOT` point elsewhere) -- mirrors
+        `TestCheckSharedFileImpactBaseline`'s equivalent shared_file_impact test."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        unit = self._make_unit(unit_id)
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        runtime_config = self._runtime_config(repo)
+
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo}),
+            patch("devbench.cli.RUNTIME_CONFIG", runtime_config),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog-does-not-exist"),
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path / "workspace-does-not-exist"),
+            patch("devbench.cli.BACKLOG_INDEX", backlog_index),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert f"ERROR: Cannot write [GATE_PASS fixture_consistency] record for {unit_id}" in captured.err
+        assert "work unit file not found" in captured.err
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+    def test_write_failure_on_append_os_error_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The work-unit file resolves, but the audit-marker append itself raises
+        `OSError` (e.g. a permission error or a full disk) -- must surface as the
+        standard `ERROR: ...` shape and exit 1, never a raw traceback (mirrors
+        `_write_ancestry_gate_pass_record`'s own `OSError` handling)."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = [
+            *self._patches(unit_id, repo, backlog_root, backlog_index),
+            patch(
+                "devbench.backlog.manager.BacklogManager._append_audit_marker_before_comments",
+                side_effect=OSError(28, "No space left on device"),
+            ),
+        ]
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            result = cli.cmd_check_fixture_consistency(unit_id)
+
+        captured = capsys.readouterr()
+        assert result == 1
+        assert captured.out == "", "a write failure must never leave partial stdout behind"
+        assert f"ERROR: Cannot write [GATE_PASS fixture_consistency] record for {unit_id}" in captured.err
+        assert "Traceback" not in captured.err, "an OSError during the append must never surface as a raw traceback"
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestFixtureFindingIsAttributable:
+    """`_fixture_finding_is_attributable` (spec 4.3, E6-F2-S1-T2 AC-6): the attribution rule
+    that limits a `missing_key` finding to blocking only the calling unit whose scope
+    contains the file it names.
+
+    SECURITY (security_review, round 5 HIGH): `FixtureFinding.location` is a structured
+    field set directly by the producing call site (`_check_scan_targets`/
+    `_check_source_literals`), never recovered by re-parsing `message`. The deleted
+    `_fixture_finding_location_path` helper re-parsed a free-text, single-quoted
+    `'{location}'` message slot with a regex, which truncated at the first apostrophe a
+    repo-relative path can legally contain (`o'brien.json`), silently misattributing an
+    IN-SCOPE finding as out-of-scope and letting it stop blocking. The parametrized cases
+    below prove the structured field is immune to that whole class of defect for every
+    character that broke (or could plausibly break) a free-text parse."""
+
+    def test_non_missing_key_finding_is_always_attributable(self) -> None:
+        """code_review (E6-F2-S1-T2): `location` is set to a non-`None`, OUT-OF-SCOPE
+        path so the leading `if finding.kind != FINDING_KIND_MISSING_KEY: return True`
+        guard is the ONLY reason this assertion can pass -- deleting that guard entirely
+        used to leave this test green too, since the default `location=None` fell
+        through to the *separate* `finding.location is None: return True` fail-closed
+        branch below it and still returned `True` by coincidence, never actually
+        exercising the kind check this test claims to pin."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="load_error", message="Failed to parse fixture 'x.json': boom", location="other.json"
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock.json"})) is True
+
+    def test_missing_key_finding_with_no_location_is_attributable_fail_closed(self) -> None:
+        """A `missing_key` finding whose `location` was never populated (a hypothetical
+        future third producer that forgets to set the field) must never be silently
+        excluded from attribution. This is fail-CLOSED, not fail-fast: nothing here
+        aborts early -- the run continues to completion and the finding with no provable
+        location is simply retained as blocking rather than excused, exactly the
+        semantics `cli.py` already names "fail-closed" elsewhere (e.g. the ancestry
+        probe's "a node whose outcome could not be determined at all" branch). Today
+        both `missing_key` producers populate `location` unconditionally, so this test
+        exercises the defensive branch directly via a hand-built finding, not the parse
+        failure the old helper used to guard against -- there is no parse step left."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(kind="missing_key", message="a message with no structured location", location=None)
+
+        assert finding.location is None
+        assert cli._fixture_finding_is_attributable(finding, frozenset()) is True
+
+    def test_missing_key_finding_in_scope_is_attributable(self) -> None:
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'mock_lookup.json' field 'sku' references...",
+            location="mock_lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock_lookup.json"})) is True
+
+    def test_missing_key_finding_out_of_scope_is_not_attributable(self) -> None:
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'other.json' field 'sku' references...",
+            location="other.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"mock_lookup.json"})) is False
+
+    def test_source_literal_finding_location_carries_no_line_suffix(self) -> None:
+        """A source-literal `missing_key` finding's `message` embeds `path:line` for a
+        human reader, but `location` is always the bare path -- attribution compares
+        `location` verbatim against `ScopeResult.files`, which never carries a line
+        suffix either."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Source file 'app/routes.py:3' assigns 'sku'...",
+            location="app/routes.py",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"app/routes.py"})) is True
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"app/routes.py:3"})) is False
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            pytest.param("o'brien.json", id="apostrophe"),
+            pytest.param("weird:name.json", id="colon"),
+            pytest.param("weird\nname.json", id="newline"),
+            pytest.param("a/../b/catalog.json", id="dot-dot-component"),
+        ],
+    )
+    def test_scan_target_shaped_finding_with_special_path_blocks_when_in_scope(self, path: str) -> None:
+        """A repo-relative path containing an apostrophe, a colon, a newline, or a `..`
+        component is unusual but legal on this filesystem -- the structured `location`
+        field compares it verbatim against `scope_files`, with no free-text parsing step
+        that could truncate or otherwise mis-split on any of those characters."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=(
+                f"Fixture '{path}' field 'sku' references 1 key(s) absent from canonical "
+                "source 'catalog.json': GHOST-SKU."
+            ),
+            location=path,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({path})) is True
+
+    @pytest.mark.parametrize(
+        "path,line",
+        [
+            pytest.param("o'brien.py", 3, id="apostrophe"),
+            pytest.param("weird:name.py", 5, id="colon"),
+            pytest.param("weird\nname.py", 7, id="newline"),
+            pytest.param("a/../b/routes.py", 9, id="dot-dot-component"),
+        ],
+    )
+    def test_source_literal_shaped_finding_with_special_path_blocks_when_in_scope(self, path: str, line: int) -> None:
+        """Same as above for the source-literal producer's `path:line` message shape --
+        `location` still carries only the bare path (no line suffix) and still compares
+        verbatim, with no parsing step to mis-split on the special character."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=(
+                f"Source file '{path}:{line}' assigns 'sku' the literal value "
+                "'<redacted, 3 chars total; see file:line above to inspect it directly>', "
+                "which is absent from canonical source 'catalog.json' ..."
+            ),
+            location=path,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({path})) is True
+
+    def test_location_that_is_a_string_prefix_of_an_in_scope_path_is_not_attributable(self) -> None:
+        """`location` must be compared for EXACT membership in `scope_files`, never a
+        prefix/substring match -- a finding naming `tests/fixtures/o` must not be treated
+        as in-scope merely because `tests/fixtures/o'brien.json` (a distinct, longer
+        path) happens to be a member of `scope_files`."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'tests/fixtures/o' field 'sku' references...",
+            location="tests/fixtures/o",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"tests/fixtures/o'brien.json"})) is False
+
+
+@pytest.mark.unit
+class TestFixtureFindingLocationNormalization:
+    """`_fixture_finding_is_attributable` (spec 4.3, E6-F2-S1-T2 -- orchestrator-directed
+    closure of a second attribution bypass reproduced independently by security_review,
+    code_review and test_review): before this fix, `location` was compared against
+    `scope_files` with NO canonicalisation on either side. `config_loader._parse_...`
+    stores a scan target's configured `path` string verbatim, and `_check_scan_targets`
+    copies it verbatim into `FixtureFinding.location` -- so a scan target declared as
+    `./mock_lookup.json` or `sub/../mock_lookup.json` compared unequal to the SAME file's
+    canonical Manifest spelling (`mock_lookup.json`), the finding was misattributed
+    out-of-scope, and the gate silently passed on an inconsistent catalog -- reaching the
+    identical end state as the round-5 HIGH this fix's sibling (`TestFixtureFindingIsAttributable`)
+    closed. The source-literal producer (`_check_source_literals`) already emits a canonical
+    `abs_path.relative_to(repo_path).as_posix()` location and needed no change.
+
+    Normalisation is lexical only (`fixture_consistency.normalize_repo_relative_path`,
+    built on `posixpath.normpath`) -- it never touches the filesystem, so it cannot resolve
+    a symlink and change which unit a finding is attributed to, and it never case-folds, so
+    two paths differing only in case remain distinct. An escaping `..` or a bare absolute
+    path is left exactly as normalised (still carrying the leading `..`/`/`), which can
+    never equal a genuine repo-relative Manifest entry -- for those two shapes specifically,
+    normalisation never turns a genuinely out-of-scope path into an in-scope one. That
+    guarantee does not extend to every path this function accepts: a symlinked-parent `..`
+    merge can turn a genuinely out-of-scope path into an in-scope one (fail-closed, block
+    direction only, never the reverse -- see `normalize_repo_relative_path`'s own
+    docstring)."""
+
+    @pytest.mark.parametrize(
+        "location,scope_files",
+        [
+            pytest.param("norm_lookup.json", frozenset({"norm_lookup.json"}), id="control-already-canonical"),
+            pytest.param("./norm_lookup.json", frozenset({"norm_lookup.json"}), id="leading-dot-slash"),
+            pytest.param("sub/../norm_lookup.json", frozenset({"norm_lookup.json"}), id="dot-dot-collapse"),
+            pytest.param("./app/norm.json", frozenset({"app/norm.json"}), id="nested-leading-dot-slash"),
+            pytest.param("norm_lookup.json/", frozenset({"norm_lookup.json"}), id="trailing-slash"),
+            pytest.param("a//norm_lookup.json", frozenset({"a/norm_lookup.json"}), id="duplicate-separator"),
+            pytest.param("a/./norm_lookup.json", frozenset({"a/norm_lookup.json"}), id="internal-dot-slash"),
+        ],
+    )
+    def test_differently_spelled_in_scope_path_is_attributable(
+        self, location: str, scope_files: frozenset[str]
+    ) -> None:
+        """test_review's four-row reproduction table, plus the control row, a trailing-
+        slash variant, and a duplicate-separator/internal-dot-slash pair pinning the two
+        collapse shapes `normalize_repo_relative_path`'s docstring names alongside the
+        original three: every spelling of the SAME repo-relative file blocks identically."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message=f"Fixture '{location}' field 'sku' references 1 key(s) absent from catalog.json: GHOST-SKU.",
+            location=location,
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, scope_files) is True
+
+    def test_dot_dot_escaping_the_root_does_not_match_a_same_named_in_scope_file(self) -> None:
+        """A scan target spelled `../outside.json` names a file one level ABOVE the repo
+        root -- a genuinely different file from an in-scope `outside.json` at the repo
+        root. Normalisation must never collapse the two together."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture '../outside.json' field 'sku' references...",
+            location="../outside.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"outside.json"})) is False
+
+    def test_absolute_path_does_not_match_a_same_named_in_scope_file(self) -> None:
+        """An absolute-path location must never be treated as equivalent to a bare
+        repo-relative Manifest entry of the same basename."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture '/norm_lookup.json' field 'sku' references...",
+            location="/norm_lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"norm_lookup.json"})) is False
+
+    def test_case_difference_does_not_match(self) -> None:
+        """Normalisation must never case-fold -- a path differing only in case is left
+        exactly as distinct as it was before normalisation."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture 'Norm_Lookup.json' field 'sku' references...",
+            location="Norm_Lookup.json",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"norm_lookup.json"})) is False
+
+    def test_normalized_string_prefix_still_does_not_match(self) -> None:
+        """Normalisation is applied before the EXACT-membership check, never before a
+        substring/prefix check -- a leading `./` on a path that is a string prefix of an
+        in-scope path must still not match (mirrors
+        `TestFixtureFindingIsAttributable.test_location_that_is_a_string_prefix_of_an_in_scope_path_is_not_attributable`,
+        with normalisation now in the comparison path)."""
+        from devbench.fixture_consistency import FixtureFinding
+
+        finding = FixtureFinding(
+            kind="missing_key",
+            message="Fixture './tests/fixtures/o' field 'sku' references...",
+            location="./tests/fixtures/o",
+        )
+
+        assert cli._fixture_finding_is_attributable(finding, frozenset({"tests/fixtures/o'brien.json"})) is False
+
+
+class TestMarkDoneRequiresFixtureGatePass(_FixtureGateCmdFixtures):
+    """AC-E6-F2-S1-T2-2/3/4/5 (spec 4.2, 4.3; AC-16, AC-7, AC-9): the fixture
+    gate's done-path cycle observed end to end against a real git fixture
+    repo -- ``mark-done`` is blocked with no record, ``check-fixture-consistency``
+    writes the record and ``mark-done`` then consumes it, an in-scope edit
+    stales an existing record, a non-operator waiver does not unblock while an
+    operator one does, and a disabled gate imposes nothing at all."""
+
+    def test_blocked_then_record_written_then_done(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            before = wu_file.read_text(encoding="utf-8")
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1, "mark-done must refuse before any [GATE_PASS fixture_consistency] record exists"
+            assert wu_file.read_text(encoding="utf-8") == before
+
+            checked = cli.cmd_check_fixture_consistency(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
+
+            done = cli.cmd_mark_done(unit_id)
+            assert done == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_mark_done_refusal_names_the_exact_remediation_command(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            blocked = cli.cmd_mark_done(unit_id)
+
+        assert blocked == 1
+        assert f"uv run devbench check-fixture-consistency {unit_id}" in capsys.readouterr().err
+
+    def test_stale_record_blocks_and_operator_waiver_unblocks(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            checked = cli.cmd_check_fixture_consistency(unit_id)
+            assert checked == 0
+            assert "[GATE_PASS fixture_consistency]" in wu_file.read_text(encoding="utf-8")
+
+            # Edit an in-scope file AFTER the record was captured (AC-3): the
+            # persisted scope hash no longer matches the recomputed one.
+            (repo / "mock_lookup.json").write_text(json.dumps([{"sku": "A1", "extra": "changed"}]), encoding="utf-8")
+
+            capsys.readouterr()  # discard the check-fixture-consistency output above
+            stale = cli.cmd_mark_done(unit_id)
+            assert stale == 1
+            assert (
+                "ERROR: gate 'fixture_consistency' record is stale (scope changed since it ran)"
+                in capsys.readouterr().err
+            )
+            content_before_waiver = wu_file.read_text(encoding="utf-8")
+            assert "## Status: done" not in content_before_waiver
+
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "fixture_consistency",
+                "--target",
+                "mock_lookup.json",
+                "--reason",
+                "reviewed manually after the stale edit",
+                "--operator",
+            )
+            assert waiver_result == 0
+
+            unblocked = cli.cmd_mark_done(unit_id)
+            assert unblocked == 0
+            assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+
+    def test_non_operator_waiver_does_not_unblock(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Two independent halves of AC-4 (spec Section 3.6: only an operator may waive a
+        machine-blocking gate): (1) ``log-waiver`` itself REFUSES to write a non-operator
+        waiver for ``fixture_consistency`` at all (the CLI-level enforcement every caller
+        goes through); (2) even if an executor-attributed ``[GATE_WAIVER fixture_consistency]``
+        marker existed anyway (e.g. hand-authored), ``mark-done``'s own
+        ``_check_gate_pass_done_invariant`` still refuses it -- defense in depth, proven by
+        appending the marker directly rather than through ``log-waiver``."""
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            waiver_result = cli.cmd_log_waiver(
+                "code_review",
+                unit_id,
+                "--gate",
+                "fixture_consistency",
+                "--target",
+                "mock_lookup.json",
+                "--reason",
+                "executor self-review, not an operator decision",
+            )
+            assert waiver_result == 2
+            assert "--operator is required" in capsys.readouterr().err
+            assert "[GATE_WAIVER fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
+
+            # Defense in depth: even an executor-attributed marker that exists on disk
+            # (never through log-waiver) must not unblock mark-done for this gate.
+            content = wu_file.read_text(encoding="utf-8")
+            hand_authored_waiver = (
+                "[2026-01-01 00:00 UTC] [agent/code_review] [GATE_WAIVER fixture_consistency] "
+                "2026-01-01T00:00:00+00:00 mock_lookup.json executor reviewed manually\n"
+            )
+            updated_content = content.replace("## Comments\n\n", f"## Comments\n\n{hand_authored_waiver}", 1)
+            wu_file.write_text(updated_content, encoding="utf-8")
+
+            capsys.readouterr()
+            blocked = cli.cmd_mark_done(unit_id)
+            assert blocked == 1
+            assert "executor-attributed" in capsys.readouterr().err
+            assert "## Status: done" not in wu_file.read_text(encoding="utf-8")
+
+    def test_disabled_gate_imposes_nothing(self, tmp_path: Path) -> None:
+        unit_id = "E0-F1-S1-T1"
+        repo, backlog_root, backlog_index, wu_file = self._seed(tmp_path, unit_id, scan_value="A1")
+        from devbench.config_loader import FixtureConsistencyConfig, GatesConfig, RepoConfig, RuntimeConfig
+
+        disabled_runtime_config = RuntimeConfig(
+            repos={self._REPO: RepoConfig(resolved_checkout_path=repo)},
+            gates=GatesConfig(fixture_consistency=FixtureConsistencyConfig(enabled=False)),
+        )
+        patches = self._patches(unit_id, repo, backlog_root, backlog_index, runtime_config=disabled_runtime_config)
+
+        with contextlib.ExitStack() as stack:
+            for one_patch in patches:
+                stack.enter_context(one_patch)
+            done = cli.cmd_mark_done(unit_id)
+
+        assert done == 0
+        assert "## Status: done" in wu_file.read_text(encoding="utf-8")
+        assert "[GATE_PASS fixture_consistency]" not in wu_file.read_text(encoding="utf-8")
 
 
 class TestCmdLogVerdict:
@@ -9813,6 +20065,230 @@ class TestCmdGitOpsFinalize:
         assert "defer_pr" in capsys.readouterr().err.lower()
 
 
+class TestCmdGitOpsFinalizeProvenance:
+    """Test the ``--provenance`` flag / ``git_ops.provenance_path`` config key
+    (E2-F9-S1-T1, spec 4.13, D-17, AC-24). The flag overrides the config key
+    for a single invocation; the config key alone suffices for unattended
+    ``auto_finalize`` runs; an unreadable/missing path fails loudly (exit 1)
+    naming the path before any push side effect runs."""
+
+    def test_provenance_flag_overrides_config_key_for_single_invocation(self, tmp_path: Path) -> None:
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        flag_map = tmp_path / "flag-map.json"
+        flag_map.write_text(json.dumps({"epics": []}), encoding="utf-8")
+        configured_map = tmp_path / "configured-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=str(configured_map)),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(flag_map))
+
+        assert result == 0
+        mock_ops.compose_finalize_pr_body.assert_called_once()
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == flag_map
+
+    def test_config_key_alone_used_when_no_flag(self, tmp_path: Path) -> None:
+        """Unattended auto_finalize runs pick up the config key with no flag."""
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        configured_map = tmp_path / "configured-map.json"
+        configured_map.write_text(json.dumps({"epics": []}), encoding="utf-8")
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=str(configured_map)),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == configured_map
+
+    def test_relative_provenance_config_key_resolves_against_repo_path(self, tmp_path: Path) -> None:
+        """Regression test (spec 4.13, Section 6): ``GitOpsConfig.provenance_path``
+        is documented as 'relative to the repo working tree, or absolute'
+        (config_loader.py). ``sample-config.yaml``, ``docs/devbench-yaml-
+        reference.md`` and ``docs/cli-reference.md`` all recommend the
+        relative form ``docs/release-notes/provenance-map.json``, and
+        AC-E2-F9-S1-T1-5 requires the config key alone to suffice for an
+        unattended ``auto_finalize`` run, whose CWD is the workspace root,
+        not the target repo. A relative ``provenance_path`` must therefore
+        resolve against the target repo's ``repo_path``, not the process
+        CWD."""
+        from devbench.config_loader import GitOpsConfig, RuntimeConfig
+
+        relative_map = "docs/release-notes/provenance-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+        mock_runtime_cfg = RuntimeConfig(
+            repos={},
+            git_ops=GitOpsConfig(single_branch="feature/combined", provenance_path=relative_map),
+        )
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.RUNTIME_CONFIG", mock_runtime_cfg),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == tmp_path / relative_map
+
+    def test_absolute_provenance_flag_is_not_re_anchored(self, tmp_path: Path) -> None:
+        """An already-absolute ``--provenance`` value must be passed through
+        unchanged, not joined onto ``repo_path`` a second time."""
+        absolute_map = tmp_path / "elsewhere" / "provenance-map.json"
+
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(absolute_map))
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] == absolute_map
+
+    def test_no_flag_no_config_key_passes_none(self, tmp_path: Path) -> None:
+        mock_ops = MagicMock()
+        mock_ops.create_pr.return_value = "https://github.com/org/repo/pull/99"
+        mock_ops.wait_for_checks_and_classify.return_value = CIResult.GREEN
+        mock_ops.compose_finalize_pr_body.return_value = "composed body"
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+            patch("devbench.cli._handle_finalize_ci_result", return_value=0),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo")
+
+        assert result == 0
+        _, kwargs = mock_ops.compose_finalize_pr_body.call_args
+        assert kwargs["provenance_path"] is None
+
+    def test_unreadable_provenance_path_exits_1_naming_path_before_push(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        bad_path = tmp_path / "does-not-exist.json"
+        mock_ops = MagicMock()
+        mock_ops.compose_finalize_pr_body.side_effect = ValueError(f"provenance map not found at '{bad_path}'")
+
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {"caylent-solutions/git-repo": tmp_path}),
+            patch("devbench.github.git_ops.GitOpsService", return_value=mock_ops),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance", str(bad_path))
+
+        assert result == 1
+        err = capsys.readouterr().err
+        assert str(bad_path) in err
+        mock_ops.commit_and_push.assert_not_called()
+        mock_ops.create_pr.assert_not_called()
+
+    def test_provenance_flag_requires_value(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "--provenance")
+
+        assert result == 1
+        assert "--provenance" in capsys.readouterr().err
+
+    def test_no_repo_argument_requires_repo(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize()
+
+        assert result == 1
+        assert "requires <repo>" in capsys.readouterr().err
+
+    def test_unexpected_second_positional_argument_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+        ):
+            result = cli.cmd_git_ops_finalize("caylent-solutions/git-repo", "extra-arg")
+
+        assert result == 1
+        assert "unexpected argument" in capsys.readouterr().err
+
+    def test_leading_empty_string_argument_is_skipped(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A blank argv slot (never produced by ``main()``'s own tokenizer, but
+        defensively handled the same way ``_parse_id_and_reason`` handles it)
+        does not get mistaken for the ``<repo>`` positional."""
+        with (
+            patch("devbench.config.SINGLE_BRANCH", "feature/combined"),
+            patch("devbench.config.DEFER_PR", True),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {}),
+        ):
+            result = cli.cmd_git_ops_finalize("", "caylent-solutions/git-repo")
+
+        assert result == 1
+        assert "No local path configured for repo 'caylent-solutions/git-repo'" in capsys.readouterr().err
+
+    def test_registered_as_variadic(self) -> None:
+        """'git-ops-finalize' must be in _VARIADIC_COMMANDS so main()'s dispatcher
+        forwards the full trailing argv (including ``--provenance <path>``) instead
+        of slicing it to the fixed-arity ``min_args + 1`` window. Without this
+        registration, ``devbench git-ops-finalize <repo> --provenance <path>`` is
+        truncated by main() before _parse_git_ops_finalize_argv ever sees the value,
+        even though every test in this class calls cmd_git_ops_finalize(...) directly
+        and bypasses main() entirely."""
+        assert "git-ops-finalize" in cli._VARIADIC_COMMANDS
+
+
 class TestCmdGitOpsFinalizeNotifications:
     """Issue #219: cmd_git_ops_finalize and _handle_finalize_ci_result fire
     the same Slack notifications as the per-WU cmd_git_ops path.
@@ -11846,6 +22322,1067 @@ class TestCmdAddDep:
         assert rc == 0
         assert flock_calls, "the canonicalize row rewrite must acquire flock_backlog (#330 FR-1)"
         assert all(call == workspace for call in flock_calls)
+
+
+class TestCmdWireGate:
+    """spec 4.5/317-D23, spec 4.9: `wire-gate <gate-task-id> --blocks-roots`.
+
+    Mechanises the fan-in that previously required hand-authoring a
+    `## Dependencies` row into every root of the intra-backlog dependency DAG
+    -- writes the edge through the same managed path `cmd_add_dep` already
+    owns so every row is written in the exact form `validate-backlog` reads.
+    """
+
+    _GATE_TITLE = "Verify upstream dependency has merged (ancestry gate)"
+
+    @staticmethod
+    def _write_task_file(
+        story_dir: Path,
+        task_id: str,
+        title: str,
+        *,
+        status: str = "in-queue",
+        deps: list[tuple[str, str, str]] | None = None,
+    ) -> Path:
+        """Write a minimal task file with a canonical ``## Dependencies`` table.
+
+        ``deps`` is a list of ``(id, title, status)`` rows; ``None``/empty
+        renders the ``| none | | |`` placeholder row.
+        """
+        if deps:
+            rows = "\n".join(f"| {did} | {dtitle} | {dstatus} |" for did, dtitle, dstatus in deps)
+        else:
+            rows = "| none | | |"
+        path = story_dir / f"{task_id}.md"
+        path.write_text(
+            f"# {task_id}: {title}\n\n## Status: {status}\n\n## Description\n\nx\n\n"
+            "## Dependencies\n\n| ID | Title | Status |\n|----|-------|--------|\n"
+            f"{rows}\n"
+        )
+        return path
+
+    def _build_workspace(
+        self,
+        tmp_path: Path,
+        *,
+        gate_id: str = "E0-F1-S1-T1",
+        gate_title: str | None = None,
+        gate_status: str = "in-queue",
+        extra_index_rows: str = "",
+    ) -> Path:
+        """Build a gate task + two DAG-root tasks + one non-root task.
+
+        Roots: ``E1-F1-S1-T1``, ``E1-F1-S1-T2`` (empty ``## Dependencies``).
+        Non-root: ``E1-F1-S1-T3`` (depends on ``E1-F1-S1-T1``, a real,
+        non-gate dependency -- must never receive the gate row).
+        """
+        gate_title = gate_title if gate_title is not None else self._GATE_TITLE
+        (tmp_path / "BACKLOG.md").write_text(
+            "# Backlog\n\n"
+            "## Status Summary\n\n"
+            "| Epic | Title | Done | In Progress | In Queue | Blocked |\n"
+            "|------|-------|------|-------------|----------|---------|\n"
+            "| E0 | Bootstrap | 0 | 0 | 1 | 0 |\n"
+            "| E1 | Work | 0 | 0 | 3 | 0 |\n\n"
+            "## Full Work Unit Index\n\n"
+            "| ID | Title | Type | Status | Dependencies | Repo | File Path |\n"
+            "|----|-------|------|--------|--------------|------|-----------|\n"
+            f"| {gate_id} | {gate_title} | Task | {gate_status} | None | caylent-solutions/example | "
+            f"`backlog/E0/E0-F1/E0-F1-S1/{gate_id}.md` |\n"
+            "| E1-F1-S1-T1 | Root A | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T1.md` |\n"
+            "| E1-F1-S1-T2 | Root B | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T2.md` |\n"
+            "| E1-F1-S1-T3 | Non-root | Task | in-queue | None | caylent-solutions/example | "
+            "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T3.md` |\n"
+            f"{extra_index_rows}"
+        )
+        e0_story = tmp_path / "backlog" / "E0" / "E0-F1" / "E0-F1-S1"
+        e0_story.mkdir(parents=True)
+        self._write_task_file(e0_story, gate_id, gate_title, status=gate_status)
+
+        e1_story = tmp_path / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        e1_story.mkdir(parents=True)
+        self._write_task_file(e1_story, "E1-F1-S1-T1", "Root A")
+        self._write_task_file(e1_story, "E1-F1-S1-T2", "Root B")
+        self._write_task_file(
+            e1_story,
+            "E1-F1-S1-T3",
+            "Non-root",
+            deps=[("E1-F1-S1-T1", "Root A", "in-queue")],
+        )
+        return tmp_path
+
+    def _build_hierarchy_workspace(self, tmp_path: Path) -> Path:
+        """Build a full Epic/Feature/Story/Task hierarchy around the gate task.
+
+        Regression fixture for two code_review findings: (1) `wire-gate`
+        previously wired the gate task's OWN ancestor Feature/Story into
+        `wired_roots`, violating AC-WIRE-001's "and to no other unit" --
+        every real `spec-to-backlog`-generated tree has these ancestors, so
+        this reproduced on every invocation; and (2) every fixture in this
+        class previously indexed Task rows only, so the `WorkUnitType.EPIC`
+        exclusion branch was never exercised as True and no Story/Feature
+        root was ever wired (AC-TEST-001). Extends `_build_workspace`'s gate
+        task `E0-F1-S1-T1` and roots `E1-F1-S1-T1` / `E1-F1-S1-T2` with:
+
+        - `E0` (Epic), `E0-F1` (Feature), `E0-F1-S1` (Story): the gate
+          task's OWN ancestors. Must never appear in `wired_roots`.
+        - `E1` (Epic): an unrelated Epic. Excluded by type, not ancestry.
+        - `E1-F1` (Feature), `E1-F1-S1` (Story): unrelated to the gate
+          task's own ancestry, each with an empty `## Dependencies` table.
+          Both ARE DAG roots and MUST be wired.
+        - `E1-F1-S1-T4` (Task, status `done`): an already-terminal root.
+          Must be excluded from `wired_roots` and left byte-identical.
+        """
+        workspace = self._build_workspace(tmp_path)
+        index_path = tmp_path / "BACKLOG.md"
+        index_path.write_text(
+            index_path.read_text().replace(
+                "|----|-------|------|--------|--------------|------|-----------|\n",
+                "|----|-------|------|--------|--------------|------|-----------|\n"
+                "| E0 | Bootstrap | Epic | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0.md` |\n"
+                "| E0-F1 | Bootstrap Feature | Feature | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0-F1/E0-F1.md` |\n"
+                "| E0-F1-S1 | Bootstrap Story | Story | in-queue | None | caylent-solutions/example | "
+                "`backlog/E0/E0-F1/E0-F1-S1/E0-F1-S1.md` |\n"
+                "| E1 | Work | Epic | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1.md` |\n"
+                "| E1-F1 | Work Feature | Feature | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1.md` |\n"
+                "| E1-F1-S1 | Work Story | Story | in-queue | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1.md` |\n"
+                "| E1-F1-S1-T4 | Already done | Task | done | None | caylent-solutions/example | "
+                "`backlog/E1/E1-F1/E1-F1-S1/E1-F1-S1-T4.md` |\n",
+            )
+        )
+        backlog_dir = tmp_path / "backlog"
+        for owning_dir, unit_id, title, status in (
+            (backlog_dir / "E0", "E0", "Bootstrap", "in-queue"),
+            (backlog_dir / "E0" / "E0-F1", "E0-F1", "Bootstrap Feature", "in-queue"),
+            (backlog_dir / "E0" / "E0-F1" / "E0-F1-S1", "E0-F1-S1", "Bootstrap Story", "in-queue"),
+            (backlog_dir / "E1", "E1", "Work", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1", "E1-F1", "Work Feature", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1" / "E1-F1-S1", "E1-F1-S1", "Work Story", "in-queue"),
+            (backlog_dir / "E1" / "E1-F1" / "E1-F1-S1", "E1-F1-S1-T4", "Already done", "done"),
+        ):
+            owning_dir.mkdir(parents=True, exist_ok=True)
+            self._write_task_file(owning_dir, unit_id, title, status=status)
+        return workspace
+
+    @staticmethod
+    def _read(path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-004: usage errors, exit 2
+    # ------------------------------------------------------------------
+
+    def test_missing_blocks_roots_flag_exits_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1")
+        assert rc == 2
+        assert "--blocks-roots" in capsys.readouterr().err
+
+    def test_missing_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("--blocks-roots")
+        assert rc == 2
+        assert "gate-task id" in capsys.readouterr().err.lower()
+
+    def test_unknown_flag_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--bogus")
+        assert rc == 2
+        assert "unknown flag" in capsys.readouterr().err
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-004 regression, through the REAL dispatcher: a nonzero
+    # ``min_args`` on the ``_COMMANDS`` registration would let main()'s
+    # pre-dispatch arity check reject a short invocation with a generic
+    # exit-1 message BEFORE cmd_wire_gate's own usage validation ever
+    # runs -- these two drive `cli.main()` end to end (not
+    # `cli.cmd_wire_gate` directly) so that regression can never hide
+    # behind a test that bypasses the dispatcher.
+    # ------------------------------------------------------------------
+
+    def test_main_missing_blocks_roots_flag_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["devbench", "wire-gate", "E0-F1-S1-T1"]):
+            rc = cli.main()
+        assert rc == 2
+        assert "--blocks-roots" in capsys.readouterr().err
+
+    def test_main_missing_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("sys.argv", ["devbench", "wire-gate", "--blocks-roots"]):
+            rc = cli.main()
+        assert rc == 2
+        assert "gate-task id" in capsys.readouterr().err.lower()
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-003: unknown gate-task id, exit 1, zero edges written
+    # ------------------------------------------------------------------
+
+    def test_unknown_gate_task_id_exits_1_no_writes(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        root_a_before = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E9-F9-S9-T9", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "gate task 'E9-F9-S9-T9' not found in backlog" in err
+        root_a_after = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        assert root_a_before == root_a_after
+
+    def test_malformed_gate_task_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = cli.cmd_wire_gate("not-a-task-id", "--blocks-roots")
+        assert rc == 2
+        assert "does not match" in capsys.readouterr().err
+
+    def test_gate_task_already_terminal_exits_1_no_writes(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        workspace = self._build_workspace(tmp_path, gate_status="done")
+        root_a_before = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "already terminal" in err
+        assert "status=Done" in err
+        root_a_after = self._read(workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1" / "E1-F1-S1-T1.md")
+        assert root_a_before == root_a_after
+
+    def test_root_file_missing_exits_1_no_writes(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A root indexed in BACKLOG.md but missing from disk fails fast (AC-WIRE-003).
+
+        ``BacklogParser.parse_index`` eagerly resolves every indexed unit's
+        file up front, so this surfaces through `_prepare_wire_gate`'s
+        backlog-read failure path rather than a later per-root check --
+        either way, wire-gate exits 1 naming the missing file with zero
+        edges written.
+        """
+        workspace = self._build_workspace(tmp_path)
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_b_path = story / "E1-F1-S1-T2.md"
+        root_b_path.unlink()
+        root_a_before = self._read(story / "E1-F1-S1-T1.md")
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "E1-F1-S1-T2" in err
+        assert "file not found" in err
+        # No partial wiring: root A never got the gate edge either.
+        assert self._read(story / "E1-F1-S1-T1.md") == root_a_before
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-001: wires every root, and only roots
+    # ------------------------------------------------------------------
+
+    def test_wires_every_dag_root_and_no_other_unit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["gate_task"] == "E0-F1-S1-T1"
+        assert sorted(out["wired_roots"]) == ["E1-F1-S1-T1", "E1-F1-S1-T2"]
+
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_a = self._read(story / "E1-F1-S1-T1.md")
+        root_b = self._read(story / "E1-F1-S1-T2.md")
+        non_root = self._read(story / "E1-F1-S1-T3.md")
+        assert "| E0-F1-S1-T1 |" in root_a
+        assert "| E0-F1-S1-T1 |" in root_b
+        assert "| E0-F1-S1-T1 |" not in non_root, "wire-gate must never wire a non-root unit"
+
+    def test_gate_own_ancestors_and_epics_excluded_unrelated_hierarchy_wired(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-WIRE-001/AC-TEST-001 regression over a real Epic/Feature/Story/Task tree.
+
+        A gate task's own parent Story and Feature (and its Epic) are
+        candidates in every real `spec-to-backlog`-generated tree; they must
+        never be wired ("and to no other unit"). An unrelated Feature/Story
+        elsewhere in the backlog, with no upstream dependency of its own,
+        IS a legitimate DAG root and must be wired -- exercising the
+        `WorkUnitType.EPIC` exclusion branch as True and covering Story/
+        Feature roots, which no fixture in this class previously did.
+        """
+        workspace = self._build_hierarchy_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        wired = set(out["wired_roots"])
+
+        assert {"E1-F1-S1-T1", "E1-F1-S1-T2"} <= wired
+        assert "E0" not in wired, "wire-gate must never wire the gate task's own ancestor Epic"
+        assert "E0-F1" not in wired, "wire-gate must never wire the gate task's own ancestor Feature"
+        assert "E0-F1-S1" not in wired, "wire-gate must never wire the gate task's own ancestor Story"
+        assert "E1" not in wired, "Epics are never eligible roots"
+        assert "E1-F1" in wired, "an unrelated Feature with no upstream dependency IS a DAG root"
+        assert "E1-F1-S1" in wired, "an unrelated Story with no upstream dependency IS a DAG root"
+        assert "E1-F1-S1-T4" not in wired, "a terminal (done) root must be excluded, not force-blocked"
+
+        backlog_dir = workspace / "backlog"
+        ancestor_story = self._read(backlog_dir / "E0" / "E0-F1" / "E0-F1-S1" / "E0-F1-S1.md")
+        ancestor_feature = self._read(backlog_dir / "E0" / "E0-F1" / "E0-F1.md")
+        ancestor_epic = self._read(backlog_dir / "E0" / "E0.md")
+        assert "| E0-F1-S1-T1 |" not in ancestor_story
+        assert "| E0-F1-S1-T1 |" not in ancestor_feature
+        assert "| E0-F1-S1-T1 |" not in ancestor_epic
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-002: idempotent re-run, no duplicate rows, exit 0
+    # ------------------------------------------------------------------
+
+    def test_rerun_is_idempotent_no_duplicate_rows(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc1 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            capsys.readouterr()
+            rc2 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        out2 = json.loads(capsys.readouterr().out)
+        assert rc1 == 0
+        assert rc2 == 0
+        assert out2["gate_task"] == "E0-F1-S1-T1"
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        root_a = self._read(story / "E1-F1-S1-T1.md")
+        root_b = self._read(story / "E1-F1-S1-T2.md")
+        assert root_a.count("| E0-F1-S1-T1 |") == 1
+        assert root_b.count("| E0-F1-S1-T1 |") == 1
+
+    def test_rerun_after_root_reaches_done_does_not_revert_status(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-WIRE-002 regression: a root that reaches `done` after being wired
+        must never be force-reverted to `blocked` by a later re-run.
+
+        `_write_add_dep_edge` reuses `add_dep`, whose `_block_wired_target`
+        path unconditionally force-sets `## Status: blocked` on every wired
+        unit with no status guard. Before this fix, a second `wire-gate`
+        call on a root that had since completed silently reverted it from
+        `done` back to `blocked`, in both its work-unit file and the
+        `BACKLOG.md` Status cell, while still exiting 0 -- contradicting
+        AC-WIRE-002's idempotency claim.
+        """
+        workspace = self._build_workspace(tmp_path)
+        story = workspace / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc1 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            capsys.readouterr()
+        assert rc1 == 0
+
+        # Root A completes its own work after the fan-in wire (the first
+        # wire-gate call forced its status to 'blocked'; simulate it later
+        # reaching 'done', independent of the gate task).
+        root_a_path = story / "E1-F1-S1-T1.md"
+        root_a_path.write_text(self._read(root_a_path).replace("## Status: blocked", "## Status: done"))
+        index_path = workspace / "BACKLOG.md"
+        index_path.write_text(
+            index_path.read_text().replace(
+                "| E1-F1-S1-T1 | Root A | Task | in-queue |",
+                "| E1-F1-S1-T1 | Root A | Task | done |",
+            )
+        )
+        done_before = self._read(root_a_path)
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc2 = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+            out2 = json.loads(capsys.readouterr().out)
+        assert rc2 == 0
+        assert "E1-F1-S1-T1" not in out2["wired_roots"], (
+            "a done root must be excluded from a re-run, not force-reverted"
+        )
+        assert self._read(root_a_path) == done_before, "wire-gate must never revert a done root back to 'blocked'"
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-003: a root already wired to a DIFFERENT gate task -> exit 1,
+    # no edge written, before any write for this call.
+    # ------------------------------------------------------------------
+
+    def test_root_already_wired_to_different_gate_task_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._build_workspace(tmp_path, gate_id="E0-F1-S1-T1")
+        # A second gate task, and pre-wire root A to it directly (as a prior
+        # `wire-gate` call would have).
+        (tmp_path / "BACKLOG.md").write_text(
+            (tmp_path / "BACKLOG.md")
+            .read_text()
+            .replace(
+                "|----|-------|------|--------|--------------|------|-----------|\n",
+                "|----|-------|------|--------|--------------|------|-----------|\n"
+                "| E0-F2-S1-T1 | Verify other dependency has merged (ancestry gate) | Task | in-queue | "
+                "None | caylent-solutions/example | `backlog/E0/E0-F2/E0-F2-S1/E0-F2-S1-T1.md` |\n",
+            )
+        )
+        other_gate_story = tmp_path / "backlog" / "E0" / "E0-F2" / "E0-F2-S1"
+        other_gate_story.mkdir(parents=True)
+        self._write_task_file(
+            other_gate_story,
+            "E0-F2-S1-T1",
+            "Verify other dependency has merged (ancestry gate)",
+        )
+        story = tmp_path / "backlog" / "E1" / "E1-F1" / "E1-F1-S1"
+        self._write_task_file(
+            story,
+            "E1-F1-S1-T1",
+            "Root A",
+            deps=[("E0-F2-S1-T1", "Verify other dependency has merged (ancestry gate)", "in-queue")],
+        )
+        root_a_before = self._read(story / "E1-F1-S1-T1.md")
+        root_b_before = self._read(story / "E1-F1-S1-T2.md")
+
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", tmp_path),
+            patch("devbench.cli.BACKLOG_ROOT", tmp_path / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", tmp_path / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "E1-F1-S1-T1" in err
+        assert "already wired to gate task" in err
+        assert "E0-F2-S1-T1" in err
+        # No partial wiring: neither root gained the E0-F1-S1-T1 edge.
+        assert self._read(story / "E1-F1-S1-T1.md") == root_a_before
+        assert self._read(story / "E1-F1-S1-T2.md") == root_b_before
+
+    # ------------------------------------------------------------------
+    # Argv parsing edge case + write-failure paths.
+    # ------------------------------------------------------------------
+
+    def test_empty_string_argv_tokens_are_skipped(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """A stray empty-string argv token (e.g. from shell interpolation) is ignored."""
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+        ):
+            rc = cli.cmd_wire_gate("", "E0-F1-S1-T1", "", "--blocks-roots", "")
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["gate_task"] == "E0-F1-S1-T1"
+
+    def test_write_edge_exception_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli._write_add_dep_edge", side_effect=cli.ProposalError("boom")),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "failed to wire" in err
+        assert "boom" in err
+
+    def test_write_edge_returns_false_exits_1(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        workspace = self._build_workspace(tmp_path)
+        with (
+            patch("devbench.cli.WORKSPACE_ROOT", workspace),
+            patch("devbench.cli.BACKLOG_ROOT", workspace / "backlog"),
+            patch("devbench.cli.BACKLOG_INDEX", workspace / "BACKLOG.md"),
+            patch("devbench.cli._write_add_dep_edge", return_value=False),
+        ):
+            rc = cli.cmd_wire_gate("E0-F1-S1-T1", "--blocks-roots")
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "failed to wire" in err
+
+    # ------------------------------------------------------------------
+    # AC-WIRE-005: registration + --help description matches docs.
+    # ------------------------------------------------------------------
+
+    def test_wire_gate_registered_in_commands(self) -> None:
+        assert "wire-gate" in cli._COMMANDS
+        func, min_args, usage = cli._COMMANDS["wire-gate"]
+        assert func is cli.cmd_wire_gate
+        # min_args must be 0: wire-gate is variadic (see
+        # test_wire_gate_is_variadic below) and owns ALL of its own usage
+        # validation via _parse_wire_gate_argv, which returns exit 2 for a
+        # missing/malformed id, an unknown flag, or a missing
+        # --blocks-roots. A nonzero min_args here would let main()'s
+        # pre-dispatch arity check reject a short invocation with exit 1
+        # and a generic message BEFORE cmd_wire_gate ever runs, silently
+        # reintroducing the AC-WIRE-004 divergence between the documented
+        # exit-2 usage contract and the actual CLI behaviour.
+        assert min_args == 0
+        assert "--blocks-roots" in usage
+
+    def test_wire_gate_is_variadic(self) -> None:
+        assert "wire-gate" in cli._VARIADIC_COMMANDS
+
+
+class _ScaffoldStoreFactoryCmdFixtures:
+    """Shared fixture helpers for ``cmd_scaffold_store_factory`` test classes
+    (E9-F1-S1-T2, spec `integration-reality-gates-hardening.md` section 4.9(b)).
+
+    Mirrors ``_WritePathCmdFixtures``'s scope-fixture pattern (this module,
+    above): ``_patch_common`` seeds a real, on-disk Changes Manifest via the
+    shared ``_seed_scope_backlog`` helper and points BOTH
+    ``devbench.cli.BacklogParser`` (this command's own unit/repo lookup,
+    ``_resolve_unit_repo_and_path``) and
+    ``devbench.work_unit_scope.BACKLOG_ROOT``/``BACKLOG_INDEX`` (the
+    independent lookup ``resolve_changed_files`` performs) at the SAME
+    fixture data -- a mocked ``devbench.cli.BacklogParser`` alone never
+    satisfies ``resolve_changed_files``'s own, separate ``BacklogParser``
+    lookup (spec 4.3).
+    """
+
+    _REPO = "caylent-solutions/devbench"
+
+    def _make_unit(self, unit_id: str = "E1-F1-S1-T1") -> WorkUnit:
+        return WorkUnit(
+            id=unit_id,
+            title="Scaffold store factory task",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path(f"backlog/{unit_id}.md"),
+            repo=self._REPO,
+            dependencies=[],
+        )
+
+    @contextlib.contextmanager
+    def _patch_common(
+        self,
+        unit: WorkUnit,
+        repo_path: Path,
+        *,
+        manifest_files: tuple[str, ...] = (),
+        manifest_body: str | None = None,
+    ) -> Iterator[None]:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = [unit]
+        backlog_root, backlog_index = _seed_scope_backlog(
+            repo_path.parent, unit_id=unit.id, files=manifest_files, manifest_body=manifest_body
+        )
+        with (
+            patch("devbench.cli.BacklogParser", return_value=mock_parser),
+            patch("devbench.cli.REPO_LOCAL_PATHS", {self._REPO: repo_path}),
+            patch("devbench.work_unit_scope.BACKLOG_ROOT", backlog_root),
+            patch("devbench.work_unit_scope.BACKLOG_INDEX", backlog_index),
+        ):
+            yield
+
+    def _write(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.unit
+class TestCmdScaffoldStoreFactory(_ScaffoldStoreFactoryCmdFixtures):
+    """AC-E9-F1-S1-T2-1..8: ``scaffold-store-factory <id> --out <path>``
+    (spec 4.9(b), issue #11 AC2 item 3, decision D-9)."""
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-4: usage errors, exit 2
+    # ------------------------------------------------------------------
+
+    def test_missing_unit_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("--out", "skeleton.py")
+        assert result == 2
+        assert "unit id" in capsys.readouterr().err
+
+    def test_missing_out_value_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out")
+        assert result == 2
+        assert "--out" in capsys.readouterr().err
+
+    def test_missing_out_flag_entirely_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1")
+        assert result == 2
+        assert "--out" in capsys.readouterr().err
+
+    def test_unknown_flag_exits_2_naming_it(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", "skeleton.py", "--force")
+        assert result == 2
+        assert "--force" in capsys.readouterr().err
+
+    def test_duplicated_unit_id_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "E1-F1-S1-T2", "--out", "skeleton.py")
+        assert result == 2
+        assert capsys.readouterr().err.startswith("ERROR:")
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-4: unknown unit id, exit 1
+    # ------------------------------------------------------------------
+
+    def test_unknown_unit_id_exits_1_naming_it(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        mock_parser = MagicMock()
+        mock_parser.parse_index.return_value = []
+        out_path = tmp_path / "skeleton.py"
+        with patch("devbench.cli.BacklogParser", return_value=mock_parser):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+        assert result == 1
+        assert "E1-F1-S1-T1" in capsys.readouterr().err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-2, AC-E9-F1-S1-T2-5: happy path -- shape detected from
+    # the unit's resolved scope, skeleton written, exit 0.
+    # ------------------------------------------------------------------
+
+    def test_redux_shape_detected_and_skeleton_written(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "import { configureStore } from '@reduxjs/toolkit';\nexport const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "store_factory_skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert f"Wrote {out_path}" in captured.out
+        assert "redux" in captured.out
+        assert out_path.exists()
+        written = out_path.read_text(encoding="utf-8")
+        assert "redux" in written
+        assert "E1-F1-S1-T1" in written
+        assert "composition-root-testing.md" in written
+        # code_review + doc_review round 1 (E9-F1-S1-T2, Blocking): the
+        # emitted skeleton must not claim it satisfies the composition-root
+        # acceptance criterion (contradicts docs/composition-root-testing.md).
+        assert "skeleton satisfies" not in written
+        assert "does NOT by itself" in written
+
+    def test_angular_di_shape_detected_and_skeleton_written(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "app.module.ts",
+            "@NgModule({\n  providers: [RealFeatureService],\n})\nexport class AppModule {}\n",
+        )
+        out_path = tmp_path / "out" / "angular_skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/app.module.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "angular-di" in captured.out
+        written = out_path.read_text(encoding="utf-8")
+        assert "angular-di" in written
+        assert "TestBed" in written
+        # code_review + doc_review round 1 (E9-F1-S1-T2, Blocking): same
+        # non-satisfaction pin as the redux skeleton above.
+        assert "skeleton satisfies" not in written
+        assert "does NOT by itself" in written
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-3: refuse to overwrite an existing --out path.
+    # ------------------------------------------------------------------
+
+    def test_existing_out_path_exits_1_and_leaves_file_unchanged(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "existing.py"
+        original_content = "# hand-written test, do not clobber\n"
+        out_path.write_text(original_content, encoding="utf-8")
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert str(out_path) in captured.err
+        assert "--force" in captured.err
+        assert out_path.read_text(encoding="utf-8") == original_content
+
+    def test_no_force_flag_exists(self) -> None:
+        _, _, usage = cli._COMMANDS["scaffold-store-factory"]
+        assert "--force" not in usage
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-2: undetectable store shape, exit 1, no placeholder
+    # skeleton ever written.
+    # ------------------------------------------------------------------
+
+    def test_undetectable_shape_exits_1_naming_scanned_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "plain.py", "def add(a, b):\n    return a + b\n")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/plain.py",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "src/plain.py" in captured.err
+        assert "composition-root-testing.md" in captured.err
+        assert not out_path.exists()
+
+    def test_undetected_shape_message_distinguishes_scanned_from_extension_excluded(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review round 3 (E9-F1-S1-T2, Blocking): `_detect_store_shape_or_report`
+        previously named the FULL resolved scope under "Files scanned",
+        even though `_detect_store_shape` never opens a file whose
+        extension is outside `_STORE_SHAPE_SOURCE_EXTENSIONS` -- masking
+        the real cause (nothing in scope had a JS/TS extension) behind a
+        message implying every listed file was read and had no markers.
+        A pure-Python scope's failure message must name zero files under
+        "Files scanned" (none were actually read) and name the excluded
+        `.py` file separately, under a distinct "excluded" label."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "plain.py", "def add(a, b):\n    return a + b\n")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("src/plain.py",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Files scanned (.ts, .tsx, .js, .jsx only): (none)." in captured.err
+        assert "src/plain.py" in captured.err
+        assert "excluded" in captured.err.lower()
+        assert not out_path.exists()
+
+    def test_undetected_shape_message_reports_scanned_missing_and_undecodable_categories(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Exercises every category `_undetected_store_shape_message` can
+        report in one undetected-shape failure: a `.ts` file that WAS read
+        but carries no recognised marker (`scanned`, non-empty), a
+        Manifest-declared `.ts` file absent from disk (`excluded_missing`),
+        and a `.ts` file that is not UTF-8 decodable (`excluded_undecodable`).
+        None of the three scope entries yields a recognised shape, so the
+        command exits 1 naming all three categories under their own
+        separate labels."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(repo_path / "src" / "unmatched.ts", "export const x = 1;\n")
+        binary_path = repo_path / "src" / "binary.ts"
+        binary_path.parent.mkdir(parents=True, exist_ok=True)
+        binary_path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_files=("src/unmatched.ts", "src/deleted.ts", "src/binary.ts"),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Files scanned (.ts, .tsx, .js, .jsx only): src/unmatched.ts." in captured.err
+        assert "not present on disk): src/deleted.ts." in captured.err
+        assert "not UTF-8 decodable): src/binary.ts." in captured.err
+        assert not out_path.exists()
+
+    def test_marker_in_markdown_file_is_not_detected_as_a_store_shape(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """code_review round 2 (E9-F1-S1-T2, Blocking): unqualified substring
+        matching over EVERY scope file previously false-positived a `redux`
+        detection when the marker `configureStore(` appeared only in
+        Markdown prose (verified live against this very repo, whose own
+        docs mention the marker once this unit lands). A marker occurring
+        ONLY inside a non-source scope file (here, `.md`) must not be
+        treated as evidence of a real store: the shape stays undetected and
+        the command exits 1 naming the scanned file, exactly as it would if
+        the file contained no marker text at all."""
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "docs" / "notes.md",
+            "This document mentions configureStore( in prose, not in source.\n",
+        )
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=("docs/notes.md",)):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "docs/notes.md" in captured.err
+        assert "redux" not in captured.out
+        assert not out_path.exists()
+
+    def test_empty_scope_exits_1_and_writes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(unit, repo_path, manifest_files=()):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "no files in unit scope" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-1: registration + variadic dispatch.
+    # ------------------------------------------------------------------
+
+    def test_registered_in_commands_with_snapshotted_description(self) -> None:
+        func, min_args, usage = cli._COMMANDS["scaffold-store-factory"]
+        assert func is cli.cmd_scaffold_store_factory
+        # min_args must be 0: scaffold-store-factory is variadic (see
+        # test_is_variadic below) and owns ALL of its own usage validation
+        # via _parse_unit_id_and_required_flag_argv, which returns exit 2 for
+        # a missing/duplicated id, an unknown flag, or a missing --out
+        # value. A nonzero min_args here would let main()'s pre-dispatch
+        # arity check reject a short invocation with a generic exit-1
+        # message BEFORE cmd_scaffold_store_factory ever runs.
+        assert min_args == 0
+        assert "scaffold-store-factory <id> --out <path>" in usage
+
+    def test_is_variadic(self) -> None:
+        assert "scaffold-store-factory" in cli._VARIADIC_COMMANDS
+
+    def test_flag_and_value_both_reach_the_handler_through_main(self) -> None:
+        mock_fn = MagicMock(return_value=0)
+        with (
+            patch(
+                "sys.argv",
+                ["devbench", "scaffold-store-factory", "E1-F1-S1-T1", "--out", "skeleton.py"],
+            ),
+            patch.dict(
+                cli._COMMANDS,
+                {
+                    "scaffold-store-factory": (
+                        mock_fn,
+                        0,
+                        "Emit a composition-root store-factory test skeleton: scaffold-store-factory <id> --out <path>",
+                    )
+                },
+            ),
+        ):
+            result = cli.main()
+
+        assert result == 0
+        mock_fn.assert_called_once_with("E1-F1-S1-T1", "--out", "skeleton.py")
+
+    # ------------------------------------------------------------------
+    # AC-E9-F1-S1-T2-5: single scope-resolution path (grep-verified in-task).
+    # ------------------------------------------------------------------
+
+    def test_no_second_scope_resolution_path_introduced(self) -> None:
+        """`cmd_scaffold_store_factory` must resolve scope only through
+        `_resolve_scope_or_report` (i.e. `work_unit_scope.resolve_changed_files`),
+        never a second, hand-rolled scope scan (spec 4.3, AC-E9-F1-S1-T2-5)."""
+        import inspect
+
+        source = inspect.getsource(cli.cmd_scaffold_store_factory)
+        assert "_resolve_scope_or_report(" in source
+        assert "resolve_changed_files(" not in source
+
+    # ------------------------------------------------------------------
+    # Scope-resolution failure propagation (spec 4.3): a malformed Changes
+    # Manifest fails `_resolve_scope_or_report` before detection ever runs.
+    # ------------------------------------------------------------------
+
+    def test_scope_resolution_failure_exits_1_before_detection(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        out_path = tmp_path / "skeleton.py"
+
+        malformed_body = "| File | Change |\n|------|--------|\n| badrow |\n"
+        with self._patch_common(unit, repo_path, manifest_body=malformed_body):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # `_detect_store_shape` skips a Manifest-declared file that is absent
+    # from disk, and a scope file it cannot decode as UTF-8, without
+    # aborting detection for the rest of the scope.
+    # ------------------------------------------------------------------
+
+    def test_missing_and_undecodable_scope_files_are_skipped_during_detection(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        # `src/deleted.ts` is declared in the Manifest but never written to
+        # disk (a Manifest-declared delete, or a same-run race) -- exercises
+        # the `not abs_path.is_file(): continue` branch. `src/binary.ts`
+        # carries a `.ts` extension (in `_STORE_SHAPE_SOURCE_EXTENSIONS`) so
+        # it still reaches `read_text` and exercises the
+        # `except UnicodeDecodeError: continue` branch, rather than being
+        # skipped earlier by the extension allowlist (code_review round 2,
+        # E9-F1-S1-T2).
+        binary_path = repo_path / "src" / "binary.ts"
+        binary_path.parent.mkdir(parents=True, exist_ok=True)
+        binary_path.write_bytes(b"\xff\xfe\x00binary-not-utf8")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "skeleton.py"
+
+        with self._patch_common(
+            unit,
+            repo_path,
+            manifest_files=("src/deleted.ts", "src/binary.ts", "src/store/index.ts"),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "redux" in captured.out
+        assert out_path.exists()
+
+    # ------------------------------------------------------------------
+    # `_parse_unit_id_and_required_flag_argv` (E9-F1-S1-T2 round 2: shared
+    # with `check-write-path` to close a DRY violation, see
+    # TestSharedGateHelperCallerEnumerationsNameCheckWritePath) skips a
+    # blank/empty argv token rather than treating it as a positional or an
+    # unknown flag.
+    # ------------------------------------------------------------------
+
+    def test_empty_argv_token_is_skipped_by_the_parser(self) -> None:
+        parsed = cli._parse_unit_id_and_required_flag_argv(
+            ("", "E1-F1-S1-T1", "--out", "skeleton.py"),
+            verb="scaffold-store-factory",
+            flag="--out",
+            value_placeholder="<path>",
+        )
+        assert parsed == ("E1-F1-S1-T1", "skeleton.py")
+
+    # ------------------------------------------------------------------
+    # code_review round 1 (E9-F1-S1-T2, Advisory): an OSError reading a
+    # scope file that DOES exist (e.g. a permission failure) must be
+    # reported by name, exit 1, never silently treated as "no markers" by
+    # ``_detect_store_shape`` (CLAUDE.md "no silent failures").
+    # ------------------------------------------------------------------
+
+    def test_unreadable_scope_file_os_error_exits_1_naming_unit(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "skeleton.py"
+
+        with (
+            self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)),
+            patch("devbench.cli._detect_store_shape", side_effect=OSError("Permission denied")),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert "E1-F1-S1-T1" in captured.err
+        assert "Permission denied" in captured.err
+        assert not out_path.exists()
+
+    # ------------------------------------------------------------------
+    # code_review round 1 (E9-F1-S1-T2, Advisory): the refuse-to-overwrite
+    # guarantee is enforced by the filesystem itself (exclusive create),
+    # not only by the earlier ``out_path.exists()`` check -- a file
+    # created in the TOCTOU window between that check and the write must
+    # still be refused with the SAME message, and not clobbered.
+    # ------------------------------------------------------------------
+
+    def test_file_created_after_exists_check_is_not_clobbered(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        unit = self._make_unit()
+        repo_path = _init_scratch_repo_for_cli(tmp_path, dir_name="devbench")
+        self._write(
+            repo_path / "src" / "store" / "index.ts",
+            "export const store = configureStore({});\n",
+        )
+        out_path = tmp_path / "out" / "skeleton.py"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        real_path_open = Path.open
+
+        def _racing_open(
+            self: Path,
+            mode: str = "r",
+            buffering: int = -1,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+        ) -> object:
+            if self == out_path and mode == "x":
+                out_path.write_text("hand-written test code\n", encoding="utf-8")
+                raise FileExistsError(17, "File exists", str(out_path))
+            return real_path_open(self, mode, buffering, encoding, errors, newline)
+
+        with (
+            self._patch_common(unit, repo_path, manifest_files=("src/store/index.ts",)),
+            patch.object(Path, "open", _racing_open),
+        ):
+            result = cli.cmd_scaffold_store_factory("E1-F1-S1-T1", "--out", str(out_path))
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "ERROR" in captured.err
+        assert "already exists" in captured.err
+        assert out_path.read_text(encoding="utf-8") == "hand-written test code\n"
 
 
 class TestProposalCommandsRegistered:
@@ -17063,6 +28600,7 @@ class TestVariadicCommandsCoverage:
         '"--reason"',
         '"--reasoning"',
         '"--message"',
+        '"--provenance"',
     )
 
     def test_every_flag_with_value_command_is_variadic(self) -> None:

@@ -9,7 +9,7 @@ You have two ways to reach a running DevBench orchestrator:
 
 | Path | When to use |
 |------|-------------|
-| **Skill-driven** (recommended for new projects) | You want the full setup automated -- Claude Code marketplace skills author the spec, generate the backlog, write `devbench.yaml`, and bootstrap every repo. See [docs/onboarding.md](onboarding.md) for the chained-skill workflow (`create-spec -> spec-to-backlog -> configure-devbench -> bootstrap-environment -> make start`). |
+| **Skill-driven** (recommended for new projects) | You want the full setup automated -- Claude Code marketplace skills author the spec, generate the backlog, write `devbench.yaml`, interview you about every environment decision (LLM credential source, model selection, GitHub token source), and bootstrap every repo. See [docs/onboarding.md](onboarding.md) for the chained-skill workflow (`create-spec -> spec-to-backlog -> configure-devbench -> bootstrap-environment -> make start`), and [docs/skills/bootstrap-environment.md](skills/bootstrap-environment.md) / [docs/skills/configure-devbench.md](skills/configure-devbench.md) for the per-skill every-invocation interview contract. |
 | **Manual** (this guide) | You already have a backlog, need fine-grained control, or prefer to walk through each step yourself. Continue reading. |
 
 ---
@@ -164,6 +164,12 @@ containing `devbench` in the installed list.
 ## Step 4: Authenticate Claude / Bedrock
 
 DevBench supports two LLM backends. Choose one.
+
+> **Skill-driven equivalent:** the `bootstrap-environment` skill's Step 0 interviews
+> you about this same choice (plus the GitHub token source and
+> `DEVBENCH_CLAUDE_MODEL`) on every invocation and verifies it works before
+> bootstrapping repos -- see [docs/skills/bootstrap-environment.md](skills/bootstrap-environment.md).
+> The steps below are the manual equivalent.
 
 ### Option A: Anthropic API (default, via Claude Code OAuth)
 
@@ -1081,10 +1087,13 @@ directory.
 
 - [`README.md`](../README.md) (ref) -- project overview and quick-start
 - [`docs/onboarding.md`](onboarding.md) (ref) -- chained-skill operator workflow (create-spec -> spec-to-backlog -> configure-devbench -> bootstrap-environment -> make start)
+- [`docs/skills/configure-devbench.md`](skills/configure-devbench.md) (ref) -- configure-devbench every-invocation interview contract (skill-driven equivalent of Step 7)
+- [`docs/skills/bootstrap-environment.md`](skills/bootstrap-environment.md) (ref) -- bootstrap-environment every-invocation interview contract (skill-driven equivalent of Steps 4 and 6)
 - [`docs/creating-specs-and-backlogs.md`](creating-specs-and-backlogs.md) (ref) -- full backlog-authoring guide
 - [`docs/backlog-contract.md`](backlog-contract.md) (ref) -- validation rule set and workspace layout
 - [`docs/llm-authentication.md`](llm-authentication.md) (ref) -- full Claude / Bedrock auth options
 - [`docs/manual-blockers.md`](manual-blockers.md) (ref) -- manual-blocker format
+- [`docs/release-notes/live-smoke-evidence.md`](release-notes/live-smoke-evidence.md) (ref) -- operator-gated live-smoke checklist (two gates enabled against a seeded fixture workspace)
 
 ---
 

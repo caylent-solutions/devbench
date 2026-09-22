@@ -1136,6 +1136,52 @@ class TestResolveWindowEndpoints:
         assert span >= -0.1
 
 
+class TestGenerateReportInjectedNow:
+    """E13-F1-S1-T1 (AC-TEST-001): ``generate_report``'s window-endpoint
+    resolution must be caller-controlled via an injectable ``now=``, not
+    hard-wired to the real wall clock. ``_resolve_window_endpoints`` bounds
+    ``window_end`` below by ``now`` (see ``TestResolveWindowEndpoints``
+    above); this proves that bound is reachable end-to-end through
+    ``generate_report`` and changes the rendered "Time span" cell for the
+    Session column deterministically, purely as a function of the injected
+    value -- never as a function of when the test suite happens to run.
+    """
+
+    @staticmethod
+    def _session_time_span(log_file: Path, now: datetime) -> str:
+        report = generate_report(log_path=log_file, now=now)
+        row_line = next(ln for ln in report.splitlines() if "Time span" in ln)
+        # Column layout with no ``report_started_at``: '' | Metric | All-time | Session | ''.
+        cells = row_line.split("│")
+        assert len(cells) == 5, f"Unexpected 'Time span' row layout: {row_line!r}"
+        return cells[3].strip()
+
+    @pytest.mark.parametrize("now_offset_days", [1, 30])
+    def test_session_time_span_changes_with_injected_now(self, tmp_path: Path, now_offset_days: int) -> None:
+        log_file = tmp_path / "test.log"
+        log_file.write_text(
+            _make_log(
+                [
+                    "2026-03-05T10:00:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'in-progress'",
+                    "2026-03-05T10:05:00Z [judges.cli] INFO Set E0-F1-S1-T1 to 'done'",
+                ]
+            )
+        )
+        base_now = datetime(2026, 3, 5, 10, 5, 0, tzinfo=UTC)
+        now_a = base_now + timedelta(hours=1)
+        now_b = now_a + timedelta(days=now_offset_days)
+
+        span_a = self._session_time_span(log_file, now_a)
+        span_b = self._session_time_span(log_file, now_b)
+
+        assert span_a != span_b, (
+            "Session 'Time span' must change when the injected now= value changes "
+            f"(now_a={now_a.isoformat()} -> {span_a!r}, now_b={now_b.isoformat()} -> {span_b!r}); "
+            "an unchanged value means window_end is still reading the real wall clock "
+            "instead of the caller-supplied now."
+        )
+
+
 class TestApiUtilizationDisplay:
     """API utilization > 100% must render as a labeled marker, not a raw percentage."""
 
@@ -5533,7 +5579,16 @@ class TestGenerateReportThreadsSessionStarts:
         entries.append("2026-08-10T18:32:33Z [devbench.backlog_manager] INFO Set E2-F6-S1-T1 to 'done'")
         log_file.write_text(_make_log(entries))
 
-        report = generate_report(log_path=log_file)
+        # E13-F1-S1-T1: pin ``now`` to a small, fixed offset past the
+        # fixture's final log timestamp so window_end -- and therefore every
+        # rendered 'Time span' cell -- is deterministic. Before this fix the
+        # call relied on the real wall clock (``now=None`` -> ``datetime.now(UTC)``),
+        # which made the guard assertions below pass or fail purely as a
+        # function of the real calendar date/time the suite happened to run
+        # on (one of the three literals, '208.8 h', coincidentally matched
+        # ``real-now - fixture-final-timestamp`` on some days).
+        fixture_final_ts = datetime(2026, 8, 10, 18, 32, 33, tzinfo=UTC)
+        report = generate_report(log_path=log_file, now=fixture_final_ts + timedelta(minutes=5))
 
         # The poisoned pair (12+ idle days across a session gap) must not
         # reach the pre-#326 mean-poisoned numbers from the live repro.
@@ -6248,6 +6303,119 @@ class TestGenerateReportTransportRestartsRow:
         assert "Transport restarts        1" in report
         assert "Tasks completed" in report
         assert "Tasks remaining" in report
+
+
+class TestReportWaiverCount:
+    """spec 4.9, PM-5 (E2-F4-S1-T1, AC-E2-F4-S1-T1-6): report surfaces the
+    outstanding [GATE_WAIVER] waiver count, split by operator/executor
+    attribution."""
+
+    @staticmethod
+    def _mk_task(tmp_path: Path, uid: str, waiver_lines: list[str]) -> WorkUnit:
+        wu_file = tmp_path / f"{uid}.md"
+        body = "\n\n".join(waiver_lines)
+        wu_file.write_text(
+            f"# {uid}\n\n## Status: in-progress\n\n## TDD Cycle Log\n\n{body}\n\n## Comments\n",
+            encoding="utf-8",
+        )
+        return WorkUnit(
+            id=uid,
+            title=f"task-{uid}",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=wu_file,
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+    def test_backlog_totals_counts_split_by_attribution(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T2",
+                [
+                    compose_gate_waiver_record("layout_geometry", "src/b.py", "executor", "reason b"),
+                    compose_gate_waiver_record("ancestry", "src/c.py", "executor", "reason c"),
+                ],
+            ),
+        ]
+
+        totals = _backlog_totals_from_units(units)
+
+        assert totals.tasks_waived_operator == 1
+        assert totals.tasks_waived_executor == 2
+
+    def test_no_waivers_counts_zero(self, tmp_path: Path) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        units = [self._mk_task(tmp_path, "E9-F1-S1-T1", [])]
+
+        totals = _backlog_totals_from_units(units)
+
+        assert totals.tasks_waived_operator == 0
+        assert totals.tasks_waived_executor == 0
+
+    def test_missing_backing_file_contributes_zero(self) -> None:
+        from devbench.reporting.report import _backlog_totals_from_units
+
+        unit = WorkUnit(
+            id="E9-F1-S1-T1",
+            title="t",
+            status=WorkUnitStatus.IN_PROGRESS,
+            unit_type=WorkUnitType.TASK,
+            file_path=Path("/nonexistent/E9-F1-S1-T1.md"),
+            repo="caylent-solutions/devbench",
+            dependencies=[],
+        )
+
+        totals = _backlog_totals_from_units([unit])
+
+        assert totals.tasks_waived_operator == 0
+        assert totals.tasks_waived_executor == 0
+
+    def test_backlog_state_rows_include_gate_waiver_row(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _backlog_state_rows, _backlog_totals_from_units
+
+        units = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+        ]
+        totals = _backlog_totals_from_units(units)
+
+        rows = dict(_backlog_state_rows(totals))
+
+        assert rows["Gate waivers (operator / executor)"] == "1 / 0"
+
+    def test_gate_waiver_counts_helper_direct(self, tmp_path: Path) -> None:
+        from devbench.backlog.manager import compose_gate_waiver_record
+        from devbench.reporting.report import _gate_waiver_counts
+
+        tasks = [
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T1",
+                [compose_gate_waiver_record("reachability", "src/a.py", "operator", "reason a")],
+            ),
+            self._mk_task(
+                tmp_path,
+                "E9-F1-S1-T2",
+                [compose_gate_waiver_record("layout_geometry", "src/b.py", "executor", "reason b")],
+            ),
+        ]
+
+        assert _gate_waiver_counts(tasks) == (1, 1)
 
 
 class TestReviewRejectionsLine:

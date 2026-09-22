@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -621,6 +623,300 @@ class TestCreatePrExistingPrReuse:
         # Second call must be the actual create.
         create_cmd_args, _ = mock_gh.call_args_list[1]
         assert create_cmd_args[0][0:2] == ["pr", "create"]
+
+
+class TestProvenancePrBody:
+    """Test compose_finalize_pr_body (E2-F9-S1-T1; spec 4.13; D-17; AC-24).
+
+    ``git-ops-finalize`` composes the batch PR body through this seam. With
+    no provenance map configured (``provenance_path=None``) the output must
+    stay byte-identical to the pre-existing plain body (spec Section 6:
+    absent config preserves today's behaviour). With a resolved map, the
+    body carries the title, a per-epic summary and one closing-keyword line
+    per mapped issue, in both the same-repo and cross-repo forms, rendered
+    by a single code path (AC-E2-F9-S1-T1-2).
+    """
+
+    #: The exact plain body ``git-ops-finalize`` has always produced.
+    #: compose_finalize_pr_body(provenance_path=None) must reproduce this
+    #: string byte-for-byte (AC-E2-F9-S1-T1-3).
+    _PLAIN_BODY = (
+        "Accumulated commits from DevBench single-branch execution.\n\n"
+        "Branch: `feature/combined`\nRepo: `caylent-solutions/git-repo`"
+    )
+
+    def _write_map(self, tmp_path: Path, payload: dict) -> Path:
+        provenance_path = tmp_path / "provenance-map.json"
+        provenance_path.write_text(json.dumps(payload), encoding="utf-8")
+        return provenance_path
+
+    def test_no_provenance_path_matches_plain_body_exactly(self) -> None:
+        judge = GitOpsService()
+        body = judge.compose_finalize_pr_body(
+            repo="caylent-solutions/git-repo",
+            branch="feature/combined",
+            title="feat: feature/combined",
+            provenance_path=None,
+        )
+        assert body == self._PLAIN_BODY
+
+    def test_composes_title_epic_summary_and_closing_keywords(self, tmp_path: Path) -> None:
+        payload = {
+            "epics": [
+                {
+                    "name": "E1: Cherry-pick integration",
+                    "summary": "Landed the eight source PRs on the campaign branch.",
+                    "issues": [
+                        {"repo": "caylent-solutions/devbench-internal-backlog", "number": 10},
+                        {"number": 335},
+                    ],
+                }
+            ]
+        }
+        provenance_path = self._write_map(tmp_path, payload)
+        judge = GitOpsService()
+
+        body = judge.compose_finalize_pr_body(
+            repo="caylent-solutions/git-repo",
+            branch="feature/combined",
+            title="feat: feature/combined",
+            provenance_path=provenance_path,
+        )
+
+        assert "feat: feature/combined" in body
+        assert "E1: Cherry-pick integration" in body
+        assert "Landed the eight source PRs on the campaign branch." in body
+        assert "Fixes caylent-solutions/devbench-internal-backlog#10" in body
+        assert "Fixes #335" in body
+
+    @pytest.mark.parametrize(
+        ("issue", "expected_line"),
+        [
+            (
+                {"repo": "caylent-solutions/devbench-internal-backlog", "number": 10},
+                "Fixes caylent-solutions/devbench-internal-backlog#10",
+            ),
+            ({"number": 335}, "Fixes #335"),
+            ({"repo": "caylent-solutions/git-repo", "number": 42}, "Fixes #42"),
+        ],
+        ids=["cross_repo", "same_repo_no_repo_key", "same_repo_explicit_repo_key"],
+    )
+    def test_closing_keyword_forms_render_from_single_code_path(
+        self, tmp_path: Path, issue: dict, expected_line: str
+    ) -> None:
+        """AC-E2-F9-S1-T1-2: cross-repo and same-repo keyword lines both come
+        from :func:`devbench.github.git_ops._render_closing_keyword_line` --
+        proven here by driving both shapes through the SAME composer call
+        rather than two separate rendering code paths."""
+        payload = {"epics": [{"name": "E1", "summary": "s", "issues": [issue]}]}
+        provenance_path = self._write_map(tmp_path, payload)
+        judge = GitOpsService()
+
+        body = judge.compose_finalize_pr_body(
+            repo="caylent-solutions/git-repo",
+            branch="feature/combined",
+            title="t",
+            provenance_path=provenance_path,
+        )
+
+        assert expected_line in body
+
+    def test_missing_provenance_path_fails_loudly_naming_path(self, tmp_path: Path) -> None:
+        missing = tmp_path / "does-not-exist.json"
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match=re.escape("does-not-exist.json")):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=missing,
+            )
+
+    def test_unreadable_provenance_path_fails_loudly_naming_path(self, tmp_path: Path) -> None:
+        unreadable = tmp_path / "unreadable-map.json"
+        unreadable.write_text(json.dumps({"epics": []}), encoding="utf-8")
+        original_mode = unreadable.stat().st_mode
+        judge = GitOpsService()
+        try:
+            unreadable.chmod(0o000)
+            # Assert on the distinctive "is unreadable" substring (test_review
+            # non-blocking hardening note), not just the filename: under a
+            # root test runner chmod(0o000) is a no-op, the read would
+            # succeed, and this fixture's {"epics": []} payload would
+            # instead raise the *no-mapped-issues* ValueError, whose message
+            # also contains the filename -- so a filename-only match would
+            # pass on that unintended branch too.
+            with pytest.raises(ValueError, match="is unreadable"):
+                judge.compose_finalize_pr_body(
+                    repo="caylent-solutions/git-repo",
+                    branch="feature/combined",
+                    title="t",
+                    provenance_path=unreadable,
+                )
+        finally:
+            unreadable.chmod(original_mode)
+
+    def test_empty_epics_list_fails_loudly_rather_than_empty_keyword_block(self, tmp_path: Path) -> None:
+        provenance_path = self._write_map(tmp_path, {"epics": []})
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="no mapped issues"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_epic_with_no_issues_fails_loudly_rather_than_empty_keyword_block(self, tmp_path: Path) -> None:
+        provenance_path = self._write_map(tmp_path, {"epics": [{"name": "E1", "summary": "s", "issues": []}]})
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="no mapped issues"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_malformed_json_fails_loudly_naming_path(self, tmp_path: Path) -> None:
+        provenance_path = tmp_path / "bad.json"
+        provenance_path.write_text("{not valid json", encoding="utf-8")
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match=re.escape("bad.json")):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_issue_entry_missing_number_fails_loudly(self, tmp_path: Path) -> None:
+        provenance_path = self._write_map(
+            tmp_path, {"epics": [{"name": "E1", "summary": "s", "issues": [{"repo": "org/repo"}]}]}
+        )
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="number"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_non_object_issue_entry_fails_loudly(self, tmp_path: Path) -> None:
+        provenance_path = self._write_map(
+            tmp_path, {"epics": [{"name": "E1", "summary": "s", "issues": ["not-an-object"]}]}
+        )
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="non-object issue entry"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_non_object_provenance_map_fails_loudly(self, tmp_path: Path) -> None:
+        provenance_path = tmp_path / "list-map.json"
+        provenance_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="must decode to a JSON object"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_non_list_epics_fails_loudly(self, tmp_path: Path) -> None:
+        provenance_path = self._write_map(tmp_path, {"epics": "not-a-list"})
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="must contain an 'epics' list"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    def test_non_object_epic_entry_fails_loudly(self, tmp_path: Path) -> None:
+        provenance_path = tmp_path / "bad-epic.json"
+        # A dedicated fixture (not via _write_map) so the total-issues guard
+        # is bypassed by a sibling well-formed epic, isolating the
+        # non-object-epic branch under test.
+        provenance_path.write_text(
+            json.dumps({"epics": ["not-an-object", {"name": "E1", "summary": "s", "issues": [{"number": 1}]}]}),
+            encoding="utf-8",
+        )
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match="non-object epic entry"):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    @pytest.mark.parametrize("issues_value", [5, True], ids=["int", "bool"])
+    def test_epic_with_non_list_issues_value_fails_loudly(self, tmp_path: Path, issues_value: object) -> None:
+        """Regression test (spec Section 7): a non-sized JSON scalar in
+        ``issues`` must raise a loud ``ValueError`` naming the path and
+        the offending epic, never an uncaught ``TypeError`` from ``len()``.
+        Restricted to the two shapes verified by execution to reach
+        ``len()`` and crash (``int``/``bool``) -- a JSON string or object
+        value already fails loudly today via a different, coincidental
+        validation branch (string iterates into single-char "issue"
+        entries, dict has its own ``__len__``), so those shapes would not
+        reproduce this specific gap."""
+        provenance_path = tmp_path / "non-list-issues.json"
+        provenance_path.write_text(
+            json.dumps({"epics": [{"name": "E1", "summary": "s", "issues": issues_value}]}),
+            encoding="utf-8",
+        )
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match=re.escape(str(provenance_path))):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    @pytest.mark.parametrize("missing_field", ["name", "summary"])
+    def test_epic_missing_name_or_summary_fails_loudly(self, tmp_path: Path, missing_field: str) -> None:
+        """Regression test (spec 4.13; AC-E2-F9-S1-T1-1): an epic missing
+        ``name`` or ``summary`` must raise loudly rather than silently
+        defaulting to an empty string, since AC-E2-F9-S1-T1-1 requires a
+        non-empty per-epic summary in the composed body."""
+        epic = {"name": "E1", "summary": "s", "issues": [{"number": 1}]}
+        del epic[missing_field]
+        provenance_path = self._write_map(tmp_path, {"epics": [epic]})
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match=re.escape(str(provenance_path))):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
+
+    @pytest.mark.parametrize("bad_repo", [42, True, "no-slash-here"], ids=["int", "bool", "missing-slash"])
+    def test_issue_entry_with_invalid_repo_value_fails_loudly(self, tmp_path: Path, bad_repo: object) -> None:
+        """Regression test (spec 4.13; D-17): an issue's ``repo`` field
+        that is not a string in ``owner/name`` shape must raise loudly
+        rather than rendering a dead closing keyword like ``Fixes 42#1``
+        that GitHub will never honour on merge."""
+        provenance_path = self._write_map(
+            tmp_path, {"epics": [{"name": "E1", "summary": "s", "issues": [{"number": 1, "repo": bad_repo}]}]}
+        )
+        judge = GitOpsService()
+        with pytest.raises(ValueError, match=re.escape(str(provenance_path))):
+            judge.compose_finalize_pr_body(
+                repo="caylent-solutions/git-repo",
+                branch="feature/combined",
+                title="t",
+                provenance_path=provenance_path,
+            )
 
 
 class TestMergePr:

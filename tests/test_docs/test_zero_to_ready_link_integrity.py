@@ -103,6 +103,7 @@ class TestZeroToReadyLinkIntegrity:
             "creating-specs-and-backlogs.md",
             "cli-reference.md",
             "manual-blockers.md",
+            "live-smoke-evidence.md",
         ],
     )
     def test_expected_cross_reference_links_present(self, expected_link_fragment: str) -> None:

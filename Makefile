@@ -3,7 +3,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 unexport VIRTUAL_ENV
 
-.PHONY: help install install-hook-deps install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live
+.PHONY: help install install-hooks plugin-install plugin-uninstall lint lint-ruff lint-bandit lint-no-duplicates format format-check typecheck test test-unit test-coverage generate-vocabulary check-vocabulary-drift validate clean start start-interactive report report-session pre-commit-check pre-push-check watch watch-live install-hook-deps
 
 ## help: Show available targets
 help:
@@ -93,21 +93,56 @@ test-unit:
 ## test-coverage: Run tests with coverage report (fails below 98%)
 ## --cov-precision=2 so the fail-under compares the real value (e.g. 97.70 < 98)
 ## instead of the default precision=0 which rounds 97.70 -> 98 and never fails.
+#
+# COVERAGE_CORE=sysmon selects coverage.py's PEP 669 sys.monitoring core.
+# That is already the default on CPython 3.14, but not on 3.12 -- the
+# `requires-python` floor and the version CI runs -- where coverage falls
+# back to the C trace function. The tracer inflates wall-clock time by
+# roughly 7x (measured on this suite: the permission_flag_writepath file
+# alone takes 38.4s traced vs 6.1s under sysmon), which pushes the ReDoS
+# linear-time regression guards in
+# tests/test_plugin_helpers/test_permission_flag_writepath.py past their
+# budgets even though the code under test is linear -- a measurement
+# artefact, not a regression. Coverage totals are identical either way
+# (17982 statements / 300 missing / 98.33% under both cores), and this
+# project does not use branch coverage, which sysmon does not support
+# before 3.14. Overridable: `make test-coverage COVERAGE_CORE=ctrace`.
+# coverage.py reads this only from the environment; it has no
+# pyproject.toml equivalent in coverage 7.13.
+COVERAGE_CORE ?= sysmon
+export COVERAGE_CORE
+
 test-coverage:
 	uv run pytest tests/ --cov=devbench --cov-report=term-missing --cov-fail-under=98 --cov-precision=2
 
 ## test: Run all tests
 test: test-unit
 
-## validate: Full validation (all checks -- identical to CI and pre-push)
-validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck test-coverage
+## generate-vocabulary: Render docs/review-feedback-vocabulary.md tables and judge-prompt
+## sentences from JUDGE_CATEGORIES between <!-- generated:vocabulary --> guard markers
+## (idempotent -- re-run after adding/renaming a review-judge rejection-feedback code)
+generate-vocabulary:
+	uv run python -m devbench.vocabulary_generation
+
+## check-vocabulary-drift: Verify every guard-marked vocabulary surface
+## matches its regenerated form (spec 4.10, AC-11). Single delegation to the
+## generator module's own check mode -- carries no separate copy of the
+## surface list, so a surface added to the module is covered automatically.
+## Fails naming the offending file(s) and `make generate-vocabulary` when a
+## generated block was hand-edited (or JUDGE_CATEGORIES changed without
+## regenerating). Never writes to the working tree.
+check-vocabulary-drift:
+	uv run python -m devbench.vocabulary_generation --check
+
+## validate: Full validation (CI's job set plus check-vocabulary-drift, which CI reaches only indirectly via TestVocabularyDriftCheck in test-coverage)
+validate: lint-ruff lint-bandit lint-no-duplicates format-check typecheck check-vocabulary-drift test-coverage
 	@echo "All validations passed"
 
 ## pre-commit-check: Checks that run on every commit (fast)
 pre-commit-check: lint-ruff format-check
 	@echo "Pre-commit checks passed"
 
-## pre-push-check: Checks that run before push (full -- identical to CI)
+## pre-push-check: Checks that run before push (runs validate, a superset of CI's job set that also gates check-vocabulary-drift)
 pre-push-check: validate
 	@echo "Pre-push checks passed"
 

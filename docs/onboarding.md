@@ -32,16 +32,24 @@ Before running any skill in the chain, verify the following are in place:
    make -C $DEVBENCH_DIR install
    ```
 
-3. **DevBench plugin available** -- the four onboarding skills are part of the devbench
-   marketplace plugin. Load the plugin per-session (recommended) or install globally:
+3. **DevBench plugin available** -- the four onboarding skills ship in the
+   `devbench-authoring` plugin, a separate marketplace from the orchestrate plugin
+   (see [`docs/migration-0.4.0.md`](migration-0.4.0.md) for why: authoring skills write
+   `backlog/*.md`, while the orchestrator's guard hooks block writes to those same
+   paths -- the two audiences can't share one plugin). Load it per-session (recommended)
+   or register it scoped to a specific workspace:
 
    ```bash
-   # Per-session (recommended -- avoids hook interference with other Claude sessions):
+   # Per-session (recommended -- loads the plugin ad-hoc, no global config touched):
    claude --dangerously-skip-permissions \
-     --plugin-dir $DEVBENCH_DIR/plugin/devbench
+     --plugin-dir $DEVBENCH_DIR/plugin-authoring/devbench-authoring
 
-   # Or globally (read the warning in zero-to-ready.md Step 3 first):
-   make -C $DEVBENCH_DIR plugin-install
+   # Or, scoped to one workspace (run from inside that workspace root, created in
+   # the next step). Use --scope project, NOT user -- a user-scope install loads the
+   # plugin in every Claude Code session on this machine, re-creating the exact
+   # conflict the plugin split was designed to eliminate:
+   claude plugin marketplace add $DEVBENCH_DIR/plugin-authoring
+   claude plugin install devbench-authoring@devbench-authoring --scope project
    ```
 
 4. **Workspace root directory** -- create the directory that will hold your backlog,
@@ -63,13 +71,13 @@ non-trivial programs, 16 top-level sections, numbered and testable acceptance cr
 **Invoke:**
 
 ```
-claude run devbench:create-spec
+claude run devbench-authoring:create-spec
 ```
 
 Or from within a Claude Code session loaded with the plugin:
 
 ```
-run devbench:create-spec
+run devbench-authoring:create-spec
 ```
 
 **What happens:**
@@ -102,7 +110,7 @@ validated backlog: `BACKLOG.md` plus work-unit `.md` files under `backlog/` in t
 **Invoke:**
 
 ```
-claude run devbench:spec-to-backlog
+claude run devbench-authoring:spec-to-backlog
 ```
 
 The skill asks: "Which spec file should I decompose into a backlog?" Provide the path
@@ -151,7 +159,7 @@ parser's error message and you are re-prompted.
 **Invoke:**
 
 ```
-claude run devbench:configure-devbench
+claude run devbench-authoring:configure-devbench
 ```
 
 **What happens:**
@@ -187,7 +195,7 @@ intervention beyond yes/no confirmations.
 **Invoke:**
 
 ```
-claude run devbench:bootstrap-environment
+claude run devbench-authoring:bootstrap-environment
 ```
 
 **What happens:**
@@ -253,10 +261,10 @@ export DEVBENCH_WORKSPACE_ROOT=~/payment-service-ws
 ```bash
 # Open Claude Code with the plugin loaded:
 claude --dangerously-skip-permissions \
-  --plugin-dir $DEVBENCH_DIR/plugin/devbench
+  --plugin-dir $DEVBENCH_DIR/plugin-authoring/devbench-authoring
 
 # Within the session:
-run devbench:create-spec
+run devbench-authoring:create-spec
 ```
 
 Answer the Q&A blocks; the skill produces `spec/payment-service.md`.
@@ -264,7 +272,7 @@ Answer the Q&A blocks; the skill produces `spec/payment-service.md`.
 **Step 2 -- spec-to-backlog:**
 
 ```
-run devbench:spec-to-backlog
+run devbench-authoring:spec-to-backlog
 ```
 
 Provide `spec/payment-service.md` when prompted. The skill produces `BACKLOG.md` and
@@ -273,7 +281,7 @@ work-unit files. All tasks land in `draft` status.
 **Step 3 -- configure-devbench:**
 
 ```
-run devbench:configure-devbench
+run devbench-authoring:configure-devbench
 ```
 
 Enter: `org/repo` = `myorg/payment-service`, `checkout_directory` = `payment-service`,
@@ -282,7 +290,7 @@ Enter: `org/repo` = `myorg/payment-service`, `checkout_directory` = `payment-ser
 **Step 4 -- bootstrap-environment:**
 
 ```
-run devbench:bootstrap-environment
+run devbench-authoring:bootstrap-environment
 ```
 
 The skill clones `github.com/myorg/payment-service` to

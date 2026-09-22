@@ -296,9 +296,9 @@ Ask the operator:
 >   max_blocks           -- Max consecutive stop-hook blocks before circuit breaker trips.
 >                           [integer >= 1, default: 5]
 >   window_seconds       -- Time window in seconds for counting blocks; counter resets after this period.
->                           [integer >= 1, default: 900]
+>                           [integer >= 1, default: 180]
 >   stale_task_minutes   -- Minutes before an in-progress task is considered stale.
->                           [integer >= 1, default: 30]"
+>                           [integer >= 1, default: 120]"
 
 ---
 

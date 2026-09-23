@@ -2800,6 +2800,42 @@ class BacklogManager:
         return any(lower.endswith(ext) for ext, tier in cls._NON_PY_EXTS_TO_TIER.items() if tier != "Markdown")
 
     @staticmethod
+    def _configured_audit_trail_paths() -> tuple[str, ...] | None:
+        """Return the workspace's declared audit-trail prefixes, or None.
+
+        Isolated the same way ``_configured_production_source_paths`` is, so a
+        workspace that never configures the key pays no behavioural cost.
+        """
+        try:
+            from devbench.config import RUNTIME_CONFIG
+
+            return RUNTIME_CONFIG.validate.audit_trail_paths
+        except Exception:
+            return None
+
+    @classmethod
+    def _is_audit_trail_path(cls, path: str) -> bool:
+        """Return True if the path sits under a declared audit-trail prefix.
+
+        The fourth row classifier, and the only one that is configuration
+        rather than shape. A target repo may require every ticket to open an
+        audit-trail record before it can commit at all; that record is
+        neither production source, nor a test, nor documentation, so none of
+        the other three classifiers accepts it, yet a docs task and a chore
+        task must both be able to declare one. Returns False for every
+        workspace that leaves ``validate.audit_trail_paths`` unset, which is
+        why adding this to each OR-list changes no existing backlog.
+
+        Prefix-matched rather than extension-matched: the exemption is meant
+        to cover one declared tree, not a file shape anywhere in the repo.
+        """
+        prefixes = cls._configured_audit_trail_paths()
+        if not prefixes:
+            return False
+        normalized = path.strip().lstrip("./")
+        return any(normalized.startswith(prefix.lstrip("./")) for prefix in prefixes)
+
+    @staticmethod
     def _is_real_manifest_path(path: str) -> bool:
         """Return True if the Manifest entry is a real file path.
 
@@ -3295,6 +3331,13 @@ class BacklogManager:
         - ``chore``: every Manifest row must be a dependency/config/lockfile
           path OR a documentation/markdown path (db-300: a chore task may
           legitimately own ``CHANGELOG.md``).
+
+        Every non-gated type additionally accepts a row under a prefix the
+        workspace declared in ``validate.audit_trail_paths``. A repo that
+        requires each ticket to open an audit-trail record before it can
+        commit needs every task type to be able to own that record, and it
+        matches none of the shape classifiers. The key is unset by default,
+        so this widens nothing until a workspace asks for it.
         - ``refactor``: exempt from the per-row invariants enforced here --
           its green-green runtime requirement is a TDD-cycle-log concern,
           out of scope for this static Manifest check.
@@ -3389,19 +3432,25 @@ class BacklogManager:
     # handled separately in ``_check_task_type_manifest_invariant`` (an
     # aggregate "at least one" check, not a per-row classifier).
     # ``refactor`` never reaches the dispatcher -- the caller filters it out
-    # before parsing the Manifest. The three classifiers below
+    # before parsing the Manifest. The four classifiers below
     # (``_is_test_source_path``, ``_is_documentation_path``,
-    # ``_is_chore_path``) are the single source of truth reused across every
-    # OR-list entry -- no fourth classifier exists.
+    # ``_is_chore_path``, ``_is_audit_trail_path``) are the single source of
+    # truth reused across every OR-list entry -- no fifth classifier exists.
+    # ``_is_audit_trail_path`` is the only one driven by configuration rather
+    # than by path shape, and it returns False for every workspace that has
+    # not declared ``validate.audit_trail_paths``.
     _TASK_TYPE_ROW_INVARIANTS: ClassVar[dict[str, tuple[tuple[str, ...], str]]] = {
-        TASK_TYPE_TEST_ONLY: (("_is_test_source_path",), "test"),
+        TASK_TYPE_TEST_ONLY: (
+            ("_is_test_source_path", "_is_audit_trail_path"),
+            "test or declared audit-trail",
+        ),
         TASK_TYPE_DOCS: (
-            ("_is_documentation_path", "_is_test_source_path"),
-            "documentation/markdown or documentation-pinning test",
+            ("_is_documentation_path", "_is_test_source_path", "_is_audit_trail_path"),
+            "documentation/markdown, documentation-pinning test, or declared audit-trail",
         ),
         TASK_TYPE_CHORE: (
-            ("_is_chore_path", "_is_documentation_path"),
-            "dependency/config/lockfile or documentation/markdown",
+            ("_is_chore_path", "_is_documentation_path", "_is_audit_trail_path"),
+            "dependency/config/lockfile, documentation/markdown, or declared audit-trail",
         ),
     }
 

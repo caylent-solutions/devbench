@@ -216,9 +216,11 @@ from devbench.config_loader import (
     QuotaHandlingConfig,
     RepoConfig,
     format_branch_name,
+    format_commit_subject,
     format_single_branch_name,
     get_configured_default_branch,
     get_effective_branch_prefix,
+    get_effective_commit_subject_template,
 )
 from devbench.constants import (
     AGENT_WRITABLE_TDD_PHASES,
@@ -5584,7 +5586,12 @@ def _git_ops_deferred(unit_id: str, unit: WorkUnit, canonical_repo: str, repo_pa
     from devbench.github.git_ops import GitOpsService
 
     ops = GitOpsService()
-    commit_message = f"{unit_id}: {unit.title}"
+    commit_message = format_commit_subject(
+        unit_id,
+        unit.title,
+        unit.branch,
+        get_effective_commit_subject_template(canonical_repo, RUNTIME_CONFIG),
+    )
 
     wu_file = _resolve_unit_file(unit)
     mgr = BacklogManager()
@@ -6624,8 +6631,17 @@ def cmd_git_ops(unit_id: str) -> int:
         return _git_ops_deferred(unit_id, unit, canonical_repo, repo_path, branch)
 
     # Standard mode: commit, push, PR, CI, merge.
-    commit_message = f"{unit_id}: {unit.title}"
-    pr_title = f"{unit_id}: {unit.title}"
+    # The PR title repeats the commit subject rather than the raw
+    # `<unit-id>: <title>`, so a repo whose subject convention names a ticket
+    # gets that ticket on the PR too -- a squash merge takes its subject from
+    # the PR title, and the two would otherwise disagree.
+    commit_message = format_commit_subject(
+        unit_id,
+        unit.title,
+        unit.branch,
+        get_effective_commit_subject_template(canonical_repo, RUNTIME_CONFIG),
+    )
+    pr_title = commit_message
     pr_body = f"Automated PR for work unit {unit_id}.\n\n{unit.title}"
 
     ops = GitOpsService()

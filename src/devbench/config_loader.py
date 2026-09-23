@@ -86,6 +86,7 @@ from devbench.constants import (
     DEFAULT_STOP_HOOK_WINDOW_SECONDS,
     STATUS_DRAFT,
     STATUS_IN_QUEUE,
+    TICKET_IN_BRANCH_RE,
     ModelRates,
 )
 
@@ -317,6 +318,15 @@ class GitOpsConfig:
             one downstream repo (each independently numbering tasks from
             ``E1-F1-S1-T1``) never collide on branch names.  Defaults to
             ``None`` (no prefix, original behaviour).
+        commit_subject_template: Template for the commit subject git-ops
+            writes, overridden per-repo by ``RepoConfig.commit_subject_template``.
+            Placeholders: ``{unit_id}``, ``{title}``, and ``{ticket}`` -- the
+            tracker id carried by the work unit's spec-defined ``**Branch:**``
+            field.  Exists because a target repo's own commit-msg hook may
+            enforce a subject shape the work-unit ID cannot satisfy: a flat
+            ``TICKET-ID: description`` rejects the multi-dash
+            ``E1-F1-S1-T1``.  Defaults to ``None``, which keeps the subject
+            ``<unit-id>: <title>``.
     """
 
     update_submodule: bool = False
@@ -332,6 +342,7 @@ class GitOpsConfig:
     auto_merge: bool = False
     branch_prefix: str | None = None
     isolate_worktrees: bool = False
+    commit_subject_template: str | None = None
 
 
 @dataclass
@@ -437,11 +448,22 @@ class ValidateConfig:
             ``scripts/`` -- otherwise a genuine behaviour fix in that tree
             cannot satisfy the invariant and cannot be authored at all.
             Test paths and ``__init__.py`` are excluded regardless.
+        audit_trail_paths: Path prefixes every task type may declare in its
+            ``## Changes Manifest`` regardless of its task-type invariant
+            (rule 21). ``None`` (the default) means no such prefix exists and
+            the invariant is unchanged. Set this when the target repository
+            requires each ticket to carry an audit-trail record: that record
+            is neither production source, nor a test, nor documentation, so
+            no existing classifier accepts it, yet a docs task and a chore
+            task must both be able to own one. Widening by prefix rather
+            than by extension keeps the exemption confined to the declared
+            tree instead of admitting a file shape anywhere in the repo.
     """
 
     check_orphan_path_tokens: bool = True
     production_source_paths: tuple[str, ...] | None = None
     production_source_extensions: tuple[str, ...] | None = None
+    audit_trail_paths: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1196,6 +1218,11 @@ class RepoConfig:
             ``wg_004`` yields ``backlog/wg_004/e1-f1-s1-t1``).  Use this to
             avoid task-branch collisions when multiple devbench workspaces
             push to the same shared repo.
+        commit_subject_template: Per-repo commit-subject template override.
+            When ``None``, the top-level ``GitOpsConfig.commit_subject_template``
+            is used, and when that is also unset the subject stays
+            ``<unit-id>: <title>``.  Set this for a repo whose commit-msg hook
+            enforces a subject shape the work-unit ID cannot satisfy.
         resolved_checkout_path: Absolute filesystem path to the repo
             checkout, populated by ``load_runtime_config``. Equal to
             ``<DEVBENCH_WORKSPACE_ROOT>/<checkout_directory or repo_short_name>``
@@ -1211,6 +1238,7 @@ class RepoConfig:
     checkout_directory: str | None = None
     merge_strategy: str | None = None
     branch_prefix: str | None = None
+    commit_subject_template: str | None = None
     resolved_checkout_path: Path | None = None
     validated_repo: str | None = None
 
@@ -1553,6 +1581,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
     repo_merge_strategy: str | None = repo_data.get("merge_strategy")
 
     repo_branch_prefix = _parse_branch_prefix(path, f"repos.{repo_name}.branch_prefix", repo_data.get("branch_prefix"))
+    repo_commit_subject_template: str | None = repo_data.get("commit_subject_template") or None
 
     raw_checkout = repo_data.get("checkout_directory")
     if raw_checkout is None:
@@ -1560,6 +1589,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
             default_branch=default_branch,
             merge_strategy=repo_merge_strategy,
             branch_prefix=repo_branch_prefix,
+            commit_subject_template=repo_commit_subject_template,
         )
 
     if Path(raw_checkout).is_absolute():
@@ -1577,6 +1607,7 @@ def _parse_repo_config(path: Path, repo_name: str, repo_data: object) -> RepoCon
         checkout_directory=raw_checkout,
         merge_strategy=repo_merge_strategy,
         branch_prefix=repo_branch_prefix,
+        commit_subject_template=repo_commit_subject_template,
     )
 
 
@@ -1717,6 +1748,36 @@ def _parse_production_source_paths(path: Path, validate_raw: Mapping[str, object
     stripped = [x.strip() for x in raw]
     if any(not x for x in stripped):
         raise ValueError(f"{path}: validate.production_source_paths must not contain an empty entry.")
+    return tuple(stripped)
+
+
+def _parse_audit_trail_paths(path: Path, validate_raw: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Parse ``validate.audit_trail_paths`` into a tuple, or ``None`` when absent.
+
+    ``None`` means no path is exempt from the task-type invariant, so a
+    workspace that never declares the key sees no behaviour change.
+
+    Args:
+        path: Config file path, used only for error messages.
+        validate_raw: The raw ``validate`` mapping from the YAML.
+
+    Returns:
+        The declared prefixes as a tuple, or ``None`` when the key is absent.
+
+    Raises:
+        ValueError: When the value is not a list of non-empty strings.
+    """
+    raw = validate_raw.get("audit_trail_paths")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(
+            f"{path}: validate.audit_trail_paths must be a list of path-prefix strings "
+            f"(for example ['.ai-sdlc/']), got {raw!r}."
+        )
+    stripped = [x.strip() for x in raw]
+    if any(not x for x in stripped):
+        raise ValueError(f"{path}: validate.audit_trail_paths must not contain an empty entry.")
     return tuple(stripped)
 
 
@@ -1885,6 +1946,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         auto_merge=auto_merge,
         branch_prefix=branch_prefix_raw,
         isolate_worktrees=isolate_worktrees,
+        commit_subject_template=git_ops_raw.get("commit_subject_template") or None,
     )
     if isolate_worktrees and single_branch_raw:
         raise ValueError(
@@ -1994,6 +2056,7 @@ def load_runtime_config(path: Path, _env: Mapping[str, str]) -> RuntimeConfig:
         ),
         production_source_paths=_parse_production_source_paths(path, validate_raw),
         production_source_extensions=_parse_production_source_extensions(path, validate_raw),
+        audit_trail_paths=_parse_audit_trail_paths(path, validate_raw),
     )
 
     # Populate StopHookConfig from YAML stop_hook block.
@@ -2199,6 +2262,106 @@ def get_effective_branch_prefix(repo: str, runtime_config: RuntimeConfig) -> str
     if runtime_config.git_ops.branch_prefix:
         return runtime_config.git_ops.branch_prefix
     return None
+
+
+def get_effective_commit_subject_template(repo: str, runtime_config: RuntimeConfig) -> str | None:
+    """Return the effective commit-subject template for *repo*.
+
+    Resolution: per-repo ``repos.<org/repo>.commit_subject_template`` override,
+    else the top-level ``git_ops.commit_subject_template``, else ``None`` (the
+    original ``<unit-id>: <title>`` subject).  Pure function -- no env reads,
+    no I/O.
+
+    Args:
+        repo: Fully-qualified repository name (e.g. ``'org/repo'``).
+        runtime_config: Loaded runtime configuration.
+
+    Returns:
+        The configured template string, or ``None`` when neither per-repo nor
+        top-level sets one.
+    """
+    repo_config = runtime_config.repos.get(repo)
+    if repo_config and repo_config.commit_subject_template:
+        return repo_config.commit_subject_template
+    if runtime_config.git_ops.commit_subject_template:
+        return runtime_config.git_ops.commit_subject_template
+    return None
+
+
+def extract_ticket_id(branch: str | None) -> str | None:
+    """Return the tracker id a work unit's spec-defined branch name carries.
+
+    A work unit whose ``**Branch:**`` field reads ``sfb-229-vendoring-pipeline``
+    is a unit whose ticket is ``SFB-229``.  That field is where a backlog
+    already records the tracker id -- reading it here is what lets a commit
+    subject name the ticket without a second field on every work unit to keep
+    in sync with the first.
+
+    Case-folded to upper because a branch name is lowercase by convention and
+    a tracker id is not.
+
+    Args:
+        branch: The work unit's branch name, or ``None``.
+
+    Returns:
+        The upper-cased tracker id, or ``None`` when *branch* carries none.
+    """
+    if not branch:
+        return None
+    match = TICKET_IN_BRANCH_RE.match(branch.strip().strip("`"))
+    if match is None:
+        return None
+    return match.group(1).upper()
+
+
+def format_commit_subject(
+    unit_id: str,
+    title: str,
+    branch: str | None,
+    template: str | None,
+) -> str:
+    """Build the commit subject git-ops writes for one work unit.
+
+    Returns ``<unit-id>: <title>`` unchanged when *template* is ``None``,
+    which is every workspace that does not set the key.
+
+    Args:
+        unit_id: Work-unit ID (e.g. ``'E1-F2-S1-T1'``).
+        title: The work unit's title.
+        branch: The work unit's branch name, the source of ``{ticket}``.
+        template: Effective template from
+            :func:`get_effective_commit_subject_template`, or ``None``.
+
+    Returns:
+        The commit subject line.
+
+    Raises:
+        ValueError: When *template* asks for ``{ticket}`` and *branch* carries
+            no tracker id, or when it names a placeholder that does not exist.
+            Both are refused loudly rather than filled with a blank: a subject
+            silently missing its ticket is exactly what the target repo's
+            commit-msg hook exists to reject, and discovering that at the
+            commit is a whole task's work later than discovering it here.
+    """
+    if template is None:
+        return f"{unit_id}: {title}"
+
+    ticket = extract_ticket_id(branch)
+    if "{ticket}" in template and ticket is None:
+        raise ValueError(
+            f"commit_subject_template {template!r} requires a {{ticket}}, but work unit "
+            f"{unit_id}'s branch {branch!r} carries no tracker id. Give the unit a "
+            "'- **Branch:** `<ticket>-<slug>`' field (e.g. `sfb-229-vendoring-pipeline`), "
+            "or drop {ticket} from the template."
+        )
+
+    try:
+        return template.format(unit_id=unit_id, title=title, ticket=ticket)
+    except KeyError as error:
+        raise ValueError(
+            f"commit_subject_template {template!r} names unknown placeholder {error}. "
+            "Available placeholders: {unit_id}, {title}, {ticket}."
+        ) from error
 
 
 def format_branch_name(unit_id: str, branch_prefix: str | None = None) -> str:

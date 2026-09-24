@@ -40,7 +40,7 @@ You have two ways to reach a running DevBench orchestrator:
 
 ## Prerequisites
 
-**On Windows**, see [docs/windows-setup.md](windows-setup.md) first —
+**On Windows**, see [docs/windows-setup.md](windows-setup.md) first --
 DevBench's tooling assumes a Unix-like environment, and native Windows
 is not a supported target. Set up WSL2 per that guide, then continue
 below from inside your WSL terminal.
